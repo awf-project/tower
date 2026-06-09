@@ -1,2 +1,14 @@
-//! Adapters layer — concrete implementations of ports (sled, fs, notify,
-//! wasmtime, MCP). Populated from spec 02 onward.
+//! Adapters layer — concrete implementations of port traits.
+//!
+//! In-memory test doubles are always compiled in (used by contract test
+//! macros). Real infrastructure adapters (sled, std::fs, wasmtime, notify)
+//! land in specs 04 / 05 / 11 and are conditionally compiled.
+
+pub mod in_memory_fs;
+pub mod in_memory_storage;
+
+pub use in_memory_fs::InMemoryFs;
+pub use in_memory_storage::InMemoryStorage;
+
+#[cfg(test)]
+mod contract_tests;

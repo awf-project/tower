@@ -13,4 +13,11 @@ path = "src/lib.rs"
 name = "tower"
 path = "src/main.rs"
 
+[features]
+# Expose test-support helpers (contract test macros, in-memory fakes) to other
+# crates. Never enable in production builds.
+# Decision: feature gate rather than a separate crate to avoid circular deps.
+# Trade-off: callers must opt-in; the feature is not automatically enabled.
+testing = []
+
 [dependencies]

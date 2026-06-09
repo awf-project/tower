@@ -23,4 +23,15 @@ impl FileId {
     pub fn generation(&self) -> u32 {
         self.generation
     }
+
+    /// Construct a `FileId` directly from raw parts for use in tests and
+    /// in-memory fakes.
+    ///
+    /// Only available with `#[cfg(any(test, feature = "testing"))]` so
+    /// production code cannot mint arbitrary ids (invariant: only the workspace
+    /// aggregate mints `FileId`s).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_testing(index: u32, generation: u32) -> Self {
+        Self::new(index, generation)
+    }
 }
