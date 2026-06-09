@@ -7,7 +7,14 @@ use serde::{Deserialize, Serialize};
 /// The `generation` guards against stale handles: when an index is reused after
 /// removal it carries a bumped generation, so an old `FileId` can never resolve
 /// to a different file (spec UN1). Only the workspace mints `FileId`s.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+// Decision: derive PartialOrd + Ord on FileId (index first, then generation).
+// Why: Match derives Ord with file_id as its last field; sorting by (path,
+// line_number) is the primary key but Ord on the whole struct requires every
+// field to be Ord. The lexicographic order (index, generation) has no semantic
+// meaning in application logic — it only exists to satisfy the derive.
+// Trade-off: Ord is now part of the public surface; callers must not interpret
+// the ordering as document order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct FileId {
     index: u32,
     generation: u32,

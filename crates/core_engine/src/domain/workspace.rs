@@ -206,6 +206,20 @@ impl ProjectWorkspace {
         Ok(())
     }
 
+    /// Return a snapshot of all live [`FileId`]s currently in the workspace.
+    ///
+    /// The snapshot is taken under a read of the internal slot vector so
+    /// concurrent writers (if any) do not interfere with the parallel grep
+    /// (spec 07 EV1). The returned `Vec` owns its contents; the caller may
+    /// freely iterate it on any thread.
+    #[must_use]
+    pub fn all_file_ids(&self) -> Vec<FileId> {
+        self.slots
+            .iter()
+            .filter_map(|s| s.occupant.as_ref().map(|f| f.id))
+            .collect()
+    }
+
     /// Returns the slot index for a `FileId` that still resolves to a live file,
     /// or `StaleHandle` if the index is out of range, the generation no longer
     /// matches, or the slot is empty (spec UN1).

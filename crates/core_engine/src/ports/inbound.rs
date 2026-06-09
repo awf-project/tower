@@ -11,18 +11,36 @@
 //! The placeholder types ([`Match`], [`TxReport`]) are deliberately minimal.
 //! They will gain fields in the specs cited above.
 
-use crate::domain::{DomainError, RelativePath};
+use crate::domain::{DomainError, FileId, RelativePath};
 
-// ── Supporting value types (minimal placeholders) ───────────────────────────
+// ── Supporting value types ───────────────────────────────────────────────────
 
-/// A single text-search hit.
+/// A single text-search hit returned by [`SearchUseCase::search_text`].
 ///
-/// **Placeholder** — spec 07 will add line number, column, and surrounding
-/// context once the search algorithm is implemented.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// Fleshed out in spec 07 with all four fields required by EV1/U2.
+///
+/// # Ordering
+///
+/// Implements `Ord` so that a `Vec<Match>` can be sorted deterministically by
+/// `(path, line_number)` regardless of Rayon scheduling order (spec 07 AC1).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Match {
-    /// The file that contains the match.
+    /// The path of the file that contains the match.
+    ///
+    /// Listed first so the derived `Ord` sorts by path before `line_number`.
     pub path: RelativePath,
+
+    /// 1-based line number of the matching line (spec U2).
+    pub line_number: u32,
+
+    /// Full content of the matching line, trimmed of the trailing newline.
+    pub line_content: String,
+
+    /// Stable identity of the file (spec U2).
+    ///
+    /// Listed last in the struct so it does not participate in the primary sort
+    /// key — path + line_number already uniquely identify a hit.
+    pub file_id: FileId,
 }
 
 /// Summary of a `global_replace` transaction.
@@ -57,6 +75,22 @@ pub trait SearchUseCase {
     ///
     /// Returns [`DomainError`] on workspace inconsistency.
     fn search_text(&self, pattern: &str) -> Result<Vec<Match>, DomainError>;
+
+    /// Return up to `cap` text matches of `pattern` across indexed file content.
+    ///
+    /// When the cap is reached the search stops early and returns partial results
+    /// promptly (spec 07 OP1). The default implementation calls [`Self::search_text`]
+    /// and truncates after the fact — implementors should override this method to
+    /// stop work at the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] on workspace inconsistency.
+    fn search_text_capped(&self, pattern: &str, cap: usize) -> Result<Vec<Match>, DomainError> {
+        let mut results = self.search_text(pattern)?;
+        results.truncate(cap);
+        Ok(results)
+    }
 }
 
 /// Mutation operations over the workspace.

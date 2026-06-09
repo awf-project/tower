@@ -27,6 +27,13 @@ proptest = "1"
 tempfile = "3.27.0"
 
 [dependencies]
+# Decision: rayon for work-stealing parallelism in domain/grep (spec 07 U1).
+# Why: pure CPU parallelism over in-memory data — no I/O API surface. Rayon
+# does not cross the hexagonal boundary; it is the same class of dep as
+# std::collections or itertools.
+# Trade-off: ~300 KB static link vs. a manual thread pool. MIT/Apache-2.0 licensed.
+rayon = "1"
+
 # Decision: ignore crate for directory walking.
 # Why: ripgrep's ignore crate handles .gitignore patterns, hidden files (dot-prefix),
 # and symlink-loop detection in one dependency. The alternative (walkdir + manual

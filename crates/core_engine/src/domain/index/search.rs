@@ -4,6 +4,11 @@
 //! implement [`SearchUseCase::find_file`] entirely in memory (spec U2 / AC4).
 //! No I/O, no persistence.
 //!
+//! `search_text` is delegated to [`crate::domain::grep::TextSearch`] when a
+//! [`FileSystemPort`] is supplied via [`FileSearch::with_fs`] (spec 07). When
+//! no `fs` is provided (as in the spec-03b tests) `search_text` returns an
+//! empty vec — the stub behaviour from the original placeholder.
+//!
 //! # Ranking
 //!
 //! Three tiers (lower ordinal = higher priority):
@@ -29,10 +34,12 @@
 
 use std::collections::HashSet;
 
+use crate::domain::grep::TextSearch;
 use crate::domain::token::tokenize;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::inbound::{Match, SearchUseCase};
+use crate::ports::FileSystemPort;
 
 use super::InvertedIndex;
 
@@ -40,6 +47,9 @@ use super::InvertedIndex;
 
 /// In-memory file search backed by an [`InvertedIndex`] and a
 /// [`ProjectWorkspace`] borrow (spec 03b).
+///
+/// Optionally holds a [`FileSystemPort`] reference for `search_text` (spec 07).
+/// When no `fs` is supplied, `search_text` returns empty (stub behaviour).
 ///
 /// # Examples
 ///
@@ -65,14 +75,56 @@ use super::InvertedIndex;
 pub struct FileSearch<'ws> {
     index: &'ws InvertedIndex,
     workspace: &'ws ProjectWorkspace,
+    /// Optional fs port for `search_text` delegation (spec 07).
+    ///
+    /// `Sync` bound required so the reference can be shared across Rayon
+    /// worker threads inside `TextSearch`.
+    fs: Option<&'ws (dyn FileSystemPort + Sync)>,
 }
 
 impl<'ws> FileSearch<'ws> {
-    /// Create a `FileSearch` that reads from `index` and resolves paths via
-    /// `workspace`.
+    /// Create a `FileSearch` for `find_file` only (spec 03b).
+    ///
+    /// `search_text` returns empty until an `fs` is attached via
+    /// [`FileSearch::with_fs`].
     #[must_use]
     pub fn new(index: &'ws InvertedIndex, workspace: &'ws ProjectWorkspace) -> Self {
-        Self { index, workspace }
+        Self {
+            index,
+            workspace,
+            fs: None,
+        }
+    }
+
+    /// Attach a [`FileSystemPort`] so that `search_text` is fully implemented
+    /// via [`TextSearch`] (spec 07).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core_engine::domain::index::{InvertedIndex, FileSearch};
+    /// use core_engine::domain::workspace::ProjectWorkspace;
+    /// use core_engine::domain::virtual_file::FileMetadata;
+    /// use core_engine::domain::RelativePath;
+    /// use core_engine::adapters::InMemoryFs;
+    /// use core_engine::ports::{FileSystemPort, inbound::SearchUseCase};
+    ///
+    /// let mut workspace = ProjectWorkspace::new();
+    /// let index = InvertedIndex::new();
+    /// let mut fs = InMemoryFs::new();
+    ///
+    /// let path = RelativePath::new("src/lib.rs");
+    /// workspace.insert(path.clone(), FileMetadata::default()).unwrap();
+    /// fs.write(path, b"fn lib() {}\n".to_vec()).unwrap();
+    ///
+    /// let search = FileSearch::new(&index, &workspace).with_fs(&fs);
+    /// let results = search.search_text("lib").unwrap();
+    /// assert_eq!(results.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_fs(mut self, fs: &'ws (dyn FileSystemPort + Sync)) -> Self {
+        self.fs = Some(fs);
+        self
     }
 
     /// Resolve a set of candidate `FileId`s to ranked `RelativePath` results.
@@ -157,9 +209,28 @@ impl SearchUseCase for FileSearch<'_> {
         Ok(self.resolve_and_rank(candidates, query.trim()))
     }
 
-    /// Not implemented in this spec — returns empty (spec 07 scope).
-    fn search_text(&self, _pattern: &str) -> Result<Vec<Match>, DomainError> {
-        Ok(Vec::new())
+    /// Search all tracked files for lines containing `pattern` (spec 07 EV1).
+    ///
+    /// Delegates to [`TextSearch`] when a [`FileSystemPort`] was supplied via
+    /// [`FileSearch::with_fs`]. Returns empty when no `fs` is available (the
+    /// stub behaviour preserved for spec-03b tests that do not supply an `fs`).
+    fn search_text(&self, pattern: &str) -> Result<Vec<Match>, DomainError> {
+        match self.fs {
+            Some(fs) => TextSearch::new(self.workspace, fs).search(pattern, None),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Search with an early-stop cap (spec 07 OP1).
+    ///
+    /// Overrides the default trait implementation to pass the cap directly to
+    /// [`TextSearch`], stopping parallel workers as soon as `cap` matches are
+    /// collected rather than buffering the full result set first.
+    fn search_text_capped(&self, pattern: &str, cap: usize) -> Result<Vec<Match>, DomainError> {
+        match self.fs {
+            Some(fs) => TextSearch::new(self.workspace, fs).search(pattern, Some(cap)),
+            None => Ok(Vec::new()),
+        }
     }
 }
 
@@ -182,6 +253,7 @@ fn last_component(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::InMemoryFs;
     use crate::domain::token::tokenize;
     use crate::domain::virtual_file::FileMetadata;
     use crate::domain::workspace::ProjectWorkspace;
@@ -409,6 +481,58 @@ mod tests {
             elapsed.as_millis() < 100,
             "find_file over 10k files took {}ms (expected < 100ms)",
             elapsed.as_millis()
+        );
+    }
+
+    // ── TDD step 9/10: search_text_capped (OP1 reachable from trait) ─────────
+
+    /// OP1 — search_text_capped stops early: result count is bounded by cap,
+    /// not the full uncapped total.
+    ///
+    /// Fixture: 10 files × 3 matching lines = 30 total without a cap.
+    /// With cap=5 and Relaxed atomics the overshoot is at most (lines_per_file - 1)
+    /// extra matches from the file that straddles the cap boundary, so the tight
+    /// upper bound is cap + max_lines_per_file = 5 + 3 = 8.
+    #[test]
+    fn op1_search_text_capped_stops_before_full_set() {
+        let mut ws = ProjectWorkspace::new();
+        let mut fs = InMemoryFs::new();
+        let idx = InvertedIndex::new();
+
+        for i in 0..10u32 {
+            let p = format!("f{i:02}.rs");
+            let rel = RelativePath::new(p.clone());
+            let id = ws.insert(rel.clone(), FileMetadata::default()).unwrap();
+            let _ = id; // index not needed for grep
+            fs.write(rel, b"match line\nmatch line\nmatch line\n".to_vec())
+                .unwrap();
+        }
+
+        let cap = 5usize;
+        let results = FileSearch::new(&idx, &ws)
+            .with_fs(&fs)
+            .search_text_capped("match", cap)
+            .unwrap();
+
+        // Must return at least one result.
+        assert!(
+            !results.is_empty(),
+            "capped search must return at least one result"
+        );
+
+        // Must not return the full uncapped total — cap must have had effect.
+        assert!(
+            results.len() < 30,
+            "cap={cap} must stop before full set; got {}",
+            results.len()
+        );
+
+        // Tight upper bound: cap + max_lines_per_file (Relaxed overshoot at most 1 file).
+        let tight_bound = cap + 3;
+        assert!(
+            results.len() <= tight_bound,
+            "results {} must not exceed cap+overshoot={tight_bound}",
+            results.len()
         );
     }
 
