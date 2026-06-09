@@ -7,7 +7,11 @@ use super::file_id::FileId;
 
 /// A workspace-relative path. Minimal newtype for now; path validation lands in
 /// spec 05 where real filesystem paths are scanned.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+///
+/// Derives `Ord` / `PartialOrd` (delegated to the inner `String`) so that
+/// `Vec<RelativePath>` can be sorted for deterministic search results (spec 03b
+/// AC2 ranking).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RelativePath(String);
 
 impl RelativePath {
