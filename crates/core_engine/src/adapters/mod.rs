@@ -8,11 +8,13 @@ pub mod fs;
 pub mod in_memory_fs;
 pub mod in_memory_storage;
 pub mod storage;
+pub mod watcher;
 
 pub use fs::RealFs;
 pub use in_memory_fs::InMemoryFs;
 pub use in_memory_storage::InMemoryStorage;
 pub use storage::SledStorageAdapter;
+pub use watcher::NotifyWatcherAdapter;
 
 #[cfg(test)]
 mod contract_tests;

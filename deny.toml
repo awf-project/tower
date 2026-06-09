@@ -23,6 +23,12 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    # CC0-1.0: Creative Commons Zero (public domain dedication).
+    # Used by: notify v6.x (filesystem event crate, spec 06).
+    # Evaluation: CC0-1.0 is a public-domain dedication; it imposes no
+    # restrictions whatsoever, making it fully compatible with EUPL-1.2
+    # distribution.  FSF and SPDX both classify it as a free/libre license.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.9
 

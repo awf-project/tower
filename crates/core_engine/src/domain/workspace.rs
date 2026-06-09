@@ -182,6 +182,30 @@ impl ProjectWorkspace {
         })
     }
 
+    /// Update metadata on an existing live slot without changing its `FileId`.
+    ///
+    /// This is the correct operation for a Modify event: the file's identity
+    /// (path ↔ `FileId` bijection) is preserved; only `size`, `modified`, and
+    /// `content_hash` are replaced. The generational counter is **not** bumped,
+    /// so existing callers holding the `FileId` continue to resolve to the same
+    /// file (spec EV2 — "update metadata/hash", not "reallocate").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::StaleHandle`] if `id` does not refer to a live
+    /// slot (out-of-range index, wrong generation, or empty slot).
+    pub fn update(&mut self, id: FileId, metadata: FileMetadata) -> Result<(), DomainError> {
+        let index = self.validated_index(id)?;
+        let occupant = self.slots[index]
+            .occupant
+            .as_mut()
+            .expect("validated_index guarantees an occupant");
+        occupant.size = metadata.size;
+        occupant.modified = metadata.modified;
+        occupant.content_hash = metadata.content_hash;
+        Ok(())
+    }
+
     /// Returns the slot index for a `FileId` that still resolves to a live file,
     /// or `StaleHandle` if the index is out of range, the generation no longer
     /// matches, or the slot is empty (spec UN1).
@@ -333,5 +357,42 @@ mod tests {
             DomainError::DuplicatePath.to_string()
         );
         assert!(!DomainError::StaleHandle.to_string().is_empty());
+    }
+
+    /// EV2: update() mutates metadata in-place without changing the FileId.
+    #[test]
+    fn update_preserves_file_id_and_path() {
+        let mut ws = ProjectWorkspace::new();
+        let path = RelativePath::new("src/main.rs");
+        let id = ws.insert(path.clone(), FileMetadata::default()).unwrap();
+
+        let new_meta = FileMetadata {
+            size: 99,
+            modified: Timestamp(42),
+            content_hash: None,
+        };
+        ws.update(id, new_meta).unwrap();
+
+        // Same FileId resolves to the updated metadata.
+        let file = ws.get(id).unwrap();
+        assert_eq!(file.id, id, "FileId must not change on update");
+        assert_eq!(file.path, path, "path must not change on update");
+        assert_eq!(file.size, 99);
+        assert_eq!(file.modified, Timestamp(42));
+    }
+
+    /// EV2: update() on a stale handle returns StaleHandle.
+    #[test]
+    fn update_on_stale_handle_errors() {
+        let mut ws = ProjectWorkspace::new();
+        let id = ws
+            .insert(RelativePath::new("src/a.rs"), FileMetadata::default())
+            .unwrap();
+        ws.remove(id).unwrap();
+
+        assert_eq!(
+            ws.update(id, FileMetadata::default()).unwrap_err(),
+            DomainError::StaleHandle
+        );
     }
 }
