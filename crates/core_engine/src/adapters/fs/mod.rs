@@ -1,17 +1,19 @@
 //! `RealFs` — `std::fs`-backed [`FileSystemPort`] adapter (spec 05a).
+//! `scan`   — initial workspace scan use case (spec 05b).
 //!
 //! # Wireframe
 //!
 //! ```text
-//!  RealFs : FileSystemPort
-//!  ┌───────────────────────────────────┐
-//!  │  root: PathBuf                    │
-//!  │  known_paths: HashSet<RelPath>    │
-//!  │  resolve(rel) -> PathBuf          │
-//!  │  read(path)   -> Vec<u8>          │
-//!  │  write(path)  -> ()               │
-//!  │  rename/delete/scan               │
-//!  └───────────────────────────────────┘
+//!  RealFs : FileSystemPort                       scan (spec 05b)
+//!  ┌───────────────────────────────────┐  ┌────────────────────────────────┐
+//!  │  root: PathBuf                    │  │  scan(root, storage, ws, idx)  │
+//!  │  known_paths: HashSet<RelPath>    │  │   walk(root) via ignore crate  │
+//!  │                                   │  │   for each file:               │
+//!  │  resolve(rel) -> PathBuf          │  │     metadata → FileMetadata    │
+//!  │  read(path)   -> Vec<u8>          │  │     ws.insert → FileId         │
+//!  │  write(path)  -> ()               │  │     tokenize  → batch          │
+//!  │  rename/delete/scan               │  │   flush_batch → storage + idx  │
+//!  └───────────────────────────────────┘  └────────────────────────────────┘
 //! ```
 //!
 //! # Path traversal policy
@@ -51,8 +53,8 @@
 //!
 //! `scan()` returns only paths that were written or renamed *into* via this
 //! adapter instance and have not since been deleted or renamed *away*.  It does
-//! not do a recursive walk of the root directory (recursive ingestion is a
-//! separate use case).  This keeps the contract test behaviour identical to
+//! not do a recursive walk of the root directory (that is spec 05b — see the
+//! `scan` module).  This keeps the contract test behaviour identical to
 //! `InMemoryFs`.
 //!
 //! # Error mapping
@@ -64,8 +66,13 @@
 //! | other (write context)  | `WriteFailed(reason)`   |
 
 mod real_fs;
+pub mod scan;
 
 pub use real_fs::RealFs;
+pub use scan::{scan as workspace_scan, ScanReport};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scan_tests;
