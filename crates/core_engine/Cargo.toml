@@ -20,4 +20,9 @@ path = "src/main.rs"
 # Trade-off: callers must opt-in; the feature is not automatically enabled.
 testing = []
 
+[dev-dependencies]
+# Property-based testing: generates arbitrary inputs to verify invariants over
+# a large random search space (DoD: determinism property test).
+proptest = "1"
+
 [dependencies]
