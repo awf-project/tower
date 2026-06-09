@@ -6,6 +6,22 @@ use super::error::DomainError;
 use super::file_id::FileId;
 use super::virtual_file::{FileMetadata, RelativePath, VirtualFile};
 
+/// Snapshot of the allocator state used when persisting and restoring a
+/// `ProjectWorkspace` across restarts (spec 04a EV1/AC2).
+///
+/// The adapter serialises this into the `meta` Sled tree alongside the
+/// individual `VirtualFile` records in the `files` tree.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSnapshot {
+    /// Per-slot generation counters, indexed by slot position. A slot at index
+    /// `i` with generation `g` and an occupant means slot `i` is live.
+    pub slot_generations: Vec<u32>,
+    /// Indices of freed (tombstoned) slots available for reuse (LIFO order).
+    pub free_slots: Vec<u32>,
+    /// Live `VirtualFile` records, in arbitrary order.
+    pub files: Vec<VirtualFile>,
+}
+
 #[derive(Debug)]
 struct Slot {
     generation: u32,
@@ -91,6 +107,79 @@ impl ProjectWorkspace {
         self.path_index.remove(&file.path);
         self.free_slots.push(id.index());
         Ok(file)
+    }
+
+    /// Capture the full allocator state as a [`WorkspaceSnapshot`].
+    ///
+    /// Used by `SledStorageAdapter` to persist workspace state to the `meta`
+    /// tree so that a restart can reconstruct the exact same workspace
+    /// (spec 04a EV1/AC2).
+    pub fn snapshot(&self) -> WorkspaceSnapshot {
+        let slot_generations: Vec<u32> = self.slots.iter().map(|s| s.generation).collect();
+        let free_slots = self.free_slots.clone();
+        let files: Vec<VirtualFile> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.occupant.as_ref().cloned())
+            .collect();
+        WorkspaceSnapshot {
+            slot_generations,
+            free_slots,
+            files,
+        }
+    }
+
+    /// Reconstruct a `ProjectWorkspace` from a persisted [`WorkspaceSnapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::DuplicatePath`] if two files in the snapshot
+    /// carry the same path (corrupt snapshot).
+    pub fn from_snapshot(snapshot: WorkspaceSnapshot) -> Result<Self, DomainError> {
+        // Build an index of files by slot index so we can populate occupants.
+        let mut file_by_index: HashMap<u32, VirtualFile> = HashMap::new();
+        for file in snapshot.files {
+            file_by_index.insert(file.id.index(), file);
+        }
+
+        let mut slots: Vec<Slot> = snapshot
+            .slot_generations
+            .into_iter()
+            .enumerate()
+            .map(|(i, generation)| Slot {
+                generation,
+                occupant: file_by_index.remove(&(i as u32)),
+            })
+            .collect();
+
+        // Ensure any remaining files with out-of-range indices are appended.
+        // (Should never happen in a non-corrupt snapshot, but be defensive.)
+        for (index, file) in file_by_index {
+            let target = index as usize;
+            while slots.len() <= target {
+                slots.push(Slot {
+                    generation: 0,
+                    occupant: None,
+                });
+            }
+            slots[target].occupant = Some(file);
+        }
+
+        // Rebuild path index from live occupants.
+        let mut path_index: HashMap<RelativePath, FileId> = HashMap::new();
+        for slot in &slots {
+            if let Some(ref file) = slot.occupant {
+                if path_index.insert(file.path.clone(), file.id).is_some() {
+                    return Err(DomainError::DuplicatePath);
+                }
+            }
+        }
+
+        Ok(Self {
+            slots,
+            path_index,
+            free_slots: snapshot.free_slots,
+        })
     }
 
     /// Returns the slot index for a `FileId` that still resolves to a live file,

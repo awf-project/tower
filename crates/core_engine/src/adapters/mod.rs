@@ -6,9 +6,11 @@
 
 pub mod in_memory_fs;
 pub mod in_memory_storage;
+pub mod storage;
 
 pub use in_memory_fs::InMemoryFs;
 pub use in_memory_storage::InMemoryStorage;
+pub use storage::SledStorageAdapter;
 
 #[cfg(test)]
 mod contract_tests;

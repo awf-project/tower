@@ -14,4 +14,4 @@ pub mod workspace;
 pub use error::DomainError;
 pub use file_id::FileId;
 pub use virtual_file::{ContentHash, FileMetadata, RelativePath, Timestamp, VirtualFile};
-pub use workspace::ProjectWorkspace;
+pub use workspace::{ProjectWorkspace, WorkspaceSnapshot};

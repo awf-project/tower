@@ -1,11 +1,13 @@
 //! `FileId` — generational value object identifying a file slot.
 
+use serde::{Deserialize, Serialize};
+
 /// A copyable handle to a workspace slot (spec U1).
 ///
 /// The `generation` guards against stale handles: when an index is reused after
 /// removal it carries a bumped generation, so an old `FileId` can never resolve
 /// to a different file (spec UN1). Only the workspace mints `FileId`s.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct FileId {
     index: u32,
     generation: u32,

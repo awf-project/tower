@@ -3,6 +3,8 @@
 //! The VFS holds *metadata*, never file bytes — content is fetched via ports
 //! (spec 02 onward). All types here are pure data.
 
+use serde::{Deserialize, Serialize};
+
 use super::file_id::FileId;
 
 /// A workspace-relative path. Minimal newtype for now; path validation lands in
@@ -11,7 +13,7 @@ use super::file_id::FileId;
 /// Derives `Ord` / `PartialOrd` (delegated to the inner `String`) so that
 /// `Vec<RelativePath>` can be sorted for deterministic search results (spec 03b
 /// AC2 ranking).
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct RelativePath(String);
 
 impl RelativePath {
@@ -26,11 +28,11 @@ impl RelativePath {
 
 /// A domain timestamp (opaque units). Kept I/O-free and deterministic so domain
 /// tests never touch the system clock.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub struct Timestamp(pub u64);
 
 /// Content fingerprint (e.g. a 32-byte digest). Opaque to the domain.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct ContentHash([u8; 32]);
 
 impl ContentHash {
@@ -45,7 +47,7 @@ impl ContentHash {
 
 /// Metadata supplied when inserting a file. The workspace mints the `FileId`,
 /// so it is not part of the input.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub size: u64,
     pub modified: Timestamp,
@@ -53,7 +55,7 @@ pub struct FileMetadata {
 }
 
 /// A file tracked by the workspace (entity). Identity is its `FileId`.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct VirtualFile {
     pub id: FileId,
     pub path: RelativePath,
