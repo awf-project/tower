@@ -1,1 +1,1 @@
-//! Ports layer — trait contracts that adapters implement. Populated by spec 01.
+//! Ports layer — trait contracts that adapters implement. Populated by spec 02.
