@@ -1,0 +1,14 @@
+[package]
+name = "plugin_ast"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Reference WASM plugin. Built for wasm32-wasip1 (spec OP1/AC4); excluded from
+# default-members so it stays out of the host `cargo test` set.
+[[bin]]
+name = "plugin_ast"
+path = "src/main.rs"
+
+[dependencies]

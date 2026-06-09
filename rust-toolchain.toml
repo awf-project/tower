@@ -1,0 +1,6 @@
+# Pins the toolchain so builds are reproducible across machines (spec U2).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip1"]
+profile = "minimal"

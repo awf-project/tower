@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core_engine",
+    "crates/plugin_sdk",
+    "crates/plugin_ast",
+]
+
+# Decision: plugin_ast is a workspace member (spec U1) but excluded from default-members.
+# Why: it targets wasm32-wasip1 and must stay out of the host `cargo test` set (spec OP1).
+# Trade-off: an explicit `cargo test --workspace` still includes it; bare `cargo test` does not.
+default-members = [
+    "crates/core_engine",
+    "crates/plugin_sdk",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+license = "EUPL-1.2"
+
+[workspace.dependencies]

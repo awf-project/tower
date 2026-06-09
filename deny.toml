@@ -1,0 +1,35 @@
+# cargo-deny policy (spec U3 step 4, DoD).
+# Rejects yanked, vulnerable, and copyleft-incompatible dependencies.
+# Note: in advisories `version = 2`, vulnerabilities are denied unconditionally
+# (the old `vulnerability` key was removed), so only `yanked`/`unmaintained` are set here.
+
+[advisories]
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# Permissive licenses + the project's own EUPL-1.2. Anything copyleft-incompatible
+# (GPL-only, AGPL, etc.) is absent from the list and therefore rejected.
+allow = [
+    "EUPL-1.2",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

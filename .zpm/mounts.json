@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "mounts": [
+    {
+      "name": "default",
+      "path": ".zpm/kb/default",
+      "scope": "project",
+      "mode": "rw"
+    },
+    {
+      "name": "feedback",
+      "path": ".zpm/kb/feedback",
+      "scope": "project",
+      "mode": "rw"
+    },
+    {
+      "name": "architecture",
+      "path": ".zpm/kb/architecture",
+      "scope": "project",
+      "mode": "rw"
+    }
+  ]
+}

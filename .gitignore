@@ -1,0 +1,18 @@
+.agent/
+.grepai/
+
+# Added by awf project-onboard
+/target/
+debug/
+**/*.rs.bk
+*.swp
+*.swo
+.env
+.env.local
+*.env
+.awf/storage/states/
+.awf/storage/logs/
+.awf/roles/
+.awf/skills/
+*.tmp
+*.bak
