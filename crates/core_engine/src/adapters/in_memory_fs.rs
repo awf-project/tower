@@ -97,7 +97,63 @@ impl FileSystemPort for InMemoryFs {
     fn scan(&self) -> Vec<RelativePath> {
         self.files
             .keys()
+            .filter(|s| !crate::domain::mutation::is_tmp_artifact(&RelativePath::new(s.as_str())))
             .map(|s| RelativePath::new(s.as_str()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ports::FileSystemPort;
+
+    /// `scan()` must never return `.tmp_write` entries even when the HashMap
+    /// contains them (e.g. when a caller intercepts `rename` before it fires,
+    /// leaving a stray shadow file in the map).
+    ///
+    /// This verifies that `InMemoryFs` is self-defending rather than relying on
+    /// every caller to apply `is_tmp_artifact` filtering after the fact.
+    #[test]
+    fn scan_excludes_tmp_write_artifacts() {
+        let mut fs = InMemoryFs::new();
+
+        // Insert a real file and a shadow-file artifact directly via `write`.
+        fs.write(RelativePath::new("src/main.rs"), b"fn main() {}".to_vec())
+            .unwrap();
+        fs.write(
+            RelativePath::new("src/main.rs.tmp_write"),
+            b"partial".to_vec(),
+        )
+        .unwrap();
+        fs.write(
+            RelativePath::new("src/lib.rs.~tmp"),
+            b"inner-shadow".to_vec(),
+        )
+        .unwrap();
+
+        let paths = fs.scan();
+
+        // Only the real file must appear.
+        assert_eq!(
+            paths.len(),
+            1,
+            "scan must return exactly 1 non-artifact path; got {paths:?}"
+        );
+        assert_eq!(paths[0], RelativePath::new("src/main.rs"));
+    }
+
+    /// `scan()` after a successful `rename` must return only the destination.
+    #[test]
+    fn scan_after_rename_returns_destination_only() {
+        let mut fs = InMemoryFs::new();
+        let tmp = RelativePath::new("src/main.rs.tmp_write");
+        let dst = RelativePath::new("src/main.rs");
+
+        fs.write(tmp.clone(), b"new content".to_vec()).unwrap();
+        fs.rename(&tmp, dst.clone()).unwrap();
+
+        let paths = fs.scan();
+        assert_eq!(paths, vec![dst]);
     }
 }

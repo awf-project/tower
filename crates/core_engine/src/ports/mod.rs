@@ -41,6 +41,6 @@ pub mod inbound;
 
 pub use error::PortError;
 pub use filesystem::FileSystemPort;
-pub use inbound::{FileMutationUseCase, Match, SearchUseCase, TxReport};
+pub use inbound::{FileMutationUseCase, FileReplaceError, Match, SearchUseCase, TxReport};
 pub use plugin::{NoOpPluginHost, PluginHostPort};
 pub use storage::StoragePort;

@@ -54,6 +54,50 @@ pub use file_mutation::FileMutationService;
 #[cfg(test)]
 mod tests;
 
+/// Write `content` to `path` using the spec-08 shadow-file atomic pattern.
+///
+/// 1. Write to `<path>.tmp_write` via the FS port.
+/// 2. Atomically rename `<path>.tmp_write` → `path`.
+///
+/// This is the single canonical implementation of the shadow-file primitive.
+/// Both [`FileMutationService::create_file`] (spec 08) and
+/// [`crate::domain::refactor::GlobalReplaceService`] (spec 09) delegate here
+/// so any change to the suffix or fsync policy applies everywhere at once.
+///
+/// # Errors
+///
+/// Returns a human-readable `String` on any FS failure so callers can
+/// aggregate it into a per-file error without leaking port types.
+///
+/// # Examples
+///
+/// ```rust
+/// use core_engine::adapters::InMemoryFs;
+/// use core_engine::domain::RelativePath;
+/// use core_engine::domain::mutation::atomic_write;
+/// use core_engine::ports::FileSystemPort;
+///
+/// let mut fs = InMemoryFs::new();
+/// let path = RelativePath::new("src/main.rs");
+/// atomic_write(&mut fs, &path, b"fn main() {}".to_vec()).unwrap();
+/// assert_eq!(fs.read(&path).unwrap(), b"fn main() {}");
+/// ```
+pub fn atomic_write(
+    fs: &mut dyn crate::ports::FileSystemPort,
+    path: &crate::domain::RelativePath,
+    content: Vec<u8>,
+) -> Result<(), String> {
+    let tmp_path = crate::domain::RelativePath::new(format!("{}.tmp_write", path.as_str()));
+
+    fs.write(tmp_path.clone(), content)
+        .map_err(|e| e.to_string())?;
+
+    fs.rename(&tmp_path, path.clone())
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Return `true` if `path` is a shadow-file temp artifact that must not be
 /// indexed as a real user file (UN2/AC5).
 ///

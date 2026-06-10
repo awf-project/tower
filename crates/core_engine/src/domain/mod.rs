@@ -9,6 +9,7 @@ pub mod file_id;
 pub mod grep;
 pub mod index;
 pub mod mutation;
+pub mod refactor;
 pub mod token;
 pub mod virtual_file;
 pub mod workspace;

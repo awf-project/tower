@@ -43,14 +43,43 @@ pub struct Match {
     pub file_id: FileId,
 }
 
-/// Summary of a `global_replace` transaction.
+/// A per-file error recorded by a [`global_replace`] transaction.
 ///
-/// **Placeholder** — spec 09 will add per-file edit counts, a rollback token,
-/// and the list of affected `FileId`s once the transaction engine exists.
+/// Partial-failure semantics (UN1/AC2): if a single file cannot be rewritten
+/// (e.g. read-only on disk, FS port rejects the write), the operation is
+/// recorded here and the transaction continues with the remaining files.
+/// Errors are sorted by `path` for deterministic output.
+///
+/// [`global_replace`]: FileMutationUseCase::global_replace
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct FileReplaceError {
+    /// Workspace-relative path of the file that could not be rewritten.
+    pub path: RelativePath,
+    /// Human-readable reason (from the underlying port error).
+    pub reason: String,
+}
+
+/// Summary of a `global_replace` transaction (spec 09).
+///
+/// Returned by [`FileMutationUseCase::global_replace`] after attempting to
+/// rewrite every file that contains the search target.
+///
+/// # Determinism
+///
+/// `errors` is sorted by `path` so callers get stable output regardless of
+/// Rayon scheduling order.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct TxReport {
-    /// Number of individual replacements made across all files.
+    /// Number of files that were successfully rewritten.
+    pub files_changed: usize,
+    /// Total number of individual string replacements performed across all
+    /// successfully rewritten files.
     pub replacements: usize,
+    /// Files that could not be rewritten. Empty on full success.
+    ///
+    /// A non-empty `errors` vec does **not** mean the transaction failed: the
+    /// successfully rewritten files are committed regardless (UN1/AC2).
+    pub errors: Vec<FileReplaceError>,
 }
 
 // ── Inbound port traits ──────────────────────────────────────────────────────
@@ -129,8 +158,33 @@ pub trait FileMutationUseCase {
     /// Replace every occurrence of `target` with `replacement` across all
     /// indexed files, in a single logical transaction.
     ///
+    /// Each file is rewritten atomically (shadow-file pattern — spec 08).
+    /// If one file fails to rewrite, it is recorded in [`TxReport::errors`]
+    /// and the remaining files are still committed (partial-failure semantics,
+    /// UN1/AC2).
+    ///
+    /// The operation is parallelised with Rayon work-stealing (U2).
+    ///
     /// # Errors
     ///
-    /// Returns [`DomainError`] if the transaction cannot be applied.
+    /// Returns [`DomainError`] only on a catastrophic failure that prevents
+    /// the transaction from starting (e.g. workspace inconsistency). Per-file
+    /// failures are reported in [`TxReport::errors`], not as an `Err`.
     fn global_replace(&mut self, target: &str, replacement: &str) -> Result<TxReport, DomainError>;
+
+    /// Dry-run variant of [`global_replace`]: compute the would-change report
+    /// without writing any file or mutating any state (OP1/AC4).
+    ///
+    /// Returns the same [`TxReport`] shape as `global_replace`, but all
+    /// `files_changed` and `replacements` counts reflect what *would* happen;
+    /// no files are written and no VFS/index/storage state is updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] only if the workspace cannot be read.
+    fn global_replace_dry_run(
+        &mut self,
+        target: &str,
+        replacement: &str,
+    ) -> Result<TxReport, DomainError>;
 }

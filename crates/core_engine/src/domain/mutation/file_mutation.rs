@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use crate::domain::index::InvertedIndex;
+use crate::domain::refactor::GlobalReplaceService;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
@@ -119,8 +120,8 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
     fn create_file(&mut self, path: RelativePath, content: Vec<u8>) -> Result<(), DomainError> {
         // ── Step 1 & 2: shadow-file write + atomic rename ─────────────────────
         //
-        // Decision: the domain explicitly writes to a sibling `.tmp_write` path
-        // then renames, rather than calling `fs.write(dst)` directly.
+        // Decision: delegate to the canonical `atomic_write` primitive in
+        // `mutation/mod.rs` rather than inlining the tmp+rename logic here.
         //
         // Why: `InMemoryFs::write` is a direct insert (no internal
         // temp+rename). If we called `fs.write(dst)`, a crash between write
@@ -134,15 +135,7 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         // fsync + rename. This "double-shadow" is intentional: the inner
         // `.~tmp` ensures the `.tmp_write` file itself is durably written
         // before the domain renames it over the destination.
-        let tmp_path = RelativePath::new(format!("{}.tmp_write", path.as_str()));
-
-        self.fs
-            .write(tmp_path.clone(), content)
-            .map_err(port_err_to_domain)?;
-
-        self.fs
-            .rename(&tmp_path, path.clone())
-            .map_err(port_err_to_domain)?;
+        super::atomic_write(self.fs, &path, content).map_err(DomainError::IoError)?;
 
         // ── Step 3: VFS + index + storage ─────────────────────────────────────
         //
@@ -269,20 +262,45 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         Ok(())
     }
 
-    /// Global find-and-replace across all indexed files.
+    /// Global find-and-replace across all indexed files (spec 09).
     ///
-    /// **Not implemented in spec 08** — scope is spec 09.
+    /// Composes spec-07 content reading and spec-08 atomic shadow-file writes.
+    /// Parallelises the read+apply phase with Rayon; commits writes sequentially
+    /// to avoid data races on shared mutable state (VFS + index + storage).
+    ///
+    /// Per-file failures (e.g. read-only files) are collected in
+    /// `TxReport::errors`; the operation continues for all remaining files
+    /// (partial-failure semantics, UN1/AC2).
     ///
     /// # Errors
     ///
-    /// Always returns `DomainError::NotFound` as a placeholder until spec 09.
-    fn global_replace(
+    /// Returns `DomainError::IoError` only if the batch storage flush fails
+    /// after all FS writes succeeded. Individual per-file errors are in
+    /// `TxReport::errors`, not in the `Err` path.
+    fn global_replace(&mut self, target: &str, replacement: &str) -> Result<TxReport, DomainError> {
+        GlobalReplaceService::new(self.fs, self.workspace, self.storage).execute(
+            target,
+            replacement,
+            false,
+        )
+    }
+
+    /// Dry-run variant: compute the would-change report without writing any
+    /// file or mutating any state (OP1/AC4).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError` only if the workspace cannot be read.
+    fn global_replace_dry_run(
         &mut self,
-        _target: &str,
-        _replacement: &str,
+        target: &str,
+        replacement: &str,
     ) -> Result<TxReport, DomainError> {
-        // Spec 09 scope — not implemented here.
-        Err(DomainError::NotFound)
+        GlobalReplaceService::new(self.fs, self.workspace, self.storage).execute(
+            target,
+            replacement,
+            true,
+        )
     }
 }
 
