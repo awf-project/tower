@@ -1,7 +1,8 @@
-//! Wasmtime plugin adapter (spec 11c).
+//! Wasmtime plugin adapter (specs 11c, 11d).
 //!
-//! Implements the wasmtime-backed [`crate::domain::PluginInstance`] trait and
-//! the [`WasmtimeHost::load`] entry point.
+//! Implements the wasmtime-backed [`crate::domain::PluginInstance`] trait,
+//! the [`WasmtimeHost::load`] entry point (11c), and the fault-isolation layer
+//! [`IsolatedSandbox`] with fuel/epoch bounds and restart/quarantine (11d).
 //!
 //! # Hexagonal boundary
 //!
@@ -24,7 +25,9 @@
 //! `WasiCtx` (no preopened dirs, no network) — see [`loader`] for details.
 
 pub mod error;
+pub mod isolation;
 pub mod loader;
 
 pub use error::PluginLoadError;
+pub use isolation::{IsolatedSandbox, IsolationConfig, IsolationEngine, MAX_CONSECUTIVE_FAILURES};
 pub use loader::WasmtimeHost;

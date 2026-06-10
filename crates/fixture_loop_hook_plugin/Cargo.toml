@@ -1,0 +1,17 @@
+[package]
+name = "fixture_loop_hook_plugin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Test fixture: plugin whose on_hook handler loops forever — used by 11d deliver_hook isolation tests"
+
+# Decision: cdylib so the wasm binary exports the four __plugin_* symbols.
+# Excluded from default-members (same pattern as fixture_loop_plugin).
+[lib]
+name = "fixture_loop_hook_plugin"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+plugin_sdk = { path = "../plugin_sdk", version = "0.1.0" }

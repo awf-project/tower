@@ -1,0 +1,17 @@
+[package]
+name = "fixture_loop_plugin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Test fixture: plugin whose tool loops forever — used by 11d AC2 (fuel/epoch) tests"
+
+# Decision: cdylib so the wasm binary exports the four __plugin_* symbols.
+# Excluded from default-members (same pattern as hello_plugin / fixture_abi_mismatch).
+[lib]
+name = "fixture_loop_plugin"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+plugin_sdk = { path = "../plugin_sdk", version = "0.1.0" }

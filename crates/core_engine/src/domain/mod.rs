@@ -21,7 +21,8 @@ pub mod workspace;
 pub use error::DomainError;
 pub use file_id::FileId;
 pub use plugin_host::{
-    PluginHostError, PluginHostRegistry, PluginId, PluginInstance, RegistrationError,
+    PluginFaultKind, PluginHostError, PluginHostRegistry, PluginId, PluginInstance,
+    RegistrationError,
 };
 pub use virtual_file::{ContentHash, FileMetadata, RelativePath, Timestamp, VirtualFile};
 pub use workspace::{ProjectWorkspace, WorkspaceSnapshot};

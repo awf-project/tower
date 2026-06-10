@@ -44,14 +44,10 @@
 //!
 //! # Unsafe surface
 //!
-//! Three small bounded `unsafe` blocks:
-//! 1. Reading the manifest buffer from guest linear memory (bounds-checked).
-//! 2. Writing serialised args into a guest buffer obtained via `__plugin_alloc`
-//!    (bounds-checked against `Memory::data_size()`).
-//! 3. Reading the result buffer from guest linear memory (bounds-checked).
-//!
-//! There is no transmutation, no raw pointer arithmetic without length guards,
-//! and no allocation that crosses the host/guest boundary without validation.
+//! One `unsafe impl Send for WasmInstance` — rationale at the impl site.
+//! All guest memory reads/writes use wasmtime's safe `Memory::data()` /
+//! `data_mut()` with explicit bounds checks; no `unsafe { }` blocks exist
+//! in this file.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -59,6 +55,11 @@ use std::sync::Arc;
 use wasmtime::{AsContext, AsContextMut, Engine, Linker, Module, Store};
 use wasmtime_wasi::p1::{add_to_linker_sync, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
+
+// IsolationConfig is defined in super::isolation but imported here only
+// for the apply_compute_bounds method parameter. Using the module path avoids
+// a re-export that would leak it from loader.rs into the public API.
+// The import is inline in the method below.
 
 use plugin_sdk::__private::BUFFER_HEADER_LEN;
 use plugin_sdk::{HookKind, HookPayload, PluginManifest, Value, ABI_VERSION};
@@ -85,7 +86,10 @@ struct HostState {
 /// Data held inside the wasmtime `Store<WasmStoreData>`.
 ///
 /// Combines the WASIp1 context (zero-capability) with our custom host state.
-struct WasmStoreData {
+///
+/// `pub(crate)` so [`super::isolation::IsolatedSandbox`] can name the store
+/// type in `Store<WasmStoreData>` for `apply_compute_bounds`.
+pub(crate) struct WasmStoreData {
     /// WASIp1 context: built with zero preopened dirs and no network.
     ///
     /// Decision: embed `WasiP1Ctx` directly (not behind a Box) so
@@ -125,7 +129,7 @@ impl WasmtimeHost {
         let path = path.as_ref();
 
         // ── 1. Engine and module ─────────────────────────────────────────────
-        // Decision: one Engine per load call for simplicity (11d will share one).
+        // Decision: one Engine per load call for simplicity (11d shares one via load_with_engine).
         // Trade-off: ~1–2 ms Engine::default() cost at load time; acceptable.
         let engine = Engine::default();
         let module = Module::from_file(&engine, path)
@@ -266,6 +270,139 @@ impl WasmtimeHost {
             store,
             manifest,
         }))
+    }
+
+    /// Load a `.wasm` plugin using a provided [`Engine`], returning the concrete
+    /// [`WasmInstance`] (spec 11d).
+    ///
+    /// Used by the fault isolation layer so all sandboxes share one engine with
+    /// fuel and epoch interruption enabled. Returns the concrete type so the
+    /// isolation layer can call `apply_compute_bounds` directly on the store
+    /// without Any-downcasting through the domain trait.
+    ///
+    /// `pub(crate)`: returns `WasmInstance` which is `pub(crate)`; callers
+    /// outside `core_engine` use `IsolatedSandbox` (which wraps this).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::load`].
+    pub(crate) fn load_with_engine(
+        engine: &Engine,
+        path: impl AsRef<Path>,
+        fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+    ) -> Result<WasmInstance, PluginLoadError> {
+        let path = path.as_ref();
+
+        let module = Module::from_file(engine, path)
+            .map_err(|e| PluginLoadError::WasmLoad(e.to_string()))?;
+
+        let wasi_p1 = WasiCtxBuilder::new().build_p1();
+        let store_data = WasmStoreData {
+            wasi: wasi_p1,
+            host: HostState { fs_port },
+        };
+        let mut store = Store::new(engine, store_data);
+
+        let mut linker: Linker<WasmStoreData> = Linker::new(engine);
+
+        add_to_linker_sync(&mut linker, |s: &mut WasmStoreData| &mut s.wasi)
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "tower_host",
+                "host_log",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>, ptr: i32, len: i32| {
+                    let ptr = ptr as u32 as usize;
+                    let len = len as u32 as usize;
+                    let mem = match caller.get_export("memory") {
+                        Some(wasmtime::Extern::Memory(m)) => m,
+                        _ => return,
+                    };
+                    let data = mem.data(&caller);
+                    if let Some(slice) = data.get(ptr..ptr.saturating_add(len)) {
+                        if let Ok(msg) = std::str::from_utf8(slice) {
+                            const MAX_LOG_BYTES: usize = 4096;
+                            let truncated = if msg.len() > MAX_LOG_BYTES {
+                                let mut end = MAX_LOG_BYTES;
+                                while !msg.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                &msg[..end]
+                            } else {
+                                msg
+                            };
+                            eprintln!("[plugin] {truncated}");
+                        }
+                    }
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "tower_host",
+                "host_read_file",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 path_ptr: i32,
+                 path_len: i32,
+                 out_ptr: i32,
+                 out_len_ptr: i32|
+                 -> i32 {
+                    host_read_file_impl(&mut caller, path_ptr, path_len, out_ptr, out_len_ptr)
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        // If the engine has fuel consumption enabled (as IsolationEngine does),
+        // we must set a generous fuel budget before calling __plugin_init so the
+        // init sequence does not immediately run out of fuel (the default is 0).
+        // This is the load-time budget, not the per-call runtime budget.
+        //
+        // Decision: 100_000_000 units for init. Init is one-time work (manifest
+        // serialisation, memory allocation) — far less than a tool call.
+        // We ignore the error if fuel consumption is not enabled on this engine.
+        let _ = store.set_fuel(100_000_000);
+
+        // If epoch interruption is enabled, set a large deadline so __plugin_init
+        // and the ABI handshake calls are not interrupted. The per-call deadline
+        // is applied fresh before each tool/hook call by apply_compute_bounds.
+        //
+        // Decision: u64::MAX / 2 ticks (~292 years at 1 tick/ns, or ~13 billion
+        // years at 10 ms/tick). This avoids the overflow that occurs when using
+        // u64::MAX - 1 with a background epoch ticker: set_epoch_deadline(n)
+        // computes current_epoch + n, which overflows if current_epoch > 0 and
+        // n = u64::MAX - 1.
+        store.set_epoch_deadline(u64::MAX / 2);
+
+        let init_fn = instance
+            .get_typed_func::<(), u32>(&mut store, "__plugin_init")
+            .map_err(|e| PluginLoadError::MissingExport(format!("__plugin_init: {e}")))?;
+
+        let manifest_ptr = init_fn
+            .call(&mut store, ())
+            .map_err(|e| PluginLoadError::InitTrap(e.to_string()))?
+            as usize;
+
+        let manifest = read_manifest_from_guest(&instance, &mut store, manifest_ptr)?;
+        free_manifest_buffer(&instance, &mut store, manifest_ptr)?;
+
+        if manifest.abi != ABI_VERSION {
+            return Err(PluginLoadError::AbiMismatch {
+                expected: ABI_VERSION,
+                got: manifest.abi,
+            });
+        }
+
+        Ok(WasmInstance {
+            instance,
+            store,
+            manifest,
+        })
     }
 }
 
@@ -722,5 +859,27 @@ impl WasmInstance {
             .map_err(|e| format!("__plugin_free trap: {e}"))?;
 
         Ok(payload)
+    }
+
+    /// Apply per-call fuel budget and epoch deadline to the store.
+    ///
+    /// Called by [`super::isolation::IsolatedSandbox`] before each guest
+    /// invocation. Lives on the concrete type (not the trait) so the isolation
+    /// layer can access the store directly without Any-downcasting.
+    ///
+    /// `config` is [`super::isolation::IsolationConfig`]; named by full path
+    /// to avoid a circular import (isolation imports loader, loader would import
+    /// isolation — resolved by using the full module path only here).
+    pub(crate) fn apply_compute_bounds(&mut self, config: &super::isolation::IsolationConfig) {
+        if let Some(fuel) = config.fuel_budget {
+            // set_fuel errors only if the engine was not built with consume_fuel(true).
+            // IsolationEngine always enables it; the error is a programming mistake.
+            if let Err(e) = self.store.set_fuel(fuel) {
+                eprintln!("[tower] set_fuel error (engine not configured for fuel?): {e}");
+            }
+        }
+        if let Some(ticks) = config.epoch_deadline_ticks {
+            self.store.set_epoch_deadline(ticks);
+        }
     }
 }

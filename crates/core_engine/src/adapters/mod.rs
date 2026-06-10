@@ -24,7 +24,10 @@ pub mod watcher;
 pub use fs::RealFs;
 pub use in_memory_fs::InMemoryFs;
 pub use in_memory_storage::InMemoryStorage;
-pub use plugin::{PluginLoadError, WasmtimeHost};
+pub use plugin::{
+    IsolatedSandbox, IsolationConfig, IsolationEngine, PluginLoadError, WasmtimeHost,
+    MAX_CONSECUTIVE_FAILURES,
+};
 // Note: WasmInstance is intentionally not re-exported — it is pub(crate) to
 // keep the concrete wasmtime runtime type behind the hexagonal adapter boundary.
 pub use storage::SledStorageAdapter;

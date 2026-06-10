@@ -104,6 +104,29 @@ pub enum PluginHostError {
     CallFailed(String),
     /// Hook delivery to this plugin instance failed.
     HookDeliveryFailed(String),
+    /// The plugin sandbox trapped, panicked, or exceeded its compute budget
+    /// (fuel exhaustion or epoch deadline). The sandbox is marked failed and
+    /// will be restarted by the supervisor (spec 11d UN1/UN2).
+    ///
+    /// The host process and MCP link survive this error.
+    PluginFault(PluginFaultKind),
+}
+
+/// The specific cause of a [`PluginHostError::PluginFault`].
+///
+/// All variants leave the host alive — the fault is isolated to the sandbox.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PluginFaultKind {
+    /// The wasm guest raised an `unreachable` trap, panicked (which compiles to
+    /// `unreachable` in wasm32-wasip1), or triggered a wasmtime runtime trap.
+    Trapped(String),
+    /// The guest exceeded its per-call fuel budget (deterministic compute bound).
+    FuelExhausted,
+    /// The guest exceeded its epoch deadline (wall-clock compute bound).
+    EpochDeadlineExceeded,
+    /// The sandbox has been quarantined after repeated restart failures and will
+    /// not be restarted again. The plugin is reported unhealthy (UN3/AC4).
+    Quarantined,
 }
 
 impl std::fmt::Display for PluginHostError {
@@ -113,6 +136,18 @@ impl std::fmt::Display for PluginHostError {
             Self::InvalidArgs(m) => write!(f, "invalid args: {m}"),
             Self::CallFailed(m) => write!(f, "call failed: {m}"),
             Self::HookDeliveryFailed(m) => write!(f, "hook delivery failed: {m}"),
+            Self::PluginFault(kind) => write!(f, "plugin fault: {kind}"),
+        }
+    }
+}
+
+impl std::fmt::Display for PluginFaultKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trapped(msg) => write!(f, "wasm trap: {msg}"),
+            Self::FuelExhausted => write!(f, "fuel budget exhausted"),
+            Self::EpochDeadlineExceeded => write!(f, "epoch deadline exceeded"),
+            Self::Quarantined => write!(f, "plugin is quarantined after repeated failures"),
         }
     }
 }
@@ -357,6 +392,16 @@ impl PluginHostRegistry {
     ///
     /// Errors from individual instances are logged to stderr and do not
     /// propagate (UN1). The fan-out continues to the next instance regardless.
+    ///
+    /// # Latency note
+    ///
+    /// This method holds the per-instance `Mutex` for the entire duration of
+    /// `deliver_hook`. With `IsolatedSandbox` wrapping each instance, a hook
+    /// handler that runs until fuel exhaustion will hold the lock for up to
+    /// ~`DEFAULT_FUEL_BUDGET` wasm instructions (roughly ≤100 ms at 1 BIPS).
+    /// During that window any concurrent `call_tool` on the same instance blocks
+    /// on the same lock. This is bounded by fuel and acceptable for the current
+    /// synchronous fan-out design.
     fn fan_out(&self, kind: &HookKind, make_payload: impl Fn() -> HookPayload) {
         for slot in &self.instances {
             // Recover poisoned mutexes (see declared_tools rationale).

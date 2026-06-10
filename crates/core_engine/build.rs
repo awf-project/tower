@@ -15,7 +15,10 @@
 //! Run this once before `cargo test`:
 //!
 //! ```sh
-//! cargo build -p hello_plugin -p fixture_abi_mismatch --target wasm32-wasip1
+//! cargo build -p hello_plugin -p fixture_abi_mismatch \
+//!             -p fixture_panic_plugin -p fixture_loop_plugin \
+//!             -p fixture_loop_hook_plugin \
+//!             --target wasm32-wasip1
 //! ```
 //!
 //! The test CI workflow in `.github/` runs this before the main `cargo test`.
@@ -26,6 +29,9 @@
 //! - `ABI_MISMATCH_WASM`          → `target/wasm32-wasip1/debug/fixture_abi_mismatch.wasm`
 //! - `FORBIDDEN_IMPORT_WASM`      → `tests/fixtures/forbidden_import.wasm` (committed)
 //! - `FORBIDDEN_HOST_IMPORT_WASM` → `tests/fixtures/forbidden_host_import.wat` (committed)
+//! - `PANIC_PLUGIN_WASM`          → `target/wasm32-wasip1/debug/fixture_panic_plugin.wasm`
+//! - `LOOP_PLUGIN_WASM`           → `target/wasm32-wasip1/debug/fixture_loop_plugin.wasm`
+//! - `LOOP_HOOK_PLUGIN_WASM`      → `target/wasm32-wasip1/debug/fixture_loop_hook_plugin.wasm`
 //!
 //! `FORBIDDEN_HOST_IMPORT_WASM` points at a `.wat` text file. wasmtime's default
 //! features include the `wat` crate, so `Module::from_file` assembles it
@@ -73,9 +79,29 @@ fn main() {
             .display()
     );
 
+    println!(
+        "cargo:rustc-env=PANIC_PLUGIN_WASM={}",
+        wasm_profile_dir.join("fixture_panic_plugin.wasm").display()
+    );
+
+    println!(
+        "cargo:rustc-env=LOOP_PLUGIN_WASM={}",
+        wasm_profile_dir.join("fixture_loop_plugin.wasm").display()
+    );
+
+    println!(
+        "cargo:rustc-env=LOOP_HOOK_PLUGIN_WASM={}",
+        wasm_profile_dir
+            .join("fixture_loop_hook_plugin.wasm")
+            .display()
+    );
+
     // Re-run if fixture sources change (for incremental correctness in IDE).
     println!("cargo:rerun-if-changed=../hello_plugin/src/lib.rs");
     println!("cargo:rerun-if-changed=../fixture_abi_mismatch/src/lib.rs");
+    println!("cargo:rerun-if-changed=../fixture_panic_plugin/src/lib.rs");
+    println!("cargo:rerun-if-changed=../fixture_loop_plugin/src/lib.rs");
+    println!("cargo:rerun-if-changed=../fixture_loop_hook_plugin/src/lib.rs");
     println!("cargo:rerun-if-changed=../plugin_sdk/src/lib.rs");
     println!("cargo:rerun-if-changed=../plugin_sdk/src/__private.rs");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_import.wasm");

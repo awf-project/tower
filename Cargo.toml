@@ -8,15 +8,21 @@ members = [
     "crates/hello_plugin",
     # Test fixtures for spec 11c — wasm32-wasip1 only, excluded from default-members.
     "crates/fixture_abi_mismatch",
+    # Test fixtures for spec 11d — wasm32-wasip1 only, excluded from default-members.
+    "crates/fixture_panic_plugin",
+    "crates/fixture_loop_plugin",
+    "crates/fixture_loop_hook_plugin",
 ]
 
-# Decision: plugin_ast, hello_plugin, and 11c fixtures target wasm32-wasip1 and
+# Decision: plugin_ast, hello_plugin, and 11c/11d fixtures target wasm32-wasip1 and
 # are excluded from default-members so host `cargo test` / `cargo build` ignores them.
 # Why: mirrors the plugin_ast precedent (spec OP1). The wasm build is verified
 # explicitly via `cargo build --target wasm32-wasip1 -p hello_plugin` etc.
 # Trade-off: `cargo test --workspace` would fail (wasm target not available on
 # the host default build); use `cargo test --workspace --exclude hello_plugin
-# --exclude plugin_ast --exclude fixture_abi_mismatch` or rely on default-members.
+# --exclude plugin_ast --exclude fixture_abi_mismatch --exclude fixture_panic_plugin
+# --exclude fixture_loop_plugin --exclude fixture_loop_hook_plugin` or rely on
+# default-members.
 default-members = [
     "crates/core_engine",
     "crates/plugin_sdk",
