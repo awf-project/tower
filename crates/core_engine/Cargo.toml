@@ -52,3 +52,9 @@ notify = "6.1"
 postcard = { version = "1.1.3", features = ["alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sled = "0.34"
+# Decision: serde_json for MCP JSON-RPC 2.0 transport (spec 10a).
+# Why: JSON-RPC is text/JSON; postcard (used by storage) is a binary format unsuitable
+# for the wire protocol. serde_json is the de-facto standard, MIT/Apache-2.0 licensed.
+# Trade-off: adds ~200 KB to binary vs. staying on postcard alone; unavoidable for
+# JSON-RPC compliance (spec U1). Scoped to the adapters/mcp layer — domain/ is untouched.
+serde_json = "1"
