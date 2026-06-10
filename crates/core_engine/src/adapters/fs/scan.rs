@@ -198,7 +198,12 @@ pub(crate) fn scan_with_batch_size(
     let walker = WalkBuilder::new(root)
         // Do not follow symlinks — prevents loops (UN2/AC4).
         .follow_links(false)
-        // Respect .gitignore files (U1/AC2).
+        // Respect .gitignore files (U1/AC2). `require_git(false)` is essential:
+        // by default the ignore crate only applies .gitignore inside a git
+        // repository, so a non-git workspace (or a temp dir) would silently
+        // index ignored paths. A workspace scanner must honor .gitignore
+        // regardless of whether the tree is a git repo.
+        .require_git(false)
         .git_ignore(true)
         // Skip hidden files (names starting with '.') (U1).
         .hidden(true)
