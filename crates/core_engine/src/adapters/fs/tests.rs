@@ -50,6 +50,9 @@ impl crate::ports::FileSystemPort for TempRealFs {
     fn delete(&mut self, path: &RelativePath) -> Result<(), PortError> {
         self.inner.delete(path)
     }
+    fn mkdir(&mut self, path: RelativePath) -> Result<(), PortError> {
+        self.inner.mkdir(path)
+    }
     fn scan(&self) -> Vec<RelativePath> {
         self.inner.scan()
     }

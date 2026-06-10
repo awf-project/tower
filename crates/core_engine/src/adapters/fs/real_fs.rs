@@ -220,6 +220,14 @@ impl FileSystemPort for RealFs {
         Ok(())
     }
 
+    /// Create the directory at `path` and all required parent components (EV4).
+    ///
+    /// Idempotent: `create_dir_all` is a no-op when the directory already exists.
+    fn mkdir(&mut self, path: RelativePath) -> Result<(), PortError> {
+        let abs = self.resolve(&path, true)?;
+        std::fs::create_dir_all(&abs).map_err(|e| map_io_error(e, true))
+    }
+
     /// Return all paths written (or renamed into) via this adapter instance
     /// that have not since been deleted or renamed away.
     ///

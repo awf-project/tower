@@ -83,6 +83,17 @@ impl FileSystemPort for InMemoryFs {
             .ok_or(PortError::NotFound)
     }
 
+    /// Create a directory entry (no-op in memory — directories are implicit).
+    ///
+    /// `InMemoryFs` does not model directory nodes; files at any depth can be
+    /// written without a prior `mkdir`. This method succeeds unconditionally
+    /// so that callers using `InMemoryFs` as a test double get the same
+    /// interface without triggering "directory not found" errors.
+    fn mkdir(&mut self, _path: RelativePath) -> Result<(), PortError> {
+        // In-memory: directories are implicit; nothing to create.
+        Ok(())
+    }
+
     fn scan(&self) -> Vec<RelativePath> {
         self.files
             .keys()

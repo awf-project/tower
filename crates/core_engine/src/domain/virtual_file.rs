@@ -47,7 +47,7 @@ impl ContentHash {
 
 /// Metadata supplied when inserting a file. The workspace mints the `FileId`,
 /// so it is not part of the input.
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub size: u64,
     pub modified: Timestamp,

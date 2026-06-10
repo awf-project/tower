@@ -64,6 +64,16 @@ pub trait FileSystemPort {
     /// Returns [`PortError::NotFound`] if `path` does not exist.
     fn delete(&mut self, path: &RelativePath) -> Result<(), PortError>;
 
+    /// Create the directory at `path`, including all parent components.
+    ///
+    /// Idempotent: if the directory already exists this is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError::WriteFailed`] on permission errors or if `path`
+    /// refers to an existing file rather than a directory.
+    fn mkdir(&mut self, path: RelativePath) -> Result<(), PortError>;
+
     /// Return all paths currently tracked by this file system.
     ///
     /// The order is unspecified; callers must not rely on insertion order.

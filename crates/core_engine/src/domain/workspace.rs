@@ -318,7 +318,7 @@ mod tests {
             content_hash: Some(ContentHash::new([0xab; 32])),
         };
 
-        let id = ws.insert(path.clone(), metadata.clone()).unwrap();
+        let id = ws.insert(path.clone(), metadata).unwrap();
         let file = ws.get(id).unwrap();
 
         assert_eq!(file.path.as_str(), "src/a.rs");

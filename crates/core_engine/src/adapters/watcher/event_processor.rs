@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::domain::index::InvertedIndex;
+use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, RelativePath, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
@@ -146,6 +147,11 @@ impl EventProcessor {
             return Ok(());
         };
 
+        // UN2/AC5: never index shadow-file temp artifacts as real user files.
+        if is_tmp_artifact(&rel_path) {
+            return Ok(());
+        }
+
         let metadata = read_metadata(&abs_path);
         let tokens = tokenize(rel_path.as_str());
 
@@ -215,6 +221,11 @@ impl EventProcessor {
         let Some(rel_path) = self.to_relative(&abs_path) else {
             return Ok(());
         };
+
+        // UN2/AC5: never process shadow-file temp artifacts.
+        if is_tmp_artifact(&rel_path) {
+            return Ok(());
+        }
 
         let metadata = read_metadata(&abs_path);
         let new_tokens = tokenize(rel_path.as_str());
@@ -319,6 +330,14 @@ impl EventProcessor {
     /// released two storage operations (delete old, put new) happen outside the
     /// lock (ST1 — short critical sections). Two `on_file_changed` calls follow:
     /// one for the deleted path and one for the created path (OP1).
+    ///
+    /// # Tmp-artifact guard (UN2/AC5)
+    ///
+    /// If `to` resolves to a `.tmp_write` or `.~tmp` path the destination is a
+    /// temp artifact and must never be indexed. The rename is treated as a plain
+    /// delete of the source (mirroring the `RealFs::write` internal `.~tmp →
+    /// <dst>` pattern in reverse). This prevents external agents that rename a
+    /// real file to a tmp-suffixed name from polluting the VFS.
     fn handle_rename(&mut self, from: PathBuf, to: PathBuf) -> Result<(), crate::ports::PortError> {
         let from_rel = self.to_relative(&from);
         let to_rel = self.to_relative(&to);
@@ -330,6 +349,15 @@ impl EventProcessor {
             }
             return Ok(());
         };
+
+        // UN2/AC5: if the destination is a tmp artifact, never insert it into
+        // the VFS. Treat it as a delete of the source (the real file moved away).
+        if is_tmp_artifact(&to_rel_path) {
+            if from_rel.is_some() {
+                return self.handle_delete(from);
+            }
+            return Ok(());
+        }
 
         // If the source is outside the root, treat as a plain create.
         let Some(from_rel_path) = from_rel else {
@@ -966,6 +994,80 @@ mod tests {
     }
 
     // ── TDD step 7/8: concurrent read+write no-deadlock ───────────────────────
+
+    // ── TDD: handle_rename tmp artifact guard (UN2/AC5) ──────────────────────
+
+    /// AC5: Rename from a real file to a .tmp_write path must NOT insert the
+    /// tmp artifact into the VFS. The source file must be treated as deleted.
+    #[test]
+    fn rename_to_tmp_write_path_treats_source_as_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let real_file = root.join("foo.rs");
+        std::fs::write(&real_file, b"x").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+
+        // Insert the real file first.
+        processor
+            .process_event(WatchEvent::Create(real_file.clone()))
+            .unwrap();
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            1,
+            "setup: one real file in VFS"
+        );
+
+        // Simulate an external agent renaming foo.rs → foo.rs.tmp_write.
+        processor
+            .process_event(WatchEvent::Rename {
+                from: real_file,
+                to: root.join("foo.rs.tmp_write"),
+            })
+            .unwrap();
+
+        let ws_guard = ws.read().unwrap();
+        // The tmp artifact must NOT be in the VFS.
+        let tmp_rel = RelativePath::new("foo.rs.tmp_write");
+        assert!(
+            ws_guard.get_by_path(&tmp_rel).is_none(),
+            ".tmp_write must never be inserted into the VFS on Rename"
+        );
+        // The original file was removed (rename = move away).
+        assert_eq!(
+            ws_guard.snapshot().files.len(),
+            0,
+            "source file must be removed when renamed to a tmp artifact path"
+        );
+    }
+
+    /// AC5: Rename whose destination is a .~tmp path is also silently suppressed.
+    #[test]
+    fn rename_to_tilde_tmp_path_is_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let real_file = root.join("bar.rs");
+        std::fs::write(&real_file, b"x").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+        processor
+            .process_event(WatchEvent::Create(real_file.clone()))
+            .unwrap();
+
+        processor
+            .process_event(WatchEvent::Rename {
+                from: real_file,
+                to: root.join("bar.rs.~tmp"),
+            })
+            .unwrap();
+
+        let ws_guard = ws.read().unwrap();
+        let tmp_rel = RelativePath::new("bar.rs.~tmp");
+        assert!(
+            ws_guard.get_by_path(&tmp_rel).is_none(),
+            ".~tmp must never be inserted into the VFS on Rename"
+        );
+    }
 
     /// Concurrent reads do not deadlock with concurrent writes.
     ///

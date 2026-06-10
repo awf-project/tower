@@ -73,6 +73,7 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::domain::index::InvertedIndex;
+use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, RelativePath, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
@@ -271,6 +272,11 @@ pub(crate) fn scan_with_batch_size(
         let rel_str: String = rel_str_raw.replace('\\', "/");
 
         let rel_path = RelativePath::new(rel_str);
+
+        // UN2/AC5: skip shadow-file temp artifacts — never index them as user files.
+        if is_tmp_artifact(&rel_path) {
+            continue;
+        }
 
         // Obtain metadata (size, mtime). A permission error here is not fatal.
         let metadata = match std::fs::metadata(abs_path) {

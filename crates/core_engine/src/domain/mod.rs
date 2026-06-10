@@ -8,6 +8,7 @@ pub mod error;
 pub mod file_id;
 pub mod grep;
 pub mod index;
+pub mod mutation;
 pub mod token;
 pub mod virtual_file;
 pub mod workspace;

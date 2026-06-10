@@ -99,18 +99,24 @@ pub trait SearchUseCase {
 ///
 /// Object-safe: mutation methods take `&mut self` and return owned values.
 pub trait FileMutationUseCase {
-    /// Create a new file at `path` with `content`.
+    /// Create or overwrite the file at `path` with `content` (upsert semantics).
+    ///
+    /// If the path already exists the file is overwritten atomically; the
+    /// existing `FileId` is preserved and metadata is updated in-place.
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::DuplicatePath`] if the path already exists.
+    /// Returns [`DomainError`] only on I/O failure (e.g. the FS port rejects
+    /// the write or rename). A pre-existing path is never an error condition.
     fn create_file(&mut self, path: RelativePath, content: Vec<u8>) -> Result<(), DomainError>;
 
-    /// Create a directory entry at `path`.
+    /// Create a directory entry at `path` recursively.
+    ///
+    /// Directories are not tracked in the VFS; this is a pure FS operation.
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::DuplicatePath`] if the path already exists.
+    /// Returns [`DomainError`] if the FS port rejects the mkdir.
     fn create_directory(&mut self, path: RelativePath) -> Result<(), DomainError>;
 
     /// Delete the file at `path`.
