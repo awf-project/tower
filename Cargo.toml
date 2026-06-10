@@ -3,15 +3,22 @@ resolver = "2"
 members = [
     "crates/core_engine",
     "crates/plugin_sdk",
+    "crates/plugin_sdk_macros",
     "crates/plugin_ast",
+    "crates/hello_plugin",
 ]
 
-# Decision: plugin_ast is a workspace member (spec U1) but excluded from default-members.
-# Why: it targets wasm32-wasip1 and must stay out of the host `cargo test` set (spec OP1).
-# Trade-off: an explicit `cargo test --workspace` still includes it; bare `cargo test` does not.
+# Decision: plugin_ast and hello_plugin target wasm32-wasip1 and are excluded
+# from default-members so host `cargo test` / `cargo build` ignores them.
+# Why: mirrors the plugin_ast precedent (spec OP1). The wasm build is verified
+# explicitly via `cargo build --target wasm32-wasip1 -p hello_plugin`.
+# Trade-off: `cargo test --workspace` would fail (wasm target not available on
+# the host default build); use `cargo test --workspace --exclude hello_plugin
+# --exclude plugin_ast` or rely on default-members for CI.
 default-members = [
     "crates/core_engine",
     "crates/plugin_sdk",
+    "crates/plugin_sdk_macros",
 ]
 
 [workspace.package]

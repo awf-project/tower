@@ -1,0 +1,5 @@
+error: #[plugin_export] takes no arguments
+ --> tests/compile_fail/plugin_export_with_args.rs:4:17
+  |
+4 | #[plugin_export(tool_name = "greet")]
+  |                 ^^^^^^^^^^^^^^^^^^^

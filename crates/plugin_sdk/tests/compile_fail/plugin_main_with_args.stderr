@@ -1,0 +1,5 @@
+error: #[plugin_main] takes no arguments
+ --> tests/compile_fail/plugin_main_with_args.rs:4:15
+  |
+4 | #[plugin_main(some_arg)]
+  |               ^^^^^^^^

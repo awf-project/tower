@@ -37,5 +37,8 @@ jobs:
       - name: Build plugin_ast for wasm32-wasip1 (spec AC4)
         run: cargo build -p plugin_ast --target wasm32-wasip1
 
+      - name: Build hello_plugin for wasm32-wasip1 (spec 11a AC1/OP1)
+        run: cargo build -p hello_plugin --target wasm32-wasip1
+
       - name: License & advisory policy
         uses: EmbarkStudios/cargo-deny-action@v2
