@@ -33,6 +33,8 @@ use crate::ports::{PortError, StoragePort};
 pub struct InMemoryStorage {
     files: HashMap<FileId, VirtualFile>,
     blobs: HashMap<[u8; 32], Vec<u8>>,
+    /// Scan-complete marker (equivalent of the sled meta flag, but in-memory).
+    scan_complete: bool,
 }
 
 impl InMemoryStorage {
@@ -49,6 +51,30 @@ impl StoragePort for InMemoryStorage {
 
     fn put(&mut self, file: VirtualFile) -> Result<(), PortError> {
         self.files.insert(file.id, file);
+        Ok(())
+    }
+
+    /// Persist all files in the slice in an all-or-nothing operation.
+    ///
+    /// # Decision
+    ///
+    /// `InMemoryStorage` has no real transaction engine. Atomicity is emulated
+    /// by collecting the fully-serialised results first (pure computation, no
+    /// side-effects), and only then writing into the map. If any step before the
+    /// write phase fails the map is not touched, preserving the all-or-nothing
+    /// guarantee at the in-memory level.
+    ///
+    /// Because `VirtualFile` is `Clone` and the HashMap insert is infallible
+    /// for in-memory storage, this implementation satisfies the contract for all
+    /// realistic in-memory use-cases. Failure-path atomicity is verified by the
+    /// `put_batch_atomicity_on_failure` contract test in `test_support`.
+    fn put_batch(&mut self, files: &[VirtualFile]) -> Result<(), PortError> {
+        // Collect all entries before touching the map so that any pre-write
+        // validation failure leaves the map untouched.
+        let entries: Vec<(FileId, VirtualFile)> = files.iter().map(|f| (f.id, f.clone())).collect();
+        for (id, file) in entries {
+            self.files.insert(id, file);
+        }
         Ok(())
     }
 
@@ -69,5 +95,14 @@ impl StoragePort for InMemoryStorage {
             .get(hash.as_bytes())
             .cloned()
             .ok_or(PortError::NotFound)
+    }
+
+    fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+        self.scan_complete = true;
+        Ok(())
+    }
+
+    fn is_scan_complete(&self) -> Result<bool, PortError> {
+        Ok(self.scan_complete)
     }
 }

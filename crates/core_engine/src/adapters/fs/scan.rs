@@ -4,15 +4,17 @@
 //!
 //! ```text
 //!  scan(root, storage, workspace, index):
-//!    ┌─ already_populated? ──► return ScanReport { skipped_because_populated: true }
+//!    ┌─ is_scan_complete? ──► return ScanReport { already_indexed: true }
 //!    │
 //!    └─ walk(root) respecting ignore rules (ignore crate)
 //!         for each eligible file:
 //!           metadata via std::fs::metadata  → FileMetadata
-//!           workspace.insert(path, meta)    → FileId
+//!           workspace.insert(path, meta)    → FileId   (new path)
+//!             OR get_by_path(path)          → FileId   (rescan: path already known)
 //!           tokenize(path)                  → Vec<Token>
 //!           batch.push((VirtualFile, tokens))
-//!         flush batch → storage.put + index.insert
+//!         flush batch → storage.put_batch (atomic) + index.insert
+//!       storage.mark_scan_complete()
 //!       return ScanReport { indexed, skipped_permission, skipped_ignore }
 //! ```
 //!
@@ -32,25 +34,27 @@
 //!
 //! # Restart / no-rescan
 //!
-//! If the workspace already contains at least one file (i.e., a previous scan
-//! was persisted), `scan` returns immediately without walking the filesystem.
-//! The caller detects this via `ScanReport::already_indexed`.
+//! The restart guard checks `StoragePort::is_scan_complete()` rather than the
+//! workspace file count.  This is the key correctness fix for the
+//! partial-scan-then-crash bug: if the process crashes mid-scan, partial data
+//! is persisted but the marker is never written, so on restart the guard sees
+//! `false` and performs a full rescan.  Re-inserting already-persisted files
+//! is idempotent (`put_batch` overwrites), so the rescan cannot corrupt or
+//! duplicate state.
 //!
 //! # Batching (OP1)
 //!
 //! Files are accumulated into a batch of up to [`BATCH_SIZE`] entries.  Each
-//! batch is flushed by calling `StoragePort::put` for every entry in the batch
-//! and then inserting all tokens into the in-memory index.
+//! batch is flushed by calling `StoragePort::put_batch`, which persists all N
+//! files in a single atomic sled transaction.  This reduces write amplification
+//! compared to N individual `put` transactions while still bounding heap usage
+//! to `batch_size` entries at a time.
 //!
-//! **Scope note**: "batching" in spec OP1 is defined here as *memory
-//! accumulation* — the hot-path is a tight loop that avoids calling into sled
-//! for each file individually during the walk, instead grouping the sled I/O
-//! into bounded bursts.  Each individual `StoragePort::put` call is still one
-//! sled transaction (specs 04a/04b require this for atomicity per file), so
-//! this does not reduce the total number of sled transactions.  Adding a
-//! `put_batch` method to `StoragePort` that wraps all N files in one sled
-//! `Transactional` call would reduce write amplification further but is
-//! deferred to a future spec (it requires a storage-port contract change).
+//! # Scan-completion marker
+//!
+//! `StoragePort::mark_scan_complete()` is called once, after the final batch
+//! flush.  On persistent backends (sled) the flag is written to the `meta`
+//! tree and flushed synchronously so it survives a process restart.
 //!
 //! # Permission errors (UN1/AC3)
 //!
@@ -162,15 +166,18 @@ pub(crate) fn scan_with_batch_size(
     index: &mut InvertedIndex,
     batch_size: usize,
 ) -> Result<ScanReport, crate::ports::PortError> {
-    // AC5 / EV2: if the workspace already has files from a previous scan,
-    // skip the walk entirely.
+    // Restart guard: skip the walk only when a previous scan COMPLETED.
     //
-    // Decision: use workspace.snapshot().files.is_empty() as the population
-    // check. This is O(n) on the slot count but n is bounded by the number of
-    // files, which is exactly the information we need. An alternative would be
-    // to expose a `file_count()` on ProjectWorkspace — but that would add API
-    // surface to the domain for a single use-site, which violates YAGNI.
-    if !workspace.snapshot().files.is_empty() {
+    // Decision: use StoragePort::is_scan_complete() rather than the workspace
+    // file count. The file-count check was the source of the
+    // partial-scan-then-crash bug: a crash mid-scan persists partial data so
+    // the file count is non-zero, but the index is incomplete. The scan-
+    // complete marker is written atomically only after the final batch flush,
+    // so it can never be set for a partial scan.
+    //
+    // Idempotency: re-inserting already-persisted files via put_batch is safe
+    // because put_batch overwrites existing records.
+    if storage.is_scan_complete()? {
         return Ok(ScanReport {
             already_indexed: true,
             ..Default::default()
@@ -275,12 +282,34 @@ pub(crate) fn scan_with_batch_size(
         };
 
         // Assign a FileId via the workspace aggregate.
-        // DuplicatePath is theoretically impossible from a well-formed walk
-        // (each path appears once), but handle it defensively by skipping.
+        //
+        // During a rescan (crash-recovery path), the workspace may already
+        // contain this path because it was rebuilt from persisted storage on
+        // open().  In that case workspace.insert returns DuplicatePath — we
+        // must NOT skip: we reuse the existing FileId and still push the entry
+        // into the batch so that put_batch re-persists it and index.insert
+        // re-adds the tokens to the in-memory index.
+        //
+        // Decision: use get_by_path on DuplicatePath rather than treating it
+        // as an error.  Any other DomainError (there are none today, but
+        // defensive) is treated as a skip.
         let file_id = match workspace.insert(rel_path.clone(), metadata) {
             Ok(id) => id,
+            Err(crate::domain::error::DomainError::DuplicatePath) => {
+                // Path was already registered (rescan path).  Reuse the
+                // existing FileId so the entry still flows through flush_batch
+                // and gets added to the in-memory index.
+                match workspace.get_by_path(&rel_path) {
+                    Some(id) => id,
+                    None => {
+                        // Workspace invariant violated — treat as a skip.
+                        report.skipped_permission.push(abs_path.to_path_buf());
+                        continue;
+                    }
+                }
+            }
             Err(_) => {
-                // Path collision — treat as a skip.
+                // Unexpected domain error — treat as a skip.
                 report.skipped_permission.push(abs_path.to_path_buf());
                 continue;
             }
@@ -288,7 +317,7 @@ pub(crate) fn scan_with_batch_size(
 
         let virtual_file = workspace
             .get(file_id)
-            .expect("just inserted — slot must be live")
+            .expect("file_id was just inserted or looked up — slot must be live")
             .clone();
 
         let tokens = tokenize(rel_path.as_str());
@@ -305,19 +334,32 @@ pub(crate) fn scan_with_batch_size(
         flush_batch(&mut batch, storage, index)?;
     }
 
+    // Mark the scan as complete AFTER all data is persisted.
+    //
+    // Decision: write the marker here, not inside flush_batch, so it is set
+    // exactly once — after the full walk — and never mid-scan.  On sled this
+    // flushes synchronously, so a crash after this point sees the marker and
+    // correctly skips the rescan on restart.  A crash before this point leaves
+    // the marker absent; the restart guard then reruns the full walk (idempotent).
+    storage.mark_scan_complete()?;
+
     report.indexed = workspace.snapshot().files.len();
     Ok(report)
 }
 
-/// Flush one batch: persist each file via `StoragePort::put` and insert tokens
-/// into the in-memory index. Clears `batch` on success.
+/// Flush one batch: persist all files atomically via `StoragePort::put_batch`
+/// and insert their tokens into the in-memory index. Clears `batch` on success.
+///
+/// Using `put_batch` instead of individual `put` calls reduces the number of
+/// sled transactions from N to 1 per batch (OP1 true batching).
 fn flush_batch(
     batch: &mut Vec<(crate::domain::VirtualFile, Vec<crate::domain::token::Token>)>,
     storage: &mut dyn StoragePort,
     index: &mut InvertedIndex,
 ) -> Result<(), crate::ports::PortError> {
+    let files: Vec<crate::domain::VirtualFile> = batch.iter().map(|(f, _)| f.clone()).collect();
+    storage.put_batch(&files)?;
     for (file, tokens) in batch.iter() {
-        storage.put(file.clone())?;
         index.insert(file.id, tokens);
     }
     batch.clear();

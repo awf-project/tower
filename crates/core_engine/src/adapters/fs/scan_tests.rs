@@ -24,6 +24,7 @@ mod scan_integration {
     use crate::domain::index::{FileSearch, InvertedIndex};
     use crate::domain::workspace::ProjectWorkspace;
     use crate::ports::inbound::SearchUseCase;
+    use crate::ports::StoragePort;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -541,6 +542,161 @@ mod scan_integration {
         .unwrap();
 
         assert_eq!(report.indexed, 3, "3 files with large batch; {report:?}");
+    }
+
+    // ── Partial-scan-then-crash → full rescan on restart ─────────────────────
+
+    /// Correctness: a crash mid-scan persists partial data but leaves the
+    /// scan-complete marker absent.  On restart the scan must detect the absent
+    /// marker and perform a full rescan so the index is complete.
+    ///
+    /// Simulation: write files to storage + workspace manually (as if a
+    /// mid-scan flush ran), but do NOT call `mark_scan_complete`.  Then call
+    /// `scan` again — it must walk the filesystem and index all files.
+    #[test]
+    fn partial_scan_then_restart_triggers_full_rescan() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        write_file(workspace_dir.path(), "first.rs", b"fn a() {}");
+        write_file(workspace_dir.path(), "second.rs", b"fn b() {}");
+
+        // Simulate a partial scan: open storage, persist only "first.rs",
+        // but do NOT mark the scan complete.  This reproduces a crash after
+        // the first batch flush.
+        {
+            let (mut storage, mut workspace, _index) = open_storage(db_dir.path());
+
+            // Insert only first.rs into workspace + storage (partial scan).
+            let id = workspace
+                .insert(
+                    crate::domain::virtual_file::RelativePath::new("first.rs"),
+                    crate::domain::virtual_file::FileMetadata::default(),
+                )
+                .unwrap();
+            let file = workspace.get(id).unwrap().clone();
+            storage.put_batch(&[file]).unwrap();
+            // Deliberately omit mark_scan_complete() — simulates a crash.
+        }
+
+        // Reopen and run scan: the absent marker must trigger a full rescan.
+        {
+            let (mut storage2, mut workspace2, mut index2) = open_storage(db_dir.path());
+
+            let report = scan(
+                workspace_dir.path(),
+                &mut storage2,
+                &mut workspace2,
+                &mut index2,
+            )
+            .unwrap();
+
+            // The scan must have run (not skipped).
+            assert!(
+                !report.already_indexed,
+                "scan must re-run after partial scan (marker absent); {report:?}"
+            );
+
+            // Both files must now be in the index.
+            assert_eq!(
+                report.indexed, 2,
+                "full rescan must index both files; {report:?}"
+            );
+
+            // Verify searchability.
+            let search = crate::domain::index::FileSearch::new(&index2, &workspace2);
+            let hits_first = search.find_file("first").unwrap();
+            assert!(
+                hits_first.iter().any(|p| p.as_str().ends_with("first.rs")),
+                "first.rs must be findable after rescan; got {hits_first:?}"
+            );
+            let hits_second = search.find_file("second").unwrap();
+            assert!(
+                hits_second
+                    .iter()
+                    .any(|p| p.as_str().ends_with("second.rs")),
+                "second.rs must be findable after rescan; got {hits_second:?}"
+            );
+
+            // The marker must now be set.
+            assert!(
+                storage2.is_scan_complete().unwrap(),
+                "scan must set the marker on completion"
+            );
+        }
+    }
+
+    // ── Rescan with already-persisted paths populates the index ──────────────
+    //
+    // Regression guard for the DuplicatePath-skip bug: when workspace is
+    // pre-populated (from a partial-scan persisted to storage before a crash),
+    // workspace.insert returns DuplicatePath.  Before the fix, the scan skipped
+    // those files entirely — never calling index.insert — so find_file returned
+    // nothing for the pre-persisted files even though the walk visited them.
+    //
+    // This test uses InMemoryStorage to isolate the bug: InMemoryStorage has no
+    // rehydrate_index step, so index entries can ONLY come from the walk itself.
+    // If the bug is present, find_file("first") returns empty. After the fix it
+    // must return "first.rs".
+    #[test]
+    fn rescan_with_pre_populated_workspace_still_populates_index() {
+        use crate::adapters::InMemoryStorage;
+
+        let workspace_dir = TempDir::new().unwrap();
+        write_file(workspace_dir.path(), "first.rs", b"fn a() {}");
+        write_file(workspace_dir.path(), "second.rs", b"fn b() {}");
+
+        // Pre-populate workspace + storage with first.rs only, simulating a
+        // partial scan that persisted one batch but crashed before completing.
+        let mut storage = InMemoryStorage::new();
+        let mut workspace = ProjectWorkspace::new();
+        let mut index = InvertedIndex::new();
+
+        let id = workspace
+            .insert(
+                crate::domain::virtual_file::RelativePath::new("first.rs"),
+                crate::domain::virtual_file::FileMetadata::default(),
+            )
+            .unwrap();
+        let file = workspace.get(id).unwrap().clone();
+        storage.put_batch(&[file]).unwrap();
+        // No mark_scan_complete — the walk must run again.
+
+        // Run the rescan.  The walk will encounter "first.rs" which is already
+        // in workspace.  The fix must reuse the existing FileId and still push
+        // (VirtualFile, tokens) into the batch so index.insert is called.
+        let report = scan(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        assert!(
+            !report.already_indexed,
+            "scan must run (marker absent); {report:?}"
+        );
+        assert_eq!(report.indexed, 2, "both files must be indexed; {report:?}");
+
+        // The index must contain entries for both files.
+        // This is the critical assertion: index is the ONLY source here
+        // (InMemoryStorage has no rehydrate step).
+        let search = crate::domain::index::FileSearch::new(&index, &workspace);
+
+        let hits_first = search.find_file("first").unwrap();
+        assert!(
+            hits_first.iter().any(|p| p.as_str().ends_with("first.rs")),
+            "first.rs must be in the in-memory index after rescan; got {hits_first:?}"
+        );
+
+        let hits_second = search.find_file("second").unwrap();
+        assert!(
+            hits_second
+                .iter()
+                .any(|p| p.as_str().ends_with("second.rs")),
+            "second.rs must be in the in-memory index after rescan; got {hits_second:?}"
+        );
     }
 
     // ── .git directory is always skipped ──────────────────────────────────────

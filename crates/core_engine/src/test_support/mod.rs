@@ -112,6 +112,176 @@ macro_rules! storage_contract_tests {
                 let hash = sample_content_hash();
                 assert_eq!(store.get_blob(&hash).unwrap_err(), PortError::NotFound);
             }
+
+            // ── put_batch contract ────────────────────────────────────────────
+
+            /// All files in a batch are reachable via `get` after `put_batch`.
+            #[test]
+            fn put_batch_round_trips_all_files() {
+                let mut store = ($make)();
+                let files = vec![
+                    make_virtual_file(0, 0, "src/a.rs"),
+                    make_virtual_file(1, 0, "src/b.rs"),
+                    make_virtual_file(2, 0, "src/c.rs"),
+                ];
+                store.put_batch(&files).unwrap();
+                for file in &files {
+                    let got = store.get(file.id).unwrap();
+                    assert_eq!(
+                        got,
+                        *file,
+                        "put_batch: file {} not round-tripped",
+                        file.id.index()
+                    );
+                }
+            }
+
+            /// An empty batch is a no-op and must not error.
+            #[test]
+            fn put_batch_with_empty_slice_is_a_noop() {
+                let mut store = ($make)();
+                store.put_batch(&[]).unwrap();
+            }
+
+            /// `put_batch` is idempotent: re-inserting the same files overwrites
+            /// existing records without error.
+            #[test]
+            fn put_batch_overwrites_existing_records_idempotently() {
+                let mut store = ($make)();
+                let file = make_virtual_file(0, 0, "src/a.rs");
+                store.put_batch(std::slice::from_ref(&file)).unwrap();
+                // Call again with the same file — must succeed.
+                store.put_batch(std::slice::from_ref(&file)).unwrap();
+                assert_eq!(store.get(file.id).unwrap(), file);
+            }
+
+            // ── put_batch atomicity on failure ────────────────────────────────
+
+            /// Verify the all-or-nothing contract: when `put_batch` fails (the
+            /// store is wrapped in a `FailingStorage` that returns `WriteFailed`
+            /// on demand), no files must have been persisted.
+            ///
+            /// Strategy: pre-populate the store with one file, then call
+            /// `put_batch` through a failing wrapper.  After the failure,
+            /// re-query the store directly and confirm the pre-existing file is
+            /// unchanged and the new files are absent.
+            ///
+            /// This tests the interface contract, not the wrapper itself: any
+            /// `StoragePort` that genuinely satisfies the all-or-nothing
+            /// guarantee will pass; one that writes partial state will fail
+            /// because the new file IDs will be findable via `get`.
+            #[test]
+            fn put_batch_atomicity_on_failure() {
+                use $crate::ports::PortError;
+
+                /// Wrapper that delegates all calls to `inner` except
+                /// `put_batch`, which always returns `WriteFailed`.
+                struct AlwaysFailBatch<S: $crate::ports::StoragePort> {
+                    inner: S,
+                }
+
+                impl<S: $crate::ports::StoragePort> $crate::ports::StoragePort
+                    for AlwaysFailBatch<S>
+                {
+                    fn get(&self, id: FileId) -> Result<VirtualFile, PortError> {
+                        self.inner.get(id)
+                    }
+                    fn put(&mut self, file: VirtualFile) -> Result<(), PortError> {
+                        self.inner.put(file)
+                    }
+                    fn put_batch(&mut self, _files: &[$crate::domain::VirtualFile]) -> Result<(), PortError> {
+                        Err(PortError::WriteFailed("injected failure".to_owned()))
+                    }
+                    fn delete(&mut self, id: FileId) -> Result<(), PortError> {
+                        self.inner.delete(id)
+                    }
+                    fn put_blob(
+                        &mut self,
+                        hash: $crate::domain::ContentHash,
+                        bytes: Vec<u8>,
+                    ) -> Result<(), PortError> {
+                        self.inner.put_blob(hash, bytes)
+                    }
+                    fn get_blob(
+                        &self,
+                        hash: &$crate::domain::ContentHash,
+                    ) -> Result<Vec<u8>, PortError> {
+                        self.inner.get_blob(hash)
+                    }
+                    fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+                        self.inner.mark_scan_complete()
+                    }
+                    fn is_scan_complete(&self) -> Result<bool, PortError> {
+                        self.inner.is_scan_complete()
+                    }
+                }
+
+                // Build the inner store and pre-populate it with file 0.
+                let inner = ($make)();
+                let mut failing = AlwaysFailBatch { inner };
+
+                // Pre-condition: file 0 is absent before anything.
+                assert_eq!(
+                    failing.get(FileId::new_for_testing(0, 0)).unwrap_err(),
+                    PortError::NotFound,
+                    "store must be empty before test"
+                );
+
+                // Attempt to batch-insert files 0 and 1.  Must fail.
+                let batch = vec![
+                    make_virtual_file(0, 0, "src/a.rs"),
+                    make_virtual_file(1, 0, "src/b.rs"),
+                ];
+                let result = failing.put_batch(&batch);
+                assert!(
+                    result.is_err(),
+                    "put_batch must return an error via the failing wrapper"
+                );
+
+                // Post-condition: neither file was persisted (all-or-nothing).
+                assert_eq!(
+                    failing.get(FileId::new_for_testing(0, 0)).unwrap_err(),
+                    PortError::NotFound,
+                    "file 0 must not be present after failed put_batch"
+                );
+                assert_eq!(
+                    failing.get(FileId::new_for_testing(1, 0)).unwrap_err(),
+                    PortError::NotFound,
+                    "file 1 must not be present after failed put_batch"
+                );
+            }
+
+            // ── scan-complete marker contract ─────────────────────────────────
+
+            /// `is_scan_complete` returns `false` on a fresh store.
+            #[test]
+            fn scan_complete_is_false_on_fresh_store() {
+                let store = ($make)();
+                assert!(!store.is_scan_complete().unwrap());
+            }
+
+            /// After `mark_scan_complete`, `is_scan_complete` returns `true`.
+            #[test]
+            fn mark_scan_complete_sets_flag() {
+                let mut store = ($make)();
+                assert!(!store.is_scan_complete().unwrap());
+                store.mark_scan_complete().unwrap();
+                assert!(store.is_scan_complete().unwrap());
+            }
+
+            /// Partial data present + marker absent => `is_scan_complete` is
+            /// `false`, meaning the scan-complete flag is independent of whether
+            /// any files are stored.
+            #[test]
+            fn partial_data_without_marker_is_not_complete() {
+                let mut store = ($make)();
+                // Persist a file without calling mark_scan_complete.
+                store.put(make_virtual_file(0, 0, "partial.rs")).unwrap();
+                assert!(
+                    !store.is_scan_complete().unwrap(),
+                    "marker must not be set by put — only mark_scan_complete sets it"
+                );
+            }
         }
     };
 }

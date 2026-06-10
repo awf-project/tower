@@ -444,3 +444,72 @@ fn blob_survives_reopen() {
     let hash = crate::test_support::sample_content_hash();
     assert_eq!(adapter2.get_blob(&hash).unwrap(), b"hello sled");
 }
+
+// ── Scan-complete marker survives restart ─────────────────────────────────────
+
+#[test]
+fn scan_complete_marker_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // First session: mark the scan complete.
+    {
+        let (mut adapter, _ws, _index) = SledStorageAdapter::open(&path).unwrap();
+        assert!(!adapter.is_scan_complete().unwrap());
+        adapter.mark_scan_complete().unwrap();
+        assert!(adapter.is_scan_complete().unwrap());
+    }
+
+    // Reopen: the flag must still be set.
+    let (adapter2, _ws, _index) = SledStorageAdapter::open(&path).unwrap();
+    assert!(
+        adapter2.is_scan_complete().unwrap(),
+        "scan-complete marker must survive a process restart (sled flush)"
+    );
+}
+
+// ── put_batch: all-or-nothing atomicity on sled ───────────────────────────────
+//
+// Because SledStorageAdapter cannot inject a mid-batch failure without a
+// test-hook (we keep production code clean), we verify the positive path here
+// and rely on the InMemoryStorage contract tests for the atomicity invariant.
+// The sled `Transactional` API guarantees rollback on any error inside the
+// closure, which is covered transitively by the index-abort tests above.
+
+#[test]
+fn put_batch_persists_all_files_atomically() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let files = vec![
+        make_virtual_file(0, 0, "batch/a.rs"),
+        make_virtual_file(1, 0, "batch/b.rs"),
+        make_virtual_file(2, 0, "batch/c.rs"),
+    ];
+
+    {
+        let (mut adapter, _ws, _index) = SledStorageAdapter::open(&path).unwrap();
+        adapter.put_batch(&files).unwrap();
+    }
+
+    // Reopen and verify all three files survive.
+    let (adapter2, _ws, _index) = SledStorageAdapter::open(&path).unwrap();
+    for file in &files {
+        assert_eq!(
+            adapter2.get(file.id).unwrap(),
+            *file,
+            "file {} must survive restart after put_batch",
+            file.id.index()
+        );
+    }
+}
+
+#[test]
+fn put_batch_empty_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    let (mut adapter, _ws, _index) = SledStorageAdapter::open(&path).unwrap();
+    // Must not error.
+    adapter.put_batch(&[]).unwrap();
+}

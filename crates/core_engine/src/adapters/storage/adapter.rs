@@ -79,6 +79,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 const META_SCHEMA_KEY: &[u8] = b"schema_version";
 const META_SLOT_GENS_KEY: &[u8] = b"slot_generations";
 const META_FREE_SLOTS_KEY: &[u8] = b"free_slots";
+/// Scan-completion marker key in the `meta` tree.
+///
+/// Absent or zero means "scan never completed (or crashed mid-scan)".
+/// Value `[1u8]` means "scan completed successfully".
+const META_SCAN_COMPLETE_KEY: &[u8] = b"scan_complete";
 
 /// Abort reasons carried through sled transaction closures.
 ///
@@ -491,6 +496,139 @@ impl StoragePort for SledStorageAdapter {
         Ok(())
     }
 
+    /// Persist N `VirtualFile` records in a single all-or-nothing Sled
+    /// transaction over the `files`, `paths`, `meta`, and `index` trees.
+    ///
+    /// # Decision
+    ///
+    /// The transaction closure iterates over all files and calls the same
+    /// per-file logic used by `put`.  Wrapping all N files in one
+    /// `Transactional` call means Sled either commits every record or commits
+    /// none of them — satisfying the OP1 batch-atomicity contract.
+    ///
+    /// Re-inserting an already-persisted file is idempotent (the existing
+    /// record is overwritten), which makes the initial scan restartable after a
+    /// crash.
+    fn put_batch(&mut self, files: &[VirtualFile]) -> Result<(), PortError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-serialise all files outside the transaction (pure computation).
+        // If any serialisation fails we return early without touching sled.
+        struct FileRecord {
+            key: [u8; 8],
+            path_bytes: Vec<u8>,
+            file_bytes: Vec<u8>,
+            new_token_set: HashSet<String>,
+            file_id: FileId,
+            file_index: u32,
+            file_gen: u32,
+        }
+
+        let mut records: Vec<FileRecord> = Vec::with_capacity(files.len());
+        for file in files {
+            let key = file_id_key(file.id);
+            let path_bytes = path_key(&file.path).to_vec();
+            let file_bytes =
+                postcard::to_allocvec(file).map_err(|e| to_port_error(StorageError::Codec(e)))?;
+            let new_tokens = tokenize(file.path.as_str());
+            let new_token_set: HashSet<String> =
+                new_tokens.iter().map(|t| t.as_str().to_owned()).collect();
+            records.push(FileRecord {
+                key,
+                path_bytes,
+                file_bytes,
+                new_token_set,
+                file_id: file.id,
+                file_index: file.id.index(),
+                file_gen: file.id.generation(),
+            });
+        }
+
+        (&self.files, &self.paths, &self.meta, &self.index)
+            .transaction(|(tx_files, tx_paths, tx_meta, tx_index)| {
+                // Read the current slot_generations once at the top of the
+                // transaction; update it for each file in the batch.
+                let mut slot_gens: Vec<u32> = match tx_meta.get(META_SLOT_GENS_KEY)? {
+                    None => Vec::new(),
+                    Some(bytes) => postcard::from_bytes::<Vec<u32>>(bytes.as_ref())
+                        .map_err(TxAbort::IndexCodec)
+                        .map_err(ConflictableTransactionError::Abort)?,
+                };
+                let mut free_slots: Vec<u32> = match tx_meta.get(META_FREE_SLOTS_KEY)? {
+                    None => Vec::new(),
+                    Some(bytes) => postcard::from_bytes::<Vec<u32>>(bytes.as_ref())
+                        .map_err(TxAbort::IndexCodec)
+                        .map_err(ConflictableTransactionError::Abort)?,
+                };
+
+                for rec in &records {
+                    // ── Compute old token set (for delta) ───────────────────
+                    let old_token_set: HashSet<String> =
+                        if let Some(old_bytes) = tx_files.get(rec.key.as_ref())? {
+                            if let Ok(old_file) =
+                                postcard::from_bytes::<VirtualFile>(old_bytes.as_ref())
+                            {
+                                let old_path = path_key(&old_file.path);
+                                if old_path != rec.path_bytes.as_slice() {
+                                    tx_paths.remove(old_path)?;
+                                }
+                                tokenize(old_file.path.as_str())
+                                    .iter()
+                                    .map(|t| t.as_str().to_owned())
+                                    .collect()
+                            } else {
+                                HashSet::new()
+                            }
+                        } else {
+                            HashSet::new()
+                        };
+
+                    // ── Write file record ────────────────────────────────────
+                    tx_files.insert(rec.key.as_ref(), rec.file_bytes.as_slice())?;
+                    tx_paths.insert(rec.path_bytes.as_slice(), rec.key.as_ref())?;
+
+                    // ── Update allocator state ───────────────────────────────
+                    let target = rec.file_index as usize;
+                    while slot_gens.len() <= target {
+                        slot_gens.push(0);
+                    }
+                    slot_gens[target] = rec.file_gen;
+                    free_slots.retain(|&i| i != rec.file_index);
+
+                    // ── Update index ─────────────────────────────────────────
+                    for token_str in &rec.new_token_set {
+                        if !old_token_set.contains(token_str) {
+                            update_posting(tx_index, token_str.as_bytes(), rec.file_id, true)
+                                .map_err(lift_index_codec)?;
+                        }
+                    }
+                    for token_str in &old_token_set {
+                        if !rec.new_token_set.contains(token_str) {
+                            update_posting(tx_index, token_str.as_bytes(), rec.file_id, false)
+                                .map_err(lift_index_codec)?;
+                        }
+                    }
+                }
+
+                // Persist updated allocator state once for the whole batch.
+                let gens_bytes = postcard::to_allocvec(&slot_gens)
+                    .map_err(TxAbort::IndexCodec)
+                    .map_err(ConflictableTransactionError::Abort)?;
+                let free_bytes = postcard::to_allocvec(&free_slots)
+                    .map_err(TxAbort::IndexCodec)
+                    .map_err(ConflictableTransactionError::Abort)?;
+                tx_meta.insert(META_SLOT_GENS_KEY, gens_bytes.as_slice())?;
+                tx_meta.insert(META_FREE_SLOTS_KEY, free_bytes.as_slice())?;
+
+                Ok::<(), ConflictableTransactionError<TxAbort>>(())
+            })
+            .map_err(|e| to_port_error(map_tx_abort_error(e)))?;
+
+        Ok(())
+    }
+
     /// Remove the entry for `id`. Mutates `files`, `paths`, `meta`, and `index`
     /// in ONE Sled transaction (spec EV2/UN1/AC3).
     ///
@@ -584,6 +722,34 @@ impl StoragePort for SledStorageAdapter {
         {
             None => Err(PortError::NotFound),
             Some(bytes) => Ok(bytes.to_vec()),
+        }
+    }
+
+    /// Durably record that the initial workspace scan completed.
+    ///
+    /// Writes a single byte `[1]` under `META_SCAN_COMPLETE_KEY` in the `meta`
+    /// tree and flushes synchronously so the flag survives a process restart.
+    fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+        self.meta
+            .insert(META_SCAN_COMPLETE_KEY, &[1u8])
+            .map_err(|e| to_port_error(StorageError::Sled(e)))?;
+        self.meta
+            .flush()
+            .map_err(|e| to_port_error(StorageError::Sled(e)))?;
+        Ok(())
+    }
+
+    /// Return `true` if the scan-complete flag is set in the `meta` tree.
+    ///
+    /// Reads with `&self` — no application-level lock (spec ST1).
+    fn is_scan_complete(&self) -> Result<bool, PortError> {
+        match self
+            .meta
+            .get(META_SCAN_COMPLETE_KEY)
+            .map_err(|e| to_read_error(StorageError::Sled(e)))?
+        {
+            Some(bytes) => Ok(bytes.first() == Some(&1u8)),
+            None => Ok(false),
         }
     }
 }
