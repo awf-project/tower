@@ -183,6 +183,15 @@ pub enum RegistrationError {
         /// The ABI version the plugin was compiled against.
         got: u32,
     },
+    /// A plugin with this manifest name is already registered.
+    ///
+    /// Plugin names are used as routing keys in `call_instance_tool` (spec 12b).
+    /// Allowing two plugins with the same name would make the second one
+    /// permanently unreachable: every `tools/call` for any of its tools would
+    /// silently route to the first plugin instead — a violation of UN1
+    /// ("never silently shadow"). Reject the duplicate at registration time so
+    /// the problem is surfaced immediately rather than at call time.
+    DuplicateName(String),
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -190,6 +199,9 @@ impl std::fmt::Display for RegistrationError {
         match self {
             Self::AbiMismatch { expected, got } => {
                 write!(f, "ABI mismatch: host={expected}, plugin={got}")
+            }
+            Self::DuplicateName(name) => {
+                write!(f, "a plugin named '{name}' is already registered")
             }
         }
     }
@@ -339,6 +351,25 @@ impl PluginHostRegistry {
                 got: plugin_abi,
             });
         }
+
+        // Decision: enforce unique manifest names at registration time.
+        // Why: call_instance_tool() routes by name and returns on first match.
+        //      A second plugin with the same name would be permanently unreachable:
+        //      any tools/call for its tools silently routes to the first — UN1.
+        // Trade-off: hot-reload must use a different name or remove the old plugin
+        //      first; this is an acceptable constraint for the current design.
+        let new_name = instance.manifest().name.clone();
+        let duplicate = self.instances.iter().any(|slot| {
+            slot.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .manifest()
+                .name
+                == new_name
+        });
+        if duplicate {
+            return Err(RegistrationError::DuplicateName(new_name));
+        }
+
         self.instances.push(Mutex::new(instance));
         Ok(())
     }
@@ -381,6 +412,49 @@ impl PluginHostRegistry {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Invoke a named tool on the first registered plugin whose manifest name
+    /// matches `plugin_id_str` (spec 12b routing).
+    ///
+    /// This is the single point where the MCP adapter layer (12b) calls into a
+    /// specific plugin instance. The call goes through the per-instance `Mutex`
+    /// so it is exclusive — no concurrent tool calls on the same instance.
+    ///
+    /// Fault isolation is transparent: if the instance is wrapped in an
+    /// `IsolatedSandbox` (11d), the sandbox catches any wasm trap and returns
+    /// `PluginHostError::PluginFault`. The adapter layer (12b) maps that to a
+    /// `ToolError::ExecutionFailed` so the MCP link stays alive.
+    ///
+    /// # Errors
+    ///
+    /// - [`PluginHostError::ToolNotFound`] — no registered plugin has the given `plugin_id_str`.
+    /// - Any [`PluginHostError`] variant returned by the matching plugin instance.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use core_engine::domain::plugin_host::{PluginHostRegistry, PluginHostError};
+    ///
+    /// let registry = PluginHostRegistry::new();
+    /// let result = registry.call_instance_tool("nonexistent", "greet", plugin_sdk::Value::Null);
+    /// assert!(matches!(result, Err(PluginHostError::ToolNotFound(_))));
+    /// ```
+    pub fn call_instance_tool(
+        &self,
+        plugin_id_str: &str,
+        tool_name: &str,
+        args: plugin_sdk::Value,
+    ) -> Result<plugin_sdk::Value, PluginHostError> {
+        for slot in &self.instances {
+            // Recover a poisoned mutex (see declared_tools rationale) rather
+            // than propagating a panic to the MCP request handler.
+            let mut instance = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if instance.manifest().name == plugin_id_str {
+                return instance.call_tool(tool_name, args);
+            }
+        }
+        Err(PluginHostError::ToolNotFound(plugin_id_str.to_owned()))
     }
 
     // ── Private fan-out helper ────────────────────────────────────────────────
@@ -880,6 +954,150 @@ mod tests {
         assert!(
             registry.register(Box::new(plugin)).is_ok(),
             "current ABI plugin must be accepted"
+        );
+    }
+
+    // ── Duplicate name guard (Finding 1) ──────────────────────────────────────
+
+    /// Registering two plugins with the same manifest name must be rejected with
+    /// `RegistrationError::DuplicateName`. The second plugin must not appear in
+    /// `declared_tools` and must not be reachable via `call_instance_tool`.
+    ///
+    /// TDD: RED first (register returned Ok before this change), now GREEN.
+    #[test]
+    fn register_rejects_duplicate_plugin_name() {
+        let mut registry = PluginHostRegistry::new();
+        let first = RecordingPlugin::new(
+            "analytics",
+            vec![],
+            vec![ToolDesc {
+                name: "report".to_owned(),
+                description: "".to_owned(),
+                schema_json: "{}".to_owned(),
+            }],
+        );
+        let second = RecordingPlugin::new(
+            "analytics",
+            vec![],
+            vec![ToolDesc {
+                name: "summary".to_owned(),
+                description: "".to_owned(),
+                schema_json: "{}".to_owned(),
+            }],
+        );
+
+        registry
+            .register(Box::new(first))
+            .expect("first registration must succeed");
+        let result = registry.register(Box::new(second));
+
+        assert_eq!(
+            result,
+            Err(RegistrationError::DuplicateName("analytics".to_owned())),
+            "duplicate name must be rejected"
+        );
+
+        // Only the first plugin's tool is visible; the second was never stored.
+        let tools = registry.declared_tools();
+        assert_eq!(tools.len(), 1, "only first plugin's tools present");
+        assert_eq!(tools[0].1.name, "report", "first plugin tool visible");
+
+        // call_instance_tool routes to the first plugin (it has 'report', not 'summary').
+        let err = registry
+            .call_instance_tool("analytics", "summary", Value::Null)
+            .expect_err("second plugin's tool must not be reachable");
+        assert!(
+            matches!(err, PluginHostError::ToolNotFound(_)),
+            "unreachable tool must return ToolNotFound: {err:?}"
+        );
+    }
+
+    /// Two differently-named plugins that both declare a tool named 'greet'
+    /// must each be independently reachable via `call_instance_tool`.
+    ///
+    /// This is the routing correctness test that was missing from the spec suite:
+    /// the previous `ac3_two_plugins_with_same_tool_name_both_appear_namespaced`
+    /// only asserted `list()` output, not actual call routing.
+    #[test]
+    fn two_plugins_same_tool_name_each_route_to_correct_instance() {
+        /// A fake whose call_tool echoes the plugin's own name as the result.
+        struct IdentifyingPlugin {
+            manifest: PluginManifest,
+        }
+
+        impl PluginInstance for IdentifyingPlugin {
+            fn manifest(&self) -> &PluginManifest {
+                &self.manifest
+            }
+
+            fn call_tool(&mut self, name: &str, _args: Value) -> Result<Value, PluginHostError> {
+                if self.manifest.tools.iter().any(|t| t.name == name) {
+                    Ok(Value::Text(self.manifest.name.clone()))
+                } else {
+                    Err(PluginHostError::ToolNotFound(name.to_owned()))
+                }
+            }
+
+            fn deliver_hook(
+                &mut self,
+                _kind: HookKind,
+                _payload: HookPayload,
+            ) -> Result<(), PluginHostError> {
+                Ok(())
+            }
+        }
+
+        let greet_tool = ToolDesc {
+            name: "greet".to_owned(),
+            description: "".to_owned(),
+            schema_json: "{}".to_owned(),
+        };
+
+        let plugin_a = IdentifyingPlugin {
+            manifest: PluginManifest {
+                name: "plugin_a".to_owned(),
+                version: "0.1.0".to_owned(),
+                abi: ABI_VERSION,
+                tools: vec![greet_tool.clone()],
+                hooks: vec![],
+            },
+        };
+        let plugin_b = IdentifyingPlugin {
+            manifest: PluginManifest {
+                name: "plugin_b".to_owned(),
+                version: "0.1.0".to_owned(),
+                abi: ABI_VERSION,
+                tools: vec![greet_tool],
+                hooks: vec![],
+            },
+        };
+
+        let mut registry = PluginHostRegistry::new();
+        registry
+            .register(Box::new(plugin_a))
+            .expect("plugin_a register");
+        registry
+            .register(Box::new(plugin_b))
+            .expect("plugin_b register");
+
+        // Call plugin_a/greet → must return "plugin_a", not "plugin_b".
+        let result_a = registry
+            .call_instance_tool("plugin_a", "greet", Value::Null)
+            .expect("plugin_a/greet must succeed");
+        assert_eq!(
+            result_a,
+            Value::Text("plugin_a".to_owned()),
+            "plugin_a/greet must route to plugin_a"
+        );
+
+        // Call plugin_b/greet → must return "plugin_b", not "plugin_a".
+        let result_b = registry
+            .call_instance_tool("plugin_b", "greet", Value::Null)
+            .expect("plugin_b/greet must succeed");
+        assert_eq!(
+            result_b,
+            Value::Text("plugin_b".to_owned()),
+            "plugin_b/greet must route to plugin_b"
         );
     }
 }

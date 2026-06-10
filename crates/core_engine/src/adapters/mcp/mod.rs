@@ -33,11 +33,13 @@
 //! The transport only calls `registry.list()` and `registry.call()` — it never
 //! needs to be changed when new tools arrive.
 
+pub mod merged_registry;
 pub mod native_tools;
 pub mod registry;
 pub mod transport;
 pub mod types;
 
+pub use merged_registry::MergedRegistry;
 pub use native_tools::{EngineState, NativeToolRegistry};
 pub use registry::ToolRegistry;
 pub use transport::serve;
