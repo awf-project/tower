@@ -106,29 +106,40 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         /// Dispatch a tool call. `ptr`/`len` point to a postcard-encoded
-        /// `CallRequest`. Returns a pointer to a postcard-encoded `CallResponse`.
+        /// `CallRequest` in a guest buffer previously allocated by `__plugin_alloc`.
+        /// Returns a pointer to a length-prefixed postcard-encoded `CallResponse`
+        /// buffer that the host must free via `__plugin_free`.
         ///
         /// # Safety (generated)
         ///
-        /// `ptr` must point to a valid, host-allocated buffer of exactly `len`
-        /// bytes that will not be freed before this function returns.
+        /// `ptr` must have been returned by a prior `__plugin_alloc(len)` call.
+        /// The host must have written exactly `len` bytes at `ptr` before calling
+        /// this function. This function takes ownership of the arg buffer and
+        /// frees it before returning; the host must not access `ptr` after the call.
         #[no_mangle]
         pub unsafe extern "C" fn __plugin_call_tool(ptr: *mut u8, len: usize) -> *mut u8 {
-            let request_bytes = unsafe { ::std::slice::from_raw_parts(ptr, len) };
-            let response = ::plugin_sdk::__private::dispatch_call_tool::<#struct_name>(request_bytes);
+            let response = {
+                let request_bytes = unsafe { ::std::slice::from_raw_parts(ptr, len) };
+                ::plugin_sdk::__private::dispatch_call_tool::<#struct_name>(request_bytes)
+            };
+            // Free the arg buffer (allocated by __plugin_alloc, owned by us now).
+            unsafe { ::plugin_sdk::__private::free_alloc_buffer(ptr, len) };
             ::plugin_sdk::__private::vec_into_raw(response)
         }
 
         /// Dispatch a lifecycle hook. `ptr`/`len` point to a postcard-encoded
-        /// `HookEnvelope`.
+        /// `HookEnvelope` in a guest buffer previously allocated by `__plugin_alloc`.
         ///
         /// # Safety (generated)
         ///
-        /// Same contract as `__plugin_call_tool`.
+        /// Same ownership contract as `__plugin_call_tool`: `ptr` was returned
+        /// by `__plugin_alloc(len)` and is freed by this function before return.
         #[no_mangle]
         pub unsafe extern "C" fn __plugin_on_hook(ptr: *mut u8, len: usize) {
             let hook_bytes = unsafe { ::std::slice::from_raw_parts(ptr, len) };
             ::plugin_sdk::__private::dispatch_on_hook::<#struct_name>(hook_bytes);
+            // Free the arg buffer (allocated by __plugin_alloc, owned by us now).
+            unsafe { ::plugin_sdk::__private::free_alloc_buffer(ptr, len) };
         }
 
         /// Free a buffer that was previously returned by `__plugin_init` or
@@ -141,6 +152,28 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[no_mangle]
         pub unsafe extern "C" fn __plugin_free(ptr: *mut u8, len: usize) {
             unsafe { ::plugin_sdk::__private::free_buffer(ptr, len) };
+        }
+
+        /// Allocate `len` bytes in the guest heap and return the pointer.
+        ///
+        /// The host (11c) calls this to reserve guest memory for serialised
+        /// arguments before calling `__plugin_call_tool` or `__plugin_on_hook`.
+        /// The host writes `len` bytes at the returned pointer, then passes the
+        /// same pointer and length to the guest export.
+        ///
+        /// The buffer is owned by the host until it is passed back; the guest
+        /// export frees it via a reconstructed `Vec` at the end of the call.
+        ///
+        /// # Safety (generated)
+        ///
+        /// - `len` must be non-zero.
+        /// - The host must write exactly `len` bytes before calling any guest
+        ///   export with the returned pointer.
+        /// - The host must not call `__plugin_free` on this pointer; the
+        ///   receiving guest export owns and frees it.
+        #[no_mangle]
+        pub extern "C" fn __plugin_alloc(len: u32) -> *mut u8 {
+            ::plugin_sdk::__private::alloc_guest_buffer(len as usize)
         }
     };
 

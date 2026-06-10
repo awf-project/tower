@@ -27,6 +27,14 @@ proptest = "1"
 tempfile = "3.27.0"
 
 [dependencies]
+# Decision: plugin_sdk provides PluginManifest, ToolDesc, HookKind, HookPayload
+# for the host-side plugin registry (spec 11b). plugin_sdk is pure (no wasmtime,
+# no I/O), so core_engine's domain layer remains infra-free — the hexagonal
+# boundary is not crossed.
+# Trade-off: core_engine and plugin_sdk now share ABI types; bumping plugin_sdk's
+# ABI_VERSION requires a coordinated rebuild of both crates.
+plugin_sdk = { path = "../plugin_sdk", version = "0.1.0" }
+
 # Decision: rayon for work-stealing parallelism in domain/grep (spec 07 U1).
 # Why: pure CPU parallelism over in-memory data — no I/O API surface. Rayon
 # does not cross the hexagonal boundary; it is the same class of dep as
@@ -58,3 +66,5 @@ sled = "0.34"
 # Trade-off: adds ~200 KB to binary vs. staying on postcard alone; unavoidable for
 # JSON-RPC compliance (spec U1). Scoped to the adapters/mcp layer — domain/ is untouched.
 serde_json = "1"
+wasmtime = "45.0.1"
+wasmtime-wasi = "45.0.1"

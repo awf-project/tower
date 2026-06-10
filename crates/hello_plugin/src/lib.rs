@@ -47,12 +47,20 @@ impl Plugin for HelloPlugin {
             name: "hello".to_owned(),
             version: "0.1.0".to_owned(),
             abi: ABI_VERSION,
-            tools: vec![ToolDesc {
-                name: "greet".to_owned(),
-                description: "Return a greeting for the given name.".to_owned(),
-                schema_json: r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#
-                    .to_owned(),
-            }],
+            tools: vec![
+                ToolDesc {
+                    name: "greet".to_owned(),
+                    description: "Return a greeting for the given name.".to_owned(),
+                    schema_json: r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}"#
+                        .to_owned(),
+                },
+                ToolDesc {
+                    name: "read_file_echo".to_owned(),
+                    description: "Read a workspace-relative file and return its UTF-8 content.".to_owned(),
+                    schema_json: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#
+                        .to_owned(),
+                },
+            ],
             hooks: vec![HookKind::BeforeToolCall],
         }
     }
@@ -61,6 +69,7 @@ impl Plugin for HelloPlugin {
     fn call_tool(name: &str, args: Value) -> Result<Value, SdkError> {
         match name {
             "greet" => greet_impl(args),
+            "read_file_echo" => read_file_echo_impl(args),
             other => Err(SdkError::ToolNotFound(other.to_owned())),
         }
     }
@@ -73,7 +82,8 @@ impl Plugin for HelloPlugin {
                     plugin_sdk::host::log(&format!("hello_plugin: before tool call '{tool_name}'"));
                 }
             }
-            HookKind::AfterToolCall => {}
+            // AfterToolCall, FileIndexed, FileChanged: no-op for this plugin.
+            HookKind::AfterToolCall | HookKind::FileIndexed | HookKind::FileChanged => {}
         }
     }
 }
@@ -95,6 +105,59 @@ impl Plugin for HelloPlugin {
 fn greet_impl(args: Value) -> Result<Value, SdkError> {
     let name = extract_name(&args)?;
     Ok(Value::Text(format!("Hello, {name}!")))
+}
+
+/// Reads a workspace-relative file via the host capability and returns the
+/// content as a UTF-8 text value.
+///
+/// # Arguments
+///
+/// `args` must be a [`Value::Map`] containing a `"path"` key with a
+/// [`Value::Text`] workspace-relative path.
+///
+/// # Errors
+///
+/// Returns [`SdkError::InvalidArgs`] if `args` is malformed or the path is
+/// missing/non-text. Returns [`SdkError::CallFailed`] if the host reports
+/// the file was not found or an I/O error occurred, or if the bytes are not
+/// valid UTF-8.
+#[plugin_export]
+fn read_file_echo_impl(args: Value) -> Result<Value, SdkError> {
+    let path = extract_text_field(&args, "path")?;
+    match plugin_sdk::host::read_file(path) {
+        Some(bytes) => {
+            let content = String::from_utf8(bytes).map_err(|e| {
+                SdkError::CallFailed(format!("file content is not valid UTF-8: {e}"))
+            })?;
+            Ok(Value::Text(content))
+        }
+        None => Err(SdkError::CallFailed(format!(
+            "host could not read file: {path}"
+        ))),
+    }
+}
+
+fn extract_text_field<'a>(args: &'a Value, field: &str) -> Result<&'a str, SdkError> {
+    match args {
+        Value::Map(pairs) => {
+            for (key, val) in pairs {
+                if key == field {
+                    return match val {
+                        Value::Text(s) => Ok(s.as_str()),
+                        _ => Err(SdkError::InvalidArgs(format!(
+                            "field '{field}' must be a string"
+                        ))),
+                    };
+                }
+            }
+            Err(SdkError::InvalidArgs(format!(
+                "missing required field '{field}'"
+            )))
+        }
+        _ => Err(SdkError::InvalidArgs(
+            "args must be a map object".to_owned(),
+        )),
+    }
 }
 
 fn extract_name(args: &Value) -> Result<&str, SdkError> {
@@ -134,8 +197,12 @@ mod tests {
         assert_eq!(manifest.name, "hello", "AC2: name");
         assert_eq!(manifest.version, "0.1.0", "AC2: version");
         assert_eq!(manifest.abi, ABI_VERSION, "AC2: abi == ABI_VERSION");
-        assert_eq!(manifest.tools.len(), 1, "AC2: one tool");
-        assert_eq!(manifest.tools[0].name, "greet", "AC2: tool name");
+        assert_eq!(manifest.tools.len(), 2, "AC2: two tools");
+        assert_eq!(manifest.tools[0].name, "greet", "AC2: greet tool name");
+        assert_eq!(
+            manifest.tools[1].name, "read_file_echo",
+            "AC2: read_file_echo tool name"
+        );
         assert_eq!(manifest.hooks, vec![HookKind::BeforeToolCall], "AC2: hooks");
     }
 
@@ -163,6 +230,29 @@ mod tests {
     fn greet_with_non_map_args_returns_invalid_args() {
         let result = HelloPlugin::call_tool("greet", Value::Null);
         assert!(matches!(result, Err(SdkError::InvalidArgs(_))));
+    }
+
+    /// read_file_echo returns CallFailed when the host stub returns None (non-wasm).
+    #[test]
+    fn read_file_echo_returns_call_failed_on_non_wasm() {
+        // On the host target, host::read_file is a no-op stub returning None.
+        let args = Value::Map(vec![("path".to_owned(), Value::Text("any.txt".to_owned()))]);
+        let result = HelloPlugin::call_tool("read_file_echo", args);
+        assert!(
+            matches!(result, Err(SdkError::CallFailed(_))),
+            "read_file_echo must return CallFailed when host returns None: {result:?}"
+        );
+    }
+
+    /// read_file_echo returns InvalidArgs when path field is missing.
+    #[test]
+    fn read_file_echo_missing_path_returns_invalid_args() {
+        let args = Value::Map(vec![]);
+        let result = HelloPlugin::call_tool("read_file_echo", args);
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(_))),
+            "read_file_echo must return InvalidArgs for missing path: {result:?}"
+        );
     }
 
     /// AC2: manifest serialises to postcard and back correctly.

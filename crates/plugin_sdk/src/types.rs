@@ -117,6 +117,17 @@ pub enum HookKind {
     BeforeToolCall,
     /// Fired after a tool call completes (native or plugin).
     AfterToolCall,
+    /// Fired after a file has been indexed (content hash computed and stored).
+    ///
+    /// Added in ABI version 2 (spec 11b). The payload carries the workspace-relative
+    /// path of the indexed file as a UTF-8 string.
+    FileIndexed,
+    /// Fired after a file's content has changed (re-indexed after a write or
+    /// an OS filesystem event).
+    ///
+    /// Added in ABI version 2 (spec 11b). The payload carries the workspace-relative
+    /// path of the changed file as a UTF-8 string.
+    FileChanged,
 }
 
 // ── HookPayload ───────────────────────────────────────────────────────────────
@@ -151,6 +162,20 @@ pub enum HookPayload {
         tool_name: String,
         /// The result returned by the tool (or an error string).
         result: Result<Value, String>,
+    },
+    /// Payload for [`HookKind::FileIndexed`].
+    ///
+    /// Added in ABI version 2 (spec 11b).
+    FileIndexed {
+        /// Workspace-relative path of the indexed file (UTF-8, forward-slash separated).
+        path: String,
+    },
+    /// Payload for [`HookKind::FileChanged`].
+    ///
+    /// Added in ABI version 2 (spec 11b).
+    FileChanged {
+        /// Workspace-relative path of the changed file (UTF-8, forward-slash separated).
+        path: String,
     },
 }
 

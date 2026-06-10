@@ -31,14 +31,17 @@ jobs:
       - name: Clippy (warnings are errors — spec UN1)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
+      # Build wasm fixtures BEFORE `cargo test` so integration tests can find them.
+      # build.rs sets HELLO_PLUGIN_WASM / ABI_MISMATCH_WASM env paths but does NOT
+      # compile the fixtures (cargo-in-cargo deadlock — see build.rs Decision comment).
+      - name: Build wasm fixtures (spec 11c AC1/AC3/AC4)
+        run: cargo build -p hello_plugin -p fixture_abi_mismatch --target wasm32-wasip1
 
       - name: Build plugin_ast for wasm32-wasip1 (spec AC4)
         run: cargo build -p plugin_ast --target wasm32-wasip1
 
-      - name: Build hello_plugin for wasm32-wasip1 (spec 11a AC1/OP1)
-        run: cargo build -p hello_plugin --target wasm32-wasip1
+      - name: Test
+        run: cargo test --workspace --exclude hello_plugin --exclude plugin_ast --exclude fixture_abi_mismatch
 
       - name: License & advisory policy
         uses: EmbarkStudios/cargo-deny-action@v2

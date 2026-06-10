@@ -97,7 +97,12 @@ pub use types::{
 /// Increment by 1 for each breaking revision. Hosts may choose to support a
 /// range of versions (e.g. `ABI_VERSION - 1 ..= ABI_VERSION`) but that policy
 /// lives in 11c.
-pub const ABI_VERSION: u32 = 1;
+// Decision: bump ABI_VERSION 1 → 2 for spec 11b.
+// Why: HookKind::FileIndexed and HookKind::FileChanged are new enum variants;
+// adding them changes the postcard discriminant layout for any payload using
+// HookKind. Guests built against ABI 1 must be rejected at load time (11c).
+// Trade-off: existing plugins built against ABI 1 must be recompiled.
+pub const ABI_VERSION: u32 = 2;
 
 /// The guest-side Plugin trait every plugin struct must implement.
 ///

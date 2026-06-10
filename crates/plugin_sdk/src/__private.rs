@@ -20,6 +20,65 @@
 use crate::types::{CallRequest, CallResponse, HookEnvelope, PluginManifest};
 use crate::Plugin;
 
+// ── Guest allocator export ────────────────────────────────────────────────────
+
+/// Allocate `len` bytes in the guest heap and return a raw pointer.
+///
+/// This function is exported from the plugin binary as `__plugin_alloc` so the
+/// host (11c) can write serialised arguments **into** the guest's linear memory
+/// before calling `__plugin_call_tool` or `__plugin_on_hook`.
+///
+/// The returned buffer is initially zeroed; the host must write exactly
+/// `len` bytes before passing the pointer to the guest export. Ownership is
+/// transferred to the host: the host must pass the same `(ptr, len)` to the
+/// relevant guest export (which consumes the slice by reference), and then the
+/// guest export is responsible for freeing the argument buffer when done.
+///
+/// # Design: in-param allocation protocol
+///
+/// Because wasm linear memory is shared between host and guest (via the
+/// `Memory` object), the host can write to any guest pointer directly after
+/// receiving it. The protocol for passing serialised data IN to the guest is:
+///
+/// ```text
+/// 1. host calls __plugin_alloc(len) -> ptr   // guest allocates
+/// 2. host writes len bytes at ptr             // host fills buffer
+/// 3. host calls __plugin_call_tool(ptr, len) // guest reads + frees
+/// ```
+///
+/// The guest export (`__plugin_call_tool` / `__plugin_on_hook`) takes the
+/// slice by reference and does NOT call `__plugin_free` on the argument pointer
+/// because the argument buffer is a simple `Vec<u8>` that the guest owns and
+/// can drop normally at the end of the call frame.
+///
+/// # Safety contract (for the generated wasm export)
+///
+/// - `len` must not be zero; the host must never pass a zero-length allocation.
+/// - The caller must not free the returned pointer independently; it is
+///   consumed by the guest export that receives it.
+#[must_use]
+pub fn alloc_guest_buffer(len: usize) -> *mut u8 {
+    // Decision: allocate via Vec so the drop machinery is standard.
+    // The generated __plugin_alloc export leaks this Vec and returns the pointer;
+    // the vec is reconstructed and freed inside the receiving guest export.
+    let mut v: Vec<u8> = vec![0u8; len];
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v);
+    ptr
+}
+
+/// Free a buffer previously returned by [`alloc_guest_buffer`].
+///
+/// # Safety
+///
+/// - `ptr` must have been returned by `alloc_guest_buffer(len)`.
+/// - Must be called exactly once per `alloc_guest_buffer` call.
+pub unsafe fn free_alloc_buffer(ptr: *mut u8, len: usize) {
+    // Safety: ptr came from alloc_guest_buffer which used Vec::with_len,
+    // so layout is consistent for Vec<u8> with capacity=len.
+    let _ = unsafe { Vec::from_raw_parts(ptr, len, len) };
+}
+
 // ── Buffer helpers ────────────────────────────────────────────────────────────
 
 /// Byte length of the length-prefix header prepended to every serialised buffer.
