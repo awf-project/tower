@@ -42,7 +42,7 @@
 
 use tree_sitter::{Language, Node, Parser};
 
-use crate::symbols::SupportedLanguage;
+use crate::symbols::{language_label, SupportedLanguage};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -179,7 +179,7 @@ pub fn parse_outline(source: &[u8], language_hint: &str) -> OutlineResult {
         Some(l) => l,
         None => {
             return OutlineResult::Unsupported {
-                language: language_hint.to_owned(),
+                language: language_label(language_hint),
             };
         }
     };
@@ -759,10 +759,31 @@ pub enum Color {
 
     #[test]
     fn ac2_unsupported_language_returns_unsupported() {
+        // MIN-01: language field must carry the extension, not the raw path.
         let result = parse_outline(b"class Foo {}", "foo.py");
         assert!(
-            matches!(result, OutlineResult::Unsupported { ref language } if language == "foo.py"),
-            "AC2: Python hint must return Unsupported, got: {result:?}"
+            matches!(result, OutlineResult::Unsupported { ref language } if language == "py"),
+            "AC2: Python hint must return Unsupported with language=\"py\", got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ac2_unsupported_path_with_directory_uses_extension() {
+        // MIN-01: a path like "lab/notes.md" must produce language="md".
+        let result = parse_outline(b"# heading", "lab/notes.md");
+        assert!(
+            matches!(result, OutlineResult::Unsupported { ref language } if language == "md"),
+            "AC2: lab/notes.md hint must return language=\"md\", got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ac2_unsupported_dotless_hint_passthrough() {
+        // MIN-01: a bare language id with no dot passes through unchanged.
+        let result = parse_outline(b"const x: number = 1;", "typescript");
+        assert!(
+            matches!(result, OutlineResult::Unsupported { ref language } if language == "typescript"),
+            "AC2: dotless hint \"typescript\" must produce language=\"typescript\", got: {result:?}"
         );
     }
 

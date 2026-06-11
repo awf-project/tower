@@ -17,7 +17,7 @@
 //!    workspace `FileSystemPort`, and register the successful ones. A missing or
 //!    empty directory simply yields no plugins; a single bad plugin is skipped
 //!    with a stderr warning and never aborts startup.
-//! 6. Serve the 7 native `vfs_*` tools PLUS any plugin tools (namespaced
+//! 6. Serve the 7 native `tower_*` tools PLUS any plugin tools (namespaced
 //!    `<plugin>/<tool>`) over real `stdin` / `stdout` via a `MergedRegistry`.
 //!
 //! # Wiring decision: `Arc<RwLock<EngineState>>`
@@ -25,7 +25,7 @@
 //! The spec requires that tool handlers and the filesystem watcher (spec 06)
 //! share workspace/index/storage/fs without copying. `Arc` provides shared
 //! ownership; `RwLock` allows concurrent readers (e.g. simultaneous
-//! `vfs_find_file` and `vfs_search_text`) with exclusive mutation for writers
+//! `tower_find_file` and `tower_search_text`) with exclusive mutation for writers
 //! (create/delete/global_replace). Short critical sections only — no blocking
 //! I/O is performed while holding the lock.
 //!
@@ -137,7 +137,7 @@ fn run() -> Result<(), String> {
     let plugin_host = Arc::new(RwLock::new(plugin_host));
 
     // ── Step 6: serve native + plugin tools over real stdin/stdout ────────────
-    // MergedRegistry exposes the 7 native vfs_* tools plus namespaced plugin
+    // MergedRegistry exposes the 7 native tower_* tools plus namespaced plugin
     // tools. A missing/empty plugins dir leaves it serving exactly the natives.
     // Lock stdin/stdout for the duration of the serve loop.
     // BufReader/BufWriter ensure line-oriented I/O matches the framing spec.

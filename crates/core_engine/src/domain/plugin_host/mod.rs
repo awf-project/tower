@@ -192,6 +192,18 @@ pub enum RegistrationError {
     /// ("never silently shadow"). Reject the duplicate at registration time so
     /// the problem is surfaced immediately rather than at call time.
     DuplicateName(String),
+    /// The plugin manifest name begins with the reserved prefix `"tower"`.
+    ///
+    /// Plugin tools are namespaced as `"tower_<plugin_id>_<tool_name>"` in the
+    /// MCP merged registry (spec 12b). The `"tower"` prefix is reserved for the
+    /// host namespace. A plugin named e.g. `"tower_find"` with tool `"file"` would
+    /// compose to `"tower_tower_find_file"` — confusing — and a plugin named
+    /// exactly `"tower"` with tool `"find_file"` would compose to
+    /// `"tower_tower_find_file"` — a namespace impersonation attack vector.
+    ///
+    /// This is a plugin-identity policy, not an MCP-transport rule: it is
+    /// enforced here in the domain with no coupling to any transport or adapter.
+    ReservedNamePrefix(String),
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -202,6 +214,13 @@ impl std::fmt::Display for RegistrationError {
             }
             Self::DuplicateName(name) => {
                 write!(f, "a plugin named '{name}' is already registered")
+            }
+            Self::ReservedNamePrefix(name) => {
+                write!(
+                    f,
+                    "plugin name '{name}' begins with the reserved prefix 'tower'; \
+                     plugin names must not start with 'tower' (host namespace)"
+                )
             }
         }
     }
@@ -352,13 +371,26 @@ impl PluginHostRegistry {
             });
         }
 
+        // Decision: reject plugin names that begin with "tower".
+        // Why: the MCP merged registry (12b) composes plugin tool names as
+        //      "tower_<plugin_id>_<tool_name>". A plugin named "tower" (or any
+        //      name starting with "tower") would produce composed names that are
+        //      indistinguishable from host-native tool names — namespace
+        //      impersonation. This is a plugin-identity policy enforced here in
+        //      the domain, independent of any transport or adapter.
+        // Trade-off: plugin authors must choose names that do not begin with
+        //      "tower". This is a permanent, documented invariant.
+        let new_name = instance.manifest().name.clone();
+        if new_name.starts_with("tower") {
+            return Err(RegistrationError::ReservedNamePrefix(new_name));
+        }
+
         // Decision: enforce unique manifest names at registration time.
         // Why: call_instance_tool() routes by name and returns on first match.
         //      A second plugin with the same name would be permanently unreachable:
         //      any tools/call for its tools silently routes to the first — UN1.
         // Trade-off: hot-reload must use a different name or remove the old plugin
         //      first; this is an acceptable constraint for the current design.
-        let new_name = instance.manifest().name.clone();
         let duplicate = self.instances.iter().any(|slot| {
             slot.lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1009,6 +1041,57 @@ mod tests {
         assert!(
             matches!(err, PluginHostError::ToolNotFound(_)),
             "unreachable tool must return ToolNotFound: {err:?}"
+        );
+    }
+
+    // ── Reserved name prefix guard ────────────────────────────────────────────
+
+    /// Registering a plugin whose manifest name begins with `"tower"` must be
+    /// rejected with `RegistrationError::ReservedNamePrefix`.
+    ///
+    /// The `"tower"` prefix is reserved for the host namespace: plugin tools are
+    /// composed as `"tower_<plugin_id>_<tool_name>"` in the MCP merged registry.
+    /// A plugin beginning with `"tower"` could produce composed names that
+    /// impersonate host-native tools — a namespace collision attack vector.
+    ///
+    /// TDD: mirrors `register_rejects_duplicate_plugin_name` pattern.
+    #[test]
+    fn register_rejects_tower_prefixed_plugin_name() {
+        let mut registry = PluginHostRegistry::new();
+
+        // Exact "tower" prefix.
+        let tower_exact = RecordingPlugin::new("tower", vec![], vec![]);
+        let result = registry.register(Box::new(tower_exact));
+        assert_eq!(
+            result,
+            Err(RegistrationError::ReservedNamePrefix("tower".to_owned())),
+            "plugin named 'tower' must be rejected"
+        );
+        assert!(
+            registry.declared_tools().is_empty(),
+            "rejected plugin must not appear in declared_tools"
+        );
+
+        // Name starting with "tower_".
+        let tower_prefixed = RecordingPlugin::new("tower_my_plugin", vec![], vec![]);
+        let result2 = registry.register(Box::new(tower_prefixed));
+        assert_eq!(
+            result2,
+            Err(RegistrationError::ReservedNamePrefix(
+                "tower_my_plugin".to_owned()
+            )),
+            "plugin named 'tower_my_plugin' must be rejected"
+        );
+        assert!(
+            registry.declared_tools().is_empty(),
+            "no rejected plugin must leak into declared_tools"
+        );
+
+        // A plugin not beginning with "tower" must still be accepted.
+        let valid = RecordingPlugin::new("ast", vec![], vec![]);
+        assert!(
+            registry.register(Box::new(valid)).is_ok(),
+            "non-tower plugin must be accepted after rejections"
         );
     }
 

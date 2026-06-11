@@ -81,8 +81,8 @@ version and capability advertisement.
 
 ### 2. tools/list
 
-Enumerate every available tool. The response lists all 7 native `vfs_*` tools
-plus any namespaced plugin tools (e.g. `"ast/ast_get_outline"`) that are loaded.
+Enumerate every available tool. The response lists all 7 native `tower_*` tools
+plus any namespaced plugin tools (e.g. `"tower_ast_ast_get_outline"`) that are loaded.
 
 **Request**
 
@@ -98,7 +98,7 @@ plus any namespaced plugin tools (e.g. `"ast/ast_get_outline"`) that are loaded.
   "result": {
     "tools": [
       {
-        "name": "vfs_find_file",
+        "name": "tower_find_file",
         "description": "Find files in the workspace whose path matches the query string.",
         "inputSchema": {
           "type": "object",
@@ -109,7 +109,7 @@ plus any namespaced plugin tools (e.g. `"ast/ast_get_outline"`) that are loaded.
         }
       },
       {
-        "name": "ast/ast_get_outline",
+        "name": "tower_ast_ast_get_outline",
         "description": "Return a structural outline ...",
         "inputSchema": { "..." : "..." }
       }
@@ -190,12 +190,12 @@ Codes `-32001` and `-32002` are in the JSON-RPC 2.0 server-defined range
 
 ---
 
-## Native VFS tools
+## Native tools
 
 Seven tools are always available, regardless of which plugins are loaded. Their
 names are undecorated (no namespace prefix).
 
-### vfs_find_file
+### tower_find_file
 
 Find workspace files whose path matches a query string via the inverted index.
 
@@ -213,7 +213,7 @@ Find workspace files whose path matches a query string via the inverted index.
   "id": 10,
   "method": "tools/call",
   "params": {
-    "name": "vfs_find_file",
+    "name": "tower_find_file",
     "arguments": { "query": "client" }
   }
 }
@@ -235,7 +235,7 @@ Empty result when nothing matches: `{"paths": []}`.
 
 ---
 
-### vfs_search_text
+### tower_search_text
 
 Parallel grep across all indexed file contents.
 
@@ -253,7 +253,7 @@ Parallel grep across all indexed file contents.
   "id": 11,
   "method": "tools/call",
   "params": {
-    "name": "vfs_search_text",
+    "name": "tower_search_text",
     "arguments": { "pattern": "fn client" }
   }
 }
@@ -273,7 +273,7 @@ Parallel grep across all indexed file contents.
 
 ---
 
-### vfs_read_file
+### tower_read_file
 
 Read the raw UTF-8 content of a workspace-relative file. Uses `FileSystemPort`
 directly (no domain logic wrapper); returns `-32002` if the path does not exist.
@@ -292,7 +292,7 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
   "id": 12,
   "method": "tools/call",
   "params": {
-    "name": "vfs_read_file",
+    "name": "tower_read_file",
     "arguments": { "path": "src/main.rs" }
   }
 }
@@ -322,7 +322,7 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
 
 ---
 
-### vfs_create_file
+### tower_create_file
 
 Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
 → flush → atomic `fs::rename`). The file is indexed immediately.
@@ -342,7 +342,7 @@ Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
   "id": 13,
   "method": "tools/call",
   "params": {
-    "name": "vfs_create_file",
+    "name": "tower_create_file",
     "arguments": { "path": "src/widget.rs", "content": "pub struct Widget;" }
   }
 }
@@ -362,7 +362,7 @@ Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
 
 ---
 
-### vfs_create_directory
+### tower_create_directory
 
 Create a directory (recursive `mkdir_all`). Does not index any files; directories
 become visible to subsequent file operations.
@@ -381,7 +381,7 @@ become visible to subsequent file operations.
   "id": 14,
   "method": "tools/call",
   "params": {
-    "name": "vfs_create_directory",
+    "name": "tower_create_directory",
     "arguments": { "path": "src/handlers" }
   }
 }
@@ -401,7 +401,7 @@ become visible to subsequent file operations.
 
 ---
 
-### vfs_delete_file
+### tower_delete_file
 
 Remove a file from the workspace and the VFS index. Returns `-32002` if the
 path is not found.
@@ -420,7 +420,7 @@ path is not found.
   "id": 15,
   "method": "tools/call",
   "params": {
-    "name": "vfs_delete_file",
+    "name": "tower_delete_file",
     "arguments": { "path": "src/old.rs" }
   }
 }
@@ -440,11 +440,38 @@ path is not found.
 
 ---
 
-### vfs_global_replace
+### tower_global_replace
 
 Parallel mass find-and-replace across every indexed file. Each file is rewritten
 atomically via the shadow-file pattern. Partial failures (per-file I/O errors)
 are reported in `errors` without aborting the remaining files.
+
+**Warning — purely textual, not AST-aware**
+
+`tower_global_replace` rewrites every literal byte-for-byte occurrence of the
+search string across **all indexed files** regardless of file type or syntactic
+context. It has no understanding of the language structure around a match. This
+means:
+
+- Occurrences inside **code comments** are replaced.
+- Occurrences inside **string literals** are replaced.
+- Occurrences in **Markdown prose**, **plain-text files**, and any other
+  non-code format are replaced.
+- A match that spans a rename in one file will be applied identically in every
+  other file that happens to contain the same byte sequence.
+
+**Observed example.** Renaming `compute_area` → `calculate_area` affected
+**6 files / 10 occurrences**, touching: a function definition, its call-sites,
+a `// compute_area: legacy alias` comment, a `docs/api.md` prose paragraph, and
+a `CHANGELOG.txt` entry — all rewritten unconditionally.
+
+**Recommended workflow — always check blast radius first:**
+
+1. Run `tower_search_text` with your `target` string to review every occurrence
+   and its surrounding context before committing to the replacement.
+2. Inspect the results: if any hit is inside a comment, a string literal, or a
+   prose file that should not change, consider a targeted edit instead.
+3. Only then call `tower_global_replace`.
 
 | Field         | Type   | Required | Description                                    |
 |---------------|--------|----------|------------------------------------------------|
@@ -461,7 +488,7 @@ are reported in `errors` without aborting the remaining files.
   "id": 16,
   "method": "tools/call",
   "params": {
-    "name": "vfs_global_replace",
+    "name": "tower_global_replace",
     "arguments": { "target": "OldName", "replacement": "NewName" }
   }
 }
@@ -485,12 +512,14 @@ are reported in `errors` without aborting the remaining files.
 
 Plugin tools are surfaced through the same `tools/list` / `tools/call` interface
 as native tools, with one invariant: **plugin tool names are always namespaced as
-`"<plugin_name>/<tool_name>"`**.
+`"tower_<plugin_name>_<tool_name>"`**.
 
 - A plugin with manifest `name = "ast"` that declares `ast_get_outline` appears
-  in `tools/list` as `"ast/ast_get_outline"`.
-- Native tools keep their plain names (`vfs_find_file`, etc.). No collision is
-  possible regardless of what a plugin declares.
+  in `tools/list` as `"tower_ast_ast_get_outline"`.
+- Native tools carry the bare `tower_` prefix (`tower_find_file`, etc.). To
+  guarantee plugin tools never collide with native ones, **a plugin name must not
+  begin with `tower`** — that prefix is reserved for host tools, and a plugin
+  whose `manifest.name` starts with `tower` is rejected at registration.
 - The namespacing is unconditional: there is no code path that allows a plugin
   to claim an un-namespaced name.
 
@@ -517,13 +546,13 @@ Supported languages (detected by file extension or language ID):
 
 Any other extension or language ID returns `{"unsupported": true, "language": "<hint>"}`.
 
-### ast/ast_get_outline
+### tower_ast_ast_get_outline
 
 Return the structural skeleton of a source file: functions, structs, enums,
 traits, impl blocks, methods, modules, type aliases, constants, statics, macro
 definitions, and PHP classes.
 
-MCP name: `"ast/ast_get_outline"`
+MCP name: `"tower_ast_ast_get_outline"`
 
 | Field  | Type   | Required | Description                            |
 |--------|--------|----------|----------------------------------------|
@@ -597,7 +626,7 @@ round-trip consistency with `ast_find_symbols kind=class`.
   "id": 20,
   "method": "tools/call",
   "params": {
-    "name": "ast/ast_get_outline",
+    "name": "tower_ast_ast_get_outline",
     "arguments": { "path": "src/lib.rs" }
   }
 }
@@ -605,13 +634,13 @@ round-trip consistency with `ast_find_symbols kind=class`.
 
 ---
 
-### ast/ast_find_symbols
+### tower_ast_ast_find_symbols
 
 Find precise definition locations for a named symbol of a given kind. Uses the
 error-tolerant Tree-sitter parse tree to exclude false positives in comments and
 string literals.
 
-MCP name: `"ast/ast_find_symbols"`
+MCP name: `"tower_ast_ast_find_symbols"`
 
 | Field         | Type   | Required | Description                                          |
 |---------------|--------|----------|------------------------------------------------------|
@@ -686,7 +715,7 @@ the target language returns `{"matches": []}` (not an error), preserving the
   "id": 21,
   "method": "tools/call",
   "params": {
-    "name": "ast/ast_find_symbols",
+    "name": "tower_ast_ast_find_symbols",
     "arguments": {
       "path": "src/lib.rs",
       "symbol_name": "parse",
@@ -744,7 +773,7 @@ result = call({
     "jsonrpc": "2.0",
     "id": 3,
     "method": "tools/call",
-    "params": {"name": "vfs_find_file", "arguments": {"query": "main"}}
+    "params": {"name": "tower_find_file", "arguments": {"query": "main"}}
 })
 # result["result"]["content"][0]["text"] is a JSON string — parse it again:
 payload = json.loads(result["result"]["content"][0]["text"])
