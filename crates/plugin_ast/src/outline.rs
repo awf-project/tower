@@ -74,7 +74,7 @@ pub enum OutlineKind {
     /// A PHP `class Foo` declaration.
     ///
     /// Distinct from `Struct` so that consumers can use `kind=class` in
-    /// `ast_find_symbols` after `ast_get_outline` reports a PHP class (round-trip
+    /// `find_symbols` after `get_outline` reports a PHP class (round-trip
     /// consistency).
     Class,
 }
@@ -480,8 +480,8 @@ fn walk_go_type_decl(node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>
 /// # Round-trip consistency
 ///
 /// `class_declaration` maps to `OutlineKind::Class` (not `Struct`) so that a
-/// consumer using `ast_get_outline` on a PHP file can pass `kind=class` to
-/// `ast_find_symbols` and get a result — using `kind=struct` would trigger
+/// consumer using `get_outline` on a PHP file can pass `kind=class` to
+/// `find_symbols` and get a result — using `kind=struct` would trigger
 /// `NotApplicable` because `Struct` is not in PHP's `kind_applicable` set.
 fn walk_php_top_level(node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>) {
     walk_php_node_outline(node, source, items);
@@ -499,7 +499,7 @@ fn walk_php_node_outline(node: Node<'_>, source: &[u8], items: &mut Vec<OutlineI
             }
             "class_declaration" => {
                 // Decision: emit OutlineKind::Class (not Struct) for PHP class declarations.
-                // Why: round-trip consistency — ast_get_outline → ast_find_symbols with
+                // Why: round-trip consistency — get_outline → find_symbols with
                 //      kind=class works; kind=struct would return NotApplicable for PHP.
                 // Trade-off: OutlineKind gains a Class variant (one extra arm everywhere).
                 if let Some(item) = extract_named_item(child, source, OutlineKind::Class) {
@@ -1209,8 +1209,8 @@ function topLevelFn() {}
         );
     }
 
-    /// Round-trip: ast_get_outline emits kind=class for PHP class declarations;
-    /// a caller using that kind in ast_find_symbols must get a result (not
+    /// Round-trip: get_outline emits kind=class for PHP class declarations;
+    /// a caller using that kind in find_symbols must get a result (not
     /// NotApplicable). Previously outline emitted kind=struct, but Struct is not
     /// in PHP's kind_applicable() set, making the round-trip silently broken.
     #[test]

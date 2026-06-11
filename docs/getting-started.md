@@ -249,8 +249,8 @@ Expected response:
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 ```
 
-The response lists 7 native `tower_*` tools plus any loaded plugin tools (e.g., `tower_ast_ast_get_outline`,
-`tower_ast_ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
+The response lists 7 native `tower_*` tools plus any loaded plugin tools (e.g., `tower_ast_get_outline`,
+`tower_ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
 `tower_<plugin_name>_<tool_name>`.
 
 To deploy a plugin, drop its `.wasm` into the plugins directory and restart `tower` — no recompile.

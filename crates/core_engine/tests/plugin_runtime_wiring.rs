@@ -8,8 +8,8 @@
 //! # What is exercised
 //!
 //! - A real `plugin_ast.wasm` dropped in the dir → `tools/list` exposes the 7
-//!   native tools PLUS `tower_ast_ast_get_outline` and `tower_ast_ast_find_symbols`, and a
-//!   `tools/call` to `tower_ast_ast_get_outline` round-trips.
+//!   native tools PLUS `tower_ast_get_outline` and `tower_ast_find_symbols`, and a
+//!   `tools/call` to `tower_ast_get_outline` round-trips.
 //! - A malformed `.wasm` and an ABI-mismatched `.wasm` are skipped; startup
 //!   succeeds and still serves the rest.
 //! - No plugins dir / empty plugins dir → exactly the 7 native tools.
@@ -131,12 +131,12 @@ fn ast_plugin_dir_exposes_native_and_ast_tools() {
         );
     }
     assert!(
-        listed.iter().any(|n| n == "tower_ast_ast_get_outline"),
-        "missing tower_ast_ast_get_outline: {listed:?}"
+        listed.iter().any(|n| n == "tower_ast_get_outline"),
+        "missing tower_ast_get_outline: {listed:?}"
     );
     assert!(
-        listed.iter().any(|n| n == "tower_ast_ast_find_symbols"),
-        "missing tower_ast_ast_find_symbols: {listed:?}"
+        listed.iter().any(|n| n == "tower_ast_find_symbols"),
+        "missing tower_ast_find_symbols: {listed:?}"
     );
 }
 
@@ -156,10 +156,10 @@ fn ast_get_outline_round_trips_through_merged_registry() {
 
     let result = merged
         .call(
-            "tower_ast_ast_get_outline",
+            "tower_ast_get_outline",
             serde_json::json!({ "path": "src/lib.rs" }),
         )
-        .expect("ast_get_outline must succeed");
+        .expect("get_outline must succeed");
     let text = result.to_string();
     assert!(text.contains("\"items\""), "expected outline items: {text}");
     assert!(
@@ -198,7 +198,7 @@ fn malformed_wasm_is_skipped_rest_served() {
         9,
         "expected 7 native + 2 ast tools after skipping broken wasm: {listed:?}"
     );
-    assert!(listed.iter().any(|n| n == "tower_ast_ast_get_outline"));
+    assert!(listed.iter().any(|n| n == "tower_ast_get_outline"));
 }
 
 // ── AC: ABI-mismatched wasm is skipped; the rest is still served ─────────────────
@@ -220,7 +220,7 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
     let listed = names(&merged);
 
     assert!(
-        listed.iter().any(|n| n == "tower_ast_ast_get_outline"),
+        listed.iter().any(|n| n == "tower_ast_get_outline"),
         "good plugin must survive abi-mismatch sibling: {listed:?}"
     );
     // No tool from the abi-mismatch fixture leaked in (its name is not "ast").

@@ -5,15 +5,15 @@
 //! **Spec 12c (outline)**
 //! - The `plugin_ast.wasm` built from the `plugin_ast` crate loads via the 11c
 //!   wasmtime loader.
-//! - The manifest declares both `ast_get_outline` and `ast_find_symbols` as tools.
-//! - `tower_ast_ast_get_outline` through `MergedRegistry` returns structural items for Rust.
-//! - `tower_ast_ast_get_outline` for a non-Rust file returns a typed unsupported-language result.
-//! - `tower_ast_ast_get_outline` for a malformed Rust file returns a partial outline (no crash).
+//! - The manifest declares both `get_outline` and `find_symbols` as tools.
+//! - `tower_ast_get_outline` through `MergedRegistry` returns structural items for Rust.
+//! - `tower_ast_get_outline` for a non-Rust file returns a typed unsupported-language result.
+//! - `tower_ast_get_outline` for a malformed Rust file returns a partial outline (no crash).
 //!
 //! **Spec 12d (symbols + multi-language — Drop & Play gate, AC5)**
 //! - Dropping the rebuilt `.wasm` with no host recompile: `tools/list` exposes
-//!   `tower_ast_ast_get_outline` AND `tower_ast_ast_find_symbols`.
-//! - `ast_find_symbols` round-trips through the MCP sandbox for Rust, Go, and PHP:
+//!   `tower_ast_get_outline` AND `tower_ast_find_symbols`.
+//! - `find_symbols` round-trips through the MCP sandbox for Rust, Go, and PHP:
 //!   definition found, comment/string false-positives excluded.
 //! - A `kind` not applicable to the language returns an empty `matches` list (OP1/AC3).
 //! - A malformed file returns partial results without crashing (UN1/AC4).
@@ -131,7 +131,7 @@ fn merged_registry_with_plugin_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
 
 /// AC4/AC5 (Drop & Play): Given the built `plugin_ast.wasm`, When loaded via
 /// `WasmtimeHost::load` with no host recompile, Then the manifest declares
-/// both `ast_get_outline` and `ast_find_symbols` as tools.
+/// both `get_outline` and `find_symbols` as tools.
 ///
 /// This is the Drop & Play gate for spec 12d (AC5): the host binary is not
 /// recompiled; only the `.wasm` artefact is swapped. Both tools appear in the
@@ -152,12 +152,12 @@ fn ac4_ac5_plugin_ast_loads_and_declares_both_tools() {
 
     let tool_names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
-        tool_names.contains(&"ast_get_outline"),
-        "manifest must have ast_get_outline, got: {tool_names:?}"
+        tool_names.contains(&"get_outline"),
+        "manifest must have get_outline, got: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"ast_find_symbols"),
-        "manifest must have ast_find_symbols, got: {tool_names:?}"
+        tool_names.contains(&"find_symbols"),
+        "manifest must have find_symbols, got: {tool_names:?}"
     );
     assert!(manifest.hooks.is_empty(), "no hooks declared");
 }
@@ -173,19 +173,19 @@ fn ac5_tools_list_exposes_both_ast_tools() {
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
     assert!(
-        tool_names.contains(&"tower_ast_ast_get_outline"),
-        "AC5: tools/list must contain tower_ast_ast_get_outline, got: {tool_names:?}"
+        tool_names.contains(&"tower_ast_get_outline"),
+        "AC5: tools/list must contain tower_ast_get_outline, got: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"tower_ast_ast_find_symbols"),
-        "AC5: tools/list must contain tower_ast_ast_find_symbols, got: {tool_names:?}"
+        tool_names.contains(&"tower_ast_find_symbols"),
+        "AC5: tools/list must contain tower_ast_find_symbols, got: {tool_names:?}"
     );
 }
 
 // ── AC1: outline returns structural items for a Rust file ────────────────────
 
 /// AC1: Given a Rust file with functions/structs/impls/traits, When
-/// `ast/ast_get_outline` is called via the MergedRegistry, Then each item is
+/// `tower_ast_get_outline` is called via the MergedRegistry, Then each item is
 /// listed with its kind, name, and location, and no raw body text is returned.
 #[test]
 fn ac1_ast_get_outline_rust_file_returns_structural_items() {
@@ -194,8 +194,8 @@ fn ac1_ast_get_outline_rust_file_returns_structural_items() {
 
     let args = serde_json::json!({ "path": "src/counter.rs" });
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
-        .expect("ac1: ast_get_outline must succeed");
+        .call("tower_ast_get_outline", args)
+        .expect("ac1: get_outline must succeed");
 
     // The result is serde_json::Value. Convert to string to inspect.
     let result_str = result.to_string();
@@ -236,8 +236,8 @@ fn ac1_outline_items_have_span_fields() {
 
     let args = serde_json::json!({ "path": "src/lib.rs" });
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
-        .expect("ac1: ast_get_outline must succeed");
+        .call("tower_ast_get_outline", args)
+        .expect("ac1: get_outline must succeed");
 
     let result_str = result.to_string();
 
@@ -252,7 +252,7 @@ fn ac1_outline_items_have_span_fields() {
 
 // ── AC2: unsupported language returns typed result ───────────────────────────
 
-/// AC2: Given a non-Rust file, When `ast/ast_get_outline` is called, Then a
+/// AC2: Given a non-Rust file, When `tower_ast_get_outline` is called, Then a
 /// typed unsupported-language result is returned (not an error).
 #[test]
 fn ac2_non_rust_file_returns_unsupported_result() {
@@ -262,7 +262,7 @@ fn ac2_non_rust_file_returns_unsupported_result() {
     let args = serde_json::json!({ "path": "hello.py" });
     // Must succeed (not error): returns unsupported result, not SdkError.
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
+        .call("tower_ast_get_outline", args)
         .expect("AC2: call must succeed even for unsupported language");
 
     let result_str = result.to_string();
@@ -278,7 +278,7 @@ fn ac2_non_rust_file_returns_unsupported_result() {
 
 // ── AC3: malformed Rust file yields partial outline ───────────────────────────
 
-/// AC3: Given a syntactically broken Rust file, When `ast/ast_get_outline` is
+/// AC3: Given a syntactically broken Rust file, When `tower_ast_get_outline` is
 /// called, Then a partial outline returns without crash.
 #[test]
 fn ac3_malformed_rust_file_returns_partial_outline_no_crash() {
@@ -292,7 +292,7 @@ fn broken_fn( {
 
     let args = serde_json::json!({ "path": "broken.rs" });
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
+        .call("tower_ast_get_outline", args)
         .expect("AC3: malformed file must not return error — partial outline expected");
 
     let result_str = result.to_string();
@@ -328,7 +328,7 @@ fn u2_empty_fs_causes_call_failed_not_raw_fs_read() {
     let mut registry = merged_registry_with_plugin_ast(Arc::new(InMemoryFs::new()));
 
     let args = serde_json::json!({ "path": "src/lib.rs" });
-    let result = registry.call("tower_ast_ast_get_outline", args);
+    let result = registry.call("tower_ast_get_outline", args);
 
     // Must be an error (CallFailed path), not a valid outline read from the host FS.
     assert!(
@@ -337,13 +337,13 @@ fn u2_empty_fs_causes_call_failed_not_raw_fs_read() {
     );
 }
 
-// ── Spec 12d: ast_find_symbols e2e (AC1/AC2/AC3/AC4/AC5) ────────────────────
+// ── Spec 12d: find_symbols e2e (AC1/AC2/AC3/AC4/AC5) ────────────────────
 //
-// All tests below exercise ast_find_symbols via the wasm sandbox through
+// All tests below exercise find_symbols via the wasm sandbox through
 // MergedRegistry — this is the Drop & Play gate (AC5): only the .wasm changes,
 // the host binary is never recompiled.
 
-/// Rust source for ast_find_symbols tests: includes definition + comment/string
+/// Rust source for find_symbols tests: includes definition + comment/string
 /// occurrences of the same name to prove false-positive exclusion (AC1/U2).
 const RUST_SYMBOLS_SOURCE: &[u8] = br#"
 // FindMe is mentioned in this comment
@@ -415,8 +415,8 @@ fn ac1_12d_rust_find_symbols_struct_no_false_positives() {
         "kind": "struct"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
-        .expect("AC1: ast_find_symbols must succeed");
+        .call("tower_ast_find_symbols", args)
+        .expect("AC1: find_symbols must succeed");
 
     let result_str = result.to_string();
     assert!(
@@ -457,8 +457,8 @@ fn ac1_12d_rust_find_symbols_method_not_free_function() {
         "kind": "method"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
-        .expect("AC1: ast_find_symbols method must succeed");
+        .call("tower_ast_find_symbols", args)
+        .expect("AC1: find_symbols method must succeed");
 
     let matches = result["matches"]
         .as_array()
@@ -483,7 +483,7 @@ fn ac1_12d_rust_find_symbols_match_has_span_fields() {
         "kind": "struct"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("must succeed");
 
     let result_str = result.to_string();
@@ -507,7 +507,7 @@ fn ac2_12d_go_find_symbols_function_definition() {
         "kind": "function"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("AC2: Go find_symbols must succeed");
 
     let matches = result["matches"]
@@ -534,7 +534,7 @@ fn ac2_12d_go_find_symbols_method_definition() {
         "kind": "method"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("AC2: Go method must succeed");
 
     let matches = result["matches"]
@@ -560,7 +560,7 @@ fn ac2_12d_go_find_symbols_struct_type() {
         "kind": "struct"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("AC2: Go struct must succeed");
 
     let matches = result["matches"]
@@ -569,7 +569,7 @@ fn ac2_12d_go_find_symbols_struct_type() {
     assert_eq!(matches.len(), 1, "AC2: one MyStruct in Go, got: {result:?}");
 }
 
-/// AC2 (12d): Go outline (ast_get_outline) returns functions, methods, structs,
+/// AC2 (12d): Go outline (get_outline) returns functions, methods, structs,
 /// and interfaces for a Go file — multi-language outline support (U1).
 #[test]
 fn ac2_12d_go_outline_returns_structural_items() {
@@ -578,7 +578,7 @@ fn ac2_12d_go_outline_returns_structural_items() {
 
     let args = serde_json::json!({ "path": "main.go" });
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
+        .call("tower_ast_get_outline", args)
         .expect("AC2: Go outline must succeed");
 
     let result_str = result.to_string();
@@ -608,7 +608,7 @@ fn ac2_12d_php_find_symbols_class_definition() {
         "kind": "class"
     });
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("AC2: PHP class find must succeed");
 
     let matches = result["matches"]
@@ -623,7 +623,7 @@ fn ac2_12d_php_find_symbols_class_definition() {
     assert_eq!(matches[0]["name"].as_str().unwrap_or(""), "FindMe");
 }
 
-/// AC2 (12d): PHP outline (ast_get_outline) returns class, methods, and function
+/// AC2 (12d): PHP outline (get_outline) returns class, methods, and function
 /// for a PHP file — multi-language outline support (U1).
 #[test]
 fn ac2_12d_php_outline_returns_structural_items() {
@@ -632,7 +632,7 @@ fn ac2_12d_php_outline_returns_structural_items() {
 
     let args = serde_json::json!({ "path": "app.php" });
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
+        .call("tower_ast_get_outline", args)
         .expect("AC2: PHP outline must succeed");
 
     let result_str = result.to_string();
@@ -665,7 +665,7 @@ fn ac3_12d_go_not_applicable_kind_returns_empty_matches() {
     });
     // Must succeed (OP1/AC3 — not an error).
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("AC3: not-applicable kind must not return an error");
 
     let result_str = result.to_string();
@@ -696,7 +696,7 @@ fn ac4_12d_malformed_rust_returns_partial_without_crash() {
     });
     // Must not crash or return a system error — partial results are acceptable.
     let result = registry
-        .call("tower_ast_ast_find_symbols", args)
+        .call("tower_ast_find_symbols", args)
         .expect("AC4: malformed file must not crash the sandbox");
 
     let result_str = result.to_string();
@@ -709,7 +709,7 @@ fn ac4_12d_malformed_rust_returns_partial_without_crash() {
 // ── BUG-01: zero-byte source file must not trap ───────────────────────────────
 
 /// BUG-01 regression: A zero-byte file with a supported extension (.rs) must
-/// return `{ "items": [] }` from `ast/ast_get_outline`, NOT a -32603 MCP error
+/// return `{ "items": [] }` from `tower_ast_get_outline`, NOT a -32603 MCP error
 /// (wasm trap). Root cause was the guest SDK treating rc=0 + null ptr as a
 /// missing-file error regardless of out_len; an empty file legitimately returns
 /// rc=0, out_len=0, and a null pointer. Fixed in `plugin_sdk::host::interpret_read`.
@@ -721,7 +721,7 @@ fn bug01_zero_byte_rust_file_returns_empty_items_not_trap() {
 
     let args = serde_json::json!({ "path": "empty.rs" });
     let result = registry
-        .call("tower_ast_ast_get_outline", args)
+        .call("tower_ast_get_outline", args)
         .expect("BUG-01: zero-byte file must not produce a wasm trap / MCP -32603");
 
     let result_str = result.to_string();

@@ -82,7 +82,7 @@ version and capability advertisement.
 ### 2. tools/list
 
 Enumerate every available tool. The response lists all 7 native `tower_*` tools
-plus any namespaced plugin tools (e.g. `"tower_ast_ast_get_outline"`) that are loaded.
+plus any namespaced plugin tools (e.g. `"tower_ast_get_outline"`) that are loaded.
 
 **Request**
 
@@ -109,7 +109,7 @@ plus any namespaced plugin tools (e.g. `"tower_ast_ast_get_outline"`) that are l
         }
       },
       {
-        "name": "tower_ast_ast_get_outline",
+        "name": "tower_ast_get_outline",
         "description": "Return a structural outline ...",
         "inputSchema": { "..." : "..." }
       }
@@ -514,8 +514,8 @@ Plugin tools are surfaced through the same `tools/list` / `tools/call` interface
 as native tools, with one invariant: **plugin tool names are always namespaced as
 `"tower_<plugin_name>_<tool_name>"`**.
 
-- A plugin with manifest `name = "ast"` that declares `ast_get_outline` appears
-  in `tools/list` as `"tower_ast_ast_get_outline"`.
+- A plugin with manifest `name = "ast"` that declares `get_outline` appears
+  in `tools/list` as `"tower_ast_get_outline"`.
 - Native tools carry the bare `tower_` prefix (`tower_find_file`, etc.). To
   guarantee plugin tools never collide with native ones, **a plugin name must not
   begin with `tower`** — that prefix is reserved for host tools, and a plugin
@@ -546,13 +546,13 @@ Supported languages (detected by file extension or language ID):
 
 Any other extension or language ID returns `{"unsupported": true, "language": "<hint>"}`.
 
-### tower_ast_ast_get_outline
+### tower_ast_get_outline
 
 Return the structural skeleton of a source file: functions, structs, enums,
 traits, impl blocks, methods, modules, type aliases, constants, statics, macro
 definitions, and PHP classes.
 
-MCP name: `"tower_ast_ast_get_outline"`
+MCP name: `"tower_ast_get_outline"`
 
 | Field  | Type   | Required | Description                            |
 |--------|--------|----------|----------------------------------------|
@@ -616,7 +616,7 @@ where the type cannot be resolved) use `"<anonymous>"`.
 `type_alias`, `const`, `static`, `macro_def`, `class`
 
 Note: `class` is emitted for PHP class declarations (not `struct`), ensuring
-round-trip consistency with `ast_find_symbols kind=class`.
+round-trip consistency with `find_symbols kind=class`.
 
 **Request example**
 
@@ -626,7 +626,7 @@ round-trip consistency with `ast_find_symbols kind=class`.
   "id": 20,
   "method": "tools/call",
   "params": {
-    "name": "tower_ast_ast_get_outline",
+    "name": "tower_ast_get_outline",
     "arguments": { "path": "src/lib.rs" }
   }
 }
@@ -634,13 +634,13 @@ round-trip consistency with `ast_find_symbols kind=class`.
 
 ---
 
-### tower_ast_ast_find_symbols
+### tower_ast_find_symbols
 
 Find precise definition locations for a named symbol of a given kind. Uses the
 error-tolerant Tree-sitter parse tree to exclude false positives in comments and
 string literals.
 
-MCP name: `"tower_ast_ast_find_symbols"`
+MCP name: `"tower_ast_find_symbols"`
 
 | Field         | Type   | Required | Description                                          |
 |---------------|--------|----------|------------------------------------------------------|
@@ -715,7 +715,7 @@ the target language returns `{"matches": []}` (not an error), preserving the
   "id": 21,
   "method": "tools/call",
   "params": {
-    "name": "tower_ast_ast_find_symbols",
+    "name": "tower_ast_find_symbols",
     "arguments": {
       "path": "src/lib.rs",
       "symbol_name": "parse",

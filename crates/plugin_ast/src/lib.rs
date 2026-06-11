@@ -1,21 +1,21 @@
 //! `plugin_ast` — reference Tree-sitter AST plugin (spec 12c/12d).
 //!
 //! Compiles to `wasm32-wasip1` using the `#[plugin_main]` macro from
-//! `plugin_sdk`. Declares two tools: `ast_get_outline` and `ast_find_symbols`.
+//! `plugin_sdk`. Declares two tools: `get_outline` and `find_symbols`.
 //!
 //! # Architecture
 //!
 //! ```text
 //! lib.rs (thin wasm export surface)
 //!   #[plugin_main]  AstPlugin
-//!   call_tool("ast_get_outline", args)
+//!   call_tool("get_outline", args)
 //!     → extract path from args
 //!     → host::read_file(path)        ← host capability (U2, never raw fs)
 //!     → outline::parse_outline(bytes, path)   [Rust + Go + PHP]
 //!     → OutlineResult::Unsupported   → Value::Map { "unsupported": true, ... }
 //!     → OutlineResult::Parsed(o)     → o.to_sdk_value()
 //!
-//!   call_tool("ast_find_symbols", args)
+//!   call_tool("find_symbols", args)
 //!     → extract path, symbol_name, kind from args
 //!     → host::read_file(path)        ← host capability (U2, never raw fs)
 //!     → symbols::find_symbols(bytes, path, name, kind)  [Rust + Go + PHP]
@@ -59,7 +59,7 @@ use plugin_sdk::{
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
-/// The AST plugin: exposes `ast_get_outline` for Tree-sitter parsing.
+/// The AST plugin: exposes `get_outline` for Tree-sitter parsing.
 ///
 /// Reads file content via the host capability (`plugin_sdk::host::read_file`),
 /// parses it with Tree-sitter, and returns a structural outline.
@@ -78,7 +78,7 @@ impl Plugin for AstPlugin {
             abi: ABI_VERSION,
             tools: vec![
                 ToolDesc {
-                    name: "ast_get_outline".to_owned(),
+                    name: "get_outline".to_owned(),
                     description: "Return a structural outline (functions, structs, methods, \
                                   traits, enums, impl blocks) for a workspace-relative source \
                                   file. Supports Rust (.rs), Go (.go), and PHP (.php). \
@@ -87,7 +87,7 @@ impl Plugin for AstPlugin {
                     schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"}},"required":["path"]}"#.to_owned(),
                 },
                 ToolDesc {
-                    name: "ast_find_symbols".to_owned(),
+                    name: "find_symbols".to_owned(),
                     description: "Find precise definition locations for a named symbol of a \
                                   given kind in a workspace-relative source file. Uses the \
                                   error-tolerant syntax tree to exclude false positives in \
@@ -104,8 +104,8 @@ impl Plugin for AstPlugin {
 
     fn call_tool(name: &str, args: Value) -> Result<Value, SdkError> {
         match name {
-            "ast_get_outline" => ast_get_outline_impl(args),
-            "ast_find_symbols" => ast_find_symbols_impl(args),
+            "get_outline" => ast_get_outline_impl(args),
+            "find_symbols" => ast_find_symbols_impl(args),
             other => Err(SdkError::ToolNotFound(other.to_owned())),
         }
     }
@@ -117,7 +117,7 @@ impl Plugin for AstPlugin {
 
 // ── Tool implementation ───────────────────────────────────────────────────────
 
-/// Implementation of the `ast_get_outline` tool.
+/// Implementation of the `get_outline` tool.
 ///
 /// Extracts the `path` argument, reads the file via the host capability,
 /// parses with Tree-sitter, and returns the outline as a [`Value::Map`].
@@ -166,7 +166,7 @@ fn ast_get_outline_impl(args: Value) -> Result<Value, SdkError> {
     Ok(value)
 }
 
-/// Implementation of the `ast_find_symbols` tool.
+/// Implementation of the `find_symbols` tool.
 ///
 /// Extracts `path`, `symbol_name`, and `kind` arguments, reads the file via the
 /// host capability, and calls [`symbols::find_symbols`].
@@ -275,12 +275,12 @@ mod tests {
         );
         let tool_names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
-            tool_names.contains(&"ast_get_outline"),
-            "manifest must have ast_get_outline, got: {tool_names:?}"
+            tool_names.contains(&"get_outline"),
+            "manifest must have get_outline, got: {tool_names:?}"
         );
         assert!(
-            tool_names.contains(&"ast_find_symbols"),
-            "manifest must have ast_find_symbols, got: {tool_names:?}"
+            tool_names.contains(&"find_symbols"),
+            "manifest must have find_symbols, got: {tool_names:?}"
         );
         assert!(manifest.hooks.is_empty());
     }
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn call_tool_missing_path_returns_invalid_args() {
         let args = Value::Map(vec![]);
-        let result = AstPlugin::call_tool("ast_get_outline", args);
+        let result = AstPlugin::call_tool("get_outline", args);
         assert!(
             matches!(result, Err(SdkError::InvalidArgs(_))),
             "expected InvalidArgs for missing path, got {result:?}"
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn call_tool_non_map_args_returns_invalid_args() {
-        let result = AstPlugin::call_tool("ast_get_outline", Value::Null);
+        let result = AstPlugin::call_tool("get_outline", Value::Null);
         assert!(
             matches!(result, Err(SdkError::InvalidArgs(_))),
             "expected InvalidArgs for non-map args, got {result:?}"
@@ -316,12 +316,12 @@ mod tests {
     #[test]
     fn call_tool_on_host_read_file_returns_call_failed() {
         // On the host target, host::read_file is a stub returning None.
-        // ast_get_outline must return CallFailed, not panic.
+        // get_outline must return CallFailed, not panic.
         let args = Value::Map(vec![(
             "path".to_owned(),
             Value::Text("src/main.rs".to_owned()),
         )]);
-        let result = AstPlugin::call_tool("ast_get_outline", args);
+        let result = AstPlugin::call_tool("get_outline", args);
         assert!(
             matches!(result, Err(SdkError::CallFailed(_))),
             "expected CallFailed on host (read_file stub returns None), got {result:?}"
@@ -335,7 +335,7 @@ mod tests {
             "path".to_owned(),
             Value::Text("src/main.rs".to_owned()),
         )]);
-        let result = AstPlugin::call_tool("ast_find_symbols", args);
+        let result = AstPlugin::call_tool("find_symbols", args);
         assert!(
             matches!(result, Err(SdkError::InvalidArgs(_))),
             "missing symbol_name must return InvalidArgs, got {result:?}"
@@ -349,7 +349,7 @@ mod tests {
             ("symbol_name".to_owned(), Value::Text("Foo".to_owned())),
             ("kind".to_owned(), Value::Text("not_a_kind".to_owned())),
         ]);
-        let result = AstPlugin::call_tool("ast_find_symbols", args);
+        let result = AstPlugin::call_tool("find_symbols", args);
         assert!(
             matches!(result, Err(SdkError::InvalidArgs(_))),
             "invalid kind must return InvalidArgs, got {result:?}"
@@ -363,7 +363,7 @@ mod tests {
             ("symbol_name".to_owned(), Value::Text("Foo".to_owned())),
             ("kind".to_owned(), Value::Text("struct".to_owned())),
         ]);
-        let result = AstPlugin::call_tool("ast_find_symbols", args);
+        let result = AstPlugin::call_tool("find_symbols", args);
         assert!(
             matches!(result, Err(SdkError::CallFailed(_))),
             "host read failure must return CallFailed, got {result:?}"

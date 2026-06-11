@@ -38,7 +38,7 @@ This guide covers everything needed to write, build, and deploy a plugin.
 │  PluginHostRegistry ── manifest.name as namespace key        │
 │  MergedRegistry ── native tools + tower_<plugin>_<tool>      │
 │                                                              │
-│  MCP tools/list: "tower_hello_greet", "tower_ast_ast_get_outline", … │
+│  MCP tools/list: "tower_hello_greet", "tower_ast_get_outline", … │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -402,7 +402,7 @@ AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
 
 mkdir -p .tower/plugins
 cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
-cargo run -p core_engine            # tools/list now includes tower_ast_ast_get_outline + tower_ast_ast_find_symbols
+cargo run -p core_engine            # tools/list now includes tower_ast_get_outline + tower_ast_find_symbols
 ```
 
 ---
@@ -488,7 +488,7 @@ All faults map to JSON-RPC `-32603 InternalError`. The MCP link is unaffected.
 Plugin tool names are always prefixed with `tower_<manifest.name>_` in MCP:
 
 ```
-manifest.name = "ast"  →  MCP tool name: "tower_ast_ast_get_outline"
+manifest.name = "ast"  →  MCP tool name: "tower_ast_get_outline"
 manifest.name = "hello" → MCP tool name: "tower_hello_greet"
 ```
 
@@ -576,11 +576,11 @@ cargo test -p plugin_ast
 MCP call examples once loaded:
 
 ```json
-{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_ast_ast_get_outline","arguments":{"path":"src/lib.rs"}},"id":3}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_ast_get_outline","arguments":{"path":"src/lib.rs"}},"id":3}
 ```
 
 ```json
-{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_ast_ast_find_symbols","arguments":{"path":"src/lib.rs","symbol_name":"MyStruct","kind":"struct"}},"id":4}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_ast_find_symbols","arguments":{"path":"src/lib.rs","symbol_name":"MyStruct","kind":"struct"}},"id":4}
 ```
 
 Valid `kind` values: `function`, `struct`, `enum`, `trait`, `impl`, `method`, `module`,

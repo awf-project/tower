@@ -82,7 +82,7 @@ crates/
 │   └── plugin_sdk_macros/ proc-macro crate: #[plugin_main], #[plugin_export]
 │
 ├── plugin_ast/            Reference AST plugin → wasm32-wasip1 (~1.2 MB release)
-│                          Tools: ast_get_outline, ast_find_symbols
+│                          Tools: get_outline, find_symbols
 │                          Languages: Rust (.rs), Go (.go), PHP (.php)
 │
 ├── hello_plugin/          Minimal example plugin (cdylib)

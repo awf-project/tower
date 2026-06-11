@@ -20,9 +20,10 @@
 //! Decision: **namespace plugin tools** as `"tower_<plugin_id>_<tool_name>"`.
 //!
 //! Why: the `tower_` prefix reserves the host namespace. A plugin named `ast` that
-//! declares a tool `ast_get_outline` appears in `tools/list` as
-//! `tower_ast_ast_get_outline`, never as `tower_ast_get_outline` (which might be a
-//! native tool). Native tools keep their `tower_*` names (e.g. `tower_find_file`).
+//! declares a tool `get_outline` appears in `tools/list` as `tower_ast_get_outline`
+//! — the plugin name is always part of the composed name, so a plugin can never
+//! claim a bare native name. Native tools keep their `tower_*` names (e.g.
+//! `tower_find_file`).
 //! No runtime name collision is possible regardless of what any plugin declares,
 //! provided the plugin name does not begin with `"tower"`.
 //!
