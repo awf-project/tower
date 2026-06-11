@@ -1,0 +1,132 @@
+name: Release
+
+# Two channels:
+#   - push to `main`  -> dev prerelease, tagged `dev-<sha>` (only the 3 newest are kept)
+#   - push a `v*` tag -> production release named after the tag
+# Both build the same per-target tarballs via `make dist`, named so that
+# scripts/install.sh can fetch them: tower-<version>-<target>.tar.gz (+ .sha256).
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Resolve the version label + channel once, share with build and release.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      channel: ${{ steps.vars.outputs.channel }}
+      prerelease: ${{ steps.vars.outputs.prerelease }}
+    steps:
+      - id: vars
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            v="${{ github.ref_name }}"
+            case "$v" in *-*) pre=true ;; *) pre=false ;; esac
+            echo "version=$v"      >> "$GITHUB_OUTPUT"
+            echo "channel=prod"    >> "$GITHUB_OUTPUT"
+            echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+          else
+            short="$(echo "$GITHUB_SHA" | cut -c1-7)"
+            echo "version=dev-$short" >> "$GITHUB_OUTPUT"
+            echo "channel=dev"        >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"    >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Channel/components/targets pinned by rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # `make dist` builds `tower` (release) and packages a native tarball named
+      # by VERSION + the rustc host target — which equals matrix.target on each
+      # native runner. No WASI SDK needed: the host binary vendors no C grammars.
+      - name: Package release tarball
+        run: make dist VERSION=${{ needs.prepare.outputs.version }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # Dev prerelease, uniquely tagged per commit.
+      - name: Publish dev release
+        if: needs.prepare.outputs.channel == 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "$VERSION" \
+            --notes "Development build from ${GITHUB_SHA}."
+
+      # Keep only the 3 newest dev-* prereleases; delete older ones + their tags.
+      - name: Prune old dev releases
+        if: needs.prepare.outputs.channel == 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,createdAt \
+            --jq 'map(select(.tagName | startswith("dev-")))
+                  | sort_by(.createdAt) | reverse | .[3:][].tagName' \
+          | while read -r tag; do
+              [ -n "$tag" ] || continue
+              echo "pruning $tag"
+              gh release delete "$tag" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY"
+            done
+
+      - name: Publish production release
+        if: needs.prepare.outputs.channel == 'prod'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          [ "${{ needs.prepare.outputs.prerelease }}" = "true" ] && flags="--prerelease"
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes $flags
