@@ -21,8 +21,8 @@
 //!    never aborts startup.
 //!
 //! The binary also exposes a `tower plugin <install|list|remove>` subcommand to
-//! manage the global scope; when `argv[1] == "plugin"` it runs that instead of the
-//! server.
+//! manage installed plugins in the local or global scope (`--local` / `--global`,
+//! default local); when `argv[1] == "plugin"` it runs that instead of the server.
 //! 6. Serve the 7 native `tower_*` tools PLUS any plugin tools (namespaced
 //!    `<plugin>/<tool>`) over real `stdin` / `stdout` via a `MergedRegistry`.
 //!
@@ -52,7 +52,7 @@ use core_engine::adapters::fs::{RealFs, workspace_scan};
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::{MergedRegistry, serve};
 use core_engine::adapters::plugin::{
-    DEFAULT_PLUGINS_SUBDIR, IsolationEngine, global_plugins_dir, install,
+    DEFAULT_PLUGINS_SUBDIR, IsolationEngine, Scope, global_plugins_dir, install,
     load_plugins_into_registry, production_isolation_config, resolve_plugin_dirs,
 };
 use core_engine::domain::index::InvertedIndex;
@@ -60,8 +60,8 @@ use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::ports::{FileSystemPort, StoragePort};
 
 fn main() {
-    // Subcommand dispatch: `tower plugin <install|list|remove> ...` manages the
-    // global plugin scope instead of starting the MCP server.
+    // Subcommand dispatch: `tower plugin <install|list|remove> ...` manages
+    // installed plugins instead of starting the MCP server.
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(String::as_str) == Some("plugin") {
         if let Err(e) = run_plugin_cli(&args[2..]) {
@@ -77,30 +77,30 @@ fn main() {
     }
 }
 
-/// Handle `tower plugin <install <path> | list | remove <name>>`.
+/// Handle `tower plugin <install <path> | list | remove <name>> [--local|--global]`.
 ///
-/// `install`/`remove` act on the XDG global scope; `list` shows both the global
-/// scope and the current directory's local `.tower/plugins`. These manage plugin
-/// **files** by name — see [`core_engine::adapters::plugin::install`].
+/// `install`/`remove` act on the scope chosen by `--local` / `--global`,
+/// defaulting to **local** (`<workspace>/.tower/plugins`); `list` always shows
+/// both scopes. These manage plugin **files** by name — see
+/// [`core_engine::adapters::plugin::install`].
 fn run_plugin_cli(args: &[String]) -> Result<(), String> {
-    let global_dir = global_plugins_dir()
-        .ok_or("cannot determine the global plugins directory (no HOME/XDG base dir)")?;
-
     match args.first().map(String::as_str) {
         Some("install") => {
-            let src = args
-                .get(1)
-                .ok_or("usage: tower plugin install <path-to.wasm>")?;
-            let dest = install::install(&global_dir, Path::new(src))
+            let src = first_positional(&args[1..])
+                .ok_or("usage: tower plugin install <path-to.wasm> [--local|--global]")?;
+            let scope = install::scope_from_flags(args, Scope::Local)?;
+            let dir = scope_dir(scope)?;
+            let dest = install::install(&dir, Path::new(src))
                 .map_err(|e| format!("install failed: {e}"))?;
-            println!("installed {src} -> {}", dest.display());
+            println!("installed {src} -> {} ({scope})", dest.display());
             Ok(())
         }
         Some("list") => {
+            let global = global_plugins_dir();
             let local = resolve_workspace_root().join(DEFAULT_PLUGINS_SUBDIR);
-            let listed = install::list(Some(&global_dir), Some(&local));
+            let listed = install::list(global.as_deref(), Some(&local));
             if listed.is_empty() {
-                println!("no plugins installed (global: {})", global_dir.display());
+                println!("no plugins installed");
             } else {
                 for p in listed {
                     println!("{:<6} {}", p.scope.to_string(), p.file_name);
@@ -109,19 +109,44 @@ fn run_plugin_cli(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("remove") => {
-            let name = args.get(1).ok_or("usage: tower plugin remove <name>")?;
-            if install::remove(&global_dir, name).map_err(|e| format!("remove failed: {e}"))? {
-                println!("removed '{name}' from {}", global_dir.display());
+            let name = first_positional(&args[1..])
+                .ok_or("usage: tower plugin remove <name> [--local|--global]")?;
+            let scope = install::scope_from_flags(args, Scope::Local)?;
+            let dir = scope_dir(scope)?;
+            if install::remove(&dir, name).map_err(|e| format!("remove failed: {e}"))? {
+                println!("removed '{name}' from {} ({scope})", dir.display());
             } else {
-                println!("no such global plugin: '{name}'");
+                println!("no such {scope} plugin: '{name}'");
             }
             Ok(())
         }
         Some(other) => Err(format!(
             "unknown plugin subcommand '{other}' (expected: install | list | remove)"
         )),
-        None => Err("usage: tower plugin <install <path> | list | remove <name>>".to_string()),
+        None => Err(
+            "usage: tower plugin <install <path> | list | remove <name>> [--local|--global]"
+                .to_string(),
+        ),
     }
+}
+
+/// The directory backing a [`Scope`]: local is `<workspace>/.tower/plugins`,
+/// global is the XDG data dir (absent only without HOME/XDG base dirs).
+fn scope_dir(scope: Scope) -> Result<PathBuf, String> {
+    match scope {
+        Scope::Local => Ok(resolve_workspace_root().join(DEFAULT_PLUGINS_SUBDIR)),
+        Scope::Global => global_plugins_dir().ok_or_else(|| {
+            "cannot determine the global plugins directory (no HOME/XDG base dir)".to_string()
+        }),
+    }
+}
+
+/// First non-flag argument (an argument not starting with `--`), so the path /
+/// name can appear before or after the scope flag.
+fn first_positional(args: &[String]) -> Option<&str> {
+    args.iter()
+        .find(|a| !a.starts_with("--"))
+        .map(String::as_str)
 }
 
 fn run() -> Result<(), String> {

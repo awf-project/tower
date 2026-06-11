@@ -1,9 +1,11 @@
 //! Global plugin management — the filesystem half of `tower plugin <cmd>`.
 //!
 //! Backs the `install` / `list` / `remove` subcommands. These operate on plugin
-//! **files** in the XDG global scope (and, for `list`, the project-local scope):
-//! they copy/enumerate/delete `*.wasm` by file name. They deliberately do **not**
-//! load wasm or read manifests — keeping the CLI path free of the wasmtime engine.
+//! **files** in either the XDG global or the project-local scope (`list` shows
+//! both): they copy/enumerate/delete `*.wasm` by file name. They deliberately do
+//! **not** load wasm or read manifests — keeping the CLI path free of the
+//! wasmtime engine. The caller picks the scope's directory (see
+//! [`scope_from_flags`]); these helpers just act on the directory they are given.
 //!
 //! # Scopes
 //!
@@ -48,6 +50,19 @@ impl fmt::Display for Scope {
     }
 }
 
+/// Pick the target [`Scope`] from CLI flags. `--local` / `--global` select it
+/// explicitly; with neither, `default` applies. Passing both is an error.
+pub fn scope_from_flags(args: &[String], default: Scope) -> Result<Scope, String> {
+    let local = args.iter().any(|a| a == "--local");
+    let global = args.iter().any(|a| a == "--global");
+    match (local, global) {
+        (true, true) => Err("cannot combine --local and --global".to_string()),
+        (true, false) => Ok(Scope::Local),
+        (false, true) => Ok(Scope::Global),
+        (false, false) => Ok(default),
+    }
+}
+
 /// A plugin `.wasm` file discovered on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPlugin {
@@ -56,11 +71,11 @@ pub struct InstalledPlugin {
     pub path: PathBuf,
 }
 
-/// Copy a `.wasm` plugin into `global_dir`, creating the directory if needed.
-/// Returns the destination path.
+/// Copy a `.wasm` plugin into `dir` (the chosen scope's directory), creating it
+/// if needed. Returns the destination path.
 ///
 /// Errors if `src` is not a `*.wasm` file, has no file name, or the copy fails.
-pub fn install(global_dir: &Path, src: &Path) -> io::Result<PathBuf> {
+pub fn install(dir: &Path, src: &Path) -> io::Result<PathBuf> {
     if src.extension().and_then(|e| e.to_str()) != Some("wasm") {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -74,8 +89,8 @@ pub fn install(global_dir: &Path, src: &Path) -> io::Result<PathBuf> {
         )
     })?;
 
-    fs::create_dir_all(global_dir)?;
-    let dest = global_dir.join(file_name);
+    fs::create_dir_all(dir)?;
+    let dest = dir.join(file_name);
     fs::copy(src, &dest)?;
     Ok(dest)
 }
@@ -94,15 +109,16 @@ pub fn list(global_dir: Option<&Path>, local_dir: Option<&Path>) -> Vec<Installe
     out
 }
 
-/// Remove `<global_dir>/<name>` where `name` is a file name with or without the
-/// `.wasm` extension. Returns `true` if a file was removed, `false` if absent.
-pub fn remove(global_dir: &Path, name: &str) -> io::Result<bool> {
+/// Remove `<dir>/<name>` (within the chosen scope) where `name` is a file name
+/// with or without the `.wasm` extension. Returns `true` if a file was removed,
+/// `false` if absent.
+pub fn remove(dir: &Path, name: &str) -> io::Result<bool> {
     let file = if name.ends_with(".wasm") {
         name.to_string()
     } else {
         format!("{name}.wasm")
     };
-    match fs::remove_file(global_dir.join(file)) {
+    match fs::remove_file(dir.join(file)) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
@@ -139,6 +155,37 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, b"\0asm").expect("write fixture");
         p
+    }
+
+    #[test]
+    fn scope_defaults_when_no_flag() {
+        let args: Vec<String> = vec!["install".into(), "x.wasm".into()];
+        assert_eq!(scope_from_flags(&args, Scope::Local).unwrap(), Scope::Local);
+        assert_eq!(
+            scope_from_flags(&args, Scope::Global).unwrap(),
+            Scope::Global
+        );
+    }
+
+    #[test]
+    fn scope_flags_select_explicitly() {
+        let local: Vec<String> = vec!["install".into(), "--local".into()];
+        let global: Vec<String> = vec!["install".into(), "--global".into()];
+        // The flag overrides the default in both directions.
+        assert_eq!(
+            scope_from_flags(&local, Scope::Global).unwrap(),
+            Scope::Local
+        );
+        assert_eq!(
+            scope_from_flags(&global, Scope::Local).unwrap(),
+            Scope::Global
+        );
+    }
+
+    #[test]
+    fn scope_rejects_both_flags() {
+        let args: Vec<String> = vec!["--local".into(), "--global".into()];
+        assert!(scope_from_flags(&args, Scope::Local).is_err());
     }
 
     #[test]
