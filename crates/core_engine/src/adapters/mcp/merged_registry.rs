@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!  MergedRegistry
-//!    native: NativeToolRegistry          (7 vfs_* tools, spec 10b)
+//!    native: NativeToolRegistry          (7 tower_* tools, spec 10b)
 //!    host:   Arc<RwLock<PluginHostRegistry>>  (declared_tools(), spec 11b)
 //!
 //!  list()   → native.list() ++ plugin tools (namespaced)  [dynamic, no cache]
@@ -17,20 +17,35 @@
 //!
 //! # Collision policy (UN1 / AC3)
 //!
-//! Decision: **namespace plugin tools** as `"<plugin_id>/<tool_name>"`.
+//! Decision: **namespace plugin tools** as `"tower_<plugin_id>_<tool_name>"`.
 //!
-//! Why: this is a total, deterministic, zero-ambiguity mapping. A plugin named
-//! `my_plugin` that declares a tool `vfs_find_file` appears in `tools/list` as
-//! `my_plugin/vfs_find_file`, never as plain `vfs_find_file`. Native tools keep
-//! their undecorated names (`vfs_find_file`). No runtime name collision is possible
-//! regardless of what any plugin declares.
+//! Why: the `tower_` prefix reserves the host namespace. A plugin named `ast` that
+//! declares a tool `ast_get_outline` appears in `tools/list` as
+//! `tower_ast_ast_get_outline`, never as `tower_ast_get_outline` (which might be a
+//! native tool). Native tools keep their `tower_*` names (e.g. `tower_find_file`).
+//! No runtime name collision is possible regardless of what any plugin declares,
+//! provided the plugin name does not begin with `"tower"`.
 //!
-//! Trade-off vs. native-wins precedence: native-wins would silently drop any
-//! plugin tool that collides. Namespacing exposes all tools — clients can use
-//! the prefixed name explicitly. This is more transparent and testable.
+//! **Plugin names must not begin with `"tower"`** (the host namespace prefix).
+//! This is enforced at registration time by
+//! [`PluginHostRegistry::register`][crate::domain::plugin_host::PluginHostRegistry::register]
+//! via the `RegistrationError::ReservedNamePrefix` guard. A plugin named e.g.
+//! `"find"` with tool `"file"` would compose to `"tower_find_file"` — colliding
+//! with the native tool — so the `"tower"` prefix is entirely reserved for the
+//! host and may never appear as a plugin name prefix.
+//!
+//! **Native-first ordering in `call()`** is defence-in-depth: even if the guard
+//! ever fails to fire, the native fast-path runs first and the composed name is
+//! only matched in the plugin iteration, never as a native name.
+//!
+//! Trade-off vs. `"<plugin>/<tool>"` slash notation: underscores are
+//! URL/shell-safe and avoid the slash ambiguity that made splitting unreliable.
+//! The trade-off is that plugin names and tool names must not collide in a way
+//! that confuses composed names, which is why the `"tower"` prefix reservation
+//! and the `ReservedNamePrefix` guard together form the complete invariant.
 //!
 //! The policy is documented here and enforced unconditionally: there is no code
-//! path that allows a plugin to register an un-namespaced tool.
+//! path that allows a plugin to register a `tower_`-prefixed name.
 //!
 //! # Fault mapping (UN2 / AC4)
 //!
@@ -67,8 +82,8 @@ use crate::domain::plugin_host::{PluginHostError, PluginHostRegistry};
 
 // ── MergedRegistry ─────────────────────────────────────────────────────────────
 
-/// A [`ToolRegistry`] that unifies native `vfs_*` tools (10b) with tools
-/// declared by loaded plugins (11b), namespaced as `"<plugin>/<tool>"`.
+/// A [`ToolRegistry`] that unifies native `tower_*` tools (10b) with tools
+/// declared by loaded plugins (11b), namespaced as `"tower_<plugin>_<tool>"`.
 ///
 /// # Example
 ///
@@ -79,7 +94,7 @@ use crate::domain::plugin_host::{PluginHostError, PluginHostRegistry};
 ///
 /// let merged = MergedRegistry::new(engine_state, plugin_registry);
 /// let tools = merged.list();
-/// // tools contains 7 native vfs_* tools plus any plugin tools.
+/// // tools contains 7 native tower_* tools plus any plugin tools.
 /// ```
 pub struct MergedRegistry {
     native: NativeToolRegistry,
@@ -103,7 +118,7 @@ impl MergedRegistry {
 }
 
 impl ToolRegistry for MergedRegistry {
-    /// Return all tools: 7 native `vfs_*` tools plus namespaced plugin tools.
+    /// Return all tools: 7 native `tower_*` tools plus namespaced plugin tools.
     ///
     /// Called once per `tools/list` request; no result is cached. Adding or
     /// removing plugins is reflected immediately in the next call (EV3 / AC5).
@@ -120,7 +135,7 @@ impl ToolRegistry for MergedRegistry {
             .unwrap_or_else(|poison| poison.into_inner());
 
         for (plugin_id, sdk_tool) in host_guard.declared_tools() {
-            let namespaced_name = format!("{}/{}", plugin_id.as_str(), sdk_tool.name);
+            let namespaced_name = format!("tower_{}_{}", plugin_id.as_str(), sdk_tool.name);
             let mcp_tool = sdk_tool_to_mcp_tool_desc(namespaced_name, &sdk_tool);
             tools.push(mcp_tool);
         }
@@ -130,11 +145,16 @@ impl ToolRegistry for MergedRegistry {
 
     /// Dispatch a tool call.
     ///
-    /// Native tool names (`vfs_*`) are forwarded to the `NativeToolRegistry`.
-    /// Plugin tool names (`"<plugin>/<tool>"`) are split at the first `/`, the
-    /// owning plugin is located in the `PluginHostRegistry`, and the call is
-    /// dispatched through `PluginInstance::call_tool` (which is already
-    /// fault-isolated by the 11d `IsolatedSandbox` wrapper).
+    /// Native tool names (`tower_*`) are forwarded to the `NativeToolRegistry`
+    /// first (fast path).
+    ///
+    /// Plugin tool names have the form `"tower_<plugin_id>_<tool_name>"`. Because
+    /// both plugin names and tool names contain underscores, splitting by `"_"` is
+    /// ambiguous. Instead, after the native fast-path, we iterate
+    /// `host_guard.declared_tools()` and for each `(plugin_id, tool_desc)` pair
+    /// reconstruct `format!("tower_{}_{}", plugin_id, tool_desc.name)`. On an
+    /// exact match we dispatch with the original `(plugin_id, tool_name)` pair via
+    /// the existing `call_instance_tool` path.
     ///
     /// # Errors
     ///
@@ -143,16 +163,10 @@ impl ToolRegistry for MergedRegistry {
     ///   quarantine). The engine and MCP link remain alive.
     /// - Any `ToolError` variant from the native registry on native tool calls.
     fn call(&mut self, name: &str, args: JsonValue) -> Result<JsonValue, ToolError> {
-        // Fast path: native tool.
+        // Fast path: native tool (defence-in-depth — native always wins).
         if self.native.list().iter().any(|t| t.name == name) {
             return self.native.call(name, args);
         }
-
-        // Plugin path: name must be "<plugin_id>/<tool_name>".
-        let (plugin_id_str, tool_name) =
-            split_plugin_tool_name(name).ok_or_else(|| ToolError::NotFound(name.to_owned()))?;
-
-        let sdk_args = json_to_sdk_value(args);
 
         // Decision: host.read() not host.write().
         // Why: call_instance_tool() acquires a per-slot Mutex for exclusive
@@ -169,7 +183,17 @@ impl ToolRegistry for MergedRegistry {
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        call_plugin_tool(&host_guard, plugin_id_str, tool_name, sdk_args)
+        // Plugin path: iterate declared tools and match by reconstructing the
+        // composed name. No splitting — underscore ambiguity is avoided entirely.
+        for (pid, tdesc) in host_guard.declared_tools() {
+            let composed = format!("tower_{}_{}", pid.as_str(), tdesc.name);
+            if composed == name {
+                let sdk_args = json_to_sdk_value(args);
+                return call_plugin_tool(&host_guard, pid.as_str(), &tdesc.name, sdk_args);
+            }
+        }
+
+        Err(ToolError::NotFound(name.to_owned()))
     }
 }
 
@@ -189,15 +213,6 @@ fn sdk_tool_to_mcp_tool_desc(namespaced_name: String, sdk_tool: &plugin_sdk::Too
         description: sdk_tool.description.clone(),
         input_schema,
     }
-}
-
-/// Split a namespaced plugin tool name `"<plugin_id>/<tool_name>"` into its
-/// two parts.
-///
-/// Returns `None` if `name` contains no `/` (i.e. is a bare native tool name
-/// or any other unrecognised token).
-fn split_plugin_tool_name(name: &str) -> Option<(&str, &str)> {
-    name.find('/').map(|pos| (&name[..pos], &name[pos + 1..]))
 }
 
 /// Dispatch a tool call to a registered plugin instance.
@@ -224,7 +239,9 @@ fn call_plugin_tool(
         .any(|(pid, tdesc)| pid.as_str() == plugin_id_str && tdesc.name == tool_name);
 
     if !exists {
-        return Err(ToolError::NotFound(format!("{plugin_id_str}/{tool_name}")));
+        return Err(ToolError::NotFound(format!(
+            "tower_{plugin_id_str}_{tool_name}"
+        )));
     }
 
     // Dispatch through the registry's call_instance_tool helper.
@@ -488,21 +505,21 @@ mod tests {
 
         // All 7 native tools present.
         for native in &[
-            "vfs_find_file",
-            "vfs_search_text",
-            "vfs_read_file",
-            "vfs_create_file",
-            "vfs_create_directory",
-            "vfs_delete_file",
-            "vfs_global_replace",
+            "tower_find_file",
+            "tower_search_text",
+            "tower_read_file",
+            "tower_create_file",
+            "tower_create_directory",
+            "tower_delete_file",
+            "tower_global_replace",
         ] {
             assert!(names.contains(native), "native tool '{native}' missing");
         }
 
         // Plugin tool present, namespaced.
         assert!(
-            names.contains(&"my_plugin/echo"),
-            "plugin tool 'my_plugin/echo' missing; got {names:?}"
+            names.contains(&"tower_my_plugin_echo"),
+            "plugin tool 'tower_my_plugin_echo' missing; got {names:?}"
         );
     }
 
@@ -512,7 +529,7 @@ mod tests {
         let tools = reg.list();
         assert_eq!(tools.len(), 7, "no plugins → 7 native tools only");
         // Sanity: call on a native tool still works.
-        let result = reg.call("vfs_find_file", json!({ "query": "x" }));
+        let result = reg.call("tower_find_file", json!({ "query": "x" }));
         assert!(result.is_ok());
     }
 
@@ -522,7 +539,7 @@ mod tests {
     fn ac2_call_routes_to_plugin_and_returns_result() {
         let mut reg = merged_with_echo_plugin("demo", "echo_it");
         let args = json!({ "msg": "hello" });
-        let result = reg.call("demo/echo_it", args.clone());
+        let result = reg.call("tower_demo_echo_it", args.clone());
         let returned = result.expect("plugin call must succeed");
         // EchoPlugin returns the args back as a Map.
         assert!(
@@ -539,7 +556,7 @@ mod tests {
     fn ac2_native_tools_still_routed_correctly_in_merged_registry() {
         let mut reg = merged_with_echo_plugin("p", "t");
         // Call a native tool through the merged registry.
-        let result = reg.call("vfs_find_file", json!({ "query": "anything" }));
+        let result = reg.call("tower_find_file", json!({ "query": "anything" }));
         assert!(result.is_ok(), "native tool route must work: {result:?}");
     }
 
@@ -547,13 +564,13 @@ mod tests {
 
     #[test]
     fn ac3_plugin_tool_named_like_native_is_namespaced_not_shadowing() {
-        // Plugin declares a tool with the same name as a native tool.
+        // Plugin declares a tool with the same name as a native tool's suffix.
         let host = Arc::new(RwLock::new(PluginHostRegistry::new()));
         host.write()
             .unwrap()
             .register(Box::new(EchoPlugin::new(
                 "evil_plugin",
-                vec![echo_tool("vfs_find_file")],
+                vec![echo_tool("tower_find_file")],
             )))
             .expect("register must succeed");
 
@@ -563,17 +580,17 @@ mod tests {
 
         // Native tool still present with its original name.
         assert!(
-            names.contains(&"vfs_find_file"),
-            "native vfs_find_file must be present: {names:?}"
+            names.contains(&"tower_find_file"),
+            "native tower_find_file must be present: {names:?}"
         );
         // Plugin tool present under its namespaced name.
         assert!(
-            names.contains(&"evil_plugin/vfs_find_file"),
+            names.contains(&"tower_evil_plugin_tower_find_file"),
             "plugin tool must be namespaced: {names:?}"
         );
-        // No duplication — exactly one plain `vfs_find_file`.
+        // No duplication — exactly one plain `tower_find_file`.
         assert_eq!(
-            names.iter().filter(|&&n| n == "vfs_find_file").count(),
+            names.iter().filter(|&&n| n == "tower_find_file").count(),
             1,
             "native tool must appear exactly once: {names:?}"
         );
@@ -602,12 +619,12 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
-            names.contains(&"plugin_a/greet"),
-            "plugin_a/greet must be present: {names:?}"
+            names.contains(&"tower_plugin_a_greet"),
+            "tower_plugin_a_greet must be present: {names:?}"
         );
         assert!(
-            names.contains(&"plugin_b/greet"),
-            "plugin_b/greet must be present: {names:?}"
+            names.contains(&"tower_plugin_b_greet"),
+            "tower_plugin_b_greet must be present: {names:?}"
         );
     }
 
@@ -623,7 +640,7 @@ mod tests {
 
         let mut reg = MergedRegistry::new(empty_engine_state(), host);
 
-        let result = reg.call("bad_plugin/danger", json!({}));
+        let result = reg.call("tower_bad_plugin_danger", json!({}));
         let err = result.expect_err("faulting plugin must return Err");
         assert!(
             matches!(
@@ -641,7 +658,7 @@ mod tests {
             tools.len()
         );
         // And call a native tool.
-        let native_result = reg.call("vfs_find_file", json!({ "query": "test" }));
+        let native_result = reg.call("tower_find_file", json!({ "query": "test" }));
         assert!(
             native_result.is_ok(),
             "native tools must work after plugin fault"
@@ -685,7 +702,7 @@ mod tests {
 
         let mut reg = MergedRegistry::new(empty_engine_state(), host);
         let err = reg
-            .call("argtest/check", json!({}))
+            .call("tower_argtest_check", json!({}))
             .expect_err("must return error");
         assert!(
             matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
@@ -710,7 +727,9 @@ mod tests {
 
         // Plugin tool is visible.
         assert!(
-            reg.list().iter().any(|t| t.name == "temp_plugin/temp_tool"),
+            reg.list()
+                .iter()
+                .any(|t| t.name == "tower_temp_plugin_temp_tool"),
             "plugin tool must be visible after registration"
         );
 
@@ -724,7 +743,7 @@ mod tests {
         assert!(
             !tools_after
                 .iter()
-                .any(|t| t.name == "temp_plugin/temp_tool"),
+                .any(|t| t.name == "tower_temp_plugin_temp_tool"),
             "removed plugin's tools must not appear in next list: {:?}",
             tools_after.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
@@ -787,7 +806,7 @@ mod tests {
     #[test]
     fn unknown_tool_name_returns_not_found() {
         let mut reg = MergedRegistry::new(empty_engine_state(), empty_plugin_host());
-        let err = reg.call("completely/unknown", json!({})).unwrap_err();
+        let err = reg.call("tower_completely_unknown", json!({})).unwrap_err();
         assert!(
             matches!(err, crate::adapters::mcp::types::ToolError::NotFound(_)),
             "unknown plugin tool must return NotFound"
@@ -854,7 +873,7 @@ mod tests {
         let engine_state = empty_engine_state();
         let mut reg = MergedRegistry::new(engine_state, Arc::clone(&host));
         // This call must not deadlock: both the reader and call() want read locks.
-        let result = reg.call("concurrent_test/ping", json!({ "x": 1 }));
+        let result = reg.call("tower_concurrent_test_ping", json!({ "x": 1 }));
         assert!(result.is_ok(), "concurrent call must succeed: {result:?}");
 
         reader_handle.join().expect("reader thread must not panic");

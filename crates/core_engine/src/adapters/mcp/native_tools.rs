@@ -1,4 +1,4 @@
-//! Native `vfs_*` tool handlers — spec 10b.
+//! Native `tower_*` tool handlers — spec 10b.
 //!
 //! Implements all 7 workspace tools and registers them into the 10a
 //! [`ToolRegistry`]. Each handler follows the same thin pattern:
@@ -11,18 +11,18 @@
 //!
 //! ```text
 //! register_native_tools(registry, state):
-//!   vfs_find_file       {query}              → SearchUseCase.find_file
-//!   vfs_search_text     {pattern}            → SearchUseCase.search_text
-//!   vfs_read_file       {path}               → FileSystemPort.read
-//!   vfs_create_file     {path, content}      → FileMutationUseCase.create_file
-//!   vfs_create_directory{path}               → FileMutationUseCase.create_directory
-//!   vfs_delete_file     {path}               → FileMutationUseCase.delete_file
-//!   vfs_global_replace  {target,replacement} → FileMutationUseCase.global_replace
+//!   tower_find_file       {query}              → SearchUseCase.find_file
+//!   tower_search_text     {pattern}            → SearchUseCase.search_text
+//!   tower_read_file       {path}               → FileSystemPort.read
+//!   tower_create_file     {path, content}      → FileMutationUseCase.create_file
+//!   tower_create_directory{path}               → FileMutationUseCase.create_directory
+//!   tower_delete_file     {path}               → FileMutationUseCase.delete_file
+//!   tower_global_replace  {target,replacement} → FileMutationUseCase.global_replace
 //! ```
 //!
 //! # Design decisions
 //!
-//! ## vfs_read_file approach
+//! ## tower_read_file approach
 //!
 //! There is no `SearchUseCase` or `FileMutationUseCase` method for reading raw
 //! bytes. Decision: call `FileSystemPort::read` directly in the handler.
@@ -117,7 +117,7 @@ impl EngineState {
 
 // ── NativeToolRegistry ────────────────────────────────────────────────────────
 
-/// [`ToolRegistry`] implementation for the 7 native `vfs_*` tools (spec 10b).
+/// [`ToolRegistry`] implementation for the 7 native `tower_*` tools (spec 10b).
 ///
 /// Holds a reference-counted, lock-protected [`EngineState`] so that both this
 /// registry and the filesystem watcher can share the workspace/index/storage/fs
@@ -172,13 +172,13 @@ impl ToolRegistry for NativeToolRegistry {
 
     fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
         match name {
-            "vfs_find_file" => call_find_file(&self.state, args),
-            "vfs_search_text" => call_search_text(&self.state, args),
-            "vfs_read_file" => call_read_file(&self.state, args),
-            "vfs_create_file" => call_create_file(&self.state, args),
-            "vfs_create_directory" => call_create_directory(&self.state, args),
-            "vfs_delete_file" => call_delete_file(&self.state, args),
-            "vfs_global_replace" => call_global_replace(&self.state, args),
+            "tower_find_file" => call_find_file(&self.state, args),
+            "tower_search_text" => call_search_text(&self.state, args),
+            "tower_read_file" => call_read_file(&self.state, args),
+            "tower_create_file" => call_create_file(&self.state, args),
+            "tower_create_directory" => call_create_directory(&self.state, args),
+            "tower_delete_file" => call_delete_file(&self.state, args),
+            "tower_global_replace" => call_global_replace(&self.state, args),
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -188,7 +188,7 @@ impl ToolRegistry for NativeToolRegistry {
 
 fn tool_find_file_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_find_file".to_owned(),
+        name: "tower_find_file".to_owned(),
         description: "Find files in the workspace whose path matches the query string.".to_owned(),
         input_schema: json!({
             "type": "object",
@@ -205,7 +205,7 @@ fn tool_find_file_desc() -> ToolDesc {
 
 fn tool_search_text_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_search_text".to_owned(),
+        name: "tower_search_text".to_owned(),
         description: "Search all indexed file contents for lines matching the pattern.".to_owned(),
         input_schema: json!({
             "type": "object",
@@ -222,7 +222,7 @@ fn tool_search_text_desc() -> ToolDesc {
 
 fn tool_read_file_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_read_file".to_owned(),
+        name: "tower_read_file".to_owned(),
         description: "Read the raw UTF-8 content of a file at the given workspace-relative path."
             .to_owned(),
         input_schema: json!({
@@ -240,7 +240,7 @@ fn tool_read_file_desc() -> ToolDesc {
 
 fn tool_create_file_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_create_file".to_owned(),
+        name: "tower_create_file".to_owned(),
         description: "Create or overwrite a file at the given path with the provided content."
             .to_owned(),
         input_schema: json!({
@@ -262,7 +262,7 @@ fn tool_create_file_desc() -> ToolDesc {
 
 fn tool_create_directory_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_create_directory".to_owned(),
+        name: "tower_create_directory".to_owned(),
         description: "Create a directory at the given workspace-relative path (recursive mkdir)."
             .to_owned(),
         input_schema: json!({
@@ -280,7 +280,7 @@ fn tool_create_directory_desc() -> ToolDesc {
 
 fn tool_delete_file_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_delete_file".to_owned(),
+        name: "tower_delete_file".to_owned(),
         description: "Delete a file from the workspace at the given path.".to_owned(),
         input_schema: json!({
             "type": "object",
@@ -297,7 +297,7 @@ fn tool_delete_file_desc() -> ToolDesc {
 
 fn tool_global_replace_desc() -> ToolDesc {
     ToolDesc {
-        name: "vfs_global_replace".to_owned(),
+        name: "tower_global_replace".to_owned(),
         description: "Replace every occurrence of a target string with a replacement string across all indexed files.".to_owned(),
         input_schema: json!({
             "type": "object",
@@ -593,7 +593,7 @@ mod tests {
     // ── AC1: tools/list shows 7 tools with schemas ────────────────────────────
 
     #[test]
-    fn ac1_tools_list_returns_seven_vfs_tools() {
+    fn ac1_tools_list_returns_seven_tower_tools() {
         let reg = make_registry(empty_state());
         let tools = reg.list();
         assert_eq!(
@@ -610,13 +610,13 @@ mod tests {
         let tool_list = reg.list();
         let names: Vec<&str> = tool_list.iter().map(|t| t.name.as_str()).collect();
         let expected = [
-            "vfs_find_file",
-            "vfs_search_text",
-            "vfs_read_file",
-            "vfs_create_file",
-            "vfs_create_directory",
-            "vfs_delete_file",
-            "vfs_global_replace",
+            "tower_find_file",
+            "tower_search_text",
+            "tower_read_file",
+            "tower_create_file",
+            "tower_create_directory",
+            "tower_delete_file",
+            "tower_global_replace",
         ];
         for name in &expected {
             assert!(names.contains(name), "missing tool '{name}'; got {names:?}");
@@ -642,12 +642,12 @@ mod tests {
         }
     }
 
-    // ── AC2: vfs_find_file round-trip ─────────────────────────────────────────
+    // ── AC2: tower_find_file round-trip ───────────────────────────────────────
 
     #[test]
     fn ac2_find_file_returns_matching_paths() {
         let mut reg = make_registry(state_with_client_file());
-        let result = reg.call("vfs_find_file", json!({ "query": "client" }));
+        let result = reg.call("tower_find_file", json!({ "query": "client" }));
         let val = result.expect("find_file must succeed");
         let paths = val["paths"]
             .as_array()
@@ -663,13 +663,13 @@ mod tests {
     fn ac2_find_file_returns_empty_for_no_match() {
         let mut reg = make_registry(state_with_client_file());
         let val = reg
-            .call("vfs_find_file", json!({ "query": "zzznomatch" }))
+            .call("tower_find_file", json!({ "query": "zzznomatch" }))
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         assert!(paths.is_empty(), "no-match query must return empty paths");
     }
 
-    // ── AC3: vfs_create_file then vfs_find_file finds it ─────────────────────
+    // ── AC3: tower_create_file then tower_find_file finds it ─────────────────
 
     #[test]
     fn ac3_create_file_then_find_file_locates_new_file() {
@@ -678,14 +678,14 @@ mod tests {
 
         // Create.
         reg.call(
-            "vfs_create_file",
+            "tower_create_file",
             json!({ "path": "src/widget.rs", "content": "pub struct Widget;" }),
         )
         .expect("create_file must succeed");
 
         // Find.
         let val = reg
-            .call("vfs_find_file", json!({ "query": "widget" }))
+            .call("tower_find_file", json!({ "query": "widget" }))
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         let path_strings: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
@@ -701,13 +701,13 @@ mod tests {
         let mut reg = make_registry(Arc::clone(&state));
 
         reg.call(
-            "vfs_create_file",
+            "tower_create_file",
             json!({ "path": "src/readme.md", "content": "# Hello" }),
         )
         .unwrap();
 
         let val = reg
-            .call("vfs_read_file", json!({ "path": "src/readme.md" }))
+            .call("tower_read_file", json!({ "path": "src/readme.md" }))
             .unwrap();
         assert_eq!(
             val["content"].as_str().unwrap(),
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn ac4_missing_query_returns_invalid_args() {
         let mut reg = make_registry(empty_state());
-        let err = reg.call("vfs_find_file", json!({})).unwrap_err();
+        let err = reg.call("tower_find_file", json!({})).unwrap_err();
         assert!(
             matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
             "missing 'query' must return InvalidArgs"
@@ -732,7 +732,7 @@ mod tests {
     fn ac4_missing_path_for_create_file_returns_invalid_args() {
         let mut reg = make_registry(empty_state());
         let err = reg
-            .call("vfs_create_file", json!({ "content": "hi" }))
+            .call("tower_create_file", json!({ "content": "hi" }))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -744,7 +744,7 @@ mod tests {
     fn ac4_missing_content_for_create_file_returns_invalid_args() {
         let mut reg = make_registry(empty_state());
         let err = reg
-            .call("vfs_create_file", json!({ "path": "a.rs" }))
+            .call("tower_create_file", json!({ "path": "a.rs" }))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -758,11 +758,11 @@ mod tests {
         let mut reg = make_registry(Arc::clone(&state));
 
         // Attempt create with missing content — must fail.
-        let _ = reg.call("vfs_create_file", json!({ "path": "ghost.rs" }));
+        let _ = reg.call("tower_create_file", json!({ "path": "ghost.rs" }));
 
         // State must be unchanged: the file must NOT exist.
         let val = reg
-            .call("vfs_find_file", json!({ "query": "ghost" }))
+            .call("tower_find_file", json!({ "query": "ghost" }))
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         assert!(
@@ -771,13 +771,13 @@ mod tests {
         );
     }
 
-    // ── AC5: vfs_delete_file on missing file → stable-code error ──────────────
+    // ── AC5: tower_delete_file on missing file → stable-code error ───────────
 
     #[test]
     fn ac5_delete_missing_file_returns_not_found_error() {
         let mut reg = make_registry(empty_state());
         let err = reg
-            .call("vfs_delete_file", json!({ "path": "nonexistent.rs" }))
+            .call("tower_delete_file", json!({ "path": "nonexistent.rs" }))
             .unwrap_err();
 
         // Must be ResourceNotFound (maps to -32002 on the wire).
@@ -787,13 +787,13 @@ mod tests {
         );
     }
 
-    // ── vfs_search_text round-trip ────────────────────────────────────────────
+    // ── tower_search_text round-trip ──────────────────────────────────────────
 
     #[test]
     fn search_text_finds_content_in_indexed_file() {
         let mut reg = make_registry(state_with_client_file());
         let val = reg
-            .call("vfs_search_text", json!({ "pattern": "client" }))
+            .call("tower_search_text", json!({ "pattern": "client" }))
             .unwrap();
         let matches = val["matches"]
             .as_array()
@@ -807,36 +807,36 @@ mod tests {
         assert!(first["line_number"].as_u64().unwrap() >= 1);
     }
 
-    // ── vfs_delete_file success + workspace cleanup ────────────────────────────
+    // ── tower_delete_file success + workspace cleanup ─────────────────────────
 
     #[test]
     fn delete_file_removes_from_workspace() {
         let state = state_with_client_file();
         let mut reg = make_registry(Arc::clone(&state));
 
-        reg.call("vfs_delete_file", json!({ "path": "src/client.rs" }))
+        reg.call("tower_delete_file", json!({ "path": "src/client.rs" }))
             .expect("delete of existing file must succeed");
 
         // File must no longer appear in find.
         let val = reg
-            .call("vfs_find_file", json!({ "query": "client" }))
+            .call("tower_find_file", json!({ "query": "client" }))
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         assert!(paths.is_empty(), "deleted file must not be findable");
     }
 
-    // ── vfs_create_directory ──────────────────────────────────────────────────
+    // ── tower_create_directory ────────────────────────────────────────────────
 
     #[test]
     fn create_directory_succeeds_on_empty_state() {
         let mut reg = make_registry(empty_state());
         let val = reg
-            .call("vfs_create_directory", json!({ "path": "a/b/c" }))
+            .call("tower_create_directory", json!({ "path": "a/b/c" }))
             .unwrap();
         assert_eq!(val["created"], true);
     }
 
-    // ── vfs_global_replace ────────────────────────────────────────────────────
+    // ── tower_global_replace ──────────────────────────────────────────────────
 
     #[test]
     fn global_replace_rewrites_content() {
@@ -845,7 +845,7 @@ mod tests {
 
         let val = reg
             .call(
-                "vfs_global_replace",
+                "tower_global_replace",
                 json!({ "target": "client", "replacement": "server" }),
             )
             .unwrap();
@@ -857,7 +857,7 @@ mod tests {
 
         // Content must have been updated.
         let read_val = reg
-            .call("vfs_read_file", json!({ "path": "src/client.rs" }))
+            .call("tower_read_file", json!({ "path": "src/client.rs" }))
             .unwrap();
         let content = read_val["content"].as_str().unwrap();
         assert!(
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn unknown_tool_name_returns_not_found() {
         let mut reg = make_registry(empty_state());
-        let err = reg.call("vfs_unknown_tool", json!({})).unwrap_err();
+        let err = reg.call("tower_unknown_tool", json!({})).unwrap_err();
         assert!(matches!(
             err,
             crate::adapters::mcp::types::ToolError::NotFound(_)

@@ -1,15 +1,15 @@
-//! End-to-end integration tests for the 7 native `vfs_*` MCP tools (spec 10b).
+//! End-to-end integration tests for the 7 native `tower_*` MCP tools (spec 10b).
 //!
 //! All tests use the 10a in-process transport: `serve()` is driven with
 //! in-memory `Cursor`/`Vec<u8>` buffers. No spawned processes, no real stdio.
 //!
 //! # TDD sequence (spec 10b §TDD sequence)
 //!
-//! 1. AC1 — `tools/list` returns 7 `vfs_*` tools with schemas.
-//! 2. AC2 — `vfs_find_file` round-trip.
-//! 3. AC3 — `vfs_create_file` then `vfs_find_file` finds it.
+//! 1. AC1 — `tools/list` returns 7 `tower_*` tools with schemas.
+//! 2. AC2 — `tower_find_file` round-trip.
+//! 3. AC3 — `tower_create_file` then `tower_find_file` finds it.
 //! 4. AC4 — malformed args → `invalid-params`, no state change.
-//! 5. AC5 — `vfs_delete_file` on missing file → stable-code error.
+//! 5. AC5 — `tower_delete_file` on missing file → stable-code error.
 
 #![forbid(unsafe_code)]
 
@@ -98,10 +98,10 @@ fn state_with_client_file() -> Arc<RwLock<EngineState>> {
     )))
 }
 
-// ── AC1: tools/list returns 7 vfs_* tools with schemas ───────────────────────
+// ── AC1: tools/list returns 7 tower_* tools with schemas ─────────────────────
 
 #[test]
-fn ac1_tools_list_returns_seven_vfs_tools_with_schemas() {
+fn ac1_tools_list_returns_seven_tower_tools_with_schemas() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
@@ -122,7 +122,7 @@ fn ac1_tools_list_returns_seven_vfs_tools_with_schemas() {
     assert_eq!(
         tools.len(),
         7,
-        "expected 7 vfs_* tools; got {}",
+        "expected 7 tower_* tools; got {}",
         tools.len()
     );
 
@@ -130,13 +130,13 @@ fn ac1_tools_list_returns_seven_vfs_tools_with_schemas() {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     for expected_name in &[
-        "vfs_find_file",
-        "vfs_search_text",
-        "vfs_read_file",
-        "vfs_create_file",
-        "vfs_create_directory",
-        "vfs_delete_file",
-        "vfs_global_replace",
+        "tower_find_file",
+        "tower_search_text",
+        "tower_read_file",
+        "tower_create_file",
+        "tower_create_directory",
+        "tower_delete_file",
+        "tower_global_replace",
     ] {
         assert!(
             names.contains(expected_name),
@@ -154,14 +154,14 @@ fn ac1_tools_list_returns_seven_vfs_tools_with_schemas() {
     }
 }
 
-// ── AC2: vfs_find_file round-trip ─────────────────────────────────────────────
+// ── AC2: tower_find_file round-trip ───────────────────────────────────────────
 
 #[test]
 fn ac2_find_file_returns_matching_paths_over_transport() {
     let state = state_with_client_file();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    let input = tools_call(2, "vfs_find_file", json!({ "query": "client" }));
+    let input = tools_call(2, "tower_find_file", json!({ "query": "client" }));
     let responses = run(&input, &mut reg);
 
     assert_eq!(responses.len(), 1);
@@ -187,11 +187,11 @@ fn ac2_find_file_returns_matching_paths_over_transport() {
 
     assert!(
         path_strings.contains(&"src/client.rs"),
-        "vfs_find_file must return src/client.rs; got {path_strings:?}"
+        "tower_find_file must return src/client.rs; got {path_strings:?}"
     );
 }
 
-// ── AC3: vfs_create_file then vfs_find_file finds it ─────────────────────────
+// ── AC3: tower_create_file then tower_find_file finds it ─────────────────────
 
 #[test]
 fn ac3_create_file_then_find_file_locates_new_file_over_transport() {
@@ -201,7 +201,7 @@ fn ac3_create_file_then_find_file_locates_new_file_over_transport() {
     // Step 1: create.
     let create_input = tools_call(
         3,
-        "vfs_create_file",
+        "tower_create_file",
         json!({ "path": "src/widget.rs", "content": "pub struct Widget;" }),
     );
     let create_responses = run(&create_input, &mut reg);
@@ -213,7 +213,7 @@ fn ac3_create_file_then_find_file_locates_new_file_over_transport() {
     );
 
     // Step 2: find.
-    let find_input = tools_call(4, "vfs_find_file", json!({ "query": "widget" }));
+    let find_input = tools_call(4, "tower_find_file", json!({ "query": "widget" }));
     let find_responses = run(&find_input, &mut reg);
     assert_eq!(find_responses.len(), 1);
     let resp = &find_responses[0];
@@ -230,7 +230,7 @@ fn ac3_create_file_then_find_file_locates_new_file_over_transport() {
     let path_strings: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
     assert!(
         path_strings.contains(&"src/widget.rs"),
-        "newly created file must be findable via vfs_find_file; got {path_strings:?}"
+        "newly created file must be findable via tower_find_file; got {path_strings:?}"
     );
 }
 
@@ -241,8 +241,8 @@ fn ac4_missing_query_returns_invalid_params_over_transport() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    // Call vfs_find_file without the required 'query' field.
-    let input = tools_call(5, "vfs_find_file", json!({}));
+    // Call tower_find_file without the required 'query' field.
+    let input = tools_call(5, "tower_find_file", json!({}));
     let responses = run(&input, &mut reg);
 
     assert_eq!(responses.len(), 1);
@@ -263,7 +263,7 @@ fn ac4_missing_content_for_create_file_returns_invalid_params() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    let input = tools_call(6, "vfs_create_file", json!({ "path": "ghost.rs" }));
+    let input = tools_call(6, "tower_create_file", json!({ "path": "ghost.rs" }));
     let responses = run(&input, &mut reg);
     let resp = &responses[0];
     assert!(resp.get("error").is_some(), "expected error: {resp}");
@@ -276,11 +276,11 @@ fn ac4_invalid_args_cause_no_state_change() {
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
     // Try to create with missing 'content' — must fail without touching state.
-    let bad_create = tools_call(7, "vfs_create_file", json!({ "path": "ghost.rs" }));
+    let bad_create = tools_call(7, "tower_create_file", json!({ "path": "ghost.rs" }));
     run(&bad_create, &mut reg); // response is an error; we don't assert here
 
     // Now find_file must return nothing — ghost.rs was not created.
-    let find_input = tools_call(8, "vfs_find_file", json!({ "query": "ghost" }));
+    let find_input = tools_call(8, "tower_find_file", json!({ "query": "ghost" }));
     let find_responses = run(&find_input, &mut reg);
     let text = find_responses[0]["result"]["content"][0]["text"]
         .as_str()
@@ -293,14 +293,18 @@ fn ac4_invalid_args_cause_no_state_change() {
     );
 }
 
-// ── AC5: vfs_delete_file on missing file → stable-code error ─────────────────
+// ── AC5: tower_delete_file on missing file → stable-code error ───────────────
 
 #[test]
 fn ac5_delete_missing_file_returns_stable_error_code_over_transport() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    let input = tools_call(9, "vfs_delete_file", json!({ "path": "does_not_exist.rs" }));
+    let input = tools_call(
+        9,
+        "tower_delete_file",
+        json!({ "path": "does_not_exist.rs" }),
+    );
     let responses = run(&input, &mut reg);
 
     assert_eq!(responses.len(), 1);
@@ -339,7 +343,7 @@ fn full_sequence_create_search_delete_over_transport() {
     // 1. Create a file.
     let create = tools_call(
         10,
-        "vfs_create_file",
+        "tower_create_file",
         json!({ "path": "src/engine.rs", "content": "pub fn run() {}" }),
     );
     let r1 = run(&create, &mut reg);
@@ -350,7 +354,7 @@ fn full_sequence_create_search_delete_over_transport() {
     );
 
     // 2. Search for content inside the file.
-    let search = tools_call(11, "vfs_search_text", json!({ "pattern": "run" }));
+    let search = tools_call(11, "tower_search_text", json!({ "pattern": "run" }));
     let r2 = run(&search, &mut reg);
     assert!(
         r2[0].get("result").is_some(),
@@ -363,7 +367,7 @@ fn full_sequence_create_search_delete_over_transport() {
     assert!(!matches.is_empty(), "search_text must find 'run'");
 
     // 3. Delete the file.
-    let delete = tools_call(12, "vfs_delete_file", json!({ "path": "src/engine.rs" }));
+    let delete = tools_call(12, "tower_delete_file", json!({ "path": "src/engine.rs" }));
     let r3 = run(&delete, &mut reg);
     assert!(
         r3[0].get("result").is_some(),
@@ -372,7 +376,7 @@ fn full_sequence_create_search_delete_over_transport() {
     );
 
     // 4. Find should now return nothing.
-    let find = tools_call(13, "vfs_find_file", json!({ "query": "engine" }));
+    let find = tools_call(13, "tower_find_file", json!({ "query": "engine" }));
     let r4 = run(&find, &mut reg);
     let text4 = r4[0]["result"]["content"][0]["text"].as_str().unwrap();
     let payload4: Value = serde_json::from_str(text4).unwrap();
@@ -382,7 +386,7 @@ fn full_sequence_create_search_delete_over_transport() {
     );
 }
 
-// ── vfs_global_replace over transport ─────────────────────────────────────────
+// ── tower_global_replace over transport ───────────────────────────────────────
 
 #[test]
 fn global_replace_returns_files_changed_count() {
@@ -391,7 +395,7 @@ fn global_replace_returns_files_changed_count() {
 
     let input = tools_call(
         20,
-        "vfs_global_replace",
+        "tower_global_replace",
         json!({ "target": "client", "replacement": "server" }),
     );
     let responses = run(&input, &mut reg);
@@ -410,14 +414,14 @@ fn global_replace_returns_files_changed_count() {
     );
 }
 
-// ── vfs_read_file over transport ──────────────────────────────────────────────
+// ── tower_read_file over transport ────────────────────────────────────────────
 
 #[test]
 fn read_file_returns_content_over_transport() {
     let state = state_with_client_file();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    let input = tools_call(30, "vfs_read_file", json!({ "path": "src/client.rs" }));
+    let input = tools_call(30, "tower_read_file", json!({ "path": "src/client.rs" }));
     let responses = run(&input, &mut reg);
     let resp = &responses[0];
     assert!(
@@ -439,7 +443,7 @@ fn read_file_on_missing_path_returns_error() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    let input = tools_call(31, "vfs_read_file", json!({ "path": "missing.rs" }));
+    let input = tools_call(31, "tower_read_file", json!({ "path": "missing.rs" }));
     let responses = run(&input, &mut reg);
     let resp = &responses[0];
     assert!(
@@ -447,21 +451,21 @@ fn read_file_on_missing_path_returns_error() {
         "read_file on missing path must error: {resp}"
     );
     // PortError::NotFound must surface as the stable -32002 code (same contract
-    // as vfs_delete_file; both go through domain_err_to_tool_error → ResourceNotFound).
+    // as tower_delete_file; both go through domain_err_to_tool_error → ResourceNotFound).
     assert_eq!(
         resp["error"]["code"], -32002,
         "read_file on missing path must return -32002: {resp}"
     );
 }
 
-// ── vfs_create_directory over transport ───────────────────────────────────────
+// ── tower_create_directory over transport ─────────────────────────────────────
 
 #[test]
 fn create_directory_succeeds_over_transport() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
-    let input = tools_call(40, "vfs_create_directory", json!({ "path": "a/b/c" }));
+    let input = tools_call(40, "tower_create_directory", json!({ "path": "a/b/c" }));
     let responses = run(&input, &mut reg);
     let resp = &responses[0];
     assert!(

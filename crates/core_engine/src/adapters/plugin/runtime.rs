@@ -26,7 +26,7 @@
 //! # Graceful degradation (drop & play)
 //!
 //! A missing or empty plugins directory yields an empty registry, so the host
-//! serves exactly the 7 native `vfs_*` tools — identical to pre-plugin behaviour.
+//! serves exactly the 7 native `tower_*` tools — identical to pre-plugin behaviour.
 //! A single plugin that fails to load (malformed wasm, ABI mismatch, forbidden
 //! import, duplicate name) logs a warning to stderr and is skipped; startup never
 //! aborts because of one bad plugin.

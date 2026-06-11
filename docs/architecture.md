@@ -166,7 +166,7 @@ stdin (newline-delimited JSON-RPC 2.0)
   │  notification (no id) → silently dropped, no response
   │  malformed frame      → -32700 ParseError, loop continues
   │
-  ├─ native tool path (vfs_* names):
+  ├─ native tool path (tower_* names):
   │    NativeToolRegistry::call(name, args)
   │      acquires RwLock::write (mutations) or RwLock::read (reads)
   │      delegates to SearchUseCase / FileMutationUseCase
@@ -176,7 +176,7 @@ stdin (newline-delimited JSON-RPC 2.0)
   │      StoragePort::put / put_batch → sled
   │      PluginHostPort::on_file_indexed / on_file_changed → plugin fan-out
   │
-  └─ plugin tool path ("<plugin_id>/<tool_name>" names):
+  └─ plugin tool path ("tower_<plugin_id>_<tool_name>" names):
        MergedRegistry::call → host.read() [RwLock read guard only]
          PluginHostRegistry::call_instance_tool(plugin_id, tool_name, args)
            Mutex<Box<dyn PluginInstance>>::lock [per-slot, not global]
@@ -203,7 +203,7 @@ OS inotify/kqueue/FSEvents
 ## Plugin runtime (Microkernel)
 
 The plugin system is a "drop and play" microkernel: place a `.wasm` file in the plugin directory
-and it is loaded, sandboxed, and its tools appear in `tools/list` under `<plugin_name>/<tool_name>`.
+and it is loaded, sandboxed, and its tools appear in `tools/list` under `tower_<plugin_name>_<tool_name>`.
 
 ```
 Plugin SDK (crates/plugin_sdk/)
@@ -259,11 +259,12 @@ Fault Isolation (adapters/plugin/isolation.rs — IsolatedSandbox)
   MCP link is never severed by a plugin fault
 
 MCP tool merging (adapters/mcp/merged_registry.rs — MergedRegistry)
-  list()  = NativeToolRegistry::list() ++ plugin tools namespaced as "<id>/<name>"
+  list()  = NativeToolRegistry::list() ++ plugin tools namespaced as "tower_<id>_<name>"
   call(name):
-    contains '/'? → split → host.read() [RwLock read, not write] → call_instance_tool
-    else          → NativeToolRegistry::call(name, args)
-  Plugin tools cannot claim un-namespaced names; no collision possible.
+    native name ("tower_find_file", …)? → NativeToolRegistry::call(name, args)
+    else "tower_<id>_<tool>"            → host.read() [RwLock read, not write] → call_instance_tool
+  Plugin names beginning with "tower" are reserved for host tools and
+  rejected at registration; no collision possible.
 ```
 
 Hook kinds (ABI v2): `BeforeToolCall`, `AfterToolCall`, `FileIndexed`, `FileChanged`.
@@ -282,7 +283,8 @@ block others.
 | **Capability security**: WASM guests reach the workspace only via `tower_host::host_log` and `tower_host::host_read_file`; any other `tower_host` import causes `LinkError` at instantiation | `WasmtimeHost` linker setup; `WasiCtxBuilder::new()` zero-capability |
 | **ABI version guard**: plugins where `manifest.abi != ABI_VERSION` (currently 2) are rejected | `PluginHostRegistry::register` and `WasmtimeHost::load` |
 | **Unique plugin names**: duplicate `manifest.name` returns `RegistrationError::DuplicateName` | `PluginHostRegistry::register` |
-| **Plugin tool namespacing**: `MergedRegistry` unconditionally uses `<plugin_name>/<tool_name>`; no code path allows an un-namespaced plugin tool | `MergedRegistry::list` |
+| **Plugin tool namespacing**: `MergedRegistry` unconditionally uses `tower_<plugin_name>_<tool_name>`; no code path allows an un-namespaced plugin tool | `MergedRegistry::list` |
+| **Reserved host prefix**: plugin names beginning with `tower` are reserved for native host tools and rejected at registration; guarantees plugin tool names never collide with native `tower_*` tools | `PluginHostRegistry::register` |
 | **Single static binary**: `cargo build -p core_engine` produces a self-contained `tower` binary; no JVM, Node, or container required | Cargo workspace; no runtime dynamic linking |
 
 ## JSON-RPC error codes
@@ -307,7 +309,7 @@ Success shape:
 
 **`Arc<RwLock<EngineState>>`** — wiring choice at startup. `Arc` provides shared ownership
 between the MCP handler and the future watcher thread without copying. `RwLock` allows
-concurrent `vfs_find_file` / `vfs_search_text` readers while serialising mutating calls
+concurrent `tower_find_file` / `tower_search_text` readers while serialising mutating calls
 (`create_file`, `delete_file`, `global_replace`). Critical sections hold no blocking I/O.
 
 **`host.read()` not `host.write()` in `MergedRegistry::call`** — plugin tool dispatch acquires
@@ -342,6 +344,6 @@ tests use only in-memory doubles — zero disk I/O.
 ## Related pages
 
 - [getting-started.md](getting-started.md) — prerequisites, build commands, first run
-- [mcp-tools.md](mcp-tools.md) — the 7 native VFS tools and 2 AST plugin tools
+- [mcp-tools.md](mcp-tools.md) — the 7 native tools and 2 AST plugin tools
 - [plugins.md](plugins.md) — writing a plugin, the ABI, SDK, and fault isolation
 - [development.md](development.md) — quality gate, CI, test strategy, contributing

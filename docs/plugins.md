@@ -5,7 +5,7 @@ or recompiling the host binary. A plugin is a single `.wasm` file compiled to `w
 
 > **Status**: drop & play is live. The production `tower` binary scans a plugins directory at
 > startup, loads every `*.wasm` through the isolated-sandbox path (specs 11c/11d), and serves their
-> tools over MCP alongside the 7 native `vfs_*` tools (spec 12b) — no host recompile required. Drop a
+> tools over MCP alongside the 7 native `tower_*` tools (spec 12b) — no host recompile required. Drop a
 > `.wasm` in the plugins directory, restart `tower`, and its tools appear in `tools/list`.
 
 This guide covers everything needed to write, build, and deploy a plugin.
@@ -36,9 +36,9 @@ This guide covers everything needed to write, build, and deploy a plugin.
 │  IsolationEngine ── fuel + epoch + background ticker        │
 │  IsolatedSandbox ── per-call budget, trap catch, quarantine  │
 │  PluginHostRegistry ── manifest.name as namespace key        │
-│  MergedRegistry ── native tools + plugin/<tool> routing      │
+│  MergedRegistry ── native tools + tower_<plugin>_<tool>      │
 │                                                              │
-│  MCP tools/list: "hello/greet", "ast/ast_get_outline", …    │
+│  MCP tools/list: "tower_hello_greet", "tower_ast_ast_get_outline", … │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -207,7 +207,7 @@ through unchanged. Tool dispatch is explicit in `call_tool`.
 
 ```rust
 PluginManifest {
-    name:    String,        // routing namespace: tools appear as "<name>/<tool_name>" in MCP
+    name:    String,        // routing namespace: tools appear as "tower_<name>_<tool_name>" in MCP; must not begin with "tower"
     version: String,        // semver string, informational
     abi:     u32,           // must equal ABI_VERSION (currently 2); any other value → load rejection
     tools:   Vec<ToolDesc>, // tools this plugin exports
@@ -374,17 +374,20 @@ For every `*.wasm` in the directory (processed in sorted order), the host:
 1. Calls `__plugin_init` to read the `PluginManifest`.
 2. Checks `manifest.abi == ABI_VERSION` (currently `2`). Mismatch → `PluginLoadError::AbiMismatch`.
 3. Checks `manifest.name` is unique. Duplicate → `RegistrationError::DuplicateName`.
+   Also checks `manifest.name` does not begin with `tower` (reserved for native host tools) →
+   `RegistrationError::ReservedName`.
 4. Wraps the instance in an `IsolatedSandbox` with fuel + epoch compute bounds (spec 11d), injecting
    the workspace `FileSystemPort` so `host::read_file` reads the real workspace.
-5. Registers the tools in the `MergedRegistry` under `<manifest.name>/<tool_name>` (spec 12b).
+5. Registers the tools in the `MergedRegistry` under `tower_<manifest.name>_<tool_name>` (spec 12b).
 
 From this point the plugin's tools appear in the MCP `tools/list` response with no host recompile.
 
 ### Graceful degradation
 
-- **No plugins directory / empty directory** → the host serves exactly the 7 native `vfs_*` tools,
+- **No plugins directory / empty directory** → the host serves exactly the 7 native `tower_*` tools,
   identical to a build with no plugins.
-- **A single bad plugin** (malformed wasm, ABI mismatch, forbidden import, duplicate name) is logged
+- **A single bad plugin** (malformed wasm, ABI mismatch, forbidden import, duplicate name, or a name
+  beginning with the reserved `tower` prefix) is logged
   to stderr as a warning and **skipped** — startup never aborts, and the remaining plugins still load.
 - **A plugin that faults at call time** (trap, infinite loop, fuel/epoch exhaustion) is isolated by
   its sandbox: the call returns a tool error and the host plus MCP link survive (spec 11d).
@@ -399,7 +402,7 @@ AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
 
 mkdir -p .tower/plugins
 cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
-cargo run -p core_engine            # tools/list now includes ast/ast_get_outline + ast/ast_find_symbols
+cargo run -p core_engine            # tools/list now includes tower_ast_ast_get_outline + tower_ast_ast_find_symbols
 ```
 
 ---
@@ -482,14 +485,17 @@ All faults map to JSON-RPC `-32603 InternalError`. The MCP link is unaffected.
 
 ## Tool namespacing
 
-Plugin tool names are always prefixed with the plugin's manifest name in MCP:
+Plugin tool names are always prefixed with `tower_<manifest.name>_` in MCP:
 
 ```
-manifest.name = "ast"  →  MCP tool name: "ast/ast_get_outline"
-manifest.name = "hello" → MCP tool name: "hello/greet"
+manifest.name = "ast"  →  MCP tool name: "tower_ast_ast_get_outline"
+manifest.name = "hello" → MCP tool name: "tower_hello_greet"
 ```
 
-Native host tools (`vfs_find_file`, etc.) keep their unprefixed names. No collision is possible.
+Native host tools (`tower_find_file`, etc.) carry the bare `tower_` prefix. To guarantee plugin
+tools can never collide with native ones, **a plugin name must not begin with `tower`** — that
+prefix is reserved for host tools. A plugin whose `manifest.name` starts with `tower` is rejected
+at registration (`RegistrationError::ReservedName`). No collision is possible.
 
 ---
 
@@ -517,7 +523,7 @@ cargo build -p hello_plugin --target wasm32-wasip1
 The `greet` tool call from MCP:
 
 ```json
-{"jsonrpc":"2.0","method":"tools/call","params":{"name":"hello/greet","arguments":{"name":"Alice"}},"id":1}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_hello_greet","arguments":{"name":"Alice"}},"id":1}
 ```
 
 Response:
@@ -529,7 +535,7 @@ Response:
 The `read_file_echo` tool demonstrates `host::read_file`:
 
 ```json
-{"jsonrpc":"2.0","method":"tools/call","params":{"name":"hello/read_file_echo","arguments":{"path":"Cargo.toml"}},"id":2}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_hello_read_file_echo","arguments":{"path":"Cargo.toml"}},"id":2}
 ```
 
 ---
@@ -570,11 +576,11 @@ cargo test -p plugin_ast
 MCP call examples once loaded:
 
 ```json
-{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ast/ast_get_outline","arguments":{"path":"src/lib.rs"}},"id":3}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_ast_ast_get_outline","arguments":{"path":"src/lib.rs"}},"id":3}
 ```
 
 ```json
-{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ast/ast_find_symbols","arguments":{"path":"src/lib.rs","symbol_name":"MyStruct","kind":"struct"}},"id":4}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tower_ast_ast_find_symbols","arguments":{"path":"src/lib.rs","symbol_name":"MyStruct","kind":"struct"}},"id":4}
 ```
 
 Valid `kind` values: `function`, `struct`, `enum`, `trait`, `impl`, `method`, `module`,

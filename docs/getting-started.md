@@ -249,9 +249,9 @@ Expected response:
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 ```
 
-The response lists 7 native `vfs_*` tools plus any loaded plugin tools (e.g., `ast/ast_get_outline`,
-`ast/ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
-`<plugin_name>/<tool_name>`.
+The response lists 7 native `tower_*` tools plus any loaded plugin tools (e.g., `tower_ast_ast_get_outline`,
+`tower_ast_ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
+`tower_<plugin_name>_<tool_name>`.
 
 To deploy a plugin, drop its `.wasm` into the plugins directory and restart `tower` — no recompile.
 The directory is resolved from `--plugins-dir <path>`, then `$TOWER_PLUGINS_DIR`, then the default
@@ -260,7 +260,7 @@ The directory is resolved from `--plugins-dir <path>`, then `$TOWER_PLUGINS_DIR`
 ```bash
 mkdir -p .tower/plugins
 cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
-cargo run -p core_engine     # ast/* tools now appear in tools/list
+cargo run -p core_engine     # tower_ast_* tools now appear in tools/list
 ```
 
 A missing or empty directory simply serves the 7 native tools; a malformed or ABI-mismatched
@@ -270,31 +270,31 @@ A missing or empty directory simply serves the 7 native tools; a malformed or AB
 ### Find a file
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vfs_find_file","arguments":{"query":"main.rs"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find_file","arguments":{"query":"main.rs"}}}
 ```
 
 ### Search for text
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"vfs_search_text","arguments":{"pattern":"fn main"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_search_text","arguments":{"pattern":"fn main"}}}
 ```
 
 ### Read a file
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"vfs_read_file","arguments":{"path":"src/main.rs"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"src/main.rs"}}}
 ```
 
 ### Create a file
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"vfs_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
 ```
 
 ### Mass find-and-replace
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"vfs_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
 ```
 
 Response shape (success):
@@ -323,6 +323,6 @@ the tool-specific payload.
 ## Next steps
 
 - [architecture.md](architecture.md) — hexagonal boundary, domain model, adapter wiring
-- [mcp-tools.md](mcp-tools.md) — all 7 native VFS tools and the AST plugin tools in full detail
+- [mcp-tools.md](mcp-tools.md) — all 7 native tools and the AST plugin tools in full detail
 - [plugins.md](plugins.md) — authoring a Drop-and-Play wasm plugin, ABI, fault isolation
 - [development.md](development.md) — contribution guide, TDD workflow, benchmark targets
