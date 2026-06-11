@@ -52,10 +52,16 @@ wasm-fixtures: ## Build the 5 wasm test fixtures + hello
 	cargo build $(FIXTURE_FLAGS) --target $(WASM_TARGET)
 
 .PHONY: wasm-ast
-wasm-ast: ## Build ast for wasm (uses cached WASI SDK; override via CC_wasm32_wasip1 / AR_wasm32_wasip1)
+wasm-ast: ## Build ast for wasm (debug; uses cached WASI SDK; override via CC_wasm32_wasip1 / AR_wasm32_wasip1)
 	CC_wasm32_wasip1="$${CC_wasm32_wasip1:-$(WASI_CC)}" \
 	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
 	cargo build -p ast --target $(WASM_TARGET)
+
+.PHONY: wasm-ast-release
+wasm-ast-release: ## Build ast for wasm (release; smaller/faster — use for deployed plugins)
+	CC_wasm32_wasip1="$${CC_wasm32_wasip1:-$(WASI_CC)}" \
+	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
+	cargo build -p ast --target $(WASM_TARGET) --release
 
 ## ---------------------------------------------------------------------------
 ## Quality gate (same order as CI — see docs/development.md)
