@@ -141,7 +141,7 @@ impl SledStorageAdapter {
     /// `sled::open` can briefly fail with "could not acquire lock" (WouldBlock).
     /// A bounded retry rides out that window; a database genuinely held by
     /// another live process still surfaces the error after the attempts.
-    fn open_db_with_retry(path: &Path) -> Result<sled::Db, sled::Error> {
+    pub(super) fn open_db_with_retry(path: &Path) -> Result<sled::Db, sled::Error> {
         const MAX_ATTEMPTS: u32 = 10;
         let backoff = std::time::Duration::from_millis(25);
         let mut attempt = 0;
