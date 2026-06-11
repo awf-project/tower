@@ -190,6 +190,29 @@ pub enum SymbolResult {
 
 // ── Language enum (dispatch) ──────────────────────────────────────────────────
 
+/// Derive a display label from a language hint (file path or bare language id).
+///
+/// If `hint` contains a `.`, the substring after the **last** `.` is returned,
+/// lowercased (i.e. the file extension).  Otherwise the hint is returned
+/// unchanged so that bare language ids like `"typescript"` pass through as-is.
+///
+/// # Examples
+///
+/// ```
+/// use plugin_ast::symbols::language_label;
+/// assert_eq!(language_label("foo.py"),        "py");
+/// assert_eq!(language_label("lab/notes.md"),  "md");
+/// assert_eq!(language_label("typescript"),    "typescript");
+/// assert_eq!(language_label("UPPER.PY"),      "py");
+/// ```
+#[must_use]
+pub fn language_label(hint: &str) -> String {
+    match hint.rfind('.') {
+        Some(pos) => hint[pos + 1..].to_lowercase(),
+        None => hint.to_owned(),
+    }
+}
+
 /// Supported languages for AST operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportedLanguage {
@@ -270,7 +293,7 @@ pub fn find_symbols(
         Some(l) => l,
         None => {
             return SymbolResult::Unsupported {
-                language: language_hint.to_owned(),
+                language: language_label(language_hint),
             }
         }
     };
@@ -1119,6 +1142,53 @@ function findFunction() {}
             matches!(result, SymbolResult::Unsupported { .. }),
             "AC3: unknown language must return Unsupported, got {result:?}"
         );
+    }
+
+    // ── MIN-01: language_label — extension extraction ─────────────────────────
+
+    /// MIN-01: path hint with directory component produces the extension as label.
+    #[test]
+    fn min01_unsupported_path_with_directory_uses_extension() {
+        let result = find_symbols(
+            b"# heading",
+            "lab/notes.md",
+            "anything",
+            SymbolKind::Function,
+        );
+        assert!(
+            matches!(result, SymbolResult::Unsupported { ref language } if language == "md"),
+            "MIN-01: lab/notes.md must produce language=\"md\", got {result:?}"
+        );
+    }
+
+    /// MIN-01: bare extension path (no directory) produces the extension.
+    #[test]
+    fn min01_unsupported_simple_path_uses_extension() {
+        let result = find_symbols(b"", "foo.py", "anything", SymbolKind::Function);
+        assert!(
+            matches!(result, SymbolResult::Unsupported { ref language } if language == "py"),
+            "MIN-01: foo.py must produce language=\"py\", got {result:?}"
+        );
+    }
+
+    /// MIN-01: dotless hint (bare language id) passes through unchanged.
+    #[test]
+    fn min01_unsupported_dotless_hint_passthrough() {
+        let result = find_symbols(b"", "typescript", "anything", SymbolKind::Function);
+        assert!(
+            matches!(result, SymbolResult::Unsupported { ref language } if language == "typescript"),
+            "MIN-01: dotless hint \"typescript\" must produce language=\"typescript\", got {result:?}"
+        );
+    }
+
+    /// MIN-01: language_label is directly testable as a public helper.
+    #[test]
+    fn min01_language_label_unit() {
+        assert_eq!(language_label("foo.py"), "py");
+        assert_eq!(language_label("lab/notes.md"), "md");
+        assert_eq!(language_label("typescript"), "typescript");
+        assert_eq!(language_label("src/main.rs"), "rs");
+        assert_eq!(language_label("UPPER.PY"), "py");
     }
 
     // ── TDD step 5 (RED → GREEN): malformed input (UN1/AC4) ──────────────────

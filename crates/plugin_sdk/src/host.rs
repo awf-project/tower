@@ -115,11 +115,65 @@ pub fn log(message: &str) {
     }
 }
 
+/// Outcome of decoding the raw values returned by `host_read_file`.
+///
+/// This enum makes the three-way decision testable on the host target
+/// without touching any `wasm32`-only unsafe pointer logic.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// `rc != 0`, or the contradictory case `rc == 0 && ptr_is_null && len > 0`.
+    Failure,
+    /// `rc == 0` and `len == 0`: the file exists but has no content.
+    Empty,
+    /// `rc == 0`, `ptr_is_null == false`, and `len > 0`: a buffer to reconstruct.
+    Buffer,
+}
+
+/// Pure decision function for `host_read_file` return values.
+///
+/// Separating this logic from the unsafe pointer reconstruction makes it
+/// testable on the host target without a wasm runtime.
+///
+/// # Decision table
+///
+/// | `rc` | `ptr_is_null` | `len` | Outcome         |
+/// |------|---------------|-------|-----------------|
+/// | 0    | true          | 0     | `Empty`         |
+/// | 0    | false         | > 0   | `Buffer`        |
+/// | 0    | false         | 0     | `Empty`         |
+/// | != 0 | any           | any   | `Failure`       |
+/// | 0    | true          | > 0   | `Failure` (contradictory) |
+///
+/// # Examples
+///
+/// ```rust
+/// use plugin_sdk::host::{interpret_read, ReadOutcome};
+///
+/// assert_eq!(interpret_read(0, true, 0), ReadOutcome::Empty);
+/// assert_eq!(interpret_read(0, false, 5), ReadOutcome::Buffer);
+/// assert_eq!(interpret_read(1, true, 0), ReadOutcome::Failure);
+/// assert_eq!(interpret_read(0, true, 5), ReadOutcome::Failure);
+/// ```
+pub fn interpret_read(rc: i32, ptr_is_null: bool, len: usize) -> ReadOutcome {
+    if rc != 0 {
+        return ReadOutcome::Failure;
+    }
+    // rc == 0 from here on.
+    if len == 0 {
+        // Empty file: null pointer is expected when len == 0.
+        return ReadOutcome::Empty;
+    }
+    // len > 0: a null pointer with len > 0 is a contradictory/invalid response.
+    if ptr_is_null {
+        return ReadOutcome::Failure;
+    }
+    ReadOutcome::Buffer
+}
+
 /// Read a workspace-relative file through the host capability.
 ///
-/// Returns the file bytes on success, or `None` if the file was not found.
-/// On I/O error the result is also `None` (conservative: treat errors as
-/// not-found from the plugin's perspective to avoid leaking error detail).
+/// Returns the file bytes on success (`Some(Vec::new())` for an empty file),
+/// or `None` if the file was not found or an I/O error occurred.
 ///
 /// On non-wasm targets this always returns `None` (stub; not callable in tests).
 ///
@@ -150,19 +204,59 @@ pub fn read_file(workspace_path: &str) -> Option<Vec<u8>> {
             )
         };
 
-        if rc != 0 || out_ptr.is_null() {
-            return None;
-        }
-
         let len = out_len as usize;
-        // Safety: host allocated this buffer via __plugin_alloc(len); we
-        // reconstruct it as a Vec and take ownership. The host will not free it.
-        let bytes = unsafe { Vec::from_raw_parts(out_ptr, len, len) };
-        Some(bytes)
+        match interpret_read(rc as i32, out_ptr.is_null(), len) {
+            ReadOutcome::Empty => Some(Vec::new()),
+            ReadOutcome::Failure => None,
+            ReadOutcome::Buffer => {
+                // Safety: host allocated this buffer via __plugin_alloc(len);
+                // interpret_read guarantees out_ptr is non-null and len > 0.
+                // We reconstruct it as a Vec and take ownership; the host will not free it.
+                Some(unsafe { Vec::from_raw_parts(out_ptr, len, len) })
+            }
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = workspace_path;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{interpret_read, ReadOutcome};
+
+    /// (rc=0, ptr_null=true, len=0) => Empty: zero-byte file, null pointer is valid.
+    #[test]
+    fn empty_file_rc0_null_ptr_len0_is_empty() {
+        assert_eq!(interpret_read(0, true, 0), ReadOutcome::Empty);
+    }
+
+    /// (rc=0, ptr_null=false, len=5) => Buffer: normal non-empty file.
+    #[test]
+    fn normal_file_rc0_nonnull_ptr_len5_is_buffer() {
+        assert_eq!(interpret_read(0, false, 5), ReadOutcome::Buffer);
+    }
+
+    /// (rc=0, ptr_null=false, len=0) => Empty: non-null but zero length, treat as empty.
+    #[test]
+    fn empty_file_rc0_nonnull_ptr_len0_is_empty() {
+        assert_eq!(interpret_read(0, false, 0), ReadOutcome::Empty);
+    }
+
+    /// (rc=1, ...) => Failure: any non-zero rc is a failure.
+    #[test]
+    fn error_rc1_is_failure() {
+        assert_eq!(interpret_read(1, true, 0), ReadOutcome::Failure);
+        assert_eq!(interpret_read(1, false, 5), ReadOutcome::Failure);
+        assert_eq!(interpret_read(2, true, 0), ReadOutcome::Failure);
+    }
+
+    /// (rc=0, ptr_null=true, len=5) => Failure: contradictory — null pointer with
+    /// non-zero length is an invalid host response.
+    #[test]
+    fn contradictory_null_ptr_with_nonzero_len_is_failure() {
+        assert_eq!(interpret_read(0, true, 5), ReadOutcome::Failure);
     }
 }

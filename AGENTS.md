@@ -46,9 +46,27 @@ cargo test --workspace                       # domain unit tests use in-memory d
 cargo clippy --workspace -- -D warnings      # warnings are errors
 cargo fmt --check
 cargo deny check                             # license/advisory policy
-cargo build -p plugin_ast --target wasm32-wasip1   # the WASM reference plugin
+cargo build -p plugin_ast --target wasm32-wasip1   # the WASM reference plugin (needs WASI SDK env — see below)
 cargo run -p core_engine                     # MCP server over stdio (after spec 10b)
 ```
+
+### Building the WASM plugins (read before "WASI sysroot" errors)
+
+`cargo build --target wasm32-wasip1` fails with a missing-sysroot error (`clang` can't find
+`stdlib.h`) unless the WASI SDK env vars are set. Tree-sitter grammars are C code cross-compiled
+to wasm; point cargo at the cached WASI toolchain:
+
+```bash
+CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang \
+AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
+cargo build -p plugin_ast --target wasm32-wasip1
+```
+
+**`build.rs` does NOT build the WASM** (spawning `cargo build` from it deadlocks on the workspace
+build lock — by design). It only *locates* the artifact and exports `PLUGIN_AST_WASM`. So
+`cargo test --workspace` runs the `plugin_ast_e2e` suite against **whatever `.wasm` is already on
+disk**. After any change to `plugin_sdk` or `plugin_ast`, **rebuild the wasm first** (command above)
+or the e2e suite silently passes against a stale binary — a false green.
 
 **Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy -- -D warnings`
 + `cargo test --workspace` all green. State it with evidence, never assume.

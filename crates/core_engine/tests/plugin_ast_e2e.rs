@@ -271,8 +271,8 @@ fn ac2_non_rust_file_returns_unsupported_result() {
         "AC2: unsupported-language result must have 'unsupported' key, got: {result_str}"
     );
     assert!(
-        result_str.contains("hello.py"),
-        "AC2: unsupported result must include the file name, got: {result_str}"
+        result_str.contains("\"py\""),
+        "AC2: unsupported result must include the language extension, got: {result_str}"
     );
 }
 
@@ -703,5 +703,40 @@ fn ac4_12d_malformed_rust_returns_partial_without_crash() {
     assert!(
         result_str.contains("\"matches\""),
         "AC4: malformed file must return 'matches', got: {result_str}"
+    );
+}
+
+// ── BUG-01: zero-byte source file must not trap ───────────────────────────────
+
+/// BUG-01 regression: A zero-byte file with a supported extension (.rs) must
+/// return `{ "items": [] }` from `ast/ast_get_outline`, NOT a -32603 MCP error
+/// (wasm trap). Root cause was the guest SDK treating rc=0 + null ptr as a
+/// missing-file error regardless of out_len; an empty file legitimately returns
+/// rc=0, out_len=0, and a null pointer. Fixed in `plugin_sdk::host::interpret_read`.
+#[test]
+fn bug01_zero_byte_rust_file_returns_empty_items_not_trap() {
+    // A zero-byte .rs file: empty content, supported extension.
+    let fs = fs_with("empty.rs", b"");
+    let mut registry = merged_registry_with_plugin_ast(fs);
+
+    let args = serde_json::json!({ "path": "empty.rs" });
+    let result = registry
+        .call("ast/ast_get_outline", args)
+        .expect("BUG-01: zero-byte file must not produce a wasm trap / MCP -32603");
+
+    let result_str = result.to_string();
+
+    // Must return the outline shape with an empty items list — not an error.
+    assert!(
+        result_str.contains("\"items\""),
+        "BUG-01: zero-byte file must return 'items' key, got: {result_str}"
+    );
+
+    let items = result["items"]
+        .as_array()
+        .expect("BUG-01: 'items' must be a JSON array");
+    assert!(
+        items.is_empty(),
+        "BUG-01: zero-byte file must yield empty items list, got: {result_str}"
     );
 }

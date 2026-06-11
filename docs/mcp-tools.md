@@ -446,6 +446,33 @@ Parallel mass find-and-replace across every indexed file. Each file is rewritten
 atomically via the shadow-file pattern. Partial failures (per-file I/O errors)
 are reported in `errors` without aborting the remaining files.
 
+**Warning — purely textual, not AST-aware**
+
+`vfs_global_replace` rewrites every literal byte-for-byte occurrence of the
+search string across **all indexed files** regardless of file type or syntactic
+context. It has no understanding of the language structure around a match. This
+means:
+
+- Occurrences inside **code comments** are replaced.
+- Occurrences inside **string literals** are replaced.
+- Occurrences in **Markdown prose**, **plain-text files**, and any other
+  non-code format are replaced.
+- A match that spans a rename in one file will be applied identically in every
+  other file that happens to contain the same byte sequence.
+
+**Observed example.** Renaming `compute_area` → `calculate_area` affected
+**6 files / 10 occurrences**, touching: a function definition, its call-sites,
+a `// compute_area: legacy alias` comment, a `docs/api.md` prose paragraph, and
+a `CHANGELOG.txt` entry — all rewritten unconditionally.
+
+**Recommended workflow — always check blast radius first:**
+
+1. Run `vfs_search_text` with your `target` string to review every occurrence
+   and its surrounding context before committing to the replacement.
+2. Inspect the results: if any hit is inside a comment, a string literal, or a
+   prose file that should not change, consider a targeted edit instead.
+3. Only then call `vfs_global_replace`.
+
 | Field         | Type   | Required | Description                                    |
 |---------------|--------|----------|------------------------------------------------|
 | `target`      | string | yes      | The string to search for                       |
