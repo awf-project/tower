@@ -1,6 +1,9 @@
 .agent/
 .grepai/
 
+# The `tower` MCP server creates a sled database under <workspace>/.tower/ at runtime.
+.tower/
+
 # Added by awf project-onboard
 /target/
 debug/
