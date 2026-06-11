@@ -11,12 +11,18 @@
 //!    (`StoragePort::is_scan_complete`).
 //! 4. Wrap all state in an `Arc<RwLock<EngineState>>` for deadlock-free sharing
 //!    with any future background watcher thread (spec 06 lock discipline).
-//! 5. Discover and load WASM plugins (drop & play): resolve the plugins
-//!    directory (`--plugins-dir` / `$TOWER_PLUGINS_DIR` / `<root>/.tower/plugins`),
-//!    load each `*.wasm` through the isolated-sandbox path (11c/11d) injecting the
-//!    workspace `FileSystemPort`, and register the successful ones. A missing or
-//!    empty directory simply yields no plugins; a single bad plugin is skipped
-//!    with a stderr warning and never aborts startup.
+//! 5. Discover and load WASM plugins (drop & play) across two scopes: resolve the
+//!    ordered plugin dirs (`--plugins-dir` / `$TOWER_PLUGINS_DIR` replace the path;
+//!    otherwise the XDG global `~/.local/share/tower/plugins` then the project-local
+//!    `<root>/.tower/plugins`, local winning on a name collision), load each
+//!    `*.wasm` through the isolated-sandbox path (11c/11d) injecting the workspace
+//!    `FileSystemPort`, and register the survivors. A missing or empty scope simply
+//!    yields no plugins; a single bad plugin is skipped with a stderr warning and
+//!    never aborts startup.
+//!
+//! The binary also exposes a `tower plugin <install|list|remove>` subcommand to
+//! manage the global scope; when `argv[1] == "plugin"` it runs that instead of the
+//! server.
 //! 6. Serve the 7 native `tower_*` tools PLUS any plugin tools (namespaced
 //!    `<plugin>/<tool>`) over real `stdin` / `stdout` via a `MergedRegistry`.
 //!
@@ -38,14 +44,15 @@
 
 use std::env;
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use core_engine::adapters::fs::{workspace_scan, RealFs};
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::{serve, MergedRegistry};
 use core_engine::adapters::plugin::{
-    load_plugins_into_registry, production_isolation_config, resolve_plugins_dir, IsolationEngine,
+    global_plugins_dir, install, load_plugins_into_registry, production_isolation_config,
+    resolve_plugin_dirs, IsolationEngine, DEFAULT_PLUGINS_SUBDIR,
 };
 use core_engine::adapters::SledStorageAdapter;
 use core_engine::domain::index::InvertedIndex;
@@ -53,9 +60,67 @@ use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::ports::{FileSystemPort, StoragePort};
 
 fn main() {
+    // Subcommand dispatch: `tower plugin <install|list|remove> ...` manages the
+    // global plugin scope instead of starting the MCP server.
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("plugin") {
+        if let Err(e) = run_plugin_cli(&args[2..]) {
+            eprintln!("tower: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = run() {
         eprintln!("tower: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Handle `tower plugin <install <path> | list | remove <name>>`.
+///
+/// `install`/`remove` act on the XDG global scope; `list` shows both the global
+/// scope and the current directory's local `.tower/plugins`. These manage plugin
+/// **files** by name — see [`core_engine::adapters::plugin::install`].
+fn run_plugin_cli(args: &[String]) -> Result<(), String> {
+    let global_dir = global_plugins_dir()
+        .ok_or("cannot determine the global plugins directory (no HOME/XDG base dir)")?;
+
+    match args.first().map(String::as_str) {
+        Some("install") => {
+            let src = args
+                .get(1)
+                .ok_or("usage: tower plugin install <path-to.wasm>")?;
+            let dest = install::install(&global_dir, Path::new(src))
+                .map_err(|e| format!("install failed: {e}"))?;
+            println!("installed {src} -> {}", dest.display());
+            Ok(())
+        }
+        Some("list") => {
+            let local = resolve_workspace_root().join(DEFAULT_PLUGINS_SUBDIR);
+            let listed = install::list(Some(&global_dir), Some(&local));
+            if listed.is_empty() {
+                println!("no plugins installed (global: {})", global_dir.display());
+            } else {
+                for p in listed {
+                    println!("{:<6} {}", p.scope.to_string(), p.file_name);
+                }
+            }
+            Ok(())
+        }
+        Some("remove") => {
+            let name = args.get(1).ok_or("usage: tower plugin remove <name>")?;
+            if install::remove(&global_dir, name).map_err(|e| format!("remove failed: {e}"))? {
+                println!("removed '{name}' from {}", global_dir.display());
+            } else {
+                println!("no such global plugin: '{name}'");
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!(
+            "unknown plugin subcommand '{other}' (expected: install | list | remove)"
+        )),
+        None => Err("usage: tower plugin <install <path> | list | remove <name>>".to_string()),
     }
 }
 
@@ -105,10 +170,14 @@ fn run() -> Result<(), String> {
         Box::new(fs),
     )));
 
-    // ── Step 5: discover and load WASM plugins (drop & play) ──────────────────
-    let plugins_dir = resolve_plugins_dir(
+    // ── Step 5: discover and load WASM plugins (global + local, drop & play) ──
+    // Explicit --plugins-dir / $TOWER_PLUGINS_DIR replace the search path; otherwise
+    // the XDG global scope is scanned first and the project-local scope last, so a
+    // local plugin shadows a global one of the same name.
+    let plugin_dirs = resolve_plugin_dirs(
         plugins_dir_arg().as_deref(),
         env::var("TOWER_PLUGINS_DIR").ok().as_deref(),
+        global_plugins_dir(),
         &workspace_root,
     );
 
@@ -122,16 +191,20 @@ fn run() -> Result<(), String> {
     let plugin_fs: Arc<dyn FileSystemPort + Send + Sync> = Arc::new(RealFs::new(&workspace_root));
 
     let plugin_host = load_plugins_into_registry(
-        &plugins_dir,
+        &plugin_dirs,
         &isolation_engine,
         plugin_fs,
         production_isolation_config(),
     );
     let plugin_count = plugin_host.declared_tools().len();
     if plugin_count > 0 {
+        let scopes: Vec<String> = plugin_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
         eprintln!(
-            "tower: loaded plugin tools from {} ({plugin_count} tool(s))",
-            plugins_dir.display()
+            "tower: loaded {plugin_count} plugin tool(s) from [{}]",
+            scopes.join(", ")
         );
     }
     let plugin_host = Arc::new(RwLock::new(plugin_host));

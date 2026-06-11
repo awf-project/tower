@@ -202,8 +202,10 @@ OS inotify/kqueue/FSEvents
 
 ## Plugin runtime (Microkernel)
 
-The plugin system is a "drop and play" microkernel: place a `.wasm` file in the plugin directory
-and it is loaded, sandboxed, and its tools appear in `tools/list` under `tower_<plugin_name>_<tool_name>`.
+The plugin system is a "drop and play" microkernel: place a `.wasm` file in a plugin scope — global
+(`~/.local/share/tower/plugins`, XDG; shared by all projects) or local (`<workspace>/.tower/plugins`;
+overrides global on a name collision) — and it is loaded, sandboxed, and its tools appear in
+`tools/list` under `tower_<plugin_name>_<tool_name>`.
 
 ```
 Plugin SDK (crates/plugin_sdk/)

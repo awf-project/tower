@@ -29,6 +29,14 @@ allow = [
     # restrictions whatsoever, making it fully compatible with EUPL-1.2
     # distribution.  FSF and SPDX both classify it as a free/libre license.
     "CC0-1.0",
+    # MPL-2.0: Mozilla Public License 2.0 (weak, file-level copyleft).
+    # Used by: option-ext (transitive via directories → dirs-sys), which resolves
+    # the XDG global plugins directory ($XDG_DATA_HOME / ~/.local/share).
+    # Evaluation: MPL-2.0 is FSF/SPDX-recognized free software. Its copyleft is
+    # per-file and only triggers on modification of MPL-covered files; we consume
+    # the crate unmodified, so it imposes no obligation beyond attribution and is
+    # compatible with EUPL-1.2 distribution.
+    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 

@@ -68,3 +68,9 @@ sled = "0.34"
 serde_json = "1"
 wasmtime = "45.0.1"
 wasmtime-wasi = "45.0.1"
+
+# Decision: directories for XDG-compliant global plugin scope resolution.
+# Why: resolves $XDG_DATA_HOME / ~/.local/share (and the spec's "ignore relative
+# XDG_DATA_HOME" rule) cross-platform, used only at the binary/adapter edge to
+# locate the global plugins dir. Domain stays untouched.
+directories = "6"
