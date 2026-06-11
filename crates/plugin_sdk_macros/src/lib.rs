@@ -49,7 +49,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemStruct};
+use syn::{ItemStruct, parse_macro_input};
 
 /// Wires up the four wasm export symbols for a `struct T: Plugin`.
 ///
@@ -98,7 +98,7 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// The returned pointer is valid until `__plugin_free` is called with
         /// the same pointer and the returned length. The host MUST call
         /// `__plugin_free` exactly once per `__plugin_init` call.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn __plugin_init() -> *mut u8 {
             let manifest = <#struct_name as ::plugin_sdk::Plugin>::init();
             let encoded = ::plugin_sdk::__private::encode_manifest(manifest);
@@ -116,7 +116,7 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// The host must have written exactly `len` bytes at `ptr` before calling
         /// this function. This function takes ownership of the arg buffer and
         /// frees it before returning; the host must not access `ptr` after the call.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn __plugin_call_tool(ptr: *mut u8, len: usize) -> *mut u8 {
             let response = {
                 let request_bytes = unsafe { ::std::slice::from_raw_parts(ptr, len) };
@@ -134,7 +134,7 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         ///
         /// Same ownership contract as `__plugin_call_tool`: `ptr` was returned
         /// by `__plugin_alloc(len)` and is freed by this function before return.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn __plugin_on_hook(ptr: *mut u8, len: usize) {
             let hook_bytes = unsafe { ::std::slice::from_raw_parts(ptr, len) };
             ::plugin_sdk::__private::dispatch_on_hook::<#struct_name>(hook_bytes);
@@ -149,7 +149,7 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         ///
         /// `ptr` must have been returned by a prior call to `__plugin_init` or
         /// `__plugin_call_tool` and must not have been freed previously.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "C" fn __plugin_free(ptr: *mut u8, len: usize) {
             unsafe { ::plugin_sdk::__private::free_buffer(ptr, len) };
         }
@@ -171,7 +171,7 @@ pub fn plugin_main(attr: TokenStream, item: TokenStream) -> TokenStream {
         ///   export with the returned pointer.
         /// - The host must not call `__plugin_free` on this pointer; the
         ///   receiving guest export owns and frees it.
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn __plugin_alloc(len: u32) -> *mut u8 {
             ::plugin_sdk::__private::alloc_guest_buffer(len as usize)
         }

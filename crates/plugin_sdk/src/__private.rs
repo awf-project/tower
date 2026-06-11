@@ -17,8 +17,8 @@
 //!
 //! All other functions are safe.
 
-use crate::types::{CallRequest, CallResponse, HookEnvelope, PluginManifest};
 use crate::Plugin;
+use crate::types::{CallRequest, CallResponse, HookEnvelope, PluginManifest};
 
 // ── Guest allocator export ────────────────────────────────────────────────────
 
@@ -221,7 +221,7 @@ pub fn dispatch_on_hook<P: Plugin>(hook_bytes: &[u8]) {
 mod tests {
     use super::*;
     use crate::types::{CallRequest, HookKind, HookPayload, SdkError, ToolDesc, Value};
-    use crate::{Plugin, PluginManifest, ABI_VERSION};
+    use crate::{ABI_VERSION, Plugin, PluginManifest};
 
     struct TestPlugin;
 

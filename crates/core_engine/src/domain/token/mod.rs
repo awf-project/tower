@@ -235,11 +235,7 @@ fn split_camel_case(input: &str) -> Vec<&str> {
         .windows(2)
         .filter_map(|w| {
             let s = &input[w[0]..w[1]];
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.is_empty() { None } else { Some(s) }
         })
         .collect()
 }

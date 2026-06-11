@@ -13,8 +13,8 @@ use crate::adapters::storage::SledStorageAdapter;
 use crate::domain::index::FileSearch;
 use crate::domain::virtual_file::FileMetadata;
 use crate::domain::{RelativePath, VirtualFile};
-use crate::ports::inbound::SearchUseCase;
 use crate::ports::StoragePort;
+use crate::ports::inbound::SearchUseCase;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -240,7 +240,7 @@ fn corrupt_index_entry_causes_put_to_abort_and_leaves_db_clean() {
     // When the real `put` tries to deserialise this, postcard will fail and
     // the transaction must abort.
     {
-        let db = sled::open(&db_path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&db_path).unwrap();
         let index_tree = db.open_tree("index").unwrap();
         index_tree
             .insert(b"corrupt", b"\xFF\xFF\xFF\xFF not valid postcard")
@@ -305,7 +305,7 @@ fn dangling_posting_reconciled_on_reload() {
         let posting: Vec<FileId> = vec![dead_id];
         let posting_bytes = postcard::to_allocvec(&posting).unwrap();
 
-        let db = sled::open(&db_path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&db_path).unwrap();
         let index_tree = db.open_tree("index").unwrap();
         index_tree
             .insert(b"phantom", posting_bytes.as_slice())
@@ -354,7 +354,7 @@ fn mixed_posting_retains_live_and_drops_dead_file_ids() {
         use crate::domain::FileId;
         let dead_id = FileId::new_for_testing(888, 7);
 
-        let db = sled::open(&db_path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&db_path).unwrap();
         let index_tree = db.open_tree("index").unwrap();
 
         // Append the dead id to the existing posting for "live" (if present)

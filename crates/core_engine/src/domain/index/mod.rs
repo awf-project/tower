@@ -135,7 +135,7 @@ impl InvertedIndex {
     /// Return an iterator over all [`FileId`]s associated with `token` (spec U1).
     ///
     /// Returns an empty iterator if no files are indexed under `token`.
-    pub fn query(&self, token: &Token) -> impl Iterator<Item = FileId> + '_ {
+    pub fn query(&self, token: &Token) -> impl Iterator<Item = FileId> + '_ + use<'_> {
         self.map
             .get(token)
             .into_iter()
@@ -166,8 +166,8 @@ mod tests {
     use super::*;
     use crate::domain::token::tokenize;
 
-    fn fid(index: u32, gen: u32) -> FileId {
-        FileId::new_for_testing(index, gen)
+    fn fid(index: u32, r#gen: u32) -> FileId {
+        FileId::new_for_testing(index, r#gen)
     }
 
     fn tok(s: &str) -> Token {

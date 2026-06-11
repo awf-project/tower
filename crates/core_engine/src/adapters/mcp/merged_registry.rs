@@ -352,10 +352,10 @@ pub fn sdk_value_to_json(sdk: SdkValue) -> JsonValue {
 mod tests {
     use std::sync::{Arc, RwLock};
 
-    use plugin_sdk::{HookKind, HookPayload, PluginManifest, Value as SdkValue, ABI_VERSION};
-    use serde_json::{json, Value as JsonValue};
+    use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, Value as SdkValue};
+    use serde_json::{Value as JsonValue, json};
 
-    use super::{json_to_sdk_value, sdk_value_to_json, MergedRegistry};
+    use super::{MergedRegistry, json_to_sdk_value, sdk_value_to_json};
     use crate::adapters::mcp::native_tools::EngineState;
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::{InMemoryFs, InMemoryStorage};

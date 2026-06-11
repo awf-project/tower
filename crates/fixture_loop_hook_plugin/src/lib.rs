@@ -14,8 +14,8 @@
 //! ```
 
 use plugin_sdk::{
-    plugin_main, HookKind, HookPayload, Plugin, PluginManifest, SdkError, ToolDesc, Value,
-    ABI_VERSION,
+    ABI_VERSION, HookKind, HookPayload, Plugin, PluginManifest, SdkError, ToolDesc, Value,
+    plugin_main,
 };
 
 /// A plugin whose hook handler runs an infinite loop.

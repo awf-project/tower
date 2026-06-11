@@ -47,7 +47,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::debounce::debounce_events;
@@ -316,8 +316,8 @@ mod tests {
     use crate::adapters::in_memory_storage::InMemoryStorage;
     use crate::domain::index::FileSearch;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::inbound::SearchUseCase as _;
     use crate::ports::NoOpPluginHost;
+    use crate::ports::inbound::SearchUseCase as _;
 
     /// Smoke test: the real OS watcher picks up a file creation under a tempdir.
     ///

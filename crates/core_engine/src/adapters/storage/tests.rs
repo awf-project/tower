@@ -19,7 +19,7 @@
 
 use tempfile::TempDir;
 
-use crate::adapters::storage::{SledStorageAdapter, StorageError, SCHEMA_VERSION};
+use crate::adapters::storage::{SCHEMA_VERSION, SledStorageAdapter, StorageError};
 use crate::domain::{FileId, RelativePath};
 use crate::ports::StoragePort;
 use crate::test_support::make_virtual_file;
@@ -144,7 +144,7 @@ fn incompatible_schema_version_is_rejected() {
 
     // Tamper with the schema_version to simulate a future incompatible version.
     {
-        let db = sled::open(&path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&path).unwrap();
         let meta = db.open_tree("meta").unwrap();
         let bad_version: u32 = SCHEMA_VERSION + 1;
         meta.insert(b"schema_version", &bad_version.to_le_bytes())
@@ -311,7 +311,7 @@ fn torn_meta_write_leaves_consistent_state_on_reopen() {
     // Corrupt the meta tree (simulate a crash-truncated write) by wiping
     // slot_generations but leaving free_slots intact.
     {
-        let db = sled::open(&path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&path).unwrap();
         let meta = db.open_tree("meta").unwrap();
         meta.remove(b"slot_generations").unwrap();
         meta.flush().unwrap();
@@ -359,7 +359,7 @@ fn put_with_changed_path_removes_old_path_entry() {
     // The old path entry must be gone from the paths tree.  Inspect directly.
     drop(adapter);
     {
-        let db = sled::open(&path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&path).unwrap();
         let paths_tree = db.open_tree("paths").unwrap();
         assert!(
             paths_tree.get(b"old.rs").unwrap().is_none(),
@@ -388,7 +388,7 @@ fn codec_error_in_delete_is_not_reported_as_not_found() {
 
     // Corrupt the stored bytes directly (adapter is dropped, exclusive lock released).
     {
-        let db = sled::open(&path).unwrap();
+        let db = SledStorageAdapter::open_db_with_retry(&path).unwrap();
         let files_tree = db.open_tree("files").unwrap();
         let key = {
             let mut k = [0u8; 8];

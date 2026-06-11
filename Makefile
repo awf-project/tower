@@ -8,6 +8,12 @@ HOST_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
 WASM_TARGET  := wasm32-wasip1
 INSTALL_DIR  ?= $(HOME)/.local/bin
 
+# WASI toolchain for the tree-sitter C sources in plugin_ast (see AGENTS.md).
+# Defaults to the tree-sitter cache; an exported CC_wasm32_wasip1 / AR_wasm32_wasip1
+# (e.g. in CI) overrides these at recipe time.
+WASI_CC      ?= $(HOME)/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
+WASI_AR      ?= $(HOME)/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
+
 # wasm fixtures that must be built before `cargo test` (see development.md).
 WASM_FIXTURES := hello_plugin fixture_abi_mismatch fixture_panic_plugin \
                  fixture_loop_plugin fixture_loop_hook_plugin
@@ -51,7 +57,9 @@ wasm-fixtures: ## Build the 5 wasm test fixtures + hello_plugin
 	cargo build $(FIXTURE_FLAGS) --target $(WASM_TARGET)
 
 .PHONY: wasm-ast
-wasm-ast: ## Build plugin_ast for wasm (needs CC_wasm32_wasip1 / AR_wasm32_wasip1)
+wasm-ast: ## Build plugin_ast for wasm (uses cached WASI SDK; override via CC_wasm32_wasip1 / AR_wasm32_wasip1)
+	CC_wasm32_wasip1="$${CC_wasm32_wasip1:-$(WASI_CC)}" \
+	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
 	cargo build -p plugin_ast --target $(WASM_TARGET)
 
 ## ---------------------------------------------------------------------------

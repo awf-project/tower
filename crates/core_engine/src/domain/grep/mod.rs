@@ -67,8 +67,8 @@ use rayon::prelude::*;
 
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId};
-use crate::ports::inbound::Match;
 use crate::ports::FileSystemPort;
+use crate::ports::inbound::Match;
 
 // ── TextSearch ────────────────────────────────────────────────────────────────
 
@@ -217,8 +217,8 @@ impl<'a> TextSearch<'a> {
 mod tests {
     use super::*;
     use crate::adapters::InMemoryFs;
-    use crate::domain::virtual_file::FileMetadata;
     use crate::domain::RelativePath;
+    use crate::domain::virtual_file::FileMetadata;
     use crate::ports::FileSystemPort;
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -53,8 +53,8 @@ pub mod outline;
 pub mod symbols;
 
 use plugin_sdk::{
-    plugin_main, HookKind, HookPayload, Plugin, PluginManifest, SdkError, ToolDesc, Value,
-    ABI_VERSION,
+    ABI_VERSION, HookKind, HookPayload, Plugin, PluginManifest, SdkError, ToolDesc, Value,
+    plugin_main,
 };
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
