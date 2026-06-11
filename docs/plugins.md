@@ -343,38 +343,55 @@ tree-sitter-rust = "0.23"  # resolved: 0.23.3
 
 ---
 
-## Step 6 — Drop into the host
+## Step 6 — Install into a scope
 
-Copy the built `.wasm` into the host's **plugins directory** and (re)start `tower`. That is the whole
-deployment step — no host recompile, no config file.
+A plugin can be installed in one of two scopes — no host recompile, no config file:
+
+- **Global** (`~/.local/share/tower/plugins`, XDG): installed once, usable by **every** project.
+- **Local** (`<workspace>/.tower/plugins`): scoped to one project, and **overrides** a global plugin
+  of the same name.
 
 ```bash
-# Default location: <workspace>/.tower/plugins/
+# Global: available in every project (uses the tower CLI).
+tower plugin install target/wasm32-wasip1/release/my_plugin.wasm
+
+# Local: this project only (a plain copy into the workspace).
 mkdir -p .tower/plugins
 cp target/wasm32-wasip1/release/my_plugin.wasm .tower/plugins/
+
 cargo run -p core_engine            # or: tower
+```
+
+Manage the global scope with the subcommand:
+
+```bash
+tower plugin list             # show global + (current dir's) local plugins
+tower plugin install <wasm>   # copy a .wasm into the global scope
+tower plugin remove <name>    # delete <name>.wasm from the global scope
 ```
 
 ### Where the host looks
 
-The plugins directory is resolved in this priority order (highest first):
+Resolution has two axes:
 
-| Source | Example |
-|--------|---------|
-| `--plugins-dir <path>` flag | `tower --plugins-dir /opt/tower/plugins` |
-| `$TOWER_PLUGINS_DIR` env var | `TOWER_PLUGINS_DIR=/opt/tower/plugins tower` |
-| Default | `<workspace>/.tower/plugins/` |
+| Mode | Sources (scanned in order) |
+|------|----------------------------|
+| **Explicit override** — *replaces* the search path with a single directory | `--plugins-dir <path>` flag, else `$TOWER_PLUGINS_DIR` env var |
+| **Default** — two scopes, **local wins** on a name collision | **global** `$XDG_DATA_HOME/tower/plugins` (fallback `~/.local/share/tower/plugins`), then **local** `<workspace>/.tower/plugins` |
 
 The workspace root itself follows `--workspace-dir` / `$TOWER_WORKSPACE` / the current directory.
 
 ### What happens at startup
 
-For every `*.wasm` in the directory (processed in sorted order), the host:
+The host scans each scope in order (global first, local last; files within a scope in sorted order),
+loads every `*.wasm`, then resolves name collisions across scopes. For each plugin it:
 
 1. Calls `__plugin_init` to read the `PluginManifest`.
 2. Checks `manifest.abi == ABI_VERSION` (currently `2`). Mismatch → `PluginLoadError::AbiMismatch`.
-3. Checks `manifest.name` is unique. Duplicate → `RegistrationError::DuplicateName`.
-   Also checks `manifest.name` does not begin with `tower` (reserved for native host tools) →
+3. Resolves **scope shadowing**: if the same `manifest.name` exists in more than one scope, the
+   highest-precedence (local) copy is kept and the others are skipped with a `tower: info — … overridden`
+   line. A same-name duplicate **within one scope** is dropped (`RegistrationError::DuplicateName`).
+   `manifest.name` must not begin with `tower` (reserved for native host tools) →
    `RegistrationError::ReservedName`.
 4. Wraps the instance in an `IsolatedSandbox` with fuel + epoch compute bounds (spec 11d), injecting
    the workspace `FileSystemPort` so `host::read_file` reads the real workspace.
@@ -384,8 +401,9 @@ From this point the plugin's tools appear in the MCP `tools/list` response with 
 
 ### Graceful degradation
 
-- **No plugins directory / empty directory** → the host serves exactly the 7 native `tower_*` tools,
-  identical to a build with no plugins.
+- **No plugins in any scope / missing or empty directories** → the host serves exactly the 7 native
+  `tower_*` tools, identical to a build with no plugins. A missing scope (e.g. no global dir) skips
+  that scope only; the other still loads.
 - **A single bad plugin** (malformed wasm, ABI mismatch, forbidden import, duplicate name, or a name
   beginning with the reserved `tower` prefix) is logged
   to stderr as a warning and **skipped** — startup never aborts, and the remaining plugins still load.

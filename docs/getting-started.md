@@ -253,19 +253,26 @@ The response lists 7 native `tower_*` tools plus any loaded plugin tools (e.g., 
 `tower_ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
 `tower_<plugin_name>_<tool_name>`.
 
-To deploy a plugin, drop its `.wasm` into the plugins directory and restart `tower` — no recompile.
-The directory is resolved from `--plugins-dir <path>`, then `$TOWER_PLUGINS_DIR`, then the default
-`<workspace>/.tower/plugins/`:
+To deploy a plugin, install it into one of two scopes and restart `tower` — no recompile:
+
+- **Global** (`~/.local/share/tower/plugins`, XDG) — usable by every project: `tower plugin install <wasm>`.
+- **Local** (`<workspace>/.tower/plugins`) — this project only, and overrides a global plugin of the
+  same name. An explicit `--plugins-dir <path>` / `$TOWER_PLUGINS_DIR` replaces both scopes with one dir.
 
 ```bash
+# Global (every project):
+tower plugin install target/wasm32-wasip1/release/plugin_ast.wasm
+
+# Or local (this project only):
 mkdir -p .tower/plugins
 cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
+
 cargo run -p core_engine     # tower_ast_* tools now appear in tools/list
 ```
 
-A missing or empty directory simply serves the 7 native tools; a malformed or ABI-mismatched
-`.wasm` is skipped with a stderr warning and never blocks startup. See
-[`plugins.md`](plugins.md) for the full deployment and fault-isolation details.
+No plugins in any scope simply serves the 7 native tools; a malformed or ABI-mismatched `.wasm` is
+skipped with a stderr warning and never blocks startup. When the same plugin name is in both scopes,
+the local copy wins. See [`plugins.md`](plugins.md) for the full deployment and fault-isolation details.
 
 ### Find a file
 

@@ -108,7 +108,7 @@ fn ast_plugin_dir_exposes_native_and_ast_tools() {
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
-        tmp.path(),
+        &[tmp.path().to_path_buf()],
         &engine,
         fs_with_rust_source(),
         production_isolation_config(),
@@ -147,7 +147,7 @@ fn ast_get_outline_round_trips_through_merged_registry() {
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
-        tmp.path(),
+        &[tmp.path().to_path_buf()],
         &engine,
         fs_with_rust_source(),
         production_isolation_config(),
@@ -184,7 +184,7 @@ fn malformed_wasm_is_skipped_rest_served() {
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
-        tmp.path(),
+        &[tmp.path().to_path_buf()],
         &engine,
         fs_with_rust_source(),
         production_isolation_config(),
@@ -211,7 +211,7 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
-        tmp.path(),
+        &[tmp.path().to_path_buf()],
         &engine,
         fs_with_rust_source(),
         production_isolation_config(),
@@ -240,7 +240,7 @@ fn missing_plugins_dir_serves_only_native_tools() {
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
-        &missing,
+        &[missing],
         &engine,
         Arc::new(InMemoryFs::new()),
         production_isolation_config(),
@@ -255,11 +255,75 @@ fn empty_plugins_dir_serves_only_native_tools() {
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
-        tmp.path(),
+        &[tmp.path().to_path_buf()],
         &engine,
         Arc::new(InMemoryFs::new()),
         production_isolation_config(),
     );
     let merged = merged(registry);
     assert_eq!(merged.list().len(), 7, "empty dir → 7 native tools only");
+}
+
+// ── AC: global scope reachable from a project with an empty local scope ──────────
+
+#[test]
+fn global_plugin_reachable_with_empty_local_scope() {
+    let global = tempfile::tempdir().expect("global tempdir");
+    let local = tempfile::tempdir().expect("local tempdir");
+    drop_wasm(global.path(), "plugin_ast.wasm", plugin_ast_wasm());
+
+    let engine = IsolationEngine::new().expect("isolation engine");
+    // dirs order = [global, local]; local is empty.
+    let registry = load_plugins_into_registry(
+        &[global.path().to_path_buf(), local.path().to_path_buf()],
+        &engine,
+        fs_with_rust_source(),
+        production_isolation_config(),
+    );
+    let merged = merged(registry);
+    let listed = names(&merged);
+
+    assert!(
+        listed.iter().any(|n| n == "tower_ast_get_outline"),
+        "a globally-installed plugin must be usable from a project: {listed:?}"
+    );
+    assert_eq!(listed.len(), 9, "7 native + 2 ast (global): {listed:?}");
+}
+
+// ── AC: same name in both scopes → local overrides global (collapses to one) ─────
+
+#[test]
+fn local_scope_overrides_global_same_name() {
+    let global = tempfile::tempdir().expect("global tempdir");
+    let local = tempfile::tempdir().expect("local tempdir");
+    // Same plugin (manifest name "ast") present in BOTH scopes.
+    drop_wasm(global.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(local.path(), "plugin_ast.wasm", plugin_ast_wasm());
+
+    let engine = IsolationEngine::new().expect("isolation engine");
+    let registry = load_plugins_into_registry(
+        &[global.path().to_path_buf(), local.path().to_path_buf()],
+        &engine,
+        fs_with_rust_source(),
+        production_isolation_config(),
+    );
+    let merged = merged(registry);
+    let listed = names(&merged);
+
+    // Shadowing collapsed the duplicate to a single "ast" plugin: 7 native + 2 ast,
+    // NOT 7 + 4. The local copy won (verified deterministically by decide_shadowing
+    // unit tests in runtime.rs).
+    assert_eq!(
+        listed.len(),
+        9,
+        "duplicate name across scopes must collapse to one plugin: {listed:?}"
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|n| n.starts_with("tower_ast_"))
+            .count(),
+        2,
+        "exactly the 2 ast tools, not duplicated: {listed:?}"
+    );
 }
