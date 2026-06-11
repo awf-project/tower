@@ -253,6 +253,20 @@ The response lists 7 native `vfs_*` tools plus any loaded plugin tools (e.g., `a
 `ast/ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
 `<plugin_name>/<tool_name>`.
 
+To deploy a plugin, drop its `.wasm` into the plugins directory and restart `tower` — no recompile.
+The directory is resolved from `--plugins-dir <path>`, then `$TOWER_PLUGINS_DIR`, then the default
+`<workspace>/.tower/plugins/`:
+
+```bash
+mkdir -p .tower/plugins
+cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
+cargo run -p core_engine     # ast/* tools now appear in tools/list
+```
+
+A missing or empty directory simply serves the 7 native tools; a malformed or ABI-mismatched
+`.wasm` is skipped with a stderr warning and never blocks startup. See
+[`plugins.md`](plugins.md) for the full deployment and fault-isolation details.
+
 ### Find a file
 
 ```json

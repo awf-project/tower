@@ -11,8 +11,14 @@
 //!    (`StoragePort::is_scan_complete`).
 //! 4. Wrap all state in an `Arc<RwLock<EngineState>>` for deadlock-free sharing
 //!    with any future background watcher thread (spec 06 lock discipline).
-//! 5. Register the 7 native `vfs_*` tools into a `NativeToolRegistry`.
-//! 6. Start the 10a `serve` loop over real `stdin` / `stdout`.
+//! 5. Discover and load WASM plugins (drop & play): resolve the plugins
+//!    directory (`--plugins-dir` / `$TOWER_PLUGINS_DIR` / `<root>/.tower/plugins`),
+//!    load each `*.wasm` through the isolated-sandbox path (11c/11d) injecting the
+//!    workspace `FileSystemPort`, and register the successful ones. A missing or
+//!    empty directory simply yields no plugins; a single bad plugin is skipped
+//!    with a stderr warning and never aborts startup.
+//! 6. Serve the 7 native `vfs_*` tools PLUS any plugin tools (namespaced
+//!    `<plugin>/<tool>`) over real `stdin` / `stdout` via a `MergedRegistry`.
 //!
 //! # Wiring decision: `Arc<RwLock<EngineState>>`
 //!
@@ -36,12 +42,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use core_engine::adapters::fs::{workspace_scan, RealFs};
-use core_engine::adapters::mcp::native_tools::{EngineState, NativeToolRegistry};
-use core_engine::adapters::mcp::serve;
+use core_engine::adapters::mcp::native_tools::EngineState;
+use core_engine::adapters::mcp::{serve, MergedRegistry};
+use core_engine::adapters::plugin::{
+    load_plugins_into_registry, production_isolation_config, resolve_plugins_dir, IsolationEngine,
+};
 use core_engine::adapters::SledStorageAdapter;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::StoragePort;
+use core_engine::ports::{FileSystemPort, StoragePort};
 
 fn main() {
     if let Err(e) = run() {
@@ -96,12 +105,44 @@ fn run() -> Result<(), String> {
         Box::new(fs),
     )));
 
-    // ── Step 5: register native tools ─────────────────────────────────────────
-    let mut registry = NativeToolRegistry::new(Arc::clone(&state));
+    // ── Step 5: discover and load WASM plugins (drop & play) ──────────────────
+    let plugins_dir = resolve_plugins_dir(
+        plugins_dir_arg().as_deref(),
+        env::var("TOWER_PLUGINS_DIR").ok().as_deref(),
+        &workspace_root,
+    );
 
-    // ── Step 6: serve loop over real stdin/stdout ──────────────────────────────
+    // The IsolationEngine owns the background epoch ticker; it must outlive the
+    // serve loop so per-call epoch deadlines keep firing. Held in `run`'s scope.
+    let isolation_engine = IsolationEngine::new()
+        .map_err(|e| format!("failed to initialise plugin isolation engine: {e}"))?;
+
+    // Plugins read the real workspace through their own FileSystemPort (the same
+    // capability the native tools use), satisfying host_read_file.
+    let plugin_fs: Arc<dyn FileSystemPort + Send + Sync> = Arc::new(RealFs::new(&workspace_root));
+
+    let plugin_host = load_plugins_into_registry(
+        &plugins_dir,
+        &isolation_engine,
+        plugin_fs,
+        production_isolation_config(),
+    );
+    let plugin_count = plugin_host.declared_tools().len();
+    if plugin_count > 0 {
+        eprintln!(
+            "tower: loaded plugin tools from {} ({plugin_count} tool(s))",
+            plugins_dir.display()
+        );
+    }
+    let plugin_host = Arc::new(RwLock::new(plugin_host));
+
+    // ── Step 6: serve native + plugin tools over real stdin/stdout ────────────
+    // MergedRegistry exposes the 7 native vfs_* tools plus namespaced plugin
+    // tools. A missing/empty plugins dir leaves it serving exactly the natives.
     // Lock stdin/stdout for the duration of the serve loop.
     // BufReader/BufWriter ensure line-oriented I/O matches the framing spec.
+    let mut registry = MergedRegistry::new(Arc::clone(&state), plugin_host);
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     serve(
@@ -136,4 +177,19 @@ fn resolve_workspace_root() -> PathBuf {
 
     // Default: current working directory.
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Extract the value of the `--plugins-dir <path>` command-line flag, if present.
+///
+/// Returns `None` when the flag is absent; resolution then falls back to
+/// `$TOWER_PLUGINS_DIR` and finally the workspace default (see
+/// [`resolve_plugins_dir`]).
+fn plugins_dir_arg() -> Option<String> {
+    let args: Vec<String> = env::args().collect();
+    for pair in args.windows(2) {
+        if pair[0] == "--plugins-dir" {
+            return Some(pair[1].clone());
+        }
+    }
+    None
 }

@@ -3,12 +3,10 @@
 Tower's plugin system lets third parties extend the tool surface exposed over MCP without modifying
 or recompiling the host binary. A plugin is a single `.wasm` file compiled to `wasm32-wasip1`.
 
-> **Current status**: the plugin loading infrastructure (`WasmtimeHost`, `IsolatedSandbox`,
-> `MergedRegistry`) is fully implemented and integration-tested (specs 11c, 11d, 12b), but the
-> production `tower` binary (`main.rs`) does not yet include a plugin directory scan. The binary
-> currently serves only the 7 native `vfs_*` tools. Wiring plugins into the startup sequence is the
-> next development step. The authoring guide below describes the stable API surface that will be
-> exposed once that wiring lands.
+> **Status**: drop & play is live. The production `tower` binary scans a plugins directory at
+> startup, loads every `*.wasm` through the isolated-sandbox path (specs 11c/11d), and serves their
+> tools over MCP alongside the 7 native `vfs_*` tools (spec 12b) — no host recompile required. Drop a
+> `.wasm` in the plugins directory, restart `tower`, and its tools appear in `tools/list`.
 
 This guide covers everything needed to write, build, and deploy a plugin.
 
@@ -345,24 +343,64 @@ tree-sitter-rust = "0.23"  # resolved: 0.23.3
 
 ---
 
-## Step 6 — Load into the host
+## Step 6 — Drop into the host
 
-> **Note**: runtime plugin directory scanning is not yet wired in `main.rs`. Until it is, load
-> plugins programmatically via `WasmtimeHost::load` + `PluginHostRegistry::register` in integration
-> tests or a custom host binary. The load sequence below describes what happens when the wiring
-> lands.
+Copy the built `.wasm` into the host's **plugins directory** and (re)start `tower`. That is the whole
+deployment step — no host recompile, no config file.
 
-Once the host is configured with a plugin path, it:
+```bash
+# Default location: <workspace>/.tower/plugins/
+mkdir -p .tower/plugins
+cp target/wasm32-wasip1/release/my_plugin.wasm .tower/plugins/
+cargo run -p core_engine            # or: tower
+```
+
+### Where the host looks
+
+The plugins directory is resolved in this priority order (highest first):
+
+| Source | Example |
+|--------|---------|
+| `--plugins-dir <path>` flag | `tower --plugins-dir /opt/tower/plugins` |
+| `$TOWER_PLUGINS_DIR` env var | `TOWER_PLUGINS_DIR=/opt/tower/plugins tower` |
+| Default | `<workspace>/.tower/plugins/` |
+
+The workspace root itself follows `--workspace-dir` / `$TOWER_WORKSPACE` / the current directory.
+
+### What happens at startup
+
+For every `*.wasm` in the directory (processed in sorted order), the host:
 
 1. Calls `__plugin_init` to read the `PluginManifest`.
-2. Checks `manifest.abi == ABI_VERSION` (currently `2`). Mismatch → `PluginLoadError::AbiMismatch`,
-   plugin rejected.
-3. Checks `manifest.name` is unique. Duplicate → `RegistrationError::DuplicateName`, plugin
-   rejected.
-4. Wraps the instance in an `IsolatedSandbox` with fuel + epoch compute bounds.
-5. Registers the tools in `MergedRegistry` under `<manifest.name>/<tool_name>`.
+2. Checks `manifest.abi == ABI_VERSION` (currently `2`). Mismatch → `PluginLoadError::AbiMismatch`.
+3. Checks `manifest.name` is unique. Duplicate → `RegistrationError::DuplicateName`.
+4. Wraps the instance in an `IsolatedSandbox` with fuel + epoch compute bounds (spec 11d), injecting
+   the workspace `FileSystemPort` so `host::read_file` reads the real workspace.
+5. Registers the tools in the `MergedRegistry` under `<manifest.name>/<tool_name>` (spec 12b).
 
 From this point the plugin's tools appear in the MCP `tools/list` response with no host recompile.
+
+### Graceful degradation
+
+- **No plugins directory / empty directory** → the host serves exactly the 7 native `vfs_*` tools,
+  identical to a build with no plugins.
+- **A single bad plugin** (malformed wasm, ABI mismatch, forbidden import, duplicate name) is logged
+  to stderr as a warning and **skipped** — startup never aborts, and the remaining plugins still load.
+- **A plugin that faults at call time** (trap, infinite loop, fuel/epoch exhaustion) is isolated by
+  its sandbox: the call returns a tool error and the host plus MCP link survive (spec 11d).
+
+### Try it with the reference plugin
+
+```bash
+# Build the reference tree-sitter plugin (needs the WASI SDK — see Prerequisites).
+CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang \
+AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
+  cargo build -p plugin_ast --target wasm32-wasip1 --release
+
+mkdir -p .tower/plugins
+cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
+cargo run -p core_engine            # tools/list now includes ast/ast_get_outline + ast/ast_find_symbols
+```
 
 ---
 

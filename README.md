@@ -18,8 +18,8 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **Parallel content search** | Rayon-backed grep across all indexed files |
 | **Safe file mutations** | Shadow-file pattern (`<path>.tmp_write` → flush → atomic `fs::rename`); crash-safe |
 | **Mass refactoring** | Parallel global find-and-replace with per-file atomic rewrites and a `TxReport` |
-| **MCP server** | JSON-RPC 2.0 over stdin/stdout; 7 native `vfs_*` tools always available |
-| **WASM plugin host** | `wasmtime` sandbox with fuel + epoch compute bounds and automatic fault isolation |
+| **MCP server** | JSON-RPC 2.0 over stdin/stdout; 7 native `vfs_*` tools plus any plugin tools, served from one surface |
+| **WASM plugin host** | Drop a `.wasm` in the plugins directory — `tower` auto-loads it at startup inside a `wasmtime` sandbox with fuel + epoch compute bounds and automatic fault isolation |
 | **AST analysis** | `plugin_ast` — Tree-sitter outline and symbol search for Rust, Go, PHP |
 | **Single static binary** | No JVM, Node, or container required at runtime |
 
@@ -63,7 +63,7 @@ cargo run -p core_engine
 # Handshake
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | cargo run -p core_engine -q
 
-# List tools (7 native vfs_* tools)
+# List tools (7 native vfs_* tools, plus <plugin>/<tool> for any loaded plugin)
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | cargo run -p core_engine -q
 
 # Find a file
@@ -73,6 +73,21 @@ echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vfs_find_f
 
 Each request is a single newline-delimited JSON object on stdin; responses arrive on stdout.
 No `Content-Length` header — unlike LSP.
+
+### Drop & Play a plugin
+
+`tower` scans a plugins directory at startup (resolved from `--plugins-dir`, then
+`$TOWER_PLUGINS_DIR`, then `<workspace>/.tower/plugins/`). Drop a `.wasm` in, restart, and its
+tools appear in `tools/list` — no host recompile:
+
+```bash
+mkdir -p .tower/plugins
+cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
+cargo run -p core_engine -q     # tools/list now also exposes ast/ast_get_outline + ast/ast_find_symbols
+```
+
+A missing/empty directory serves exactly the 7 native tools; a bad plugin is skipped with a stderr
+warning and never aborts startup. See [`docs/plugins.md`](docs/plugins.md) for details.
 
 ---
 
