@@ -1,4 +1,4 @@
-//! `plugin_ast` — reference Tree-sitter AST plugin (spec 12c/12d).
+//! `ast` — reference Tree-sitter AST plugin (spec 12c/12d).
 //!
 //! Compiles to `wasm32-wasip1` using the `#[plugin_main]` macro from
 //! `plugin_sdk`. Declares two tools: `get_outline` and `find_symbols`.
@@ -36,7 +36,7 @@
 //!
 //! # Compilation targets
 //!
-//! - **Host (`x86_64-unknown-linux-gnu`)**: `cargo test -p plugin_ast` runs the
+//! - **Host (`x86_64-unknown-linux-gnu`)**: `cargo test -p ast` runs the
 //!   `outline::tests` and `symbols::tests` suites with native tree-sitter — no WASI SDK needed.
 //! - **Wasm (`wasm32-wasip1`)**: requires `CC_wasm32_wasip1` and `AR_wasm32_wasip1`
 //!   pointing at the WASI SDK clang (see `docs/spikes/12a-tree-sitter-wasm-feasibility.md`).
@@ -46,7 +46,7 @@
 //! ```text
 //! CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
 //! AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
-//! cargo build -p plugin_ast --target wasm32-wasip1
+//! cargo build -p ast --target wasm32-wasip1
 //! ```
 
 pub mod outline;

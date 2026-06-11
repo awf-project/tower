@@ -58,7 +58,7 @@ targets   = ["wasm32-wasip1"]
 profile   = "minimal"
 ```
 
-**Pure-Rust plugins** (no C dependencies) need no additional tools — `hello_plugin` falls in this
+**Pure-Rust plugins** (no C dependencies) need no additional tools — `hello` falls in this
 category.
 
 **Plugins that vendor C sources** (e.g. tree-sitter grammars) require the WASI SDK. Two sources:
@@ -289,7 +289,7 @@ plugins.
 
 ## Step 5 — Build to `wasm32-wasip1`
 
-### Pure-Rust plugin (e.g. `hello_plugin`)
+### Pure-Rust plugin (e.g. `hello`)
 
 No WASI SDK needed:
 
@@ -301,7 +301,7 @@ cargo build -p my_plugin --target wasm32-wasip1 --release
 # Output: target/wasm32-wasip1/release/my_plugin.wasm  (~small, opt-level="s")
 ```
 
-### Plugin with C dependencies (e.g. `plugin_ast` — tree-sitter grammars)
+### Plugin with C dependencies (e.g. `ast` — tree-sitter grammars)
 
 The tree-sitter grammar crates vendor C sources compiled via the `cc` crate. The Rust
 `wasm32-wasip1` toolchain component has no C sysroot, so WASI SDK must be pointed at via two
@@ -313,8 +313,8 @@ environment variables. The `cc` crate honours the `CC_<target>` / `AR_<target>` 
 export CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
 export AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
 
-cargo build -p plugin_ast --target wasm32-wasip1 --release
-# Output: target/wasm32-wasip1/release/plugin_ast.wasm  (~1.2 MB)
+cargo build -p ast --target wasm32-wasip1 --release
+# Output: target/wasm32-wasip1/release/ast.wasm  (~1.2 MB)
 ```
 
 Or using a manually downloaded WASI SDK 25:
@@ -323,7 +323,7 @@ Or using a manually downloaded WASI SDK 25:
 export CC_wasm32_wasip1=/opt/wasi-sdk/bin/wasm32-wasip1-clang
 export AR_wasm32_wasip1=/opt/wasi-sdk/bin/llvm-ar
 
-cargo build -p plugin_ast --target wasm32-wasip1 --release
+cargo build -p ast --target wasm32-wasip1 --release
 ```
 
 `CC_wasm32_wasip1` points the `cc` crate at the WASI SDK clang, which carries a `--sysroot`
@@ -416,10 +416,10 @@ From this point the plugin's tools appear in the MCP `tools/list` response with 
 # Build the reference tree-sitter plugin (needs the WASI SDK — see Prerequisites).
 CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang \
 AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
-  cargo build -p plugin_ast --target wasm32-wasip1 --release
+  cargo build -p ast --target wasm32-wasip1 --release
 
 mkdir -p .tower/plugins
-cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
+cp target/wasm32-wasip1/release/ast.wasm .tower/plugins/
 cargo run -p core_engine            # tools/list now includes tower_ast_get_outline + tower_ast_find_symbols
 ```
 
@@ -517,13 +517,13 @@ at registration (`RegistrationError::ReservedName`). No collision is possible.
 
 ---
 
-## Worked example: `hello_plugin`
+## Worked example: `hello`
 
-`crates/hello_plugin` is the minimal reference plugin. It demonstrates the complete authoring
+`plugins/hello` is the minimal reference plugin. It demonstrates the complete authoring
 workflow with two tools (`greet`, `read_file_echo`) and one hook (`BeforeToolCall`).
 
 ```
-crates/hello_plugin/
+plugins/hello/
 ├── Cargo.toml   crate-type = ["cdylib", "rlib"]
 └── src/lib.rs   HelloPlugin: #[plugin_main], impl Plugin
 ```
@@ -532,10 +532,10 @@ Build and run host-side tests (no wasm runtime needed):
 
 ```bash
 # Host-side unit tests — no WASI SDK, no wasmtime
-cargo test -p hello_plugin
+cargo test -p hello
 
 # Build the wasm binary
-cargo build -p hello_plugin --target wasm32-wasip1
+cargo build -p hello --target wasm32-wasip1
 ```
 
 The `greet` tool call from MCP:
@@ -558,13 +558,13 @@ The `read_file_echo` tool demonstrates `host::read_file`:
 
 ---
 
-## Worked example: `plugin_ast`
+## Worked example: `ast`
 
-`crates/plugin_ast` is the reference Tree-sitter AST plugin (spec 12c/12d). It illustrates a
+`plugins/ast` is the reference Tree-sitter AST plugin (spec 12c/12d). It illustrates a
 plugin with C grammar sources and two tools.
 
 ```
-crates/plugin_ast/
+plugins/ast/
 ├── Cargo.toml   tree-sitter = "0.25", tree-sitter-rust = "0.23", tree-sitter-go, tree-sitter-php
 └── src/
     ├── lib.rs      AstPlugin: #[plugin_main], impl Plugin — tool dispatch
@@ -581,14 +581,14 @@ Build (requires WASI SDK for C grammar compilation):
 export CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
 export AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
 
-cargo build -p plugin_ast --target wasm32-wasip1 --release
-# Produces: target/wasm32-wasip1/release/plugin_ast.wasm  (~1.2 MB)
+cargo build -p ast --target wasm32-wasip1 --release
+# Produces: target/wasm32-wasip1/release/ast.wasm  (~1.2 MB)
 ```
 
 Host-side tests (no WASI SDK or wasmtime needed):
 
 ```bash
-cargo test -p plugin_ast
+cargo test -p ast
 ```
 
 MCP call examples once loaded:
@@ -629,4 +629,3 @@ A kind not applicable to the target language (e.g. `enum` in a `.go` file) retur
 - [getting-started.md](getting-started.md) — workspace setup, first build
 - [mcp-tools.md](mcp-tools.md) — MCP protocol reference, native tools, JSON-RPC error codes
 - [development.md](development.md) — CI quality gate, full test command reference
-- [docs/spikes/12a-tree-sitter-wasm-feasibility.md](spikes/12a-tree-sitter-wasm-feasibility.md) — detailed WASI SDK recipe and approach analysis

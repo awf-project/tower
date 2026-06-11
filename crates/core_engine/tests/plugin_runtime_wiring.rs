@@ -7,7 +7,7 @@
 //!
 //! # What is exercised
 //!
-//! - A real `plugin_ast.wasm` dropped in the dir → `tools/list` exposes the 7
+//! - A real `ast.wasm` dropped in the dir → `tools/list` exposes the 7
 //!   native tools PLUS `tower_ast_get_outline` and `tower_ast_find_symbols`, and a
 //!   `tools/call` to `tower_ast_get_outline` round-trips.
 //! - A malformed `.wasm` and an ABI-mismatched `.wasm` are skipped; startup
@@ -45,7 +45,7 @@ use core_engine::ports::FileSystemPort;
 
 // ── Fixture paths ───────────────────────────────────────────────────────────────
 
-fn plugin_ast_wasm() -> &'static str {
+fn ast_wasm() -> &'static str {
     env!("PLUGIN_AST_WASM")
 }
 
@@ -99,12 +99,12 @@ fn names(registry: &MergedRegistry) -> Vec<String> {
     registry.list().into_iter().map(|t| t.name).collect()
 }
 
-// ── AC: plugin_ast dropped in the dir → native + ast tools listed ───────────────
+// ── AC: ast dropped in the dir → native + ast tools listed ───────────────
 
 #[test]
 fn ast_plugin_dir_exposes_native_and_ast_tools() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    drop_wasm(tmp.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(tmp.path(), "ast.wasm", ast_wasm());
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
@@ -143,7 +143,7 @@ fn ast_plugin_dir_exposes_native_and_ast_tools() {
 #[test]
 fn ast_get_outline_round_trips_through_merged_registry() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    drop_wasm(tmp.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(tmp.path(), "ast.wasm", ast_wasm());
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
@@ -180,7 +180,7 @@ fn malformed_wasm_is_skipped_rest_served() {
     // Garbage bytes with a .wasm extension — fails Module::from_file.
     std::fs::write(tmp.path().join("broken.wasm"), b"this is not wasm at all")
         .expect("write broken wasm");
-    drop_wasm(tmp.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(tmp.path(), "ast.wasm", ast_wasm());
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
@@ -207,7 +207,7 @@ fn malformed_wasm_is_skipped_rest_served() {
 fn abi_mismatch_wasm_is_skipped_rest_served() {
     let tmp = tempfile::tempdir().expect("tempdir");
     drop_wasm(tmp.path(), "abi_mismatch.wasm", abi_mismatch_wasm());
-    drop_wasm(tmp.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(tmp.path(), "ast.wasm", ast_wasm());
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(
@@ -270,7 +270,7 @@ fn empty_plugins_dir_serves_only_native_tools() {
 fn global_plugin_reachable_with_empty_local_scope() {
     let global = tempfile::tempdir().expect("global tempdir");
     let local = tempfile::tempdir().expect("local tempdir");
-    drop_wasm(global.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(global.path(), "ast.wasm", ast_wasm());
 
     let engine = IsolationEngine::new().expect("isolation engine");
     // dirs order = [global, local]; local is empty.
@@ -297,8 +297,8 @@ fn local_scope_overrides_global_same_name() {
     let global = tempfile::tempdir().expect("global tempdir");
     let local = tempfile::tempdir().expect("local tempdir");
     // Same plugin (manifest name "ast") present in BOTH scopes.
-    drop_wasm(global.path(), "plugin_ast.wasm", plugin_ast_wasm());
-    drop_wasm(local.path(), "plugin_ast.wasm", plugin_ast_wasm());
+    drop_wasm(global.path(), "ast.wasm", ast_wasm());
+    drop_wasm(local.path(), "ast.wasm", ast_wasm());
 
     let engine = IsolationEngine::new().expect("isolation engine");
     let registry = load_plugins_into_registry(

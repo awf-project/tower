@@ -14,4 +14,4 @@ crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-plugin_sdk = { path = "../plugin_sdk", version = "0.1.0" }
+plugin_sdk = { path = "../../../crates/plugin_sdk", version = "0.1.0" }

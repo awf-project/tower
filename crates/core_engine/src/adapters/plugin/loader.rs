@@ -19,7 +19,7 @@
 //!
 //! # WASI lockdown (critical — U2)
 //!
-//! `hello_plugin` (and all plugins) compile for `wasm32-wasip1`, whose std
+//! `hello` (and all plugins) compile for `wasm32-wasip1`, whose std
 //! library emits `wasi_snapshot_preview1::*` imports. We MUST link those imports
 //! or the module fails to instantiate. However, full WASI with preopened
 //! directories and network would grant the guest raw filesystem/network access —

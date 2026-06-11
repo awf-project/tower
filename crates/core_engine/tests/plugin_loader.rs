@@ -2,7 +2,7 @@
 //!
 //! # TDD sequence
 //!
-//! 1. RED → GREEN: AC1 — load hello_plugin, verify PluginInstance returned.
+//! 1. RED → GREEN: AC1 — load hello, verify PluginInstance returned.
 //! 2. RED → GREEN: AC2 — allowed capability round-trip (host_read_file).
 //! 3. RED → GREEN: AC3 — forbidden import denied at link/instantiation.
 //! 4. RED → GREEN: AC4 — ABI mismatch rejected with version error.
@@ -10,7 +10,7 @@
 //! # Fixture paths
 //!
 //! Wasm fixture paths are set by `core_engine`'s `build.rs` script as
-//! `cargo:rustc-env` variables. The CI workflow builds `hello_plugin` and
+//! `cargo:rustc-env` variables. The CI workflow builds `hello` and
 //! `fixture_abi_mismatch` for `wasm32-wasip1` BEFORE running `cargo test`.
 //! The `forbidden_import.wasm` and `forbidden_host_import.wat` are committed
 //! directly to `tests/fixtures/` (no build step needed).
@@ -39,7 +39,7 @@ use core_engine::ports::FileSystemPort;
 
 // ── Fixture paths (set by build.rs) ──────────────────────────────────────────
 
-fn hello_plugin_wasm() -> &'static str {
+fn hello_wasm() -> &'static str {
     env!("HELLO_PLUGIN_WASM")
 }
 
@@ -73,9 +73,9 @@ fn fs_with_file(path: &str, content: &[u8]) -> Arc<InMemoryFs> {
 /// AC1: Given a trivial .wasm plugin, When loaded, Then it instantiates and
 /// returns a PluginInstance with the expected manifest.
 #[test]
-fn ac1_load_hello_plugin_returns_plugin_instance() {
-    let instance = WasmtimeHost::load(hello_plugin_wasm(), empty_fs())
-        .expect("AC1: hello_plugin must load successfully");
+fn ac1_load_hello_returns_plugin_instance() {
+    let instance =
+        WasmtimeHost::load(hello_wasm(), empty_fs()).expect("AC1: hello must load successfully");
 
     let manifest = instance.manifest();
     assert_eq!(manifest.name, "hello", "AC1: manifest name");
@@ -95,8 +95,7 @@ fn ac1_load_hello_plugin_returns_plugin_instance() {
 fn ac1_loaded_instance_registers_in_domain_registry() {
     use core_engine::domain::PluginHostRegistry;
 
-    let instance =
-        WasmtimeHost::load(hello_plugin_wasm(), empty_fs()).expect("AC1: hello_plugin must load");
+    let instance = WasmtimeHost::load(hello_wasm(), empty_fs()).expect("AC1: hello must load");
 
     let mut registry = PluginHostRegistry::new();
     registry
@@ -128,8 +127,7 @@ fn ac1_loaded_instance_registers_in_domain_registry() {
 fn ac2_call_tool_greet_returns_greeting() {
     use plugin_sdk::Value;
 
-    let mut instance =
-        WasmtimeHost::load(hello_plugin_wasm(), empty_fs()).expect("AC2: hello_plugin must load");
+    let mut instance = WasmtimeHost::load(hello_wasm(), empty_fs()).expect("AC2: hello must load");
 
     let args = Value::Map(vec![("name".to_owned(), Value::Text("World".to_owned()))]);
     let result = instance
@@ -156,8 +154,7 @@ fn ac2_host_read_file_round_trips_content() {
 
     let content = b"# Tower workspace file\n";
     let fs = fs_with_file("docs/readme.md", content);
-    let mut instance =
-        WasmtimeHost::load(hello_plugin_wasm(), fs).expect("AC2: hello_plugin must load");
+    let mut instance = WasmtimeHost::load(hello_wasm(), fs).expect("AC2: hello must load");
 
     let args = Value::Map(vec![(
         "path".to_owned(),
@@ -183,8 +180,7 @@ fn ac2_host_read_file_rejects_traversal_path() {
     // Provide a populated FS so the test does not fail due to not-found on a
     // legitimate path. The traversal path must be rejected regardless.
     let fs = fs_with_file("safe.txt", b"safe content");
-    let mut instance =
-        WasmtimeHost::load(hello_plugin_wasm(), fs).expect("AC2: hello_plugin must load");
+    let mut instance = WasmtimeHost::load(hello_wasm(), fs).expect("AC2: hello must load");
 
     // A path with ".." is a traversal attempt — must not reach the FS port.
     let args = Value::Map(vec![(
@@ -204,8 +200,7 @@ fn ac2_host_read_file_rejects_absolute_path() {
     use plugin_sdk::Value;
 
     let fs = fs_with_file("safe.txt", b"safe content");
-    let mut instance =
-        WasmtimeHost::load(hello_plugin_wasm(), fs).expect("AC2: hello_plugin must load");
+    let mut instance = WasmtimeHost::load(hello_wasm(), fs).expect("AC2: hello must load");
 
     let args = Value::Map(vec![(
         "path".to_owned(),
@@ -224,7 +219,7 @@ fn ac2_call_tool_unknown_returns_tool_not_found() {
     use core_engine::domain::PluginHostError;
 
     let mut instance =
-        WasmtimeHost::load(hello_plugin_wasm(), empty_fs()).expect("AC2: load must succeed");
+        WasmtimeHost::load(hello_wasm(), empty_fs()).expect("AC2: load must succeed");
 
     let result = instance.call_tool("nonexistent", plugin_sdk::Value::Null);
     assert!(
@@ -240,7 +235,7 @@ fn ac2_deliver_hook_before_tool_call_succeeds() {
     use plugin_sdk::{HookKind, HookPayload, Value};
 
     let mut instance =
-        WasmtimeHost::load(hello_plugin_wasm(), empty_fs()).expect("AC2: load must succeed");
+        WasmtimeHost::load(hello_wasm(), empty_fs()).expect("AC2: load must succeed");
 
     let result = instance.deliver_hook(
         HookKind::BeforeToolCall,
@@ -361,12 +356,12 @@ fn ac4_abi_mismatch_error_message_is_clear() {
 /// is the only file access channel. The WASI context has no preopened dirs.
 #[test]
 fn u2_wasi_has_no_preopened_directories() {
-    // Load hello_plugin with an empty InMemoryFs. The plugin does NOT call
+    // Load hello with an empty InMemoryFs. The plugin does NOT call
     // host_read_file, so loading and calling greet must succeed.
     // This confirms the WASI lockdown doesn't break the plugin while also
     // confirming no real filesystem access occurs.
-    let mut instance = WasmtimeHost::load(hello_plugin_wasm(), empty_fs())
-        .expect("U2: hello_plugin with empty FS must still load");
+    let mut instance = WasmtimeHost::load(hello_wasm(), empty_fs())
+        .expect("U2: hello with empty FS must still load");
 
     // The greet tool works because it needs no file access.
     let args = plugin_sdk::Value::Map(vec![(

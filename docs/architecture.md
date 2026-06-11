@@ -81,15 +81,17 @@ crates/
 │   │                       Value, SdkError, CallRequest, CallResponse, ABI_VERSION=2)
 │   └── plugin_sdk_macros/ proc-macro crate: #[plugin_main], #[plugin_export]
 │
-├── plugin_ast/            Reference AST plugin → wasm32-wasip1 (~1.2 MB release)
+plugins/                   wasm32-wasip1 plugins (excluded from default-members)
+├── ast/                   Reference AST plugin → wasm32-wasip1 (~1.2 MB release)
 │                          Tools: get_outline, find_symbols
 │                          Languages: Rust (.rs), Go (.go), PHP (.php)
 │
-├── hello_plugin/          Minimal example plugin (cdylib)
-├── fixture_abi_mismatch/  Test fixture: wrong ABI version
-├── fixture_panic_plugin/  Test fixture: panicking guest
-├── fixture_loop_plugin/   Test fixture: infinite-loop guest (fuel test)
-└── fixture_loop_hook_plugin/ Test fixture: infinite-loop in hook handler
+├── hello/                 Minimal example plugin (cdylib)
+└── fixtures/              Test-only wasm fixtures
+    ├── fixture_abi_mismatch/     wrong ABI version
+    ├── fixture_panic_plugin/     panicking guest
+    ├── fixture_loop_plugin/      infinite-loop guest (fuel test)
+    └── fixture_loop_hook_plugin/ infinite-loop in hook handler
 ```
 
 `default-members` excludes the wasm crates so `cargo build` on the host does not

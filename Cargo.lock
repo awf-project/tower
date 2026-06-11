@@ -54,6 +54,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "ast"
+version = "0.1.0"
+dependencies = [
+ "plugin_sdk",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-php",
+ "tree-sitter-rust",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -961,7 +972,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hello_plugin"
+name = "hello"
 version = "0.1.0"
 dependencies = [
  "plugin_sdk",
@@ -1473,17 +1484,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "plugin_ast"
-version = "0.1.0"
-dependencies = [
- "plugin_sdk",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-php",
- "tree-sitter-rust",
-]
 
 [[package]]
 name = "plugin_sdk"

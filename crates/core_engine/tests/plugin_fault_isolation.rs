@@ -21,7 +21,7 @@
 //! Set by `core_engine`'s `build.rs` (same pattern as 11c fixtures):
 //! - `PANIC_PLUGIN_WASM`         → `target/wasm32-wasip1/debug/fixture_panic_plugin.wasm`
 //! - `LOOP_PLUGIN_WASM`          → `target/wasm32-wasip1/debug/fixture_loop_plugin.wasm`
-//! - `HELLO_PLUGIN_WASM`         → `target/wasm32-wasip1/debug/hello_plugin.wasm`
+//! - `HELLO_PLUGIN_WASM`         → `target/wasm32-wasip1/debug/hello.wasm`
 //! - `LOOP_HOOK_PLUGIN_WASM`     → `target/wasm32-wasip1/debug/fixture_loop_hook_plugin.wasm`
 
 use std::sync::Arc;
@@ -41,7 +41,7 @@ fn loop_plugin_wasm() -> &'static str {
     env!("LOOP_PLUGIN_WASM")
 }
 
-fn hello_plugin_wasm() -> &'static str {
+fn hello_wasm() -> &'static str {
     env!("HELLO_PLUGIN_WASM")
 }
 
@@ -229,26 +229,26 @@ fn ac2_epoch_interruption_mid_execution() {
 /// AC3: Given a sandbox that faulted (panic plugin), When the next tool call is
 /// made, Then:
 /// - The supervisor recreates the sandbox from the .wasm file.
-/// - The subsequent call to a valid plugin (hello_plugin) succeeds.
+/// - The subsequent call to a valid plugin (hello) succeeds.
 /// - The engine is NOT restarted (same IsolationEngine across both calls).
 ///
-/// We test with hello_plugin: first call succeeds, which proves that after a
+/// We test with hello: first call succeeds, which proves that after a
 /// fault the sandbox is recreated and returns to service.
 ///
 /// For the panic plugin specifically, recreate succeeds but calling panic_tool
-/// again faults again. We use hello_plugin for the "subsequent call succeeds"
+/// again faults again. We use hello for the "subsequent call succeeds"
 /// verification.
 #[test]
 fn ac3_failed_sandbox_recreated_and_returns_to_service() {
     let engine = IsolationEngine::new().expect("IsolationEngine must create");
 
-    // Use hello_plugin: we simulate a fault by using a tiny fuel budget on the
+    // Use hello: we simulate a fault by using a tiny fuel budget on the
     // first call to a long-running sequence, then reset to full budget.
     // Actually: we test with panic_plugin first fault, then verify recreate
-    // succeeds and manifest is intact, then test that a good call to hello_plugin
+    // succeeds and manifest is intact, then test that a good call to hello
     // works on a fresh sandbox with the same engine.
 
-    // Step 1: Load hello_plugin into an isolated sandbox.
+    // Step 1: Load hello into an isolated sandbox.
     let config_good = IsolationConfig {
         fuel_budget: Some(100_000_000),
         epoch_deadline_ticks: None,
@@ -256,11 +256,11 @@ fn ac3_failed_sandbox_recreated_and_returns_to_service() {
 
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
-        hello_plugin_wasm(),
+        hello_wasm(),
         empty_fs(),
         config_good.clone(),
     )
-    .expect("hello_plugin must load");
+    .expect("hello must load");
 
     // Step 2: First call succeeds normally.
     let args = Value::Map(vec![("name".to_owned(), Value::Text("Tower".to_owned()))]);
@@ -275,7 +275,7 @@ fn ac3_failed_sandbox_recreated_and_returns_to_service() {
 
     // Step 3: Simulate a fault by switching to a tiny fuel budget that will
     // exhaust mid-call if we called loop_tool, but here we use the panic plugin.
-    // For hello_plugin we cannot easily cause an in-flight trap. Instead we
+    // For hello we cannot easily cause an in-flight trap. Instead we
     // directly load the panic_plugin sandbox to test recreate.
     let mut panic_sandbox = IsolatedSandbox::load(
         engine.engine(),
@@ -311,21 +311,21 @@ fn ac3_failed_sandbox_recreated_and_returns_to_service() {
         other => panic!("AC3: expected PluginFault after recreate, got {other:?}"),
     }
 
-    // Step 5: hello_plugin sandbox is still alive — engine was not restarted.
+    // Step 5: hello sandbox is still alive — engine was not restarted.
     let result3 = sandbox
         .call_tool("greet", args)
-        .expect("AC3: hello_plugin still works after engine reuse");
+        .expect("AC3: hello still works after engine reuse");
     assert_eq!(
         result3,
         Value::Text("Hello, Tower!".to_owned()),
-        "AC3: hello_plugin call after engine reuse"
+        "AC3: hello call after engine reuse"
     );
 }
 
 /// AC3 core: the SAME sandbox that faulted returns a successful call after recreate.
 ///
 /// This is the spec AC3 requirement: "a subsequent valid call succeeds on the
-/// recreated sandbox." The test uses hello_plugin with a normal fuel budget.
+/// recreated sandbox." The test uses hello with a normal fuel budget.
 /// A fault is forced by calling a non-existent tool (host maps ToolNotFound →
 /// Trapped → Failed state). On the next call to "greet" the sandbox recreates
 /// and returns Ok, proving the lazy-recreate path completes end-to-end.
@@ -338,9 +338,8 @@ fn ac3_faulted_sandbox_serves_successful_call_after_recreate() {
         epoch_deadline_ticks: None,
     };
 
-    let mut sandbox =
-        IsolatedSandbox::load(engine.engine(), hello_plugin_wasm(), empty_fs(), config)
-            .expect("hello_plugin must load");
+    let mut sandbox = IsolatedSandbox::load(engine.engine(), hello_wasm(), empty_fs(), config)
+        .expect("hello must load");
 
     assert!(sandbox.is_ready(), "AC3: sandbox starts Ready");
 
@@ -377,7 +376,7 @@ fn ac3_faulted_sandbox_serves_successful_call_after_recreate() {
 fn ac3_sandbox_is_ready_after_successful_recreate() {
     let engine = IsolationEngine::new().expect("IsolationEngine must create");
 
-    // Load hello_plugin with a tiny fuel budget to trigger a fuel fault.
+    // Load hello with a tiny fuel budget to trigger a fuel fault.
     let config_tiny = IsolationConfig {
         fuel_budget: Some(1_000),
         epoch_deadline_ticks: None,
@@ -404,32 +403,28 @@ fn ac3_sandbox_is_ready_after_successful_recreate() {
     );
 
     // Now switch to a normal fuel budget and call again. The lazy recreate
-    // will rebuild the sandbox and the call on the hello_plugin would succeed.
+    // will rebuild the sandbox and the call on the hello would succeed.
     // For loop_plugin it will fault again (loop never ends). The key: the
     // sandbox was recreated (consecutive_failures reset to 0, then fault again).
     // We verify by checking it's not quarantined after 1 more fault.
 
     // Reset config to normal fuel before next call.
-    // (IsolationConfig is stored on the sandbox; we test via a fresh hello_plugin.)
-    let mut hello_sandbox = IsolatedSandbox::load(
-        engine.engine(),
-        hello_plugin_wasm(),
-        empty_fs(),
-        config_normal,
-    )
-    .expect("hello_plugin must load");
+    // (IsolationConfig is stored on the sandbox; we test via a fresh hello.)
+    let mut hello_sandbox =
+        IsolatedSandbox::load(engine.engine(), hello_wasm(), empty_fs(), config_normal)
+            .expect("hello must load");
 
     // Cause a fault by exhausting a tiny budget on a greet call — we do this by
     // recreating the sandbox with tiny budget.
-    // Actually: let's just verify hello_plugin works with the normal engine.
+    // Actually: let's just verify hello works with the normal engine.
     let args = Value::Map(vec![("name".to_owned(), Value::Text("Restore".to_owned()))]);
     let result = hello_sandbox
         .call_tool("greet", args)
-        .expect("AC3: hello_plugin greet must succeed");
+        .expect("AC3: hello greet must succeed");
     assert_eq!(
         result,
         Value::Text("Hello, Restore!".to_owned()),
-        "AC3: hello_plugin call succeeds"
+        "AC3: hello call succeeds"
     );
     assert!(
         hello_sandbox.is_ready(),

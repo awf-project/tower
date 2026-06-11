@@ -1,16 +1,16 @@
 [package]
-name = "plugin_ast"
+name = "ast"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Reference Tree-sitter AST plugin — compiles to wasm32-wasip1 (spec 12c)"
 
-# Decision: cdylib (same as hello_plugin) so the wasm binary exposes the four
+# Decision: cdylib (same as hello) so the wasm binary exposes the four
 # `__plugin_*` symbols as wasm exports without a `_start` entrypoint.
-# rlib is kept so host-side unit tests (`cargo test -p plugin_ast`) compile.
+# rlib is kept so host-side unit tests (`cargo test -p ast`) compile.
 [lib]
-name = "plugin_ast"
+name = "ast"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
@@ -18,7 +18,7 @@ path = "src/lib.rs"
 # The #[plugin_main] macro generates the wasm entry surface.
 
 [dependencies]
-plugin_sdk = { path = "../plugin_sdk", version = "0.1.0" }
+plugin_sdk = { path = "../../crates/plugin_sdk", version = "0.1.0" }
 # Tree-sitter per 12a recipe: pin both crates together (minor upgrade = API mismatch risk).
 # tree-sitter 0.25.x + tree-sitter-rust 0.23.x are the tested combination (12a/12b).
 # tree-sitter-go 0.25.0 and tree-sitter-php 0.24.2 added for spec 12d.

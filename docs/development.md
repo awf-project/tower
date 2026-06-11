@@ -40,7 +40,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # 3. Build wasm fixtures (MUST precede cargo test — see fixture ordering below)
 cargo build \
-  -p hello_plugin \
+  -p hello \
   -p fixture_abi_mismatch \
   -p fixture_panic_plugin \
   -p fixture_loop_plugin \
@@ -48,19 +48,14 @@ cargo build \
   --target wasm32-wasip1
 
 # 4. Build the Tree-sitter AST plugin
-cargo build -p plugin_ast --target wasm32-wasip1
+cargo build -p ast --target wasm32-wasip1
 
-# 5. Run host-side tests (wasm crates excluded — they cannot run on the host target)
-cargo test --workspace \
-  --exclude hello_plugin \
-  --exclude plugin_ast \
-  --exclude fixture_abi_mismatch \
-  --exclude fixture_panic_plugin \
-  --exclude fixture_loop_plugin \
-  --exclude fixture_loop_hook_plugin
+# 5. Run host-side tests — default-members already scopes this to the host crates,
+#    so the wasm-only crates are skipped without an --exclude list.
+cargo test
 
-# 6. Run plugin_ast host-side tests separately
-cargo test -p plugin_ast
+# 6. Run ast host-side tests separately
+cargo test -p ast
 
 # 7. License and advisory policy
 cargo deny check
@@ -99,8 +94,8 @@ included; no manual `rustup target add` is needed on a fresh clone.
 
 ### WASI SDK
 
-The WASI SDK is required only to compile `plugin_ast` (and any future grammar
-plugin that vendors C sources). Pure-Rust wasm crates (`hello_plugin`, all
+The WASI SDK is required only to compile `ast` (and any future grammar
+plugin that vendors C sources). Pure-Rust wasm crates (`hello`, all
 fixtures) compile without it.
 
 Two ways to obtain the SDK locally:
@@ -128,8 +123,7 @@ export AR_wasm32_wasip1="$WASI_SDK_DIR/bin/llvm-ar"
 
 The variable names follow the `cc` crate convention: `CC_<target>` and
 `AR_<target>`, with non-alphanumeric characters replaced by underscores. Minimum
-tested version: wasi-sdk-25.0. wasi-sdk-29.0 also works (verified in spike
-`docs/spikes/12a-tree-sitter-wasm-feasibility.md`).
+tested version: wasi-sdk-25.0. wasi-sdk-29.0 also works.
 
 ---
 
@@ -146,10 +140,10 @@ pull request on `ubuntu-latest`. Steps in order:
 6. Verify WASI clang with `"$CC_wasm32_wasip1" --version`
 7. `cargo fmt --all --check`
 8. `cargo clippy --workspace --all-targets -- -D warnings`
-9. Build wasm fixtures (all five fixture crates + `hello_plugin`, `--target wasm32-wasip1`)
-10. Build `plugin_ast` for `wasm32-wasip1`
+9. Build wasm fixtures (all five fixture crates + `hello`, `--target wasm32-wasip1`)
+10. Build `ast` for `wasm32-wasip1`
 11. `cargo test --workspace --exclude ...` (all wasm crates excluded)
-12. `cargo test -p plugin_ast` (host-side outline walker tests)
+12. `cargo test -p ast` (host-side outline walker tests)
 13. `EmbarkStudios/cargo-deny-action@v2`
 
 The CI job env block sets `WASI_SDK_DIR`, `CC_wasm32_wasip1`, and
@@ -244,7 +238,7 @@ adapter-wired scenarios:
 | `integration_global_replace.rs` | Parallel mass find-and-replace, error cases |
 | `integration_mutation.rs` | Shadow-file atomic writes |
 | `plugin_loader.rs` | WasmtimeHost load, ABI guard, capability linker |
-| `plugin_ast_e2e.rs` | AST outline + symbol search via MCP |
+| `ast_e2e.rs` | AST outline + symbol search via MCP |
 | `plugin_fault_isolation.rs` | Trap, fuel exhaustion, epoch timeout, quarantine |
 
 Fixture `.wasm` paths are injected via `env!("...")` macros, set by
@@ -253,11 +247,11 @@ these tests.
 
 ### Plugin logic tested on the host
 
-`crates/plugin_ast` exposes its outline parsing as a Rust library (`rlib`). Its
-host-side unit tests run with `cargo test -p plugin_ast` — no wasm sandbox,
+`plugins/ast` exposes its outline parsing as a Rust library (`rlib`). Its
+host-side unit tests run with `cargo test -p ast` — no wasm sandbox,
 no WASI SDK needed. This makes the Tree-sitter logic fast to iterate on.
 
-The wasm build (`cargo build -p plugin_ast --target wasm32-wasip1`) is a
+The wasm build (`cargo build -p ast --target wasm32-wasip1`) is a
 separate gate that verifies the same code compiles for the target and produces
 a correctly sized module (~1.2 MB release, ~opt-level=s).
 
@@ -281,7 +275,7 @@ rather than relying on the background ticker thread.
 
 | Crate | Purpose |
 |-------|---------|
-| `hello_plugin` | Minimal example: `greet` tool + `BeforeToolCall` hook |
+| `hello` | Minimal example: `greet` tool + `BeforeToolCall` hook |
 | `fixture_abi_mismatch` | Wrong `ABI_VERSION` → `PluginLoadError::AbiMismatch` |
 | `fixture_panic_plugin` | Guest `panic!` → `PluginFaultKind::Trapped` |
 | `fixture_loop_plugin` | Infinite loop in tool handler → `FuelExhausted` |
@@ -338,7 +332,7 @@ Tower was constructed through an orchestrated TDD workflow applied spec by spec:
    done.
 4. **Gate check**: `fmt + clippy + test` green — only then move to the next spec.
 
-This cycle produced 423 passing host tests and 65 passing `plugin_ast` host-side
+This cycle produced 423 passing host tests and 65 passing `ast` host-side
 tests across 23 specs, with no spec leaving the tree in a broken state.
 
 The dependency order of the 23 specs is preserved in `.agent/todo/README.md`.
@@ -351,7 +345,6 @@ beyond port traits.
 ## Related docs
 
 - [docs/ADR/](ADR/) — architectural decision records
-- [docs/spikes/12a-tree-sitter-wasm-feasibility.md](spikes/12a-tree-sitter-wasm-feasibility.md) — Tree-sitter in WASM spike, including the WASI SDK recipe used in CI
 - [project-brief.md](../project-brief.md) — the original product intent
 - [AGENTS.md](../AGENTS.md) — crate layout, port/adapter names, invariants (the authoritative quick-reference for contributors)
 - [.github/workflows/ci.yml](../.github/workflows/ci.yml) — canonical CI definition

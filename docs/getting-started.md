@@ -36,13 +36,13 @@ Used to enforce license and advisory policy (`deny.toml` at the workspace root).
 cargo install cargo-deny --locked
 ```
 
-### WASI SDK (required only for `plugin_ast` and future grammar plugins)
+### WASI SDK (required only for `ast` and future grammar plugins)
 
-`plugin_ast` vendors tree-sitter C grammar sources that must be compiled to `wasm32-wasip1`. The
+`ast` vendors tree-sitter C grammar sources that must be compiled to `wasm32-wasip1`. The
 Rust wasm target ships no C sysroot, so WASI SDK provides the wasm-targeting clang and the
 `wasi-sysroot`.
 
-Pure-Rust wasm crates (`hello_plugin`, all `fixture_*`) compile without it.
+Pure-Rust wasm crates (`hello`, all `fixture_*`) compile without it.
 
 **Option A — reuse what the tree-sitter CLI already downloaded (zero extra work)**
 
@@ -70,9 +70,6 @@ export AR_wasm32_wasip1="$WASI_SDK_DIR/bin/llvm-ar"
 The env-var names follow the `cc` crate convention: `CC_<target>` / `AR_<target>` with hyphens
 replaced by underscores. They must be visible in every shell session that builds the wasm target.
 Add the `export` lines to your shell profile or a `.envrc` file to make them persistent.
-
-> See [docs/spikes/12a-tree-sitter-wasm-feasibility.md](spikes/12a-tree-sitter-wasm-feasibility.md)
-> for the full investigation and reasoning behind this approach.
 
 ---
 
@@ -116,7 +113,7 @@ Those vars point at `target/wasm32-wasip1/debug/*.wasm`, so the fixtures must be
 
 ```bash
 cargo build \
-  -p hello_plugin \
+  -p hello \
   -p fixture_abi_mismatch \
   -p fixture_panic_plugin \
   -p fixture_loop_plugin \
@@ -124,35 +121,32 @@ cargo build \
   --target wasm32-wasip1
 ```
 
-### 4. Build plugin_ast for wasm32-wasip1
+### 4. Build ast for wasm32-wasip1
 
 Requires `CC_wasm32_wasip1` and `AR_wasm32_wasip1` to be set (see [Prerequisites](#prerequisites)).
 
 ```bash
-cargo build -p plugin_ast --target wasm32-wasip1
+cargo build -p ast --target wasm32-wasip1
 ```
 
 ### 5. Run host-side tests
 
+`default-members` scopes the workspace to the host crates, so a plain `cargo test`
+skips the wasm-only crates — no `--exclude` list needed:
+
 ```bash
-cargo test --workspace \
-  --exclude hello_plugin \
-  --exclude plugin_ast \
-  --exclude fixture_abi_mismatch \
-  --exclude fixture_panic_plugin \
-  --exclude fixture_loop_plugin \
-  --exclude fixture_loop_hook_plugin
+cargo test
 ```
 
 Expected: 423 tests pass, 6 ignored.
 
-### 6. Run plugin_ast host-side tests
+### 6. Run ast host-side tests
 
-`plugin_ast` contains a native outline walker that is tested without WASI SDK (tree-sitter compiles
+`ast` contains a native outline walker that is tested without WASI SDK (tree-sitter compiles
 natively here).
 
 ```bash
-cargo test -p plugin_ast
+cargo test -p ast
 ```
 
 Expected: 65 tests pass.
@@ -250,7 +244,7 @@ Expected response:
 ```
 
 The response lists 7 native `tower_*` tools plus any loaded plugin tools (e.g., `tower_ast_get_outline`,
-`tower_ast_find_symbols` if `plugin_ast` is deployed). Plugin tools are always namespaced as
+`tower_ast_find_symbols` if `ast` is deployed). Plugin tools are always namespaced as
 `tower_<plugin_name>_<tool_name>`.
 
 To deploy a plugin, install it into one of two scopes and restart `tower` — no recompile:
@@ -261,11 +255,11 @@ To deploy a plugin, install it into one of two scopes and restart `tower` — no
 
 ```bash
 # Global (every project):
-tower plugin install target/wasm32-wasip1/release/plugin_ast.wasm
+tower plugin install target/wasm32-wasip1/release/ast.wasm
 
 # Or local (this project only):
 mkdir -p .tower/plugins
-cp target/wasm32-wasip1/release/plugin_ast.wasm .tower/plugins/
+cp target/wasm32-wasip1/release/ast.wasm .tower/plugins/
 
 cargo run -p core_engine     # tower_ast_* tools now appear in tools/list
 ```

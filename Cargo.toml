@@ -4,29 +4,28 @@ members = [
     "crates/core_engine",
     "crates/plugin_sdk",
     "crates/plugin_sdk_macros",
-    "crates/plugin_ast",
-    "crates/hello_plugin",
-    # Test fixtures for spec 11c — wasm32-wasip1 only, excluded from default-members.
-    "crates/fixture_abi_mismatch",
-    # Test fixtures for spec 11d — wasm32-wasip1 only, excluded from default-members.
-    "crates/fixture_panic_plugin",
-    "crates/fixture_loop_plugin",
-    "crates/fixture_loop_hook_plugin",
+    # Plugins (wasm32-wasip1) live under plugins/, separate from the engine + SDK.
+    "plugins/ast",
+    "plugins/hello",
+    # Test-only fixtures (specs 11c/11d), grouped under plugins/fixtures/ and
+    # excluded from default-members so host builds/tests ignore them.
+    "plugins/fixtures/fixture_abi_mismatch",
+    "plugins/fixtures/fixture_panic_plugin",
+    "plugins/fixtures/fixture_loop_plugin",
+    "plugins/fixtures/fixture_loop_hook_plugin",
 ]
 
-# Decision: plugin_ast, hello_plugin, and 11c/11d fixtures target wasm32-wasip1 and
+# Decision: ast, hello, and 11c/11d fixtures target wasm32-wasip1 and
 # are excluded from default-members so host `cargo test` / `cargo build` ignores them.
-# Why: mirrors the plugin_ast precedent (spec OP1). The wasm build is verified
-# explicitly via `cargo build --target wasm32-wasip1 -p hello_plugin` etc.
-# Trade-off: `cargo test --workspace` would fail (wasm target not available on
-# the host default build); use `cargo test --workspace --exclude hello_plugin
-# --exclude plugin_ast --exclude fixture_abi_mismatch --exclude fixture_panic_plugin
-# --exclude fixture_loop_plugin --exclude fixture_loop_hook_plugin` or rely on
-# default-members.
+# Why: mirrors the ast precedent (spec OP1). The wasm build is verified
+# explicitly via `cargo build --target wasm32-wasip1 -p hello` etc.
+# Trade-off: `cargo test --workspace` fails (wasm target unavailable on the host
+# default build). Run plain `cargo test` instead — default-members already scopes
+# it to the host crates below, so no `--exclude` list is needed.
 #
-# Exception: plugin_ast (spec 12c) can also be tested host-side because its
+# Exception: ast (spec 12c) can also be tested host-side because its
 # outline module uses native tree-sitter. Host tests run via
-# `cargo test -p plugin_ast` explicitly; the wasm build is gated separately.
+# `cargo test -p ast` explicitly; the wasm build is gated separately.
 default-members = [
     "crates/core_engine",
     "crates/plugin_sdk",
@@ -39,8 +38,8 @@ rust-version = "1.96"
 license = "EUPL-1.2"
 
 # Decision: opt-level="s" for release builds to control wasm module size.
-# Primarily relevant for wasm crates (plugin_ast, hello_plugin, fixtures).
-# Per 12a recipe: plugin_ast release target is ~1.2 MB with this setting.
+# Primarily relevant for wasm crates (ast, hello, fixtures).
+# Per 12a recipe: the ast release target is ~1.2 MB with this setting.
 # Trade-off: marginally slower host binaries in release mode (acceptable;
 # no user-visible difference at this project scale).
 [profile.release]

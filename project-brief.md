@@ -66,37 +66,37 @@ The central `McpJsonRpcAdapter` unifies native Core utilities and third-party WA
 
 ### Core Native Tools
 
-1. **`vfs_find_file`**
+1. **`tower_find_file`**
 * *Arguments:* `{ "query": "string" }`
 * *Returns:* Array of matching file paths resolved via the inverted index.
 
 
-2. **`vfs_search_text`**
+2. **`tower_search_text`**
 * *Arguments:* `{ "pattern": "string" }`
 * *Returns:* Structured list of string matches including `FileId`, `path`, `line_number`, and `line_content`.
 
 
-3. **`vfs_read_file`**
+3. **`tower_read_file`**
 * *Arguments:* `{ "path": "string" }`
 * *Returns:* Raw text content of the target file.
 
 
-4. **`vfs_create_file`**
+4. **`tower_create_file`**
 * *Arguments:* `{ "path": "string", "content": "string" }`
 * *Returns:* Success confirmation following safe shadow-file creation.
 
 
-5. **`vfs_create_directory`**
+5. **`tower_create_directory`**
 * *Arguments:* `{ "path": "string" }`
 * *Returns:* Recursive directory structure initialization confirmation.
 
 
-6. **`vfs_delete_file`**
+6. **`tower_delete_file`**
 * *Arguments:* `{ "path": "string" }`
 * *Returns:* Confirmation of physical removal and immediate VFS index clearing.
 
 
-7. **`vfs_global_replace`**
+7. **`tower_global_replace`**
 * *Arguments:* `{ "target": "string", "replacement": "string" }`
 * *Returns:* Transaction status of the mass-parallel refactoring job.
 
@@ -124,21 +124,20 @@ The codebase is organized as a Cargo Workspace to split the distributable SDK fr
 ```text
 my_project_workspace/
 ├── Cargo.toml               # Workspace configuration file
-├── crates/
+├── crates/                  # Engine + SDK (host-side, default-members)
 │   ├── core_engine/         # Core Host binary (Clean/Hexagonal)
-│   │   ├── src/
-│   │   │   ├── domain/      # VFS logic, indexing, and PluginHost engine
-│   │   │   ├── ports/       # Inbound (API) and Outbound (SPI) interfaces
-│   │   │   └── adapters/    # Sled storage, Notify watcher, Wasmtime loader, MCP Server
+│   │   └── src/
+│   │       ├── domain/      # VFS logic, indexing, and PluginHost engine
+│   │       ├── ports/       # Inbound (API) and Outbound (SPI) interfaces
+│   │       └── adapters/    # Sled storage, Notify watcher, Wasmtime loader, MCP Server
 │   │
 │   ├── plugin_sdk/          # Shared SDK crate distributed to third-party developers
-│   │   ├── src/
-│   │   │   └── lib.rs       # Shared types, safety macros, and SPI bindings
-│   │
-│   └── plugin_ast/          # Reference Tree-sitter WASM plugin implementation
-│       ├── src/
-│       │   ├── parser.rs    # Grammar definitions (Go, PHP, Rust, etc.)
-│       │   └── main.rs      # Independent binaire targeted to wasm32-wasip1
+│   └── plugin_sdk_macros/   # Proc-macros: #[plugin_main], #[plugin_export]
+│
+└── plugins/                 # wasm32-wasip1 plugins (excluded from default-members)
+    ├── ast/                 # Reference Tree-sitter WASM plugin (Go, PHP, Rust)
+    ├── hello/               # Minimal example plugin
+    └── fixtures/            # Test-only wasm fixtures (11c/11d)
 
 ```
 

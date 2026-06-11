@@ -1,9 +1,9 @@
-//! End-to-end integration test for the `plugin_ast` wasm plugin (specs 12c + 12d).
+//! End-to-end integration test for the `ast` wasm plugin (specs 12c + 12d).
 //!
 //! # What this verifies
 //!
 //! **Spec 12c (outline)**
-//! - The `plugin_ast.wasm` built from the `plugin_ast` crate loads via the 11c
+//! - The `ast.wasm` built from the `ast` crate loads via the 11c
 //!   wasmtime loader.
 //! - The manifest declares both `get_outline` and `find_symbols` as tools.
 //! - `tower_ast_get_outline` through `MergedRegistry` returns structural items for Rust.
@@ -29,7 +29,7 @@
 //! # Fixture path
 //!
 //! `PLUGIN_AST_WASM` is set by `core_engine`'s `build.rs`. The CI workflow builds
-//! `plugin_ast --target wasm32-wasip1` with the WASI SDK env vars before running
+//! `ast --target wasm32-wasip1` with the WASI SDK env vars before running
 //! `cargo test`, so the `.wasm` is always present when this test runs.
 //!
 //! # File reads through the host capability
@@ -51,7 +51,7 @@ use core_engine::ports::FileSystemPort;
 
 // ── Fixture path (set by build.rs) ────────────────────────────────────────────
 
-fn plugin_ast_wasm() -> &'static str {
+fn ast_wasm() -> &'static str {
     env!("PLUGIN_AST_WASM")
 }
 
@@ -102,15 +102,15 @@ fn fs_with(path: &str, content: &[u8]) -> Arc<InMemoryFs> {
     Arc::new(fs)
 }
 
-/// Build a `MergedRegistry` with the `plugin_ast` plugin registered.
+/// Build a `MergedRegistry` with the `ast` plugin registered.
 ///
 /// `fs` is the filesystem the plugin will use for `host::read_file` calls.
 ///
 /// A second empty `EngineState` is wired for the native tool side (not used by
 /// these tests — we only exercise the plugin tool path).
-fn merged_registry_with_plugin_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
+fn merged_registry_with_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
     let fs_port: Arc<dyn core_engine::ports::FileSystemPort + Send + Sync> = fs;
-    let instance = WasmtimeHost::load(plugin_ast_wasm(), fs_port).expect("plugin_ast must load");
+    let instance = WasmtimeHost::load(ast_wasm(), fs_port).expect("ast must load");
 
     let mut plugin_registry = PluginHostRegistry::new();
     plugin_registry
@@ -129,7 +129,7 @@ fn merged_registry_with_plugin_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
 
 // ── AC4/AC5: plugin loads and declares both ast tools ────────────────────────
 
-/// AC4/AC5 (Drop & Play): Given the built `plugin_ast.wasm`, When loaded via
+/// AC4/AC5 (Drop & Play): Given the built `ast.wasm`, When loaded via
 /// `WasmtimeHost::load` with no host recompile, Then the manifest declares
 /// both `get_outline` and `find_symbols` as tools.
 ///
@@ -137,9 +137,8 @@ fn merged_registry_with_plugin_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
 /// recompiled; only the `.wasm` artefact is swapped. Both tools appear in the
 /// manifest, proving the plugin ABI surface is forward-compatible.
 #[test]
-fn ac4_ac5_plugin_ast_loads_and_declares_both_tools() {
-    let instance =
-        WasmtimeHost::load(plugin_ast_wasm(), Arc::new(InMemoryFs::new())).expect("must load");
+fn ac4_ac5_ast_loads_and_declares_both_tools() {
+    let instance = WasmtimeHost::load(ast_wasm(), Arc::new(InMemoryFs::new())).expect("must load");
 
     let manifest = instance.manifest();
     assert_eq!(manifest.name, "ast", "plugin name must be 'ast'");
@@ -167,7 +166,7 @@ fn ac4_ac5_plugin_ast_loads_and_declares_both_tools() {
 #[test]
 fn ac5_tools_list_exposes_both_ast_tools() {
     let fs = Arc::new(InMemoryFs::new());
-    let registry = merged_registry_with_plugin_ast(fs);
+    let registry = merged_registry_with_ast(fs);
 
     let tools = registry.list();
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -190,7 +189,7 @@ fn ac5_tools_list_exposes_both_ast_tools() {
 #[test]
 fn ac1_ast_get_outline_rust_file_returns_structural_items() {
     let fs = fs_with("src/counter.rs", RUST_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "src/counter.rs" });
     let result = registry
@@ -232,7 +231,7 @@ fn ac1_ast_get_outline_rust_file_returns_structural_items() {
 #[test]
 fn ac1_outline_items_have_span_fields() {
     let fs = fs_with("src/lib.rs", RUST_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "src/lib.rs" });
     let result = registry
@@ -257,7 +256,7 @@ fn ac1_outline_items_have_span_fields() {
 #[test]
 fn ac2_non_rust_file_returns_unsupported_result() {
     let fs = fs_with("hello.py", b"def hello(): pass");
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "hello.py" });
     // Must succeed (not error): returns unsupported result, not SdkError.
@@ -288,7 +287,7 @@ pub fn good_fn() {}
 fn broken_fn( {
 ";
     let fs = fs_with("broken.rs", broken_source);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "broken.rs" });
     let result = registry
@@ -325,7 +324,7 @@ fn broken_fn( {
 #[test]
 fn u2_empty_fs_causes_call_failed_not_raw_fs_read() {
     // Empty InMemoryFs: the plugin cannot read any file.
-    let mut registry = merged_registry_with_plugin_ast(Arc::new(InMemoryFs::new()));
+    let mut registry = merged_registry_with_ast(Arc::new(InMemoryFs::new()));
 
     let args = serde_json::json!({ "path": "src/lib.rs" });
     let result = registry.call("tower_ast_get_outline", args);
@@ -407,7 +406,7 @@ function findMeFn() {}
 #[test]
 fn ac1_12d_rust_find_symbols_struct_no_false_positives() {
     let fs = fs_with("src/lib.rs", RUST_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "src/lib.rs",
@@ -449,7 +448,7 @@ fn ac1_12d_rust_find_symbols_struct_no_false_positives() {
 #[test]
 fn ac1_12d_rust_find_symbols_method_not_free_function() {
     let fs = fs_with("src/lib.rs", RUST_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "src/lib.rs",
@@ -475,7 +474,7 @@ fn ac1_12d_rust_find_symbols_method_not_free_function() {
 #[test]
 fn ac1_12d_rust_find_symbols_match_has_span_fields() {
     let fs = fs_with("src/lib.rs", RUST_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "src/lib.rs",
@@ -499,7 +498,7 @@ fn ac1_12d_rust_find_symbols_match_has_span_fields() {
 #[test]
 fn ac2_12d_go_find_symbols_function_definition() {
     let fs = fs_with("main.go", GO_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "main.go",
@@ -526,7 +525,7 @@ fn ac2_12d_go_find_symbols_function_definition() {
 #[test]
 fn ac2_12d_go_find_symbols_method_definition() {
     let fs = fs_with("main.go", GO_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "main.go",
@@ -552,7 +551,7 @@ fn ac2_12d_go_find_symbols_method_definition() {
 #[test]
 fn ac2_12d_go_find_symbols_struct_type() {
     let fs = fs_with("main.go", GO_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "main.go",
@@ -574,7 +573,7 @@ fn ac2_12d_go_find_symbols_struct_type() {
 #[test]
 fn ac2_12d_go_outline_returns_structural_items() {
     let fs = fs_with("main.go", GO_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "main.go" });
     let result = registry
@@ -600,7 +599,7 @@ fn ac2_12d_go_outline_returns_structural_items() {
 #[test]
 fn ac2_12d_php_find_symbols_class_definition() {
     let fs = fs_with("app.php", PHP_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "app.php",
@@ -628,7 +627,7 @@ fn ac2_12d_php_find_symbols_class_definition() {
 #[test]
 fn ac2_12d_php_outline_returns_structural_items() {
     let fs = fs_with("app.php", PHP_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "app.php" });
     let result = registry
@@ -656,7 +655,7 @@ fn ac2_12d_php_outline_returns_structural_items() {
 #[test]
 fn ac3_12d_go_not_applicable_kind_returns_empty_matches() {
     let fs = fs_with("main.go", GO_SYMBOLS_SOURCE);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "main.go",
@@ -687,7 +686,7 @@ fn ac3_12d_go_not_applicable_kind_returns_empty_matches() {
 fn ac4_12d_malformed_rust_returns_partial_without_crash() {
     let broken = b"pub struct Good {} fn broken( { ";
     let fs = fs_with("broken.rs", broken);
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({
         "path": "broken.rs",
@@ -717,7 +716,7 @@ fn ac4_12d_malformed_rust_returns_partial_without_crash() {
 fn bug01_zero_byte_rust_file_returns_empty_items_not_trap() {
     // A zero-byte .rs file: empty content, supported extension.
     let fs = fs_with("empty.rs", b"");
-    let mut registry = merged_registry_with_plugin_ast(fs);
+    let mut registry = merged_registry_with_ast(fs);
 
     let args = serde_json::json!({ "path": "empty.rs" });
     let result = registry

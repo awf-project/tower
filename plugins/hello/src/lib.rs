@@ -79,7 +79,7 @@ impl Plugin for HelloPlugin {
         match kind {
             HookKind::BeforeToolCall => {
                 if let HookPayload::BeforeToolCall { tool_name, .. } = &payload {
-                    plugin_sdk::host::log(&format!("hello_plugin: before tool call '{tool_name}'"));
+                    plugin_sdk::host::log(&format!("hello: before tool call '{tool_name}'"));
                 }
             }
             // AfterToolCall, FileIndexed, FileChanged: no-op for this plugin.

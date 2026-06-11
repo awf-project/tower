@@ -532,7 +532,7 @@ the MCP link.
 
 ## AST plugin tools
 
-The `plugin_ast` crate (manifest `name = "ast"`) provides Tree-sitter-based
+The `ast` crate (manifest `name = "ast"`) provides Tree-sitter-based
 structural analysis for Rust, Go, and PHP. It must be compiled to
 `wasm32-wasip1` and placed in the plugin directory for the tools to appear.
 

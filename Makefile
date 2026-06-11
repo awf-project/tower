@@ -8,21 +8,16 @@ HOST_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
 WASM_TARGET  := wasm32-wasip1
 INSTALL_DIR  ?= $(HOME)/.local/bin
 
-# WASI toolchain for the tree-sitter C sources in plugin_ast (see AGENTS.md).
+# WASI toolchain for the tree-sitter C sources in ast (see AGENTS.md).
 # Defaults to the tree-sitter cache; an exported CC_wasm32_wasip1 / AR_wasm32_wasip1
 # (e.g. in CI) overrides these at recipe time.
 WASI_CC      ?= $(HOME)/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
 WASI_AR      ?= $(HOME)/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
 
 # wasm fixtures that must be built before `cargo test` (see development.md).
-WASM_FIXTURES := hello_plugin fixture_abi_mismatch fixture_panic_plugin \
+WASM_FIXTURES := hello fixture_abi_mismatch fixture_panic_plugin \
                  fixture_loop_plugin fixture_loop_hook_plugin
 FIXTURE_FLAGS := $(addprefix -p ,$(WASM_FIXTURES))
-
-# Crates excluded from host-side `cargo test` (wasm-only or tested separately).
-TEST_EXCLUDES := --exclude hello_plugin --exclude plugin_ast \
-                 --exclude fixture_abi_mismatch --exclude fixture_panic_plugin \
-                 --exclude fixture_loop_plugin --exclude fixture_loop_hook_plugin
 
 .DEFAULT_GOAL := help
 
@@ -53,14 +48,14 @@ run: ## Run the MCP server over stdio (cargo run)
 ## WASM artifacts
 ## ---------------------------------------------------------------------------
 .PHONY: wasm-fixtures
-wasm-fixtures: ## Build the 5 wasm test fixtures + hello_plugin
+wasm-fixtures: ## Build the 5 wasm test fixtures + hello
 	cargo build $(FIXTURE_FLAGS) --target $(WASM_TARGET)
 
 .PHONY: wasm-ast
-wasm-ast: ## Build plugin_ast for wasm (uses cached WASI SDK; override via CC_wasm32_wasip1 / AR_wasm32_wasip1)
+wasm-ast: ## Build ast for wasm (uses cached WASI SDK; override via CC_wasm32_wasip1 / AR_wasm32_wasip1)
 	CC_wasm32_wasip1="$${CC_wasm32_wasip1:-$(WASI_CC)}" \
 	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
-	cargo build -p plugin_ast --target $(WASM_TARGET)
+	cargo build -p ast --target $(WASM_TARGET)
 
 ## ---------------------------------------------------------------------------
 ## Quality gate (same order as CI — see docs/development.md)
@@ -79,11 +74,11 @@ clippy: ## Lint, warnings as errors (CI step 2)
 
 .PHONY: test
 test: wasm-fixtures wasm-ast ## Run host-side tests (builds wasm first)
-	cargo test --workspace $(TEST_EXCLUDES)
+	cargo test
 
 .PHONY: test-ast
-test-ast: ## Run plugin_ast host-side tests
-	cargo test -p plugin_ast
+test-ast: ## Run ast host-side tests
+	cargo test -p ast
 
 .PHONY: deny
 deny: ## License & advisory policy
@@ -91,8 +86,8 @@ deny: ## License & advisory policy
 
 .PHONY: gate
 gate: fmt-check clippy wasm-fixtures wasm-ast ## Full quality gate (fmt+clippy+wasm+tests+deny)
-	cargo test --workspace $(TEST_EXCLUDES)
-	cargo test -p plugin_ast
+	cargo test
+	cargo test -p ast
 	cargo deny check
 
 ## ---------------------------------------------------------------------------

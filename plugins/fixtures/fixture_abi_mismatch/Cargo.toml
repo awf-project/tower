@@ -7,11 +7,11 @@ license.workspace = true
 description = "Test fixture: plugin with wrong ABI version — used by 11c AC4 tests"
 
 # Decision: cdylib so the wasm binary exports the four __plugin_* symbols.
-# Excluded from default-members (same pattern as hello_plugin / plugin_ast).
+# Excluded from default-members (same pattern as hello / ast).
 [lib]
 name = "fixture_abi_mismatch"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-plugin_sdk = { path = "../plugin_sdk", version = "0.1.0" }
+plugin_sdk = { path = "../../../crates/plugin_sdk", version = "0.1.0" }

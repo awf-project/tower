@@ -199,7 +199,7 @@ pub enum SymbolResult {
 /// # Examples
 ///
 /// ```
-/// use plugin_ast::symbols::language_label;
+/// use ast::symbols::language_label;
 /// assert_eq!(language_label("foo.py"),        "py");
 /// assert_eq!(language_label("lab/notes.md"),  "md");
 /// assert_eq!(language_label("typescript"),    "typescript");

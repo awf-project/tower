@@ -7,7 +7,7 @@
 //!
 //! Spawning `cargo build` inside a `build.rs` script causes a build-lock
 //! deadlock: the outer `cargo build -p core_engine` holds the workspace build
-//! lock; the inner `cargo build -p hello_plugin` tries to acquire the same
+//! lock; the inner `cargo build -p hello` tries to acquire the same
 //! lock — and blocks forever.
 //!
 //! # How to build fixtures
@@ -17,9 +17,9 @@
 //! ```sh
 //! CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang \
 //! AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
-//! cargo build -p hello_plugin -p fixture_abi_mismatch \
+//! cargo build -p hello -p fixture_abi_mismatch \
 //!             -p fixture_panic_plugin -p fixture_loop_plugin \
-//!             -p fixture_loop_hook_plugin -p plugin_ast \
+//!             -p fixture_loop_hook_plugin -p ast \
 //!             --target wasm32-wasip1
 //! ```
 //!
@@ -27,14 +27,14 @@
 //!
 //! # Fixture paths
 //!
-//! - `HELLO_PLUGIN_WASM`          → `target/wasm32-wasip1/debug/hello_plugin.wasm`
+//! - `HELLO_PLUGIN_WASM`          → `target/wasm32-wasip1/debug/hello.wasm`
 //! - `ABI_MISMATCH_WASM`          → `target/wasm32-wasip1/debug/fixture_abi_mismatch.wasm`
 //! - `FORBIDDEN_IMPORT_WASM`      → `tests/fixtures/forbidden_import.wasm` (committed)
 //! - `FORBIDDEN_HOST_IMPORT_WASM` → `tests/fixtures/forbidden_host_import.wat` (committed)
 //! - `PANIC_PLUGIN_WASM`          → `target/wasm32-wasip1/debug/fixture_panic_plugin.wasm`
 //! - `LOOP_PLUGIN_WASM`           → `target/wasm32-wasip1/debug/fixture_loop_plugin.wasm`
 //! - `LOOP_HOOK_PLUGIN_WASM`      → `target/wasm32-wasip1/debug/fixture_loop_hook_plugin.wasm`
-//! - `PLUGIN_AST_WASM`            → `target/wasm32-wasip1/debug/plugin_ast.wasm`
+//! - `PLUGIN_AST_WASM`            → `target/wasm32-wasip1/debug/ast.wasm`
 //!
 //! `FORBIDDEN_HOST_IMPORT_WASM` points at a `.wat` text file. wasmtime's default
 //! features include the `wat` crate, so `Module::from_file` assembles it
@@ -56,7 +56,7 @@ fn main() {
 
     println!(
         "cargo:rustc-env=HELLO_PLUGIN_WASM={}",
-        wasm_profile_dir.join("hello_plugin.wasm").display()
+        wasm_profile_dir.join("hello.wasm").display()
     );
 
     println!(
@@ -101,20 +101,20 @@ fn main() {
 
     println!(
         "cargo:rustc-env=PLUGIN_AST_WASM={}",
-        wasm_profile_dir.join("plugin_ast.wasm").display()
+        wasm_profile_dir.join("ast.wasm").display()
     );
 
     // Re-run if fixture sources change (for incremental correctness in IDE).
-    println!("cargo:rerun-if-changed=../hello_plugin/src/lib.rs");
-    println!("cargo:rerun-if-changed=../fixture_abi_mismatch/src/lib.rs");
-    println!("cargo:rerun-if-changed=../fixture_panic_plugin/src/lib.rs");
-    println!("cargo:rerun-if-changed=../fixture_loop_plugin/src/lib.rs");
-    println!("cargo:rerun-if-changed=../fixture_loop_hook_plugin/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../plugins/hello/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../plugins/fixtures/fixture_abi_mismatch/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../plugins/fixtures/fixture_panic_plugin/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../plugins/fixtures/fixture_loop_plugin/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../plugins/fixtures/fixture_loop_hook_plugin/src/lib.rs");
     println!("cargo:rerun-if-changed=../plugin_sdk/src/lib.rs");
     println!("cargo:rerun-if-changed=../plugin_sdk/src/__private.rs");
-    println!("cargo:rerun-if-changed=../plugin_ast/src/lib.rs");
-    println!("cargo:rerun-if-changed=../plugin_ast/src/outline.rs");
-    println!("cargo:rerun-if-changed=../plugin_ast/src/symbols.rs");
+    println!("cargo:rerun-if-changed=../../plugins/ast/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../plugins/ast/src/outline.rs");
+    println!("cargo:rerun-if-changed=../../plugins/ast/src/symbols.rs");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_import.wasm");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_host_import.wat");
 }

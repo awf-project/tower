@@ -5,18 +5,7 @@ text processing, an embedded **WASM plugin host** (`wasmtime`), and an **MCP** (
 interface. Architecture: **DDD + Hexagonal (Ports & Adapters) + Microkernel**.
 
 > This file holds project-specific facts. General engineering conventions (persona, git, code style,
-> TDD discipline) live in the user-global `~/.claude/CLAUDE.md` and are not repeated here.
-
-## Current state: specs-first
-
-The repo is **not yet scaffolded** (no `Cargo.toml` until spec `00`). Work is driven by an iterative
-spec backlog in **`.agent/todo/`** — read `.agent/todo/README.md` first (roadmap, dependency DAG,
-architecture wireframe, milestones). The source of intent is **`project-brief.md`**.
-
-- 23 single-responsibility specs, format **EARS + Given/When/Then**, each with a TDD sequence.
-- **Build them in dependency order.** Every spec must leave the tree in a **stable state**: all gates
-  green before moving on.
-- `.agent/` is git-ignored — specs are local working artifacts, not versioned.
+> TDD discipline) live in the user-global and are not repeated here.
 
 ## The golden rule (hexagonal boundary)
 
@@ -33,10 +22,15 @@ adapters. If you reach for an I/O crate inside the domain, stop — you're cross
 ## Crate layout (Cargo workspace)
 
 ```
-crates/
-├── core_engine/   # Host binary — domain/ ports/ adapters/   (specs 00–11d)
-├── plugin_sdk/    # Distributable SDK: shared types, ABI, macros  (spec 11a)
-└── plugin_ast/    # Reference Tree-sitter plugin → wasm32-wasip1  (specs 12a–12d)
+crates/                # Engine + SDK (host-side, default-members)
+├── core_engine/        # Host binary — domain/ ports/ adapters/   (specs 00–11d)
+├── plugin_sdk/         # Distributable SDK: shared types, ABI, macros  (spec 11a)
+└── plugin_sdk_macros/  # Proc-macros: #[plugin_main], #[plugin_export]
+
+plugins/                # wasm32-wasip1 plugins (excluded from default-members)
+├── ast/                # Reference Tree-sitter plugin → wasm32-wasip1  (specs 12a–12d)
+├── hello/              # Minimal example plugin
+└── fixtures/           # Test-only fault-isolation fixtures (specs 11c/11d)
 ```
 
 ## Commands (target — available after spec 00)
@@ -46,7 +40,7 @@ cargo test --workspace                       # domain unit tests use in-memory d
 cargo clippy --workspace -- -D warnings      # warnings are errors
 cargo fmt --check
 cargo deny check                             # license/advisory policy
-cargo build -p plugin_ast --target wasm32-wasip1   # the WASM reference plugin (needs WASI SDK env — see below)
+cargo build -p ast --target wasm32-wasip1   # the WASM reference plugin (needs WASI SDK env — see below)
 cargo run -p core_engine                     # MCP server over stdio (after spec 10b)
 ```
 
@@ -59,13 +53,13 @@ to wasm; point cargo at the cached WASI toolchain:
 ```bash
 CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang \
 AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
-cargo build -p plugin_ast --target wasm32-wasip1
+cargo build -p ast --target wasm32-wasip1
 ```
 
 **`build.rs` does NOT build the WASM** (spawning `cargo build` from it deadlocks on the workspace
 build lock — by design). It only *locates* the artifact and exports `PLUGIN_AST_WASM`. So
-`cargo test --workspace` runs the `plugin_ast_e2e` suite against **whatever `.wasm` is already on
-disk**. After any change to `plugin_sdk` or `plugin_ast`, **rebuild the wasm first** (command above)
+`cargo test --workspace` runs the `ast_e2e` suite against **whatever `.wasm` is already on
+disk**. After any change to `plugin_sdk` or `ast`, **rebuild the wasm first** (command above)
 or the e2e suite silently passes against a stale binary — a false green.
 
 **Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy -- -D warnings`
