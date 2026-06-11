@@ -53,8 +53,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use wasmtime::{AsContext, AsContextMut, Engine, Linker, Module, Store};
-use wasmtime_wasi::p1::{add_to_linker_sync, WasiP1Ctx};
 use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::p1::{WasiP1Ctx, add_to_linker_sync};
 
 // IsolationConfig is defined in super::isolation but imported here only
 // for the apply_compute_bounds method parameter. Using the module path avoids
@@ -62,7 +62,7 @@ use wasmtime_wasi::WasiCtxBuilder;
 // The import is inline in the method below.
 
 use plugin_sdk::__private::BUFFER_HEADER_LEN;
-use plugin_sdk::{HookKind, HookPayload, PluginManifest, Value, ABI_VERSION};
+use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, Value};
 
 use crate::domain::RelativePath;
 use crate::domain::{PluginHostError, PluginInstance};
@@ -183,23 +183,23 @@ impl WasmtimeHost {
                         _ => return, // no memory — silently drop
                     };
                     let data = mem.data(&caller);
-                    if let Some(slice) = data.get(ptr..ptr.saturating_add(len)) {
-                        if let Ok(msg) = std::str::from_utf8(slice) {
-                            // Cap at 4096 bytes on a char boundary to prevent
-                            // log-flooding DoS from a misbehaving plugin.
-                            const MAX_LOG_BYTES: usize = 4096;
-                            let truncated = if msg.len() > MAX_LOG_BYTES {
-                                // Walk back to the last char boundary at or before MAX_LOG_BYTES.
-                                let mut end = MAX_LOG_BYTES;
-                                while !msg.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                &msg[..end]
-                            } else {
-                                msg
-                            };
-                            eprintln!("[plugin] {truncated}");
-                        }
+                    if let Some(slice) = data.get(ptr..ptr.saturating_add(len))
+                        && let Ok(msg) = std::str::from_utf8(slice)
+                    {
+                        // Cap at 4096 bytes on a char boundary to prevent
+                        // log-flooding DoS from a misbehaving plugin.
+                        const MAX_LOG_BYTES: usize = 4096;
+                        let truncated = if msg.len() > MAX_LOG_BYTES {
+                            // Walk back to the last char boundary at or before MAX_LOG_BYTES.
+                            let mut end = MAX_LOG_BYTES;
+                            while !msg.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            &msg[..end]
+                        } else {
+                            msg
+                        };
+                        eprintln!("[plugin] {truncated}");
                     }
                     // Out-of-bounds / invalid UTF-8: silently ignore.
                 },
@@ -320,20 +320,20 @@ impl WasmtimeHost {
                         _ => return,
                     };
                     let data = mem.data(&caller);
-                    if let Some(slice) = data.get(ptr..ptr.saturating_add(len)) {
-                        if let Ok(msg) = std::str::from_utf8(slice) {
-                            const MAX_LOG_BYTES: usize = 4096;
-                            let truncated = if msg.len() > MAX_LOG_BYTES {
-                                let mut end = MAX_LOG_BYTES;
-                                while !msg.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                &msg[..end]
-                            } else {
-                                msg
-                            };
-                            eprintln!("[plugin] {truncated}");
-                        }
+                    if let Some(slice) = data.get(ptr..ptr.saturating_add(len))
+                        && let Ok(msg) = std::str::from_utf8(slice)
+                    {
+                        const MAX_LOG_BYTES: usize = 4096;
+                        let truncated = if msg.len() > MAX_LOG_BYTES {
+                            let mut end = MAX_LOG_BYTES;
+                            while !msg.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            &msg[..end]
+                        } else {
+                            msg
+                        };
+                        eprintln!("[plugin] {truncated}");
                     }
                 },
             )

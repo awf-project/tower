@@ -19,7 +19,7 @@
 
 use tempfile::TempDir;
 
-use crate::adapters::storage::{SledStorageAdapter, StorageError, SCHEMA_VERSION};
+use crate::adapters::storage::{SCHEMA_VERSION, SledStorageAdapter, StorageError};
 use crate::domain::{FileId, RelativePath};
 use crate::ports::StoragePort;
 use crate::test_support::make_virtual_file;

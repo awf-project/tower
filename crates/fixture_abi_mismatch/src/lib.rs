@@ -51,14 +51,14 @@ impl Plugin for MismatchPlugin {
 // Manual export surface — mirrors what #[plugin_main] would generate but with
 // the manifest above (abi=0) instead of the real ABI_VERSION.
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __plugin_init() -> *mut u8 {
     let manifest = MismatchPlugin::init();
     let encoded = __private::encode_manifest(manifest);
     __private::vec_into_raw(encoded)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __plugin_call_tool(ptr: *mut u8, len: usize) -> *mut u8 {
     let response = {
         let request_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -68,19 +68,19 @@ pub unsafe extern "C" fn __plugin_call_tool(ptr: *mut u8, len: usize) -> *mut u8
     __private::vec_into_raw(response)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __plugin_on_hook(ptr: *mut u8, len: usize) {
     let hook_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     __private::dispatch_on_hook::<MismatchPlugin>(hook_bytes);
     unsafe { __private::free_alloc_buffer(ptr, len) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn __plugin_free(ptr: *mut u8, len: usize) {
     unsafe { __private::free_buffer(ptr, len) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __plugin_alloc(len: u32) -> *mut u8 {
     __private::alloc_guest_buffer(len as usize)
 }

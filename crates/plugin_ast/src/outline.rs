@@ -42,7 +42,7 @@
 
 use tree_sitter::{Language, Node, Parser};
 
-use crate::symbols::{language_label, SupportedLanguage};
+use crate::symbols::{SupportedLanguage, language_label};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -299,10 +299,10 @@ fn walk_impl_body(impl_node: Node<'_>, source: &[u8], items: &mut Vec<OutlineIte
 
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        if child.kind() == "function_item" {
-            if let Some(item) = extract_named_item(child, source, OutlineKind::Method) {
-                items.push(item);
-            }
+        if child.kind() == "function_item"
+            && let Some(item) = extract_named_item(child, source, OutlineKind::Method)
+        {
+            items.push(item);
         }
     }
 }
@@ -1215,7 +1215,7 @@ function topLevelFn() {}
     /// in PHP's kind_applicable() set, making the round-trip silently broken.
     #[test]
     fn php_class_outline_kind_matches_find_symbols_kind() {
-        use crate::symbols::{find_symbols, SymbolKind, SymbolResult};
+        use crate::symbols::{SymbolKind, SymbolResult, find_symbols};
 
         let source = br#"<?php
 class MyClass {

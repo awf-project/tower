@@ -16,16 +16,16 @@
 use std::io::Cursor;
 use std::sync::{Arc, RwLock};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use core_engine::adapters::mcp::native_tools::{EngineState, NativeToolRegistry};
 use core_engine::adapters::mcp::transport::serve;
 use core_engine::adapters::{InMemoryFs, InMemoryStorage};
+use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::token::tokenize;
 use core_engine::domain::virtual_file::FileMetadata;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::domain::RelativePath;
 use core_engine::ports::FileSystemPort;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────

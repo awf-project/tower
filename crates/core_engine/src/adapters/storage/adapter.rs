@@ -59,10 +59,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use sled::transaction::ConflictableTransactionError;
 use sled::Transactional;
+use sled::transaction::ConflictableTransactionError;
 
-use super::error::{to_port_error, to_read_error, StorageError};
+use super::error::{StorageError, to_port_error, to_read_error};
 use super::keys::{blob_key, file_id_key, path_key};
 use crate::domain::index::InvertedIndex;
 use crate::domain::token::tokenize;
@@ -162,10 +162,10 @@ impl SledStorageAdapter {
     /// True when a sled error is transient file-lock contention (a previous
     /// handle has not released its OS lock yet), not a real failure.
     fn is_lock_contention(e: &sled::Error) -> bool {
-        if let sled::Error::Io(io) = e {
-            if io.kind() == std::io::ErrorKind::WouldBlock {
-                return true;
-            }
+        if let sled::Error::Io(io) = e
+            && io.kind() == std::io::ErrorKind::WouldBlock
+        {
+            return true;
         }
         e.to_string().contains("could not acquire lock")
     }
@@ -444,24 +444,25 @@ impl StoragePort for SledStorageAdapter {
                 // `From<UnabortableTransactionError> for
                 // ConflictableTransactionError<TxAbort>` impl provided by
                 // sled, so the abort type stays `TxAbort` throughout.
-                let old_token_set: HashSet<String> = if let Some(old_bytes) =
-                    tx_files.get(key.as_ref())?
-                {
-                    if let Ok(old_file) = postcard::from_bytes::<VirtualFile>(old_bytes.as_ref()) {
-                        // Remove old path entry if the path changed.
-                        let old_path = path_key(&old_file.path);
-                        if old_path != new_path_bytes.as_slice() {
-                            tx_paths.remove(old_path)?;
+                let old_token_set: HashSet<String> = match tx_files.get(key.as_ref())? {
+                    Some(old_bytes) => {
+                        if let Ok(old_file) =
+                            postcard::from_bytes::<VirtualFile>(old_bytes.as_ref())
+                        {
+                            // Remove old path entry if the path changed.
+                            let old_path = path_key(&old_file.path);
+                            if old_path != new_path_bytes.as_slice() {
+                                tx_paths.remove(old_path)?;
+                            }
+                            tokenize(old_file.path.as_str())
+                                .iter()
+                                .map(|t| t.as_str().to_owned())
+                                .collect()
+                        } else {
+                            HashSet::new()
                         }
-                        tokenize(old_file.path.as_str())
-                            .iter()
-                            .map(|t| t.as_str().to_owned())
-                            .collect()
-                    } else {
-                        HashSet::new()
                     }
-                } else {
-                    HashSet::new()
+                    _ => HashSet::new(),
                 };
 
                 // ── Write file record ───────────────────────────────────────
@@ -603,8 +604,8 @@ impl StoragePort for SledStorageAdapter {
 
                 for rec in &records {
                     // ── Compute old token set (for delta) ───────────────────
-                    let old_token_set: HashSet<String> =
-                        if let Some(old_bytes) = tx_files.get(rec.key.as_ref())? {
+                    let old_token_set: HashSet<String> = match tx_files.get(rec.key.as_ref())? {
+                        Some(old_bytes) => {
                             if let Ok(old_file) =
                                 postcard::from_bytes::<VirtualFile>(old_bytes.as_ref())
                             {
@@ -619,9 +620,9 @@ impl StoragePort for SledStorageAdapter {
                             } else {
                                 HashSet::new()
                             }
-                        } else {
-                            HashSet::new()
-                        };
+                        }
+                        _ => HashSet::new(),
+                    };
 
                     // ── Write file record ────────────────────────────────────
                     tx_files.insert(rec.key.as_ref(), rec.file_bytes.as_slice())?;

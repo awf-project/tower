@@ -268,25 +268,23 @@ impl<'a> GlobalReplaceService<'a> {
         //
         // Storage metadata will be repaired by the watcher on the next Modify
         // event once the OS notifies about the renamed files.
-        if !updated_virtual_files.is_empty() {
-            if let Err(port_err) = self.storage.put_batch(&updated_virtual_files) {
-                // Decision: represent the storage failure as a synthetic
-                // FileReplaceError with a sentinel path rather than returning
-                // Err. This preserves the accurate files_changed / replacements
-                // counts and signals to the caller that the FS state is correct
-                // but the metadata store is temporarily stale.
-                //
-                // Trade-off: the sentinel path "(storage)" is not a real
-                // RelativePath. If a future caller iterates errors to re-apply
-                // them they will see an unfamiliar path. Acceptable: the error
-                // message is human-readable and the FS content is correct.
-                errors.push(FileReplaceError {
-                    path: RelativePath::new("(storage)"),
-                    reason: format!(
-                        "storage put_batch failed after successful FS writes: {port_err}"
-                    ),
-                });
-            }
+        if !updated_virtual_files.is_empty()
+            && let Err(port_err) = self.storage.put_batch(&updated_virtual_files)
+        {
+            // Decision: represent the storage failure as a synthetic
+            // FileReplaceError with a sentinel path rather than returning
+            // Err. This preserves the accurate files_changed / replacements
+            // counts and signals to the caller that the FS state is correct
+            // but the metadata store is temporarily stale.
+            //
+            // Trade-off: the sentinel path "(storage)" is not a real
+            // RelativePath. If a future caller iterates errors to re-apply
+            // them they will see an unfamiliar path. Acceptable: the error
+            // message is human-readable and the FS content is correct.
+            errors.push(FileReplaceError {
+                path: RelativePath::new("(storage)"),
+                reason: format!("storage put_batch failed after successful FS writes: {port_err}"),
+            });
         }
 
         // Sort errors deterministically (UN1/AC2 report requirement).

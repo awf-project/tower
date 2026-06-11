@@ -42,7 +42,7 @@
 
 use std::sync::Mutex;
 
-use plugin_sdk::{HookKind, HookPayload, PluginManifest, ToolDesc, Value, ABI_VERSION};
+use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, ToolDesc, Value};
 
 use crate::domain::{FileId, RelativePath};
 use crate::ports::PluginHostPort;
@@ -272,7 +272,7 @@ pub trait PluginInstance: Send {
     /// delivery. The registry isolates this failure (UN1) and continues
     /// delivering to other plugins.
     fn deliver_hook(&mut self, kind: HookKind, payload: HookPayload)
-        -> Result<(), PluginHostError>;
+    -> Result<(), PluginHostError>;
 }
 
 // ── PluginHostRegistry ────────────────────────────────────────────────────────
@@ -563,7 +563,7 @@ impl PluginHostPort for PluginHostRegistry {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use plugin_sdk::{HookKind, HookPayload, PluginManifest, ToolDesc, Value, ABI_VERSION};
+    use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, ToolDesc, Value};
 
     use super::{PluginHostError, PluginHostRegistry, PluginId, PluginInstance, RegistrationError};
     use crate::domain::{FileId, RelativePath};

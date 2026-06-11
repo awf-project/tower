@@ -58,7 +58,7 @@ pub mod ffi {
     //   Returns: 0=ok, 1=not_found, 2=io_error.
     #[cfg(target_arch = "wasm32")]
     #[link(wasm_import_module = "tower_host")]
-    extern "C" {
+    unsafe extern "C" {
         pub fn host_log(ptr: *const u8, len: usize);
         pub fn host_read_file(
             path_ptr: *const u8,
@@ -225,7 +225,7 @@ pub fn read_file(workspace_path: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{interpret_read, ReadOutcome};
+    use super::{ReadOutcome, interpret_read};
 
     /// (rc=0, ptr_null=true, len=0) => Empty: zero-byte file, null pointer is valid.
     #[test]

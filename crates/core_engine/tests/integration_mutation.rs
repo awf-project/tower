@@ -10,12 +10,12 @@
 
 use core_engine::adapters::fs::RealFs;
 use core_engine::adapters::in_memory_storage::InMemoryStorage;
+use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::mutation::FileMutationService;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::domain::RelativePath;
-use core_engine::ports::inbound::FileMutationUseCase;
 use core_engine::ports::NoOpPluginHost;
+use core_engine::ports::inbound::FileMutationUseCase;
 
 // ── AC1: create_file writes durable content ───────────────────────────────────
 

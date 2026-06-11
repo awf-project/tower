@@ -69,7 +69,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
@@ -541,16 +541,16 @@ fn lock_poisoned<G>(_: std::sync::PoisonError<G>) -> ToolError {
 mod tests {
     use std::sync::{Arc, RwLock};
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::{EngineState, NativeToolRegistry};
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::{InMemoryFs, InMemoryStorage};
+    use crate::domain::RelativePath;
     use crate::domain::index::InvertedIndex;
     use crate::domain::token::tokenize;
     use crate::domain::virtual_file::FileMetadata;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::domain::RelativePath;
     use crate::ports::FileSystemPort;
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
@@ -782,7 +782,10 @@ mod tests {
 
         // Must be ResourceNotFound (maps to -32002 on the wire).
         assert!(
-            matches!(err, crate::adapters::mcp::types::ToolError::ResourceNotFound(_)),
+            matches!(
+                err,
+                crate::adapters::mcp::types::ToolError::ResourceNotFound(_)
+            ),
             "delete-missing must return ResourceNotFound for stable -32002 client detection; got: {err:?}"
         );
     }

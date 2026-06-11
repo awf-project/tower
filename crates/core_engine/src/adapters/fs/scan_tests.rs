@@ -23,8 +23,8 @@ mod scan_integration {
     use crate::adapters::storage::SledStorageAdapter;
     use crate::domain::index::{FileSearch, InvertedIndex};
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::inbound::SearchUseCase;
     use crate::ports::StoragePort;
+    use crate::ports::inbound::SearchUseCase;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

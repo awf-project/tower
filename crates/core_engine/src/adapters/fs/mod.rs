@@ -69,7 +69,7 @@ mod real_fs;
 pub mod scan;
 
 pub use real_fs::RealFs;
-pub use scan::{scan as workspace_scan, ScanReport};
+pub use scan::{ScanReport, scan as workspace_scan};
 
 #[cfg(test)]
 mod tests;

@@ -45,7 +45,7 @@ pub use fixtures::{make_virtual_file, sample_content_hash};
 /// each time it is called.
 #[macro_export]
 macro_rules! storage_contract_tests {
-    ($make:expr) => {
+    ($make:expr_2021) => {
         mod storage_contract {
             use super::*;
             use $crate::domain::{FileId, VirtualFile};
@@ -296,7 +296,7 @@ macro_rules! storage_contract_tests {
 /// ```
 #[macro_export]
 macro_rules! filesystem_contract_tests {
-    ($make:expr) => {
+    ($make:expr_2021) => {
         mod filesystem_contract {
             use super::*;
             use $crate::domain::RelativePath;

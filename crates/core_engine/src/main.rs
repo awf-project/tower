@@ -47,14 +47,14 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use core_engine::adapters::fs::{workspace_scan, RealFs};
-use core_engine::adapters::mcp::native_tools::EngineState;
-use core_engine::adapters::mcp::{serve, MergedRegistry};
-use core_engine::adapters::plugin::{
-    global_plugins_dir, install, load_plugins_into_registry, production_isolation_config,
-    resolve_plugin_dirs, IsolationEngine, DEFAULT_PLUGINS_SUBDIR,
-};
 use core_engine::adapters::SledStorageAdapter;
+use core_engine::adapters::fs::{RealFs, workspace_scan};
+use core_engine::adapters::mcp::native_tools::EngineState;
+use core_engine::adapters::mcp::{MergedRegistry, serve};
+use core_engine::adapters::plugin::{
+    DEFAULT_PLUGINS_SUBDIR, IsolationEngine, global_plugins_dir, install,
+    load_plugins_into_registry, production_isolation_config, resolve_plugin_dirs,
+};
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::ports::{FileSystemPort, StoragePort};
@@ -242,10 +242,10 @@ fn resolve_workspace_root() -> PathBuf {
     }
 
     // Fall back to env var.
-    if let Ok(val) = env::var("TOWER_WORKSPACE") {
-        if !val.is_empty() {
-            return PathBuf::from(val);
-        }
+    if let Ok(val) = env::var("TOWER_WORKSPACE")
+        && !val.is_empty()
+    {
+        return PathBuf::from(val);
     }
 
     // Default: current working directory.

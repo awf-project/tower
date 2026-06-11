@@ -13,8 +13,8 @@ use crate::adapters::storage::SledStorageAdapter;
 use crate::domain::index::FileSearch;
 use crate::domain::virtual_file::FileMetadata;
 use crate::domain::{RelativePath, VirtualFile};
-use crate::ports::inbound::SearchUseCase;
 use crate::ports::StoragePort;
+use crate::ports::inbound::SearchUseCase;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

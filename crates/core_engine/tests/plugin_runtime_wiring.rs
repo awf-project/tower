@@ -32,15 +32,15 @@ use std::sync::{Arc, RwLock};
 use core_engine::adapters::mcp::merged_registry::MergedRegistry;
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::registry::ToolRegistry;
+use core_engine::adapters::plugin::IsolationEngine;
 use core_engine::adapters::plugin::runtime::{
     load_plugins_into_registry, production_isolation_config,
 };
-use core_engine::adapters::plugin::IsolationEngine;
 use core_engine::adapters::{InMemoryFs, InMemoryStorage};
+use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::plugin_host::PluginHostRegistry;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::domain::RelativePath;
 use core_engine::ports::FileSystemPort;
 
 // ── Fixture paths ───────────────────────────────────────────────────────────────

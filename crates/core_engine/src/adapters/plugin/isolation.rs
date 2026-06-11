@@ -94,8 +94,8 @@
 // All other code in this file is safe.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use wasmtime::{Config, Engine};
@@ -345,7 +345,7 @@ impl IsolatedSandbox {
     fn try_recreate(&mut self) -> Result<(), PluginHostError> {
         let consecutive_failures = match &self.state {
             SandboxState::Quarantined => {
-                return Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined))
+                return Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined));
             }
             SandboxState::Ready(_) => return Ok(()),
             SandboxState::Failed {
@@ -410,7 +410,7 @@ impl IsolatedSandbox {
         // Ensure we are in the Ready state.
         match &self.state {
             SandboxState::Quarantined => {
-                return Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined))
+                return Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined));
             }
             SandboxState::Failed { .. } => {
                 self.try_recreate()?;
@@ -575,14 +575,20 @@ mod tests {
     #[test]
     fn fault_kind_display_messages() {
         assert!(PluginFaultKind::FuelExhausted.to_string().contains("fuel"));
-        assert!(PluginFaultKind::EpochDeadlineExceeded
-            .to_string()
-            .contains("epoch"));
-        assert!(PluginFaultKind::Quarantined
-            .to_string()
-            .contains("quarantined"));
-        assert!(PluginFaultKind::Trapped("boom".to_owned())
-            .to_string()
-            .contains("boom"));
+        assert!(
+            PluginFaultKind::EpochDeadlineExceeded
+                .to_string()
+                .contains("epoch")
+        );
+        assert!(
+            PluginFaultKind::Quarantined
+                .to_string()
+                .contains("quarantined")
+        );
+        assert!(
+            PluginFaultKind::Trapped("boom".to_owned())
+                .to_string()
+                .contains("boom")
+        );
     }
 }

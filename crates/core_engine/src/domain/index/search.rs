@@ -38,8 +38,8 @@ use crate::domain::grep::TextSearch;
 use crate::domain::token::tokenize;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId, RelativePath};
-use crate::ports::inbound::{Match, SearchUseCase};
 use crate::ports::FileSystemPort;
+use crate::ports::inbound::{Match, SearchUseCase};
 
 use super::InvertedIndex;
 

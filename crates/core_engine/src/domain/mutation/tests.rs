@@ -16,10 +16,10 @@ use std::sync::{Arc, RwLock};
 use crate::adapters::in_memory_fs::InMemoryFs;
 use crate::adapters::in_memory_storage::InMemoryStorage;
 use crate::adapters::watcher::event_processor::{EventProcessor, WatchEvent};
-use crate::domain::index::InvertedIndex;
-use crate::domain::mutation::{is_tmp_artifact, FileMutationService};
-use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::RelativePath;
+use crate::domain::index::InvertedIndex;
+use crate::domain::mutation::{FileMutationService, is_tmp_artifact};
+use crate::domain::workspace::ProjectWorkspace;
 use crate::ports::inbound::FileMutationUseCase;
 use crate::ports::{FileSystemPort, NoOpPluginHost, PortError, StoragePort};
 

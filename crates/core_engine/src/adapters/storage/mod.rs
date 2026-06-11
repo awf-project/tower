@@ -23,7 +23,7 @@ mod adapter;
 mod error;
 mod keys;
 
-pub use adapter::{SledStorageAdapter, SCHEMA_VERSION};
+pub use adapter::{SCHEMA_VERSION, SledStorageAdapter};
 pub use error::StorageError;
 
 #[cfg(test)]

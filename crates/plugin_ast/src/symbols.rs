@@ -294,7 +294,7 @@ pub fn find_symbols(
         None => {
             return SymbolResult::Unsupported {
                 language: language_label(language_hint),
-            }
+            };
         }
     };
 
@@ -361,10 +361,10 @@ fn walk_rust_symbols(
             }
             (SymbolKind::Impl, "impl_item") => {
                 // impl name = the type name (child_by_field_name("type")).
-                if let Some(name_text) = impl_name(child, source) {
-                    if name_text == symbol_name {
-                        matches.push(node_to_match(child, name_text, kind));
-                    }
+                if let Some(name_text) = impl_name(child, source)
+                    && name_text == symbol_name
+                {
+                    matches.push(node_to_match(child, name_text, kind));
                 }
             }
             (SymbolKind::Method, "impl_item") => {
@@ -375,12 +375,11 @@ fn walk_rust_symbols(
                 if let Some(body) = body {
                     let mut bcursor = body.walk();
                     for method in body.children(&mut bcursor) {
-                        if method.kind() == "function_item" {
-                            if let Some(m) =
+                        if method.kind() == "function_item"
+                            && let Some(m) =
                                 match_named_item(method, source, symbol_name, SymbolKind::Method)
-                            {
-                                matches.push(m);
-                            }
+                        {
+                            matches.push(m);
                         }
                     }
                 }
@@ -456,10 +455,10 @@ fn walk_go_type_decl(
         }
         // Determine what this type_spec defines.
         let detected_kind = go_type_spec_kind(child, source);
-        if detected_kind == Some(kind) {
-            if let Some(m) = match_named_item(child, source, symbol_name, kind) {
-                matches.push(m);
-            }
+        if detected_kind == Some(kind)
+            && let Some(m) = match_named_item(child, source, symbol_name, kind)
+        {
+            matches.push(m);
         }
     }
 }
@@ -565,11 +564,10 @@ fn walk_php_node(
                 }
             }
             "class_declaration" => {
-                if matches!(kind, SymbolKind::Class) {
-                    if let Some(m) = match_named_item(child, source, symbol_name, SymbolKind::Class)
-                    {
-                        matches.push(m);
-                    }
+                if matches!(kind, SymbolKind::Class)
+                    && let Some(m) = match_named_item(child, source, symbol_name, SymbolKind::Class)
+                {
+                    matches.push(m);
                 }
                 // Recurse into class body for method_declaration.
                 if matches!(kind, SymbolKind::Method | SymbolKind::Const) {
@@ -577,11 +575,10 @@ fn walk_php_node(
                 }
             }
             "interface_declaration" | "trait_declaration" => {
-                if matches!(kind, SymbolKind::Trait) {
-                    if let Some(m) = match_named_item(child, source, symbol_name, SymbolKind::Trait)
-                    {
-                        matches.push(m);
-                    }
+                if matches!(kind, SymbolKind::Trait)
+                    && let Some(m) = match_named_item(child, source, symbol_name, SymbolKind::Trait)
+                {
+                    matches.push(m);
                 }
                 // Recurse into interface/trait body for method_declaration.
                 if matches!(kind, SymbolKind::Method) {

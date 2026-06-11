@@ -40,11 +40,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::domain::plugin_host::PluginHostRegistry;
 use crate::domain::PluginInstance;
+use crate::domain::plugin_host::PluginHostRegistry;
 use crate::ports::FileSystemPort;
 
-use super::isolation::{IsolatedSandbox, IsolationConfig, IsolationEngine, DEFAULT_FUEL_BUDGET};
+use super::isolation::{DEFAULT_FUEL_BUDGET, IsolatedSandbox, IsolationConfig, IsolationEngine};
 
 /// Default plugins directory, relative to the workspace root.
 pub const DEFAULT_PLUGINS_SUBDIR: &str = ".tower/plugins";

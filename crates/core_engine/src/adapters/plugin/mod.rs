@@ -31,10 +31,10 @@ pub mod loader;
 pub mod runtime;
 
 pub use error::PluginLoadError;
-pub use install::{global_plugins_dir, InstalledPlugin, Scope};
+pub use install::{InstalledPlugin, Scope, global_plugins_dir};
 pub use isolation::{IsolatedSandbox, IsolationConfig, IsolationEngine, MAX_CONSECUTIVE_FAILURES};
 pub use loader::WasmtimeHost;
 pub use runtime::{
-    load_plugins_into_registry, production_isolation_config, resolve_plugin_dirs,
-    resolve_plugins_dir, DEFAULT_PLUGINS_SUBDIR,
+    DEFAULT_PLUGINS_SUBDIR, load_plugins_into_registry, production_isolation_config,
+    resolve_plugin_dirs, resolve_plugins_dir,
 };

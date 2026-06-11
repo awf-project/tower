@@ -168,10 +168,10 @@ impl ProjectWorkspace {
         // Rebuild path index from live occupants.
         let mut path_index: HashMap<RelativePath, FileId> = HashMap::new();
         for slot in &slots {
-            if let Some(ref file) = slot.occupant {
-                if path_index.insert(file.path.clone(), file.id).is_some() {
-                    return Err(DomainError::DuplicatePath);
-                }
+            if let Some(ref file) = slot.occupant
+                && path_index.insert(file.path.clone(), file.id).is_some()
+            {
+                return Err(DomainError::DuplicatePath);
             }
         }
 
