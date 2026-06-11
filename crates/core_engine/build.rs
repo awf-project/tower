@@ -15,9 +15,11 @@
 //! Run this once before `cargo test`:
 //!
 //! ```sh
+//! CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang \
+//! AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar \
 //! cargo build -p hello_plugin -p fixture_abi_mismatch \
 //!             -p fixture_panic_plugin -p fixture_loop_plugin \
-//!             -p fixture_loop_hook_plugin \
+//!             -p fixture_loop_hook_plugin -p plugin_ast \
 //!             --target wasm32-wasip1
 //! ```
 //!
@@ -32,6 +34,7 @@
 //! - `PANIC_PLUGIN_WASM`          → `target/wasm32-wasip1/debug/fixture_panic_plugin.wasm`
 //! - `LOOP_PLUGIN_WASM`           → `target/wasm32-wasip1/debug/fixture_loop_plugin.wasm`
 //! - `LOOP_HOOK_PLUGIN_WASM`      → `target/wasm32-wasip1/debug/fixture_loop_hook_plugin.wasm`
+//! - `PLUGIN_AST_WASM`            → `target/wasm32-wasip1/debug/plugin_ast.wasm`
 //!
 //! `FORBIDDEN_HOST_IMPORT_WASM` points at a `.wat` text file. wasmtime's default
 //! features include the `wat` crate, so `Module::from_file` assembles it
@@ -96,6 +99,11 @@ fn main() {
             .display()
     );
 
+    println!(
+        "cargo:rustc-env=PLUGIN_AST_WASM={}",
+        wasm_profile_dir.join("plugin_ast.wasm").display()
+    );
+
     // Re-run if fixture sources change (for incremental correctness in IDE).
     println!("cargo:rerun-if-changed=../hello_plugin/src/lib.rs");
     println!("cargo:rerun-if-changed=../fixture_abi_mismatch/src/lib.rs");
@@ -104,6 +112,9 @@ fn main() {
     println!("cargo:rerun-if-changed=../fixture_loop_hook_plugin/src/lib.rs");
     println!("cargo:rerun-if-changed=../plugin_sdk/src/lib.rs");
     println!("cargo:rerun-if-changed=../plugin_sdk/src/__private.rs");
+    println!("cargo:rerun-if-changed=../plugin_ast/src/lib.rs");
+    println!("cargo:rerun-if-changed=../plugin_ast/src/outline.rs");
+    println!("cargo:rerun-if-changed=../plugin_ast/src/symbols.rs");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_import.wasm");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_host_import.wat");
 }

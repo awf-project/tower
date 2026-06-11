@@ -9,6 +9,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # WASI SDK paths for wasm32-wasip1 C builds (tree-sitter grammar compilation).
+  # These are installed by tree-sitter CLI (cached at ~/.cache/tree-sitter/wasi-sdk).
+  # See: docs/spikes/12a-tree-sitter-wasm-feasibility.md — "Recipe for Spec 12c"
+  # The cc crate uses CC_<target> / AR_<target> (non-alphanum replaced by _) to
+  # select a per-target compiler. Required by plugin_ast and any future plugin that
+  # vendors tree-sitter grammar C sources.
+  WASI_SDK_DIR: ${{ github.workspace }}/.wasi-sdk
+  CC_wasm32_wasip1: ${{ github.workspace }}/.wasi-sdk/bin/wasm32-wasip1-clang
+  AR_wasm32_wasip1: ${{ github.workspace }}/.wasi-sdk/bin/llvm-ar
 
 jobs:
   quality:
@@ -24,6 +33,36 @@ jobs:
       - name: Cache build artifacts
         uses: Swatinem/rust-cache@v2
 
+      # WASI SDK: required to compile tree-sitter C grammar sources for wasm32-wasip1.
+      #
+      # Decision: use ~/.cache/tree-sitter/wasi-sdk if the tree-sitter CLI already
+      # populated it; otherwise download WASI SDK 25 from the official GitHub release.
+      # The tree-sitter CLI ships wasi-sdk into ~/.cache automatically on 'build --wasm';
+      # in CI we install it explicitly for reproducibility.
+      #
+      # Version: wasi-sdk-25.0 (the minimum that satisfies tree-sitter 0.25.x's
+      # sysroot requirements; tested in 12a spike with wasi-sdk-29.0 as well).
+      #
+      # Cache key: wasi-sdk version so the download is skipped on subsequent runs.
+      - name: Cache WASI SDK
+        id: cache-wasi-sdk
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WASI_SDK_DIR }}
+          key: wasi-sdk-25.0-x86_64-linux
+
+      - name: Download WASI SDK (cache miss only)
+        if: steps.cache-wasi-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$WASI_SDK_DIR"
+          curl -fsSL \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz \
+            | tar -xz -C "$WASI_SDK_DIR" --strip-components=1
+
+      - name: Verify WASI SDK clang
+        run: |
+          "$CC_wasm32_wasip1" --version
+
       # Quality gate, run in the order mandated by spec U3.
       - name: Format check
         run: cargo fmt --all --check
@@ -32,16 +71,34 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # Build wasm fixtures BEFORE `cargo test` so integration tests can find them.
-      # build.rs sets HELLO_PLUGIN_WASM / ABI_MISMATCH_WASM env paths but does NOT
-      # compile the fixtures (cargo-in-cargo deadlock — see build.rs Decision comment).
-      - name: Build wasm fixtures (spec 11c AC1/AC3/AC4)
-        run: cargo build -p hello_plugin -p fixture_abi_mismatch --target wasm32-wasip1
+      # build.rs sets env paths but does NOT compile the fixtures (cargo-in-cargo deadlock).
+      #
+      # The WASI SDK env vars (CC_wasm32_wasip1, AR_wasm32_wasip1) are inherited from
+      # the job env block above. They are required for plugin_ast because tree-sitter
+      # vendors C grammar sources that need a wasm32-wasip1 C toolchain.
+      #
+      # hello_plugin, fixture_abi_mismatch, fixture_panic_plugin, fixture_loop_plugin,
+      # fixture_loop_hook_plugin: pure-Rust wasm; WASI SDK env vars are set but not
+      # used (no C compilation). Safe to pass regardless.
+      - name: Build wasm fixtures (spec 11c AC1/AC3/AC4 + 11d + 12c AC4)
+        run: |
+          cargo build \
+            -p hello_plugin \
+            -p fixture_abi_mismatch \
+            -p fixture_panic_plugin \
+            -p fixture_loop_plugin \
+            -p fixture_loop_hook_plugin \
+            --target wasm32-wasip1
 
-      - name: Build plugin_ast for wasm32-wasip1 (spec AC4)
+      - name: Build plugin_ast for wasm32-wasip1 (spec 12c AC4)
         run: cargo build -p plugin_ast --target wasm32-wasip1
 
       - name: Test
-        run: cargo test --workspace --exclude hello_plugin --exclude plugin_ast --exclude fixture_abi_mismatch
+        run: cargo test --workspace --exclude hello_plugin --exclude plugin_ast --exclude fixture_abi_mismatch --exclude fixture_panic_plugin --exclude fixture_loop_plugin --exclude fixture_loop_hook_plugin
+
+      # Run plugin_ast host-side tests separately (tree-sitter compiles natively, no WASI SDK needed).
+      - name: Test plugin_ast (host-side outline walker)
+        run: cargo test -p plugin_ast
 
       - name: License & advisory policy
         uses: EmbarkStudios/cargo-deny-action@v2

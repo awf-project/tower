@@ -23,6 +23,10 @@ members = [
 # --exclude plugin_ast --exclude fixture_abi_mismatch --exclude fixture_panic_plugin
 # --exclude fixture_loop_plugin --exclude fixture_loop_hook_plugin` or rely on
 # default-members.
+#
+# Exception: plugin_ast (spec 12c) can also be tested host-side because its
+# outline module uses native tree-sitter. Host tests run via
+# `cargo test -p plugin_ast` explicitly; the wasm build is gated separately.
 default-members = [
     "crates/core_engine",
     "crates/plugin_sdk",
@@ -33,3 +37,11 @@ default-members = [
 edition = "2021"
 rust-version = "1.96"
 license = "EUPL-1.2"
+
+# Decision: opt-level="s" for release builds to control wasm module size.
+# Primarily relevant for wasm crates (plugin_ast, hello_plugin, fixtures).
+# Per 12a recipe: plugin_ast release target is ~1.2 MB with this setting.
+# Trade-off: marginally slower host binaries in release mode (acceptable;
+# no user-visible difference at this project scale).
+[profile.release]
+opt-level = "s"
