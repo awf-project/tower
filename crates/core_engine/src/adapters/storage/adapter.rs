@@ -132,6 +132,44 @@ pub struct SledStorageAdapter {
 }
 
 impl SledStorageAdapter {
+    /// Open the sled database, retrying briefly on transient lock contention.
+    ///
+    /// sled holds an OS file lock on the database directory and releases it when
+    /// the handle drops — but that release is not synchronous with the previous
+    /// handle's `Drop` returning (a background flusher can still hold it). When
+    /// the engine restarts right after a prior instance shuts down, a fresh
+    /// `sled::open` can briefly fail with "could not acquire lock" (WouldBlock).
+    /// A bounded retry rides out that window; a database genuinely held by
+    /// another live process still surfaces the error after the attempts.
+    fn open_db_with_retry(path: &Path) -> Result<sled::Db, sled::Error> {
+        const MAX_ATTEMPTS: u32 = 10;
+        let backoff = std::time::Duration::from_millis(25);
+        let mut attempt = 0;
+        loop {
+            match sled::open(path) {
+                Ok(db) => return Ok(db),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS || !Self::is_lock_contention(&e) {
+                        return Err(e);
+                    }
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+    }
+
+    /// True when a sled error is transient file-lock contention (a previous
+    /// handle has not released its OS lock yet), not a real failure.
+    fn is_lock_contention(e: &sled::Error) -> bool {
+        if let sled::Error::Io(io) = e {
+            if io.kind() == std::io::ErrorKind::WouldBlock {
+                return true;
+            }
+        }
+        e.to_string().contains("could not acquire lock")
+    }
+
     /// Open (or create) a Sled database at `path` and reconstruct the
     /// [`ProjectWorkspace`] and [`InvertedIndex`] from persisted state.
     ///
@@ -142,7 +180,7 @@ impl SledStorageAdapter {
     /// - [`StorageError::Sled`] — a Sled I/O error occurred.
     /// - [`StorageError::Codec`] — a serialisation round-trip failed.
     pub fn open(path: &Path) -> Result<(Self, ProjectWorkspace, InvertedIndex), StorageError> {
-        let db = sled::open(path)?;
+        let db = Self::open_db_with_retry(path)?;
         let files = db.open_tree("files")?;
         let paths = db.open_tree("paths")?;
         let blobs = db.open_tree("blobs")?;
