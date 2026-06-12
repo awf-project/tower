@@ -493,11 +493,11 @@ mod tests {
         let reg = merged_with_echo_plugin("my_plugin", "echo");
         let tools = reg.list();
 
-        // 7 native + 1 plugin tool.
+        // 8 native + 1 plugin tool.
         assert_eq!(
             tools.len(),
-            8,
-            "expected 7 native + 1 plugin tool; got {}: {:?}",
+            9,
+            "expected 8 native + 1 plugin tool; got {}: {:?}",
             tools.len(),
             tools.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
@@ -525,10 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn ac1_empty_plugin_host_yields_only_seven_native_tools() {
+    fn ac1_empty_plugin_host_yields_only_eight_native_tools() {
         let mut reg = MergedRegistry::new(empty_engine_state(), empty_plugin_host());
         let tools = reg.list();
-        assert_eq!(tools.len(), 7, "no plugins → 7 native tools only");
+        assert_eq!(tools.len(), 8, "no plugins → 8 native tools only");
         // Sanity: call on a native tool still works.
         let result = reg.call("tower_find_file", json!({ "query": "x" }));
         assert!(result.is_ok());
@@ -750,8 +750,8 @@ mod tests {
         );
         assert_eq!(
             tools_after.len(),
-            7,
-            "only 7 native tools remain after plugin removal"
+            8,
+            "only 8 native tools remain after plugin removal"
         );
     }
 

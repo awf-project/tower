@@ -4,7 +4,14 @@
 //! macros). Real infrastructure adapters (sled, std::fs, wasmtime, notify)
 //! land in specs 04 / 05 / 11 and are conditionally compiled.
 
+/// XDG-backed AST index adapter and workspace path helpers (Stage 3a).
+///
+/// Outbound port: [`crate::ports::AstIndexPort`].
+/// Real adapter: [`ast_index::XdgAstIndexAdapter`].
+/// In-memory fake: [`InMemoryAstIndex`].
+pub mod ast_index;
 pub mod fs;
+pub mod in_memory_ast_index;
 pub mod in_memory_fs;
 pub mod in_memory_storage;
 /// MCP JSON-RPC 2.0 stdio transport (spec 10a).
@@ -21,12 +28,14 @@ pub mod plugin;
 pub mod storage;
 pub mod watcher;
 
+pub use ast_index::XdgAstIndexAdapter;
 pub use fs::RealFs;
+pub use in_memory_ast_index::InMemoryAstIndex;
 pub use in_memory_fs::InMemoryFs;
 pub use in_memory_storage::InMemoryStorage;
 pub use plugin::{
-    IsolatedSandbox, IsolationConfig, IsolationEngine, MAX_CONSECUTIVE_FAILURES, PluginLoadError,
-    WasmtimeHost,
+    HostDeps, IsolatedSandbox, IsolationConfig, IsolationEngine, MAX_CONSECUTIVE_FAILURES,
+    PluginLoadError, WasmtimeHost,
 };
 // Note: WasmInstance is intentionally not re-exported — it is pub(crate) to
 // keep the concrete wasmtime runtime type behind the hexagonal adapter boundary.

@@ -19,6 +19,7 @@
 //! │ trait StoragePort    { get / put / delete VirtualFile + blobs}│
 //! │ trait FileSystemPort { read / write / rename / scan bytes }  │
 //! │ trait PluginHostPort { on_file_indexed / on_file_changed }   │
+//! │ trait AstIndexPort   { put / get / delete / list blobs }     │
 //! └──────────────────────────────────────────────────────────────┘
 //! TEST DOUBLES (spec 02):
 //!   InMemoryStorage : HashMap-backed StoragePort
@@ -31,6 +32,7 @@
 //! through its constructor (or method parameters), ensuring that `domain/` stays
 //! free of `sled`, `std::fs`, `wasmtime`, and `notify` (AC4).
 
+pub mod ast_index;
 pub mod error;
 pub mod filesystem;
 pub mod plugin;
@@ -39,6 +41,7 @@ pub mod storage;
 // Inbound ports — use-case contracts called by external drivers.
 pub mod inbound;
 
+pub use ast_index::{AstIndexPort, validate_key as validate_ast_index_key};
 pub use error::PortError;
 pub use filesystem::FileSystemPort;
 pub use inbound::{FileMutationUseCase, FileReplaceError, Match, SearchUseCase, TxReport};

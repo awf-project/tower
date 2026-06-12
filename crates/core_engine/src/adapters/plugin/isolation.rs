@@ -103,9 +103,8 @@ use wasmtime::{Config, Engine};
 use plugin_sdk::{HookKind, HookPayload, PluginManifest, Value};
 
 use crate::domain::{PluginFaultKind, PluginHostError, PluginInstance};
-use crate::ports::FileSystemPort;
 
-use super::loader::{WasmInstance, WasmtimeHost};
+use super::loader::{HostDeps, WasmInstance, WasmtimeHost};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -279,8 +278,13 @@ enum SandboxState {
 pub struct IsolatedSandbox {
     /// Path used to recreate the sandbox on failure.
     wasm_path: PathBuf,
-    /// Filesystem port forwarded to recreated instances.
-    fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+    /// Bundled host dependencies forwarded to every (re)created instance.
+    ///
+    /// `HostDeps` is `Clone` so `try_recreate` can pass it into
+    /// `load_with_engine` without re-acquiring from external callers.
+    /// The Arcs survive across fault cycles — the same fs/index/workspace is
+    /// used for every recreated instance.
+    deps: HostDeps,
     /// Shared engine (fuel + epoch enabled).
     engine: Engine,
     /// Per-call compute bound settings.
@@ -308,16 +312,15 @@ impl IsolatedSandbox {
     pub fn load(
         engine: &Engine,
         wasm_path: impl Into<PathBuf>,
-        fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+        deps: HostDeps,
         config: IsolationConfig,
     ) -> Result<Self, super::error::PluginLoadError> {
         let wasm_path = wasm_path.into();
-        let wasm_instance =
-            WasmtimeHost::load_with_engine(engine, &wasm_path, Arc::clone(&fs_port))?;
+        let wasm_instance = WasmtimeHost::load_with_engine(engine, &wasm_path, deps.clone())?;
         let manifest = wasm_instance.manifest().clone();
         Ok(Self {
             wasm_path,
-            fs_port,
+            deps,
             engine: engine.clone(),
             config,
             manifest,
@@ -362,11 +365,7 @@ impl IsolatedSandbox {
             return Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined));
         }
 
-        match WasmtimeHost::load_with_engine(
-            &self.engine,
-            &self.wasm_path,
-            Arc::clone(&self.fs_port),
-        ) {
+        match WasmtimeHost::load_with_engine(&self.engine, &self.wasm_path, self.deps.clone()) {
             Ok(new_instance) => {
                 eprintln!(
                     "[tower] plugin '{}' sandbox recreated successfully",

@@ -3,16 +3,16 @@
 //! These verify the glue that the `tower` binary uses at startup:
 //! discover `*.wasm` in a plugins directory, load each through the 11c/11d
 //! isolated-sandbox path, register them in a [`PluginHostRegistry`], and serve
-//! the result through a [`MergedRegistry`] alongside the 7 native `tower_*` tools.
+//! the result through a [`MergedRegistry`] alongside the 8 native `tower_*` tools.
 //!
 //! # What is exercised
 //!
-//! - A real `ast.wasm` dropped in the dir → `tools/list` exposes the 7
+//! - A real `ast.wasm` dropped in the dir → `tools/list` exposes the 8
 //!   native tools PLUS `tower_ast_get_outline` and `tower_ast_find_symbols`, and a
 //!   `tools/call` to `tower_ast_get_outline` round-trips.
 //! - A malformed `.wasm` and an ABI-mismatched `.wasm` are skipped; startup
 //!   succeeds and still serves the rest.
-//! - No plugins dir / empty plugins dir → exactly the 7 native tools.
+//! - No plugins dir / empty plugins dir → exactly the 8 native tools.
 //!
 //! # Hermetic file reads
 //!
@@ -36,7 +36,7 @@ use core_engine::adapters::plugin::IsolationEngine;
 use core_engine::adapters::plugin::runtime::{
     load_plugins_into_registry, production_isolation_config,
 };
-use core_engine::adapters::{InMemoryFs, InMemoryStorage};
+use core_engine::adapters::{HostDeps, InMemoryAstIndex, InMemoryFs, InMemoryStorage};
 use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::plugin_host::PluginHostRegistry;
@@ -74,7 +74,7 @@ fn fs_with_rust_source() -> Arc<dyn FileSystemPort + Send + Sync> {
     Arc::new(fs)
 }
 
-/// Empty native engine state — gives the 7 native tools without indexed files.
+/// Empty native engine state — gives the 8 native tools without indexed files.
 fn empty_engine_state() -> Arc<RwLock<EngineState>> {
     Arc::new(RwLock::new(EngineState::new(
         ProjectWorkspace::new(),
@@ -99,6 +99,22 @@ fn names(registry: &MergedRegistry) -> Vec<String> {
     registry.list().into_iter().map(|t| t.name).collect()
 }
 
+fn empty_deps() -> HostDeps {
+    HostDeps {
+        fs: Arc::new(InMemoryFs::new()),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+    }
+}
+
+fn deps_with_rust_source() -> HostDeps {
+    HostDeps {
+        fs: fs_with_rust_source(),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+    }
+}
+
 // ── AC: ast dropped in the dir → native + ast tools listed ───────────────
 
 #[test]
@@ -110,7 +126,7 @@ fn ast_plugin_dir_exposes_native_and_ast_tools() {
     let registry = load_plugins_into_registry(
         &[tmp.path().to_path_buf()],
         &engine,
-        fs_with_rust_source(),
+        deps_with_rust_source(),
         production_isolation_config(),
     );
     let merged = merged(registry);
@@ -149,7 +165,7 @@ fn ast_get_outline_round_trips_through_merged_registry() {
     let registry = load_plugins_into_registry(
         &[tmp.path().to_path_buf()],
         &engine,
-        fs_with_rust_source(),
+        deps_with_rust_source(),
         production_isolation_config(),
     );
     let mut merged = merged(registry);
@@ -186,17 +202,17 @@ fn malformed_wasm_is_skipped_rest_served() {
     let registry = load_plugins_into_registry(
         &[tmp.path().to_path_buf()],
         &engine,
-        fs_with_rust_source(),
+        deps_with_rust_source(),
         production_isolation_config(),
     );
     let merged = merged(registry);
     let listed = names(&merged);
 
-    // The good plugin survived; the broken one was skipped (7 native + 2 ast).
+    // The good plugin survived; the broken one was skipped (8 native + 4 ast).
     assert_eq!(
         listed.len(),
-        9,
-        "expected 7 native + 2 ast tools after skipping broken wasm: {listed:?}"
+        12,
+        "expected 8 native + 4 ast tools after skipping broken wasm: {listed:?}"
     );
     assert!(listed.iter().any(|n| n == "tower_ast_get_outline"));
 }
@@ -213,7 +229,7 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
     let registry = load_plugins_into_registry(
         &[tmp.path().to_path_buf()],
         &engine,
-        fs_with_rust_source(),
+        deps_with_rust_source(),
         production_isolation_config(),
     );
     let merged = merged(registry);
@@ -226,12 +242,12 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
     // No tool from the abi-mismatch fixture leaked in (its name is not "ast").
     assert_eq!(
         listed.len(),
-        9,
-        "expected 7 native + 2 ast tools; abi-mismatch must be skipped: {listed:?}"
+        12,
+        "expected 8 native + 4 ast tools; abi-mismatch must be skipped: {listed:?}"
     );
 }
 
-// ── AC: no plugins dir / empty dir → exactly the 7 native tools ──────────────────
+// ── AC: no plugins dir / empty dir → exactly the 8 native tools ──────────────────
 
 #[test]
 fn missing_plugins_dir_serves_only_native_tools() {
@@ -242,11 +258,11 @@ fn missing_plugins_dir_serves_only_native_tools() {
     let registry = load_plugins_into_registry(
         &[missing],
         &engine,
-        Arc::new(InMemoryFs::new()),
+        empty_deps(),
         production_isolation_config(),
     );
     let merged = merged(registry);
-    assert_eq!(merged.list().len(), 7, "missing dir → 7 native tools only");
+    assert_eq!(merged.list().len(), 8, "missing dir → 8 native tools only");
 }
 
 #[test]
@@ -257,11 +273,11 @@ fn empty_plugins_dir_serves_only_native_tools() {
     let registry = load_plugins_into_registry(
         &[tmp.path().to_path_buf()],
         &engine,
-        Arc::new(InMemoryFs::new()),
+        empty_deps(),
         production_isolation_config(),
     );
     let merged = merged(registry);
-    assert_eq!(merged.list().len(), 7, "empty dir → 7 native tools only");
+    assert_eq!(merged.list().len(), 8, "empty dir → 8 native tools only");
 }
 
 // ── AC: global scope reachable from a project with an empty local scope ──────────
@@ -277,7 +293,7 @@ fn global_plugin_reachable_with_empty_local_scope() {
     let registry = load_plugins_into_registry(
         &[global.path().to_path_buf(), local.path().to_path_buf()],
         &engine,
-        fs_with_rust_source(),
+        deps_with_rust_source(),
         production_isolation_config(),
     );
     let merged = merged(registry);
@@ -287,7 +303,7 @@ fn global_plugin_reachable_with_empty_local_scope() {
         listed.iter().any(|n| n == "tower_ast_get_outline"),
         "a globally-installed plugin must be usable from a project: {listed:?}"
     );
-    assert_eq!(listed.len(), 9, "7 native + 2 ast (global): {listed:?}");
+    assert_eq!(listed.len(), 12, "8 native + 4 ast (global): {listed:?}");
 }
 
 // ── AC: same name in both scopes → local overrides global (collapses to one) ─────
@@ -304,18 +320,18 @@ fn local_scope_overrides_global_same_name() {
     let registry = load_plugins_into_registry(
         &[global.path().to_path_buf(), local.path().to_path_buf()],
         &engine,
-        fs_with_rust_source(),
+        deps_with_rust_source(),
         production_isolation_config(),
     );
     let merged = merged(registry);
     let listed = names(&merged);
 
-    // Shadowing collapsed the duplicate to a single "ast" plugin: 7 native + 2 ast,
-    // NOT 7 + 4. The local copy won (verified deterministically by decide_shadowing
+    // Shadowing collapsed the duplicate to a single "ast" plugin: 8 native + 4 ast,
+    // NOT 8 + 8. The local copy won (verified deterministically by decide_shadowing
     // unit tests in runtime.rs).
     assert_eq!(
         listed.len(),
-        9,
+        12,
         "duplicate name across scopes must collapse to one plugin: {listed:?}"
     );
     assert_eq!(
@@ -323,7 +339,7 @@ fn local_scope_overrides_global_same_name() {
             .iter()
             .filter(|n| n.starts_with("tower_ast_"))
             .count(),
-        2,
-        "exactly the 2 ast tools, not duplicated: {listed:?}"
+        4,
+        "exactly the 4 ast tools, not duplicated: {listed:?}"
     );
 }

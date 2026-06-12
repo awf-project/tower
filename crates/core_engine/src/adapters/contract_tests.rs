@@ -11,14 +11,50 @@
 //! - GREEN: `InMemoryStorage` / `InMemoryFs` implementations made them pass.
 //! - REFACTOR: the contract logic lives in the macros, not duplicated here.
 
-use crate::adapters::{InMemoryFs, InMemoryStorage};
-use crate::{filesystem_contract_tests, storage_contract_tests};
+use crate::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage, XdgAstIndexAdapter};
+use crate::{ast_index_contract_tests, filesystem_contract_tests, storage_contract_tests};
 
 // Expand StoragePort contract suite against InMemoryStorage.
 storage_contract_tests!(InMemoryStorage::new);
 
 // Expand FileSystemPort contract suite against InMemoryFs.
 filesystem_contract_tests!(InMemoryFs::new);
+
+// ── AstIndexPort contract suite ───────────────────────────────────────────────
+//
+// Both the in-memory fake and the real XDG adapter must pass the same
+// behavioural contract (spec 02 dependency-inversion proof).
+
+// In-memory fake — no I/O.
+ast_index_contract_tests!(InMemoryAstIndex::new);
+
+// Real adapter wired to a TempDir — exercises the shadow-file path.
+//
+// Each macro-expanded test calls `make_xdg_adapter()` to get a fresh
+// `XdgAstIndexAdapter` pointed at its own temporary directory. The
+// `TempDir` is leaked (via `into_path`) so the directory survives for the
+// duration of the test; the OS cleans it up on process exit.
+//
+// The macro expands a module named `ast_index_contract`. To avoid a name
+// collision with the `InMemoryAstIndex` invocation above, wrap this one in
+// a distinct outer module.
+mod xdg {
+    use super::*;
+
+    // Decision: `TempDir::keep()` instead of leaking: `keep()` returns the
+    // path and drops the guard cleanly (no OS-level descriptor leak). The
+    // returned `PathBuf` keeps the directory alive implicitly on Linux because
+    // the directory entry still exists; it is cleaned up by the OS only after
+    // the process exits (or when the test framework's temp-cleanup runs).
+    fn make_xdg_adapter() -> XdgAstIndexAdapter {
+        let tmp = tempfile::tempdir().expect("tempdir for XdgAstIndexAdapter contract tests");
+        let base = tmp.path().join("ast");
+        let _ = tmp.keep();
+        XdgAstIndexAdapter::new(base)
+    }
+
+    ast_index_contract_tests!(make_xdg_adapter);
+}
 
 // ── Dependency-inversion proof (spec U1 / EV1 / TDD step 5) ─────────────────
 //

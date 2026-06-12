@@ -1,11 +1,11 @@
-//! End-to-end integration tests for the 7 native `tower_*` MCP tools (spec 10b).
+//! End-to-end integration tests for the 8 native `tower_*` MCP tools (spec 10b).
 //!
 //! All tests use the 10a in-process transport: `serve()` is driven with
 //! in-memory `Cursor`/`Vec<u8>` buffers. No spawned processes, no real stdio.
 //!
 //! # TDD sequence (spec 10b §TDD sequence)
 //!
-//! 1. AC1 — `tools/list` returns 7 `tower_*` tools with schemas.
+//! 1. AC1 — `tools/list` returns 8 `tower_*` tools with schemas.
 //! 2. AC2 — `tower_find_file` round-trip.
 //! 3. AC3 — `tower_create_file` then `tower_find_file` finds it.
 //! 4. AC4 — malformed args → `invalid-params`, no state change.
@@ -98,10 +98,10 @@ fn state_with_client_file() -> Arc<RwLock<EngineState>> {
     )))
 }
 
-// ── AC1: tools/list returns 7 tower_* tools with schemas ─────────────────────
+// ── AC1: tools/list returns 8 tower_* tools with schemas ─────────────────────
 
 #[test]
-fn ac1_tools_list_returns_seven_tower_tools_with_schemas() {
+fn ac1_tools_list_returns_eight_tower_tools_with_schemas() {
     let state = empty_state();
     let mut reg = NativeToolRegistry::new(Arc::clone(&state));
 
@@ -118,15 +118,15 @@ fn ac1_tools_list_returns_seven_tower_tools_with_schemas() {
         .as_array()
         .expect("result.tools must be an array");
 
-    // Must have exactly 7 tools.
+    // Must have exactly 8 tools.
     assert_eq!(
         tools.len(),
-        7,
-        "expected 7 tower_* tools; got {}",
+        8,
+        "expected 8 tower_* tools; got {}",
         tools.len()
     );
 
-    // All 7 names must be present.
+    // All 8 names must be present.
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     for expected_name in &[
@@ -137,6 +137,7 @@ fn ac1_tools_list_returns_seven_tower_tools_with_schemas() {
         "tower_create_directory",
         "tower_delete_file",
         "tower_global_replace",
+        "tower_reindex",
     ] {
         assert!(
             names.contains(expected_name),

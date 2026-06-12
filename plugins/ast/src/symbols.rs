@@ -336,6 +336,10 @@ pub fn find_symbols(
 /// Walk the Rust syntax tree looking for definitions of `symbol_name` with
 /// the given `kind`. Only definition nodes are visited — comments and string
 /// literals are different node kinds and are never matched (U2/AC1).
+///
+/// Recurses into inline `mod_item` bodies (see `walk_rust_mod_body`) and
+/// `impl_item` bodies (for methods) so symbols declared at any nesting depth
+/// inside inline modules are found.
 fn walk_rust_symbols(
     root: Node<'_>,
     source: &[u8],
@@ -345,47 +349,104 @@ fn walk_rust_symbols(
 ) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        match (kind, child.kind()) {
-            (SymbolKind::Function, "function_item")
-            | (SymbolKind::Struct, "struct_item")
-            | (SymbolKind::Enum, "enum_item")
-            | (SymbolKind::Trait, "trait_item")
-            | (SymbolKind::Module, "mod_item")
-            | (SymbolKind::TypeAlias, "type_item")
-            | (SymbolKind::Const, "const_item")
-            | (SymbolKind::Static, "static_item")
-            | (SymbolKind::MacroDef, "macro_definition") => {
-                if let Some(m) = match_named_item(child, source, symbol_name, kind) {
-                    matches.push(m);
-                }
+        visit_rust_node(child, source, symbol_name, kind, matches);
+    }
+}
+
+/// Dispatch a single Rust AST node — the shared kind-match logic used by both
+/// the top-level walk and the inline-module recursion path.
+///
+/// Keeping the dispatch in one place ensures that recursing into a `mod_item`
+/// body applies the full kind set (function, struct, impl, nested mod, …)
+/// rather than a subset.
+fn visit_rust_node(
+    child: Node<'_>,
+    source: &[u8],
+    symbol_name: &str,
+    kind: SymbolKind,
+    matches: &mut Vec<SymbolMatch>,
+) {
+    match (kind, child.kind()) {
+        (SymbolKind::Function, "function_item")
+        | (SymbolKind::Struct, "struct_item")
+        | (SymbolKind::Enum, "enum_item")
+        | (SymbolKind::Trait, "trait_item")
+        | (SymbolKind::TypeAlias, "type_item")
+        | (SymbolKind::Const, "const_item")
+        | (SymbolKind::Static, "static_item")
+        | (SymbolKind::MacroDef, "macro_definition") => {
+            if let Some(m) = match_named_item(child, source, symbol_name, kind) {
+                matches.push(m);
             }
-            (SymbolKind::Impl, "impl_item") => {
-                // impl name = the type name (child_by_field_name("type")).
-                if let Some(name_text) = impl_name(child, source)
-                    && name_text == symbol_name
-                {
-                    matches.push(node_to_match(child, name_text, kind));
-                }
+        }
+        (SymbolKind::Module, "mod_item") => {
+            if let Some(m) = match_named_item(child, source, symbol_name, kind) {
+                matches.push(m);
             }
-            (SymbolKind::Method, "impl_item") => {
-                // Recurse into impl body looking for function_item (methods).
-                let body = child
-                    .children(&mut child.walk())
-                    .find(|n| n.kind() == "declaration_list");
-                if let Some(body) = body {
-                    let mut bcursor = body.walk();
-                    for method in body.children(&mut bcursor) {
-                        if method.kind() == "function_item"
-                            && let Some(m) =
-                                match_named_item(method, source, symbol_name, SymbolKind::Method)
-                        {
-                            matches.push(m);
-                        }
+            // Decision: always recurse into the mod body for all kinds, not
+            // only when kind==Module.  A caller searching for a function that
+            // lives inside an inline module must find it even though the
+            // containing node is a mod_item, not a function_item.
+            // Why: exhaustive search — a symbol declared inside `mod foo { fn bar() {} }`
+            //      is a real definition that must be reachable.
+            // Trade-off: names are unqualified; qualification is deferred to the
+            //            indexing stage.
+            walk_rust_mod_body(child, source, symbol_name, kind, matches);
+        }
+        (_, "mod_item") => {
+            // The kind being searched is NOT Module — but the definition we seek
+            // might be nested inside this inline module.  Always recurse.
+            walk_rust_mod_body(child, source, symbol_name, kind, matches);
+        }
+        (SymbolKind::Impl, "impl_item") => {
+            // impl name = the type name (child_by_field_name("type")).
+            if let Some(name_text) = impl_name(child, source)
+                && name_text == symbol_name
+            {
+                matches.push(node_to_match(child, name_text, kind));
+            }
+        }
+        (SymbolKind::Method, "impl_item") => {
+            // Recurse into impl body looking for function_item (methods).
+            let body = child
+                .children(&mut child.walk())
+                .find(|n| n.kind() == "declaration_list");
+            if let Some(body) = body {
+                let mut bcursor = body.walk();
+                for method in body.children(&mut bcursor) {
+                    if method.kind() == "function_item"
+                        && let Some(m) =
+                            match_named_item(method, source, symbol_name, SymbolKind::Method)
+                    {
+                        matches.push(m);
                     }
                 }
             }
-            _ => {}
         }
+        _ => {}
+    }
+}
+
+/// Recurse into an inline `mod_item`'s `declaration_list` body.
+///
+/// `mod foo;` (file module, no braces) has no `declaration_list` child — the
+/// `.find()` returns `None` and this function is a no-op for those nodes.
+fn walk_rust_mod_body(
+    mod_node: Node<'_>,
+    source: &[u8],
+    symbol_name: &str,
+    kind: SymbolKind,
+    matches: &mut Vec<SymbolMatch>,
+) {
+    let body = mod_node
+        .children(&mut mod_node.walk())
+        .find(|n| n.kind() == "declaration_list");
+
+    let Some(body) = body else { return };
+
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        visit_rust_node(child, source, symbol_name, kind, matches);
     }
 }
 
@@ -687,21 +748,11 @@ fn node_to_match(node: Node<'_>, name: String, kind: SymbolKind) -> SymbolMatch 
     }
 }
 
-/// Extract the source text covered by `node` (capped at 256 bytes).
-fn extract_text(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let bytes = source.get(node.start_byte()..node.end_byte())?;
-    let text = std::str::from_utf8(bytes).ok()?;
-    let capped = if text.len() > 256 {
-        let mut end = 256;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        &text[..end]
-    } else {
-        text
-    };
-    Some(capped.to_owned())
-}
+// Decision: extract_text moved to crate::text::extract_text (shared with outline.rs).
+// Why: the function was byte-identical in both modules — consolidate to one copy.
+// Trade-off: a use alias is needed in each module; the logic is no longer co-located
+//            with the "capped at 256 bytes" comment (see text.rs instead).
+use crate::text::extract_text;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1270,6 +1321,99 @@ function findFunction() {}
     fn language_hint_unknown_returns_none() {
         assert_eq!(SupportedLanguage::from_hint("main.py"), None);
         assert_eq!(SupportedLanguage::from_hint("hello.js"), None);
+    }
+
+    // ── Rust inline module recursion (Fix 3) ─────────────────────────────────
+
+    const INLINE_MOD_FIXTURE: &[u8] = br#"
+mod outer {
+    fn inner_fn() {}
+    struct InnerStruct {}
+    mod nested {
+        fn deep() {}
+    }
+}
+
+fn top_level_fn() {}
+"#;
+
+    /// `inner_fn` declared inside `mod outer` must be found when searching
+    /// for kind=function.
+    #[test]
+    fn rust_inline_mod_function_is_found() {
+        let result = find_symbols(
+            INLINE_MOD_FIXTURE,
+            "test.rs",
+            "inner_fn",
+            SymbolKind::Function,
+        );
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "inner_fn inside mod outer must be found, got: {matches:?}"
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Function);
+        assert_eq!(matches[0].name, "inner_fn");
+    }
+
+    /// `deep` declared inside `mod outer { mod nested { fn deep() {} } }` (two
+    /// levels of nesting) must be found.
+    #[test]
+    fn rust_deeply_nested_mod_function_is_found() {
+        let result = find_symbols(INLINE_MOD_FIXTURE, "test.rs", "deep", SymbolKind::Function);
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "deep inside nested mod must be found, got: {matches:?}"
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Function);
+        assert_eq!(matches[0].name, "deep");
+    }
+
+    /// Searching for `outer` as a module must still return the module itself.
+    #[test]
+    fn rust_inline_mod_itself_is_found() {
+        let result = find_symbols(INLINE_MOD_FIXTURE, "test.rs", "outer", SymbolKind::Module);
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "module outer must itself be found, got: {matches:?}"
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Module);
+    }
+
+    /// Regression: a symbol at top level (not inside any inline module) must
+    /// still be found after the mod-recursion refactor.
+    #[test]
+    fn rust_top_level_symbol_not_regressed_after_mod_recursion() {
+        let result = find_symbols(
+            INLINE_MOD_FIXTURE,
+            "test.rs",
+            "top_level_fn",
+            SymbolKind::Function,
+        );
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "top_level_fn must still be found after mod-recursion refactor, got: {matches:?}"
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Function);
     }
 
     // ── SymbolKind round-trip ─────────────────────────────────────────────────

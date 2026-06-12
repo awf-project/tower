@@ -235,4 +235,10 @@ impl FileSystemPort for RealFs {
     fn scan(&self) -> Vec<RelativePath> {
         self.known_paths.iter().cloned().collect()
     }
+
+    /// A `RealFs` is rooted at a real directory, so the forced reindex can walk
+    /// it recursively instead of relying on the session-only `scan()` set.
+    fn workspace_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
 }

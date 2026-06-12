@@ -38,13 +38,12 @@
 //! aborts because of one bad plugin.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::domain::PluginInstance;
 use crate::domain::plugin_host::PluginHostRegistry;
-use crate::ports::FileSystemPort;
 
 use super::isolation::{DEFAULT_FUEL_BUDGET, IsolatedSandbox, IsolationConfig, IsolationEngine};
+use super::loader::HostDeps;
 
 /// Default plugins directory, relative to the workspace root.
 pub const DEFAULT_PLUGINS_SUBDIR: &str = ".tower/plugins";
@@ -143,9 +142,9 @@ pub fn production_isolation_config() -> IsolationConfig {
 ///
 /// `dirs` is the ordered scope list from [`resolve_plugin_dirs`] — earlier dirs are
 /// lower precedence (global), the last dir is highest (local). `engine` supplies
-/// the shared fuel+epoch [`Engine`]; `fs_port` is the workspace filesystem each
-/// plugin reads through (`host_read_file`); `config` is the per-call compute bound
-/// (see [`production_isolation_config`]).
+/// the shared fuel+epoch [`Engine`]; `deps` bundles the filesystem port, AST index,
+/// and workspace that each plugin receives as its capability surface; `config` is
+/// the per-call compute bound (see [`production_isolation_config`]).
 ///
 /// # Shadowing (local overrides global)
 ///
@@ -169,7 +168,7 @@ pub fn production_isolation_config() -> IsolationConfig {
 pub fn load_plugins_into_registry(
     dirs: &[PathBuf],
     engine: &IsolationEngine,
-    fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+    deps: HostDeps,
     config: IsolationConfig,
 ) -> PluginHostRegistry {
     let mut registry = PluginHostRegistry::new();
@@ -194,12 +193,7 @@ pub fn load_plugins_into_registry(
         wasm_paths.sort();
 
         for path in wasm_paths {
-            match IsolatedSandbox::load(
-                engine.engine(),
-                &path,
-                Arc::clone(&fs_port),
-                config.clone(),
-            ) {
+            match IsolatedSandbox::load(engine.engine(), &path, deps.clone(), config.clone()) {
                 Ok(sandbox) => loaded.push((dir_idx, path, sandbox)),
                 Err(e) => {
                     eprintln!("tower: warning — skipping plugin {}: {e}", path.display());

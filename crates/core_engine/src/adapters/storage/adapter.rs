@@ -321,6 +321,36 @@ impl SledStorageAdapter {
         Ok(inverted)
     }
 
+    /// Return a second `SledStorageAdapter` backed by the **same** underlying
+    /// sled database.
+    ///
+    /// # Decision
+    ///
+    /// `sled::Tree` is an `Arc`-backed handle; cloning it is cheap and produces
+    /// a second handle to the same on-disk tree. This lets the filesystem watcher
+    /// own its own `Box<dyn StoragePort + Send>` without opening the sled database
+    /// a second time (a second `sled::open` on the same path would fail with a
+    /// file-lock error on most platforms).
+    ///
+    /// # Trade-off
+    ///
+    /// Both handles write to the same physical trees, so callers must use the
+    /// `RwLock`-protected workspace/index state to avoid logical inconsistencies.
+    /// In practice the watcher and MCP handlers never write concurrently (the
+    /// watcher holds workspace/index write-locks while mutating; the MCP handlers
+    /// hold the outer `EngineState` write-lock). sled's own per-tree optimistic
+    /// concurrency control handles any remaining conflicts.
+    #[must_use]
+    pub fn try_clone(&self) -> Self {
+        Self {
+            files: self.files.clone(),
+            paths: self.paths.clone(),
+            blobs: self.blobs.clone(),
+            meta: self.meta.clone(),
+            index: self.index.clone(),
+        }
+    }
+
     /// Test-only: attempt a `put` that writes to both the files tree and the
     /// index tree, then unconditionally aborts the transaction so callers can
     /// verify that neither the file record nor the postings commit.

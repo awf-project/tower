@@ -48,16 +48,56 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use core_engine::adapters::SledStorageAdapter;
+use core_engine::adapters::ast_index::{
+    XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
+};
 use core_engine::adapters::fs::{RealFs, workspace_scan};
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::{MergedRegistry, serve};
 use core_engine::adapters::plugin::{
-    DEFAULT_PLUGINS_SUBDIR, IsolationEngine, Scope, global_plugins_dir, install,
+    DEFAULT_PLUGINS_SUBDIR, HostDeps, IsolationEngine, Scope, global_plugins_dir, install,
     load_plugins_into_registry, production_isolation_config, resolve_plugin_dirs,
 };
+use core_engine::adapters::watcher::NotifyWatcherAdapter;
 use core_engine::domain::index::InvertedIndex;
+use core_engine::domain::plugin_host::PluginHostRegistry;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::{FileSystemPort, StoragePort};
+use core_engine::domain::{FileId, RelativePath};
+use core_engine::ports::AstIndexPort;
+use core_engine::ports::{FileSystemPort, PluginHostPort, StoragePort};
+
+// ── SharedPluginHost ──────────────────────────────────────────────────────────
+
+/// Adapter that delegates [`PluginHostPort`] calls to the shared
+/// [`PluginHostRegistry`] through an `Arc<RwLock<_>>`.
+///
+/// # Decision
+///
+/// The watcher needs `Box<dyn PluginHostPort + Send + Sync>`, while the MCP
+/// serve loop holds `Arc<RwLock<PluginHostRegistry>>`. Rather than cloning the
+/// registry (which would break the shared-identity requirement — watcher would
+/// fire hooks into a dead copy), we wrap the `Arc` in a thin newtype that
+/// delegates through the lock.
+///
+/// # Trade-off
+///
+/// Each `on_file_changed` / `on_file_indexed` call acquires a read lock on the
+/// registry. This is bounded by the per-plugin `Mutex` inside
+/// `PluginHostRegistry` and is safe to do from the watcher thread.
+struct SharedPluginHost(Arc<RwLock<PluginHostRegistry>>);
+
+impl PluginHostPort for SharedPluginHost {
+    fn on_file_indexed(&self, id: FileId, path: &RelativePath) {
+        // Recover a poisoned lock (wasm trap inside a hook could poison it).
+        let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
+        guard.on_file_indexed(id, path);
+    }
+
+    fn on_file_changed(&self, id: FileId, path: &RelativePath) {
+        let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
+        guard.on_file_changed(id, path);
+    }
+}
 
 fn main() {
     // Subcommand dispatch: `tower plugin <install|list|remove> ...` manages
@@ -187,6 +227,12 @@ fn run() -> Result<(), String> {
     };
 
     // ── Step 4: build shared engine state ─────────────────────────────────────
+    //
+    // Clone the sled adapter before moving `storage` into `EngineState`.
+    // `SledStorageAdapter::try_clone` shares the same underlying sled trees —
+    // no second `sled::open`, no second file lock. The clone is kept here
+    // and moved into `NotifyWatcherAdapter` below.
+    let storage_for_watcher = storage.try_clone();
     let fs = RealFs::new(&workspace_root);
     let state = Arc::new(RwLock::new(EngineState::new(
         workspace,
@@ -215,10 +261,51 @@ fn run() -> Result<(), String> {
     // capability the native tools use), satisfying host_read_file.
     let plugin_fs: Arc<dyn FileSystemPort + Send + Sync> = Arc::new(RealFs::new(&workspace_root));
 
+    // ── AST index: resolve the per-workspace XDG data directory ──────────────
+    //
+    // Decision: fall back to `<workspace_root>/.tower/ast` when
+    // `global_ast_workspace_dir()` returns None (no HOME/XDG_DATA_HOME, e.g.
+    // a headless CI container without $HOME set).
+    //
+    // Why: silently falling back to a workspace-local directory keeps the
+    // binary usable in constrained environments. The data is a pure cache
+    // (re-derivable by the plugin); losing XDG isolation in those environments
+    // is acceptable.
+    //
+    // Trade-off: the local `.tower/ast` directory is committed-adjacent and
+    // could appear in version control if the user forgets to gitignore it.
+    // A future improvement could warn and suggest adding `.tower/ast/` to
+    // `.gitignore`, but that is out of scope here.
+    let ast_base_dir = match global_ast_workspace_dir() {
+        Some(_) => workspace_ast_dir(&compute_workspace_key(&workspace_root)),
+        None => {
+            eprintln!(
+                "tower: warning — XDG data directory unavailable; \
+                 AST index will be stored in <workspace>/.tower/ast"
+            );
+            workspace_root.join(".tower").join("ast")
+        }
+    };
+    let plugin_ast_index: Arc<dyn AstIndexPort + Send + Sync> =
+        Arc::new(XdgAstIndexAdapter::new(ast_base_dir));
+
+    // Extract the workspace Arc from EngineState so plugins see the same live
+    // workspace as the MCP handlers and the watcher (same Arc, same RwLock).
+    let plugin_workspace = state
+        .read()
+        .map_err(|_| "engine state lock poisoned".to_string())?
+        .workspace_arc();
+
+    let plugin_deps = HostDeps {
+        fs: plugin_fs,
+        ast_index: plugin_ast_index,
+        workspace: plugin_workspace,
+    };
+
     let plugin_host = load_plugins_into_registry(
         &plugin_dirs,
         &isolation_engine,
-        plugin_fs,
+        plugin_deps,
         production_isolation_config(),
     );
     let plugin_count = plugin_host.declared_tools().len();
@@ -233,6 +320,49 @@ fn run() -> Result<(), String> {
         );
     }
     let plugin_host = Arc::new(RwLock::new(plugin_host));
+
+    // ── Step 5b: spawn the filesystem watcher for live VFS sync ───────────────
+    //
+    // Decision: always-on, fail-fast at startup.
+    // Why: live VFS sync is now a core feature (spec 06), not optional. A watcher
+    // that fails to initialise means FS events will never reach the index —
+    // silently serving stale data is worse than a clear startup error.
+    //
+    // Trade-off: if the host OS notify backend is unavailable (e.g. certain
+    // container environments with no inotify), the server will refuse to start.
+    // An operator that truly wants a read-only / scan-only mode can be added
+    // later with a `--no-watch` flag; for now the binary makes the correct
+    // default: always live.
+    //
+    // Watcher state sharing:
+    //   workspace + index — Arc clones from EngineState (same instances as MCP)
+    //   storage          — try_clone() of the sled adapter (same Db, no re-open)
+    //   plugin_host      — SharedPluginHost wrapping Arc<RwLock<PluginHostRegistry>>
+    let watcher_workspace = state
+        .read()
+        .map_err(|_| "engine state lock poisoned".to_string())?
+        .workspace_arc();
+    let watcher_index = state
+        .read()
+        .map_err(|_| "engine state lock poisoned".to_string())?
+        .index_arc();
+    let watcher_plugin_host = Box::new(SharedPluginHost(Arc::clone(&plugin_host)));
+
+    // `_watcher` is intentionally bound (not `_`) so the Drop impl runs at the
+    // end of `run()` — dropping it earlier would stop live sync.
+    let _watcher = NotifyWatcherAdapter::new(
+        workspace_root.clone(),
+        watcher_workspace,
+        watcher_index,
+        Box::new(storage_for_watcher),
+        watcher_plugin_host,
+    )
+    .map_err(|e| format!("failed to start filesystem watcher: {e}"))?;
+
+    eprintln!(
+        "tower: filesystem watcher active on {}",
+        workspace_root.display()
+    );
 
     // ── Step 6: serve native + plugin tools over real stdin/stdout ────────────
     // MergedRegistry exposes the 7 native tower_* tools plus namespaced plugin

@@ -24,11 +24,14 @@
 //! - `HELLO_PLUGIN_WASM`         → `target/wasm32-wasip1/debug/hello.wasm`
 //! - `LOOP_HOOK_PLUGIN_WASM`     → `target/wasm32-wasip1/debug/fixture_loop_hook_plugin.wasm`
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use plugin_sdk::{HookKind, HookPayload, Value};
 
-use core_engine::adapters::{InMemoryFs, IsolatedSandbox, IsolationConfig, IsolationEngine};
+use core_engine::adapters::{
+    HostDeps, InMemoryAstIndex, InMemoryFs, IsolatedSandbox, IsolationConfig, IsolationEngine,
+};
+use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::domain::{PluginFaultKind, PluginHostError, PluginInstance};
 
 // ── Fixture paths ─────────────────────────────────────────────────────────────
@@ -51,8 +54,12 @@ fn loop_hook_plugin_wasm() -> &'static str {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn empty_fs() -> Arc<InMemoryFs> {
-    Arc::new(InMemoryFs::new())
+fn empty_deps() -> HostDeps {
+    HostDeps {
+        fs: Arc::new(InMemoryFs::new()),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+    }
 }
 
 fn empty_args() -> Value {
@@ -75,7 +82,7 @@ fn ac1_panic_plugin_returns_plugin_fault_trapped() {
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
         panic_plugin_wasm(),
-        empty_fs(),
+        empty_deps(),
         IsolationConfig::default(),
     )
     .expect("panic_plugin must load");
@@ -101,7 +108,7 @@ fn ac1_sandbox_reports_manifest_after_panic() {
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
         panic_plugin_wasm(),
-        empty_fs(),
+        empty_deps(),
         IsolationConfig::default(),
     )
     .expect("panic_plugin must load");
@@ -143,7 +150,7 @@ fn ac2_loop_plugin_interrupted_by_fuel_exhaustion() {
     };
 
     let mut sandbox =
-        IsolatedSandbox::load(engine.engine(), loop_plugin_wasm(), empty_fs(), config)
+        IsolatedSandbox::load(engine.engine(), loop_plugin_wasm(), empty_deps(), config)
             .expect("loop_plugin must load");
 
     let result = sandbox.call_tool("loop_tool", empty_args());
@@ -189,7 +196,7 @@ fn ac2_epoch_interruption_mid_execution() {
     };
 
     let mut sandbox =
-        IsolatedSandbox::load(engine.engine(), loop_plugin_wasm(), empty_fs(), config)
+        IsolatedSandbox::load(engine.engine(), loop_plugin_wasm(), empty_deps(), config)
             .expect("loop_plugin must load");
 
     // Clone the engine handle for the incrementer thread.
@@ -257,7 +264,7 @@ fn ac3_failed_sandbox_recreated_and_returns_to_service() {
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
         hello_wasm(),
-        empty_fs(),
+        empty_deps(),
         config_good.clone(),
     )
     .expect("hello must load");
@@ -280,7 +287,7 @@ fn ac3_failed_sandbox_recreated_and_returns_to_service() {
     let mut panic_sandbox = IsolatedSandbox::load(
         engine.engine(),
         panic_plugin_wasm(),
-        empty_fs(),
+        empty_deps(),
         config_good.clone(),
     )
     .expect("panic_plugin must load for recreate test");
@@ -338,7 +345,7 @@ fn ac3_faulted_sandbox_serves_successful_call_after_recreate() {
         epoch_deadline_ticks: None,
     };
 
-    let mut sandbox = IsolatedSandbox::load(engine.engine(), hello_wasm(), empty_fs(), config)
+    let mut sandbox = IsolatedSandbox::load(engine.engine(), hello_wasm(), empty_deps(), config)
         .expect("hello must load");
 
     assert!(sandbox.is_ready(), "AC3: sandbox starts Ready");
@@ -390,7 +397,7 @@ fn ac3_sandbox_is_ready_after_successful_recreate() {
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
         loop_plugin_wasm(),
-        empty_fs(),
+        empty_deps(),
         config_tiny.clone(),
     )
     .expect("loop_plugin must load");
@@ -411,7 +418,7 @@ fn ac3_sandbox_is_ready_after_successful_recreate() {
     // Reset config to normal fuel before next call.
     // (IsolationConfig is stored on the sandbox; we test via a fresh hello.)
     let mut hello_sandbox =
-        IsolatedSandbox::load(engine.engine(), hello_wasm(), empty_fs(), config_normal)
+        IsolatedSandbox::load(engine.engine(), hello_wasm(), empty_deps(), config_normal)
             .expect("hello must load");
 
     // Cause a fault by exhausting a tiny budget on a greet call — we do this by
@@ -459,7 +466,7 @@ fn ac4_sandbox_quarantined_after_repeated_load_failures() {
     let valid_sandbox = IsolatedSandbox::load(
         engine.engine(),
         panic_plugin_wasm(),
-        empty_fs(),
+        empty_deps(),
         IsolationConfig::default(),
     )
     .expect("panic_plugin must load for initial setup");
@@ -503,7 +510,7 @@ fn ac4_sandbox_quarantined_after_repeated_load_failures() {
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
         &tmp_wasm,
-        empty_fs(),
+        empty_deps(),
         IsolationConfig::default(),
     )
     .expect("AC4: temp sandbox must load");
@@ -560,7 +567,7 @@ fn ac4_quarantined_sandbox_rejects_all_calls() {
     let mut sandbox = IsolatedSandbox::load(
         engine.engine(),
         &tmp_wasm,
-        empty_fs(),
+        empty_deps(),
         IsolationConfig::default(),
     )
     .expect("AC4: temp sandbox must load");
@@ -620,9 +627,13 @@ fn deliver_hook_looping_handler_interrupted_by_fuel() {
         epoch_deadline_ticks: None,
     };
 
-    let mut sandbox =
-        IsolatedSandbox::load(engine.engine(), loop_hook_plugin_wasm(), empty_fs(), config)
-            .expect("loop_hook_plugin must load");
+    let mut sandbox = IsolatedSandbox::load(
+        engine.engine(),
+        loop_hook_plugin_wasm(),
+        empty_deps(),
+        config,
+    )
+    .expect("loop_hook_plugin must load");
 
     let hook_result = sandbox.deliver_hook(
         HookKind::FileIndexed,
@@ -660,9 +671,13 @@ fn deliver_hook_fault_sandbox_recovers_on_next_tool_call() {
         epoch_deadline_ticks: None,
     };
 
-    let mut sandbox =
-        IsolatedSandbox::load(engine.engine(), loop_hook_plugin_wasm(), empty_fs(), config)
-            .expect("loop_hook_plugin must load");
+    let mut sandbox = IsolatedSandbox::load(
+        engine.engine(),
+        loop_hook_plugin_wasm(),
+        empty_deps(),
+        config,
+    )
+    .expect("loop_hook_plugin must load");
 
     assert!(sandbox.is_ready(), "sandbox starts Ready");
 
@@ -695,7 +710,7 @@ fn deliver_hook_fault_sandbox_recovers_on_next_tool_call() {
     let mut recovery_sandbox = IsolatedSandbox::load(
         engine.engine(),
         loop_hook_plugin_wasm(),
-        empty_fs(),
+        empty_deps(),
         config_normal,
     )
     .expect("loop_hook_plugin must load for recovery sandbox");

@@ -17,12 +17,15 @@
 //! the SDK still compiles for host-side tests; calling them on the host target
 //! will panic.
 //!
-//! # Current capability surface (spec 11c)
+//! # Current capability surface (spec 11c / stage 4a)
 //!
 //! | Symbol | Description |
 //! |--------|-------------|
 //! | `host_log` | Write a log message to the host's diagnostic log. |
 //! | `host_read_file` | Read a workspace-relative file through the host FileSystemPort. |
+//! | `ast_store_put` | Persist opaque bytes under an opaque key via AstIndexPort. |
+//! | `ast_store_get` | Retrieve bytes previously stored under an opaque key. |
+//! | `host_list_files` | Enumerate all workspace-relative file paths as a postcard `Vec<String>`. |
 //!
 //! # Wire protocol for `host_read_file`
 //!
@@ -34,6 +37,25 @@
 //!   calls `__plugin_alloc(file_len)` to allocate this buffer.
 //! - `out_len_ptr`: pointer to a `u32` the host will set to the file length.
 //! - Returns `0` on success, `1` if the file was not found, `2` on I/O error.
+//!
+//! # Wire protocol for `ast_store_put` / `ast_store_get`
+//!
+//! The guest calls `ast_store_put(key_ptr, key_len, val_ptr, val_len)`:
+//!
+//! - `key_ptr`/`key_len`: UTF-8 opaque key string (no NUL, no `/`, no `..`).
+//! - `val_ptr`/`val_len`: raw bytes to persist.
+//! - Returns `0` on success, `1` if the key is invalid (`InvalidArgs`),
+//!   `2` on a write error.
+//!
+//! The guest calls `ast_store_get(key_ptr, key_len, out_ptr, out_len_ptr)`:
+//!
+//! - `key_ptr`/`key_len`: UTF-8 opaque key string.
+//! - `out_ptr`: pointer to a `*mut u8` the host fills with an allocated guest
+//!   buffer (via `__plugin_alloc`) containing the stored bytes.
+//! - `out_len_ptr`: pointer to a `u32` set to the buffer length.
+//! - Returns `0` if the key is present (including a zero-byte value, which sets
+//!   `out_len = 0` and leaves `out_ptr` null — `Some(vec![])` on the Rust side),
+//!   `1` if the key is absent, `2` on error.
 //!
 //! # Wire protocol for buffer exchange
 //!
@@ -56,6 +78,16 @@ pub mod ffi {
     //   __plugin_alloc and writes the file content there. The guest receives
     //   the pointer and length through out_ptr/out_len_ptr.
     //   Returns: 0=ok, 1=not_found, 2=io_error.
+    //
+    // ast_store_put(key_ptr, key_len, val_ptr, val_len) -> u32:
+    //   Persist raw bytes under an opaque key via AstIndexPort.
+    //   Returns: 0=ok, 1=InvalidArgs (bad key), 2=write error.
+    //
+    // ast_store_get(key_ptr, key_len, out_ptr, out_len_ptr) -> u32:
+    //   Retrieve bytes stored under an opaque key. The host allocates a guest
+    //   buffer via __plugin_alloc when len > 0.
+    //   Returns: 0=present (out_len may be 0 for an empty value),
+    //            1=absent, 2=error.
     #[cfg(target_arch = "wasm32")]
     #[link(wasm_import_module = "tower_host")]
     unsafe extern "C" {
@@ -66,6 +98,25 @@ pub mod ffi {
             out_ptr: *mut *mut u8,
             out_len_ptr: *mut u32,
         ) -> u32;
+        pub fn ast_store_put(
+            key_ptr: *const u8,
+            key_len: usize,
+            val_ptr: *const u8,
+            val_len: usize,
+        ) -> u32;
+        pub fn ast_store_get(
+            key_ptr: *const u8,
+            key_len: usize,
+            out_ptr: *mut *mut u8,
+            out_len_ptr: *mut u32,
+        ) -> u32;
+        // host_list_files(out_ptr, out_len_ptr) -> u32:
+        //   Enumerate all workspace-relative file paths. The host serialises a
+        //   Vec<String> with postcard, allocates a guest buffer via __plugin_alloc,
+        //   and writes the payload there.
+        //   Returns: 0=ok (out_len bytes of postcard payload), 2=error.
+        //   rc=1 is intentionally unused.
+        pub fn host_list_files(out_ptr: *mut *mut u8, out_len_ptr: *mut u32) -> u32;
     }
 
     // ── Host-target stubs ────────────────────────────────────────────────────
@@ -89,6 +140,37 @@ pub mod ffi {
         _out_len_ptr: *mut u32,
     ) -> u32 {
         panic!("host_read_file is only available inside a wasm32 guest");
+    }
+
+    /// Host stub — panics on non-wasm targets.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn ast_store_put(
+        _key_ptr: *const u8,
+        _key_len: usize,
+        _val_ptr: *const u8,
+        _val_len: usize,
+    ) -> u32 {
+        panic!("ast_store_put is only available inside a wasm32 guest");
+    }
+
+    /// Host stub — panics on non-wasm targets.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn ast_store_get(
+        _key_ptr: *const u8,
+        _key_len: usize,
+        _out_ptr: *mut *mut u8,
+        _out_len_ptr: *mut u32,
+    ) -> u32 {
+        panic!("ast_store_get is only available inside a wasm32 guest");
+    }
+
+    /// Host stub — panics on non-wasm targets.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn host_list_files(_out_ptr: *mut *mut u8, _out_len_ptr: *mut u32) -> u32 {
+        panic!("host_list_files is only available inside a wasm32 guest");
     }
 }
 
@@ -220,6 +302,171 @@ pub fn read_file(workspace_path: &str) -> Option<Vec<u8>> {
     {
         let _ = workspace_path;
         None
+    }
+}
+
+/// Persist raw bytes under an opaque key via the host AST index capability.
+///
+/// The `key` must be non-empty, must not contain `/`, and must not be `..` or
+/// start with `../` — the same rules enforced by `AstIndexPort::put` on the
+/// host side. Invalid keys are caught by the host and surfaced as `Err`.
+///
+/// Returns `Ok(())` on success, `Err(String)` on failure (invalid key or write
+/// error). On non-wasm targets this always panics (stub).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Inside a wasm32 plugin:
+/// plugin_sdk::host::ast_store_put("symbols", &serialised_index)?;
+/// ```
+pub fn ast_store_put(key: &str, value: &[u8]) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Safety: key and value are valid Rust slices; we pass ptr+len correctly.
+        let rc =
+            unsafe { ffi::ast_store_put(key.as_ptr(), key.len(), value.as_ptr(), value.len()) };
+        match rc {
+            0 => Ok(()),
+            1 => Err(format!("ast_store_put: invalid key '{key}'")),
+            _ => Err(format!("ast_store_put: write error for key '{key}'")),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (key, value);
+        panic!("ast_store_put is only available inside a wasm32 guest");
+    }
+}
+
+/// Retrieve bytes stored under an opaque key via the host AST index capability.
+///
+/// # Return convention
+///
+/// | Host rc | Meaning | Rust return |
+/// |---------|---------|-------------|
+/// | `0` | Key is **present**; `out_len` may be 0 for a stored empty value | `Some(bytes)` (may be `Some(vec![])`) |
+/// | `1` | Key is **absent** | `None` |
+/// | `2` | Error (bad key or I/O) | `None` |
+///
+/// `rc 0` with `out_len == 0` is disambiguated from absent (`rc 1`) — an
+/// explicitly stored empty value returns `Some(vec![])`, not `None`.
+///
+/// On non-wasm targets this always panics (stub).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Inside a wasm32 plugin:
+/// match plugin_sdk::host::ast_store_get("symbols") {
+///     Some(bytes) => { /* deserialise index */ }
+///     None        => { /* cache miss — build the index */ }
+/// }
+/// ```
+pub fn ast_store_get(key: &str) -> Option<Vec<u8>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::ptr;
+
+        let mut out_ptr: *mut u8 = ptr::null_mut();
+        let mut out_len: u32 = 0;
+
+        // Safety: key is a valid UTF-8 &str; we pass ptr+len correctly.
+        let rc = unsafe {
+            ffi::ast_store_get(key.as_ptr(), key.len(), &raw mut out_ptr, &raw mut out_len)
+        };
+
+        match rc {
+            0 => {
+                let len = out_len as usize;
+                if len == 0 {
+                    // Key present but value is empty. out_ptr may be null (host
+                    // skips alloc(0)); return Some(vec![]) to distinguish from
+                    // absent (rc 1 → None).
+                    Some(Vec::new())
+                } else {
+                    // Safety: host allocated this buffer via __plugin_alloc(len);
+                    // rc==0 and len>0 guarantee out_ptr is non-null and valid.
+                    // We reconstruct and take ownership; the host will not free it.
+                    Some(unsafe { Vec::from_raw_parts(out_ptr, len, len) })
+                }
+            }
+            _ => None, // rc 1 = absent, rc 2 = error — both map to None
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = key;
+        panic!("ast_store_get is only available inside a wasm32 guest");
+    }
+}
+
+/// Enumerate all workspace-relative file paths known to the host.
+///
+/// The host takes a read-lock snapshot of the `ProjectWorkspace`, collects
+/// every live file's path, serialises the `Vec<String>` with postcard, and
+/// writes the payload into a guest buffer allocated via `__plugin_alloc`.
+///
+/// # Return value
+///
+/// Returns a `Vec<String>` of workspace-relative path strings (e.g.
+/// `"src/main.rs"`, `"Cargo.toml"`). Returns an empty `Vec` on error or
+/// when the workspace contains no indexed files.
+///
+/// # RC convention
+///
+/// | Host rc | Meaning | Rust return |
+/// |---------|---------|-------------|
+/// | `0` | Success; payload is a valid postcard `Vec<String>` | deserialized paths |
+/// | `2` | Error (serialisation or guest memory fault) | `vec![]` |
+///
+/// rc=1 is intentionally unused — there is no "absent" concept for a file list.
+///
+/// On non-wasm targets this always panics (stub — not callable outside a wasm runtime).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Inside a wasm32 plugin:
+/// let files = plugin_sdk::host::list_files();
+/// for path in &files {
+///     plugin_sdk::host::log(&format!("file: {path}"));
+/// }
+/// ```
+pub fn list_files() -> Vec<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::ptr;
+
+        let mut out_ptr: *mut u8 = ptr::null_mut();
+        let mut out_len: u32 = 0;
+
+        // Safety: we pass valid mutable references; the host writes the pointer
+        // and length of the allocated guest buffer through them.
+        let rc = unsafe { ffi::host_list_files(&raw mut out_ptr, &raw mut out_len) };
+
+        if rc != 0 {
+            return Vec::new();
+        }
+
+        let len = out_len as usize;
+        if len == 0 {
+            // Host allocated nothing — workspace is empty. postcard encodes
+            // Vec::<String>::new() as a single zero byte, so len==0 here
+            // would only happen if the host skipped the alloc for an empty
+            // workspace.  Return empty vec as documented.
+            return Vec::new();
+        }
+
+        // Safety: host allocated this buffer via __plugin_alloc(len);
+        // rc==0 and len>0 guarantee out_ptr is non-null and valid.
+        // We reconstruct it as a Vec<u8>, deserialise, and take ownership.
+        let payload = unsafe { Vec::from_raw_parts(out_ptr, len, len) };
+        postcard::from_bytes::<Vec<String>>(&payload).unwrap_or_default()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        panic!("host_list_files is only available inside a wasm32 guest");
     }
 }
 

@@ -1,16 +1,19 @@
-//! Wasmtime loader and capability linker (spec 11c).
+//! Wasmtime loader and capability linker (spec 11c / stage 4a).
 //!
 //! # Wireframe
 //!
 //! ```text
-//! WasmtimeHost::load(path, fs_port)
+//! WasmtimeHost::load(path, HostDeps { fs, ast_index, workspace })
 //!   Engine(config)
 //!   Module::from_file(engine, path)          ← U1: single .wasm file
 //!   Store<WasmStoreData> { wasi_p1, host }
 //!   Linker::new(engine)
 //!     + p1::add_to_linker_sync (ZERO preopened dirs, no net) ← WASI tension
-//!     + func_wrap("tower_host","host_log",…)  ← explicit allow-list
-//!     + func_wrap("tower_host","host_read_file",…) via FileSystemPort
+//!     + func_wrap("tower_host","host_log",…)         ← explicit allow-list
+//!     + func_wrap("tower_host","host_read_file",…)   via FileSystemPort
+//!     + func_wrap("tower_host","ast_store_put",…)    via AstIndexPort
+//!     + func_wrap("tower_host","ast_store_get",…)    via AstIndexPort
+//!     + func_wrap("tower_host","host_list_files",…)  via ProjectWorkspace
 //!   linker.instantiate(store, module)         ← link error = denied import
 //!   instance.__plugin_init()                  ← ABI handshake
 //!   verify manifest.abi == ABI_VERSION        ← reject on mismatch (AC4)
@@ -38,7 +41,8 @@
 //! filesystem, network, or environment access.
 //!
 //! The **only** real capability surface is our explicit `tower_host` allow-list
-//! (two functions: `host_log` and `host_read_file`). Any other `tower_host`
+//! (five functions: `host_log`, `host_read_file`, `ast_store_put`,
+//! `ast_store_get`, and `host_list_files`). Any other `tower_host`
 //! import — whether from an attacker or a misconfigured plugin — produces a
 //! `LinkError` at instantiation time (AC3 / UN2).
 //!
@@ -50,7 +54,7 @@
 //! in this file.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use wasmtime::{AsContext, AsContextMut, Engine, Linker, Module, Store};
 use wasmtime_wasi::WasiCtxBuilder;
@@ -65,20 +69,51 @@ use plugin_sdk::__private::BUFFER_HEADER_LEN;
 use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, Value};
 
 use crate::domain::RelativePath;
+use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{PluginHostError, PluginInstance};
-use crate::ports::{FileSystemPort, PortError};
+use crate::ports::{AstIndexPort, FileSystemPort, PortError};
 
 use super::error::PluginLoadError;
+
+// ── HostDeps ──────────────────────────────────────────────────────────────────
+
+/// All host-side dependencies injected into a plugin sandbox at load time.
+///
+/// Bundling the three Arcs into one struct avoids positional-arg churn each
+/// time a new capability is added. The struct is `Clone` so `IsolatedSandbox`
+/// can pass it to recreated instances without re-acquiring from call sites.
+///
+/// Decision: bundle over positional args.
+/// Why: every new capability (like `workspace`) would otherwise require
+/// updating every call site signature; the bundle touches the same call sites
+/// once and is stable thereafter.
+/// Trade-off: a thin wrapper type with no behaviour — acceptable because the
+/// alternative is repeating three Arc<dyn Trait> params everywhere.
+#[derive(Clone)]
+pub struct HostDeps {
+    /// Outbound filesystem port — file-read capability for `host_read_file`.
+    ///
+    /// `Arc<dyn ... + Send + Sync>` so the Store (which embeds this) is Send.
+    pub fs: Arc<dyn FileSystemPort + Send + Sync>,
+    /// Outbound AST index port — opaque blob storage for `ast_store_put/get`.
+    ///
+    /// Guests only ever see an opaque string key; the host maps it to a
+    /// filesystem path under the per-workspace XDG data directory.
+    pub ast_index: Arc<dyn AstIndexPort + Send + Sync>,
+    /// Live workspace — read-only snapshot for `host_list_files`.
+    ///
+    /// The same `Arc<RwLock<ProjectWorkspace>>` the MCP handlers and the
+    /// watcher use, so `list_files` always reflects live indexing state.
+    pub workspace: Arc<RwLock<ProjectWorkspace>>,
+}
 
 // ── HostState ─────────────────────────────────────────────────────────────────
 
 /// Custom host state accessible from capability host functions via
 /// `Caller::data()` / `Caller::data_mut()`.
 struct HostState {
-    /// Outbound filesystem port — the only real I/O surface for file reads.
-    ///
-    /// `Arc<dyn ... + Send + Sync>` so the Store (which embeds this) is Send.
-    fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+    /// All injected host dependencies for the capability functions.
+    deps: HostDeps,
 }
 
 // ── WasmStoreData ─────────────────────────────────────────────────────────────
@@ -96,7 +131,7 @@ pub(crate) struct WasmStoreData {
     /// `p1::add_to_linker_sync(linker, |s| &mut s.wasi)` is a simple field
     /// projection — the closure is `Copy + Send + Sync` as required.
     wasi: WasiP1Ctx,
-    /// Custom tower_host capabilities.
+    /// Custom tower_host capabilities (filesystem, AST index, workspace).
     host: HostState,
 }
 
@@ -106,9 +141,12 @@ pub(crate) struct WasmStoreData {
 ///
 /// # Security boundary
 ///
-/// The linker exposes exactly two host functions under the `"tower_host"` module:
+/// The linker exposes exactly five host functions under the `"tower_host"` module:
 /// - `host_log`: log to host stderr.
 /// - `host_read_file`: read a workspace-relative file via [`FileSystemPort`].
+/// - `ast_store_put`: persist opaque bytes under an opaque key via [`AstIndexPort`].
+/// - `ast_store_get`: retrieve bytes from [`AstIndexPort`] by opaque key.
+/// - `host_list_files`: enumerate all workspace-relative file paths (read-only snapshot).
 ///
 /// Any other `"tower_host"` import causes an instantiation link error (AC3).
 /// WASI syscalls are linked but with a zero-capability context so they are
@@ -124,7 +162,7 @@ impl WasmtimeHost {
     /// Returns a typed [`PluginLoadError`] for every failure mode. No panics.
     pub fn load(
         path: impl AsRef<Path>,
-        fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+        deps: HostDeps,
     ) -> Result<Box<dyn PluginInstance>, PluginLoadError> {
         let path = path.as_ref();
 
@@ -156,7 +194,7 @@ impl WasmtimeHost {
         // ── 3. Store ─────────────────────────────────────────────────────────
         let store_data = WasmStoreData {
             wasi: wasi_p1,
-            host: HostState { fs_port },
+            host: HostState { deps },
         };
         let mut store = Store::new(&engine, store_data);
 
@@ -233,6 +271,73 @@ impl WasmtimeHost {
             )
             .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
 
+        // ── tower_host::ast_store_put ─────────────────────────────────────────
+        // Allow-listed capability #3: persist opaque bytes via AstIndexPort.
+        // The guest supplies an opaque key (flat string, no path separators)
+        // and raw value bytes. The host maps the key to a filesystem path under
+        // the per-workspace XDG data directory — the guest never sees a path.
+        //
+        // Signature: (key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32
+        // Returns: 0=ok, 1=InvalidArgs (bad key), 2=write error
+        linker
+            .func_wrap(
+                "tower_host",
+                "ast_store_put",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 val_ptr: i32,
+                 val_len: i32|
+                 -> i32 {
+                    ast_store_put_impl(&mut caller, key_ptr, key_len, val_ptr, val_len)
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        // ── tower_host::ast_store_get ─────────────────────────────────────────
+        // Allow-listed capability #4: retrieve opaque bytes via AstIndexPort.
+        // The host allocates a guest buffer via `__plugin_alloc` when the
+        // stored value is non-empty. An empty stored value returns rc=0 with
+        // out_len=0 (present but empty), distinguished from absent (rc=1).
+        //
+        // Signature: (key_ptr: i32, key_len: i32, out_ptr: i32, out_len_ptr: i32) -> i32
+        // Returns: 0=present (out_len may be 0), 1=absent, 2=error
+        linker
+            .func_wrap(
+                "tower_host",
+                "ast_store_get",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 out_ptr: i32,
+                 out_len_ptr: i32|
+                 -> i32 {
+                    ast_store_get_impl(&mut caller, key_ptr, key_len, out_ptr, out_len_ptr)
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        // ── tower_host::host_list_files ───────────────────────────────────────
+        // Allow-listed capability #5: enumerate all workspace-relative file
+        // paths as a postcard-serialised `Vec<String>`. The host takes a
+        // read-lock snapshot of the workspace (no disk I/O), serialises the
+        // path list, allocates a guest buffer via `__plugin_alloc`, and writes
+        // the payload there.
+        //
+        // Signature: (out_ptr: i32, out_len_ptr: i32) -> i32
+        // Returns: 0=ok (out_len may be 0 for empty workspace), 2=error
+        // rc=1 is intentionally unused — an empty workspace is ok with len=0.
+        linker
+            .func_wrap(
+                "tower_host",
+                "host_list_files",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 out_ptr: i32,
+                 out_len_ptr: i32|
+                 -> i32 { host_list_files_impl(&mut caller, out_ptr, out_len_ptr) },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
         // ── 5. Instantiate ───────────────────────────────────────────────────
         // A guest importing a function NOT in the above allow-list and NOT in
         // wasi_snapshot_preview1 will fail here with LinkError (AC3 / UN2).
@@ -289,7 +394,7 @@ impl WasmtimeHost {
     pub(crate) fn load_with_engine(
         engine: &Engine,
         path: impl AsRef<Path>,
-        fs_port: Arc<dyn FileSystemPort + Send + Sync>,
+        deps: HostDeps,
     ) -> Result<WasmInstance, PluginLoadError> {
         let path = path.as_ref();
 
@@ -299,7 +404,7 @@ impl WasmtimeHost {
         let wasi_p1 = WasiCtxBuilder::new().build_p1();
         let store_data = WasmStoreData {
             wasi: wasi_p1,
-            host: HostState { fs_port },
+            host: HostState { deps },
         };
         let mut store = Store::new(engine, store_data);
 
@@ -351,6 +456,47 @@ impl WasmtimeHost {
                  -> i32 {
                     host_read_file_impl(&mut caller, path_ptr, path_len, out_ptr, out_len_ptr)
                 },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "tower_host",
+                "ast_store_put",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 val_ptr: i32,
+                 val_len: i32|
+                 -> i32 {
+                    ast_store_put_impl(&mut caller, key_ptr, key_len, val_ptr, val_len)
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "tower_host",
+                "ast_store_get",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 out_ptr: i32,
+                 out_len_ptr: i32|
+                 -> i32 {
+                    ast_store_get_impl(&mut caller, key_ptr, key_len, out_ptr, out_len_ptr)
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "tower_host",
+                "host_list_files",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 out_ptr: i32,
+                 out_len_ptr: i32|
+                 -> i32 { host_list_files_impl(&mut caller, out_ptr, out_len_ptr) },
             )
             .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
 
@@ -448,7 +594,7 @@ fn host_read_file_impl(
     // Read through the outbound port (no raw std::fs).
     let rel_path = RelativePath::new(&path_str);
     let file_bytes: Vec<u8> = {
-        let fs = Arc::clone(&caller.data().host.fs_port);
+        let fs = Arc::clone(&caller.data().host.deps.fs);
         match fs.read(&rel_path) {
             Ok(bytes) => bytes,
             Err(PortError::NotFound) => return 1,
@@ -511,6 +657,253 @@ fn host_read_file_impl(
         data[out_ptr..out_ptr + 4].copy_from_slice(&(guest_buf_ptr as u32).to_le_bytes());
         // Write file_len as little-endian u32 at *out_len_ptr.
         data[out_len_ptr..out_len_ptr + 4].copy_from_slice(&(file_len as u32).to_le_bytes());
+    }
+
+    0 // ok
+}
+
+// ── ast_store_put implementation ──────────────────────────────────────────────
+
+/// Extracted `ast_store_put` logic. Decodes key and value from guest memory,
+/// clones the `AstIndexPort` Arc before borrowing memory, then calls `put`.
+///
+/// Returns 0=ok, 1=InvalidArgs (bad key), 2=write error.
+fn ast_store_put_impl(
+    caller: &mut wasmtime::Caller<'_, WasmStoreData>,
+    key_ptr: i32,
+    key_len: i32,
+    val_ptr: i32,
+    val_len: i32,
+) -> i32 {
+    let key_ptr = key_ptr as u32 as usize;
+    let key_len = key_len as u32 as usize;
+    let val_ptr = val_ptr as u32 as usize;
+    let val_len = val_len as u32 as usize;
+
+    // Decode key and value bytes from guest memory (bounds-checked).
+    let (key_str, value_bytes): (String, Vec<u8>) = {
+        let mem = match caller.get_export("memory") {
+            Some(wasmtime::Extern::Memory(m)) => m,
+            _ => return 2,
+        };
+        let data = mem.data(&*caller);
+
+        let key_slice = match data.get(key_ptr..key_ptr.saturating_add(key_len)) {
+            Some(s) => s,
+            None => return 2,
+        };
+        let key = match std::str::from_utf8(key_slice) {
+            Ok(s) => s.to_owned(),
+            Err(_) => return 2,
+        };
+
+        let val_slice = match data.get(val_ptr..val_ptr.saturating_add(val_len)) {
+            Some(s) => s,
+            None => return 2,
+        };
+
+        (key, val_slice.to_owned())
+    };
+
+    // Clone Arc before the store borrow ends (borrow discipline mirrors host_read_file_impl).
+    let index = Arc::clone(&caller.data().host.deps.ast_index);
+
+    match index.put(&key_str, &value_bytes) {
+        Ok(()) => 0,
+        Err(PortError::InvalidArgs(_)) => 1,
+        Err(_) => 2,
+    }
+}
+
+// ── ast_store_get implementation ──────────────────────────────────────────────
+
+/// Extracted `ast_store_get` logic. Decodes key from guest memory, calls the
+/// port, then allocates a guest buffer and writes the bytes when present.
+///
+/// Returns 0=present (out_len may be 0 for an empty stored value),
+///         1=absent, 2=error.
+fn ast_store_get_impl(
+    caller: &mut wasmtime::Caller<'_, WasmStoreData>,
+    key_ptr: i32,
+    key_len: i32,
+    out_ptr: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let key_ptr = key_ptr as u32 as usize;
+    let key_len = key_len as u32 as usize;
+
+    // Decode key from guest memory (bounds-checked).
+    let key_str: String = {
+        let mem = match caller.get_export("memory") {
+            Some(wasmtime::Extern::Memory(m)) => m,
+            _ => return 2,
+        };
+        let data = mem.data(&*caller);
+        let key_slice = match data.get(key_ptr..key_ptr.saturating_add(key_len)) {
+            Some(s) => s,
+            None => return 2,
+        };
+        match std::str::from_utf8(key_slice) {
+            Ok(s) => s.to_owned(),
+            Err(_) => return 2,
+        }
+    };
+
+    // Clone Arc before any mutable memory borrow (borrow discipline).
+    let index = Arc::clone(&caller.data().host.deps.ast_index);
+
+    let stored_bytes = match index.get(&key_str) {
+        Ok(Some(b)) => b,
+        Ok(None) => return 1, // absent
+        Err(PortError::InvalidArgs(_)) => return 2,
+        Err(_) => return 2,
+    };
+
+    let stored_len = stored_bytes.len();
+
+    // Empty stored value: write 0 to out_len_ptr, leave out_ptr null.
+    // This is rc=0 with len=0 — present-but-empty, distinct from absent (rc=1).
+    if stored_len == 0 {
+        let mem = match caller.get_export("memory") {
+            Some(wasmtime::Extern::Memory(m)) => m,
+            _ => return 2,
+        };
+        let out_len_ptr = out_len_ptr as u32 as usize;
+        let data = mem.data_mut(&mut *caller);
+        if out_len_ptr.saturating_add(4) > data.len() {
+            return 2;
+        }
+        data[out_len_ptr..out_len_ptr + 4].copy_from_slice(&0u32.to_le_bytes());
+        return 0;
+    }
+
+    // Non-empty value: allocate a guest buffer via __plugin_alloc(stored_len).
+    let alloc_fn = match caller.get_export("__plugin_alloc") {
+        Some(wasmtime::Extern::Func(f)) => f,
+        _ => return 2,
+    };
+    let alloc_typed = match alloc_fn.typed::<u32, u32>(&*caller) {
+        Ok(f) => f,
+        Err(_) => return 2,
+    };
+    let guest_buf_ptr = match alloc_typed.call(&mut *caller, stored_len as u32) {
+        Ok(p) => p as usize,
+        Err(_) => return 2,
+    };
+
+    // Write bytes into guest buffer and fill out_ptr / out_len_ptr.
+    let mem = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 2,
+    };
+    {
+        let data = mem.data_mut(&mut *caller);
+
+        if guest_buf_ptr.saturating_add(stored_len) > data.len() {
+            return 2;
+        }
+        data[guest_buf_ptr..guest_buf_ptr + stored_len].copy_from_slice(&stored_bytes);
+
+        let out_ptr = out_ptr as u32 as usize;
+        let out_len_ptr = out_len_ptr as u32 as usize;
+
+        if out_ptr.saturating_add(4) > data.len() || out_len_ptr.saturating_add(4) > data.len() {
+            return 2;
+        }
+
+        // Write guest_buf_ptr as little-endian u32 at *out_ptr.
+        data[out_ptr..out_ptr + 4].copy_from_slice(&(guest_buf_ptr as u32).to_le_bytes());
+        // Write stored_len as little-endian u32 at *out_len_ptr.
+        data[out_len_ptr..out_len_ptr + 4].copy_from_slice(&(stored_len as u32).to_le_bytes());
+    }
+
+    0 // present
+}
+
+// ── host_list_files implementation ────────────────────────────────────────────
+
+/// Extracted `host_list_files` logic. Takes a read-lock snapshot of the
+/// workspace, collects all live workspace-relative paths, serialises the
+/// `Vec<String>` with postcard, and writes the payload into a newly
+/// allocated guest buffer.
+///
+/// # RC convention
+///
+/// - `0`: success. `out_len` contains the payload byte count; `out_ptr` points
+///   to the guest buffer (allocated via `__plugin_alloc`). If the workspace is
+///   empty the payload encodes an empty `Vec<String>` — still rc=0 with len>0
+///   (postcard uses at minimum 1 byte for the length prefix of an empty vec).
+/// - `2`: serialisation error or guest memory fault.
+/// - rc=1 is intentionally unused; there is no "absent" concept here.
+///
+/// # Borrow discipline
+///
+/// 1. Read-lock the workspace, snapshot the path strings into a plain `Vec<String>`.
+/// 2. Drop the lock immediately.
+/// 3. Serialise with postcard — no lock held.
+/// 4. Clone the `workspace` Arc before any guest memory borrow — matches the
+///    `read_file` and `ast_store_*` discipline established in this file.
+fn host_list_files_impl(
+    caller: &mut wasmtime::Caller<'_, WasmStoreData>,
+    out_ptr: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    // Step 1: snapshot path strings — hold the lock for the shortest possible
+    // duration before any guest memory operations.
+    let workspace_arc = Arc::clone(&caller.data().host.deps.workspace);
+    let paths: Vec<String> = {
+        let ws = workspace_arc.read().unwrap_or_else(|p| p.into_inner());
+        ws.all_file_ids()
+            .into_iter()
+            .filter_map(|id| ws.get(id).ok().map(|f| f.path.as_str().to_owned()))
+            .collect()
+    };
+    // Lock released here.
+
+    // Step 2: serialise — no lock held.
+    let payload = match postcard::to_allocvec(&paths) {
+        Ok(b) => b,
+        Err(_) => return 2,
+    };
+    let payload_len = payload.len();
+
+    // Step 3: allocate a guest buffer and write payload.
+    // (even an empty Vec<String> produces a non-empty postcard payload)
+    let alloc_fn = match caller.get_export("__plugin_alloc") {
+        Some(wasmtime::Extern::Func(f)) => f,
+        _ => return 2,
+    };
+    let alloc_typed = match alloc_fn.typed::<u32, u32>(&*caller) {
+        Ok(f) => f,
+        Err(_) => return 2,
+    };
+    let guest_buf_ptr = match alloc_typed.call(&mut *caller, payload_len as u32) {
+        Ok(p) => p as usize,
+        Err(_) => return 2,
+    };
+
+    // Step 4: write payload into guest memory and fill out-pointers.
+    let mem = match caller.get_export("memory") {
+        Some(wasmtime::Extern::Memory(m)) => m,
+        _ => return 2,
+    };
+    {
+        let data = mem.data_mut(&mut *caller);
+
+        if guest_buf_ptr.saturating_add(payload_len) > data.len() {
+            return 2;
+        }
+        data[guest_buf_ptr..guest_buf_ptr + payload_len].copy_from_slice(&payload);
+
+        let out_ptr = out_ptr as u32 as usize;
+        let out_len_ptr = out_len_ptr as u32 as usize;
+
+        if out_ptr.saturating_add(4) > data.len() || out_len_ptr.saturating_add(4) > data.len() {
+            return 2;
+        }
+
+        data[out_ptr..out_ptr + 4].copy_from_slice(&(guest_buf_ptr as u32).to_le_bytes());
+        data[out_len_ptr..out_len_ptr + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
     }
 
     0 // ok

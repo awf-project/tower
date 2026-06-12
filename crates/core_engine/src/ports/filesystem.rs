@@ -20,6 +20,8 @@
 //! into place so readers never observe a partial write. This port must
 //! guarantee that semantics.
 
+use std::path::PathBuf;
+
 use crate::domain::RelativePath;
 use crate::ports::PortError;
 
@@ -78,4 +80,17 @@ pub trait FileSystemPort {
     ///
     /// The order is unspecified; callers must not rely on insertion order.
     fn scan(&self) -> Vec<RelativePath>;
+
+    /// Return the absolute workspace root this adapter is rooted at, when it is
+    /// backed by a real directory.
+    ///
+    /// Used by the forced reindex (`tower_reindex`) to perform a true recursive
+    /// filesystem walk rather than relying on `scan()`, which for a real
+    /// filesystem only reports paths written through this adapter instance.
+    ///
+    /// Returns `None` for in-memory / virtual implementations that have no real
+    /// root; callers fall back to `scan()` in that case.
+    fn workspace_root(&self) -> Option<PathBuf> {
+        None
+    }
 }

@@ -1,6 +1,6 @@
 //! Native `tower_*` tool handlers — spec 10b.
 //!
-//! Implements all 7 workspace tools and registers them into the 10a
+//! Implements all 8 workspace tools and registers them into the 10a
 //! [`ToolRegistry`]. Each handler follows the same thin pattern:
 //!
 //! ```text
@@ -18,6 +18,7 @@
 //!   tower_create_directory{path}               → FileMutationUseCase.create_directory
 //!   tower_delete_file     {path}               → FileMutationUseCase.delete_file
 //!   tower_global_replace  {target,replacement} → FileMutationUseCase.global_replace
+//!   tower_reindex         {}                   → full VFS + text-index rebuild from fs
 //! ```
 //!
 //! # Design decisions
@@ -75,6 +76,8 @@ use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
 use crate::domain::index::{FileSearch, InvertedIndex};
 use crate::domain::mutation::FileMutationService;
+use crate::domain::token::tokenize;
+use crate::domain::virtual_file::FileMetadata;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::inbound::{FileMutationUseCase, SearchUseCase};
@@ -85,21 +88,33 @@ use crate::ports::{FileSystemPort, NoOpPluginHost, StoragePort};
 /// All mutable engine state shared between the MCP tool handlers and (in
 /// production) the filesystem watcher.
 ///
+/// # Sharing model
+///
+/// `workspace` and `index` are held as `Arc<RwLock<_>>` so the filesystem
+/// watcher (spec 06) can be given clones of the same `Arc`s without needing
+/// to take the outer `Arc<RwLock<EngineState>>` lock. The outer lock protects
+/// `storage` and `fs`, which are not shared with the watcher.
+///
 /// # Locking discipline (matches spec 06 watcher lock order)
 ///
-/// Callers acquire the `RwLock` write-lock for any mutation and read-lock for
-/// read-only queries. Short critical sections only — no blocking I/O while
-/// holding the lock. The watcher (spec 06) follows the same convention so there
-/// is no possibility of lock-order inversion (there is only one lock here).
+/// The watcher acquires workspace then index (in that order) — always. MCP
+/// mutation handlers acquire the outer `EngineState` write-lock first, then
+/// lock workspace and index (in the same workspace→index order). Because the
+/// watcher never touches the outer `EngineState` lock, there is no lock-order
+/// cycle. Short critical sections only — no blocking I/O while holding any lock.
 pub struct EngineState {
-    pub workspace: ProjectWorkspace,
-    pub index: InvertedIndex,
+    pub workspace: Arc<RwLock<ProjectWorkspace>>,
+    pub index: Arc<RwLock<InvertedIndex>>,
     pub storage: Box<dyn StoragePort + Send + Sync>,
     pub fs: Box<dyn FileSystemPort + Send + Sync>,
 }
 
 impl EngineState {
-    /// Create a new `EngineState` with the given components.
+    /// Create a new `EngineState` wrapping the given components.
+    ///
+    /// `workspace` and `index` are wrapped in `Arc<RwLock<_>>` internally.
+    /// Call [`EngineState::workspace_arc`] / [`EngineState::index_arc`] to
+    /// obtain clones for the filesystem watcher.
     pub fn new(
         workspace: ProjectWorkspace,
         index: InvertedIndex,
@@ -107,17 +122,35 @@ impl EngineState {
         fs: Box<dyn FileSystemPort + Send + Sync>,
     ) -> Self {
         Self {
-            workspace,
-            index,
+            workspace: Arc::new(RwLock::new(workspace)),
+            index: Arc::new(RwLock::new(index)),
             storage,
             fs,
         }
+    }
+
+    /// Return a clone of the workspace `Arc` for sharing with the watcher.
+    ///
+    /// The watcher and MCP handlers operate on the **same** `ProjectWorkspace`
+    /// instance through separate `Arc` references.
+    #[must_use]
+    pub fn workspace_arc(&self) -> Arc<RwLock<ProjectWorkspace>> {
+        Arc::clone(&self.workspace)
+    }
+
+    /// Return a clone of the index `Arc` for sharing with the watcher.
+    ///
+    /// The watcher and MCP handlers operate on the **same** `InvertedIndex`
+    /// instance through separate `Arc` references.
+    #[must_use]
+    pub fn index_arc(&self) -> Arc<RwLock<InvertedIndex>> {
+        Arc::clone(&self.index)
     }
 }
 
 // ── NativeToolRegistry ────────────────────────────────────────────────────────
 
-/// [`ToolRegistry`] implementation for the 7 native `tower_*` tools (spec 10b).
+/// [`ToolRegistry`] implementation for the 8 native `tower_*` tools (spec 10b).
 ///
 /// Holds a reference-counted, lock-protected [`EngineState`] so that both this
 /// registry and the filesystem watcher can share the workspace/index/storage/fs
@@ -143,7 +176,7 @@ impl EngineState {
 /// let mut registry = NativeToolRegistry::new(shared);
 ///
 /// let tools = registry.list();
-/// assert_eq!(tools.len(), 7);
+/// assert_eq!(tools.len(), 8);
 /// ```
 pub struct NativeToolRegistry {
     state: Arc<RwLock<EngineState>>,
@@ -167,6 +200,7 @@ impl ToolRegistry for NativeToolRegistry {
             tool_create_directory_desc(),
             tool_delete_file_desc(),
             tool_global_replace_desc(),
+            tool_reindex_desc(),
         ]
     }
 
@@ -179,6 +213,7 @@ impl ToolRegistry for NativeToolRegistry {
             "tower_create_directory" => call_create_directory(&self.state, args),
             "tower_delete_file" => call_delete_file(&self.state, args),
             "tower_global_replace" => call_global_replace(&self.state, args),
+            "tower_reindex" => call_reindex(&self.state),
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -316,13 +351,30 @@ fn tool_global_replace_desc() -> ToolDesc {
     }
 }
 
+fn tool_reindex_desc() -> ToolDesc {
+    ToolDesc {
+        name: "tower_reindex".to_owned(),
+        description: "Force a full re-scan of the workspace: rebuild the file index and text-search index from the current filesystem state (reconciles created and deleted files). Use after external changes or if the index drifted.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    }
+}
+
 // ── Handler implementations ───────────────────────────────────────────────────
 
 fn call_find_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let query = require_str(&args, "query")?;
 
     let guard = state.read().map_err(lock_poisoned)?;
-    let search = FileSearch::new(&guard.index, &guard.workspace);
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    drop(guard); // release outer read-lock before acquiring inner read-locks
+    let ws = ws_arc.read().map_err(lock_poisoned)?;
+    let idx = idx_arc.read().map_err(lock_poisoned)?;
+    let search = FileSearch::new(&idx, &ws);
     let paths = search.find_file(query).map_err(domain_err_to_tool_error)?;
 
     let paths_json: Vec<Value> = paths
@@ -335,11 +387,18 @@ fn call_find_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value
 fn call_search_text(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let pattern = require_str(&args, "pattern")?;
 
+    // We need both workspace/index and fs under the outer read-lock to ensure
+    // fs is not replaced while we're iterating. Clone Arcs then release guard.
     let guard = state.read().map_err(lock_poisoned)?;
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    // Keep the outer guard alive here to borrow fs safely for the search.
     // FileSearch::with_fs requires `FileSystemPort + Sync`. The EngineState
     // fs field is `Box<dyn FileSystemPort + Send + Sync>`, which satisfies the
     // `Sync` bound by coercion to `&dyn FileSystemPort + Sync`.
-    let search = FileSearch::new(&guard.index, &guard.workspace).with_fs(guard.fs.as_ref());
+    let ws = ws_arc.read().map_err(lock_poisoned)?;
+    let idx = idx_arc.read().map_err(lock_poisoned)?;
+    let search = FileSearch::new(&idx, &ws).with_fs(guard.fs.as_ref());
     let matches = search
         .search_text(pattern)
         .map_err(domain_err_to_tool_error)?;
@@ -361,6 +420,7 @@ fn call_read_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value
     let path = require_str(&args, "path")?;
     let rel = RelativePath::new(path);
 
+    // Only `fs` is needed here; take the outer read-lock for fs access.
     let guard = state.read().map_err(lock_poisoned)?;
     let bytes = guard.fs.read(&rel).map_err(port_err_to_tool_error)?;
     let content = String::from_utf8_lossy(&bytes).into_owned();
@@ -388,18 +448,22 @@ fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
     let rel = RelativePath::new(path);
     let bytes = content.as_bytes().to_vec();
 
+    // Outer write-lock gives exclusive access to storage + fs.
+    // Destructure to split the mutable borrow across fields — the borrow
+    // checker cannot split it through a DerefMut guard, but it CAN through a
+    // raw &mut reference to the struct.
     let mut guard = state.write().map_err(lock_poisoned)?;
-    let EngineState {
-        workspace,
-        index,
-        storage,
-        fs,
-    } = &mut *guard;
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
+    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
+    // Split the &mut EngineState into independent field borrows.
+    let engine = &mut *guard;
     let mut svc = FileMutationService::new(
-        fs.as_mut(),
-        workspace,
-        index,
-        storage.as_mut(),
+        engine.fs.as_mut(),
+        &mut ws,
+        &mut idx,
+        engine.storage.as_mut(),
         &NoOpPluginHost,
     );
     svc.create_file(rel, bytes)
@@ -416,17 +480,16 @@ fn call_create_directory(
     let rel = RelativePath::new(path);
 
     let mut guard = state.write().map_err(lock_poisoned)?;
-    let EngineState {
-        workspace,
-        index,
-        storage,
-        fs,
-    } = &mut *guard;
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
+    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
+    let engine = &mut *guard;
     let mut svc = FileMutationService::new(
-        fs.as_mut(),
-        workspace,
-        index,
-        storage.as_mut(),
+        engine.fs.as_mut(),
+        &mut ws,
+        &mut idx,
+        engine.storage.as_mut(),
         &NoOpPluginHost,
     );
     svc.create_directory(rel)
@@ -440,17 +503,16 @@ fn call_delete_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
     let rel = RelativePath::new(path);
 
     let mut guard = state.write().map_err(lock_poisoned)?;
-    let EngineState {
-        workspace,
-        index,
-        storage,
-        fs,
-    } = &mut *guard;
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
+    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
+    let engine = &mut *guard;
     let mut svc = FileMutationService::new(
-        fs.as_mut(),
-        workspace,
-        index,
-        storage.as_mut(),
+        engine.fs.as_mut(),
+        &mut ws,
+        &mut idx,
+        engine.storage.as_mut(),
         &NoOpPluginHost,
     );
     svc.delete_file(&rel).map_err(domain_err_to_tool_error)?;
@@ -463,17 +525,16 @@ fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<
     let replacement = require_str(&args, "replacement")?;
 
     let mut guard = state.write().map_err(lock_poisoned)?;
-    let EngineState {
-        workspace,
-        index,
-        storage,
-        fs,
-    } = &mut *guard;
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
+    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
+    let engine = &mut *guard;
     let mut svc = FileMutationService::new(
-        fs.as_mut(),
-        workspace,
-        index,
-        storage.as_mut(),
+        engine.fs.as_mut(),
+        &mut ws,
+        &mut idx,
+        engine.storage.as_mut(),
         &NoOpPluginHost,
     );
     let report = svc
@@ -491,6 +552,148 @@ fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<
         "replacements": report.replacements,
         "errors": errors_json
     }))
+}
+
+/// Force a full rebuild of the VFS + text-search index from the current filesystem.
+///
+/// # Algorithm
+///
+/// 1. Walk the filesystem via `FileSystemPort::scan()` (no locks held during the walk).
+/// 2. Build a fresh `ProjectWorkspace` and `InvertedIndex` from the scan results.
+/// 3. Persist the rebuilt state: write fresh records via `StoragePort::put_batch`,
+///    delete records whose paths are absent from the scan, then call
+///    `StoragePort::mark_scan_complete()`.
+/// 4. Acquire workspace→index write locks in that order and swap in the rebuilt
+///    structures.
+///
+/// # Concurrency trade-off
+///
+/// Decision: perform the filesystem walk and in-memory rebuild WITHOUT holding the
+/// live workspace/index write-locks. The locks are only acquired for the final swap
+/// in step 4.
+/// Why: the fs walk may be long (thousands of files); holding write-locks for its
+/// duration would starve the watcher and all MCP readers.
+/// Trade-off: a watcher event applied to the live workspace during the rebuild
+/// window is superseded by the swap, but the next watcher event will re-apply the
+/// change. For a deliberate forced reindex (external drift correction) this is
+/// acceptable — the caller is explicitly requesting a full reset.
+///
+/// # FileId generations
+///
+/// A fresh rebuild reassigns `FileId`s from a new empty `ProjectWorkspace`. Stale
+/// external `FileId`s from the previous workspace will fail `validated_index` checks
+/// (generation mismatch) — the generational invariant is preserved.
+fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
+    // Phase 1: enumerate workspace files WITH real metadata (size, mtime,
+    // content hash) WITHOUT holding the workspace/index write-locks.
+    //
+    // Decision: for a real filesystem, perform a TRUE recursive walk via
+    // `collect_workspace_files` rather than `fs.scan()`.
+    // Why: `RealFs::scan()` only reports paths written through the adapter this
+    // session — using it for a project reindex would shrink the index to the
+    // session's own writes and miss files created/edited outside the engine.
+    // Trade-off: the walk reads each file's bytes to compute the content hash.
+    // In-memory adapters (tests) have no real root → fall back to `scan()` +
+    // read, still computing real size and hash.
+    let entries: Vec<(RelativePath, FileMetadata)> = {
+        let guard = state.read().map_err(lock_poisoned)?;
+        match guard.fs.workspace_root() {
+            Some(root) => crate::adapters::fs::scan::collect_workspace_files(&root),
+            None => guard
+                .fs
+                .scan()
+                .into_iter()
+                .filter(|p| !crate::domain::mutation::is_tmp_artifact(p))
+                .map(|p| {
+                    let bytes = guard.fs.read(&p).unwrap_or_default();
+                    let metadata = FileMetadata {
+                        size: bytes.len() as u64,
+                        modified: crate::domain::virtual_file::Timestamp(0),
+                        content_hash: Some(crate::adapters::fs::scan::content_hash_of(&bytes)),
+                    };
+                    (p, metadata)
+                })
+                .collect(),
+        }
+    };
+
+    // Phase 2: build fresh in-memory structures from the enumerated entries.
+    let mut new_workspace = ProjectWorkspace::new();
+    let mut new_index = InvertedIndex::new();
+    let mut new_files: Vec<crate::domain::VirtualFile> = Vec::with_capacity(entries.len());
+
+    for (rel_path, metadata) in &entries {
+        match new_workspace.insert(rel_path.clone(), *metadata) {
+            Ok(file_id) => {
+                let virtual_file = new_workspace
+                    .get(file_id)
+                    .expect("just inserted — slot must be live")
+                    .clone();
+                let tokens = tokenize(rel_path.as_str());
+                new_index.insert(file_id, &tokens);
+                new_files.push(virtual_file);
+            }
+            Err(_) => {
+                // DuplicatePath or other domain error — skip the duplicate.
+                // A legitimate filesystem scan cannot produce duplicate paths,
+                // so this branch is defensive only.
+                continue;
+            }
+        }
+    }
+
+    let files_indexed = new_files.len();
+
+    // Phase 3: persist the rebuilt state.
+    //
+    // Acquire the outer write-lock for exclusive storage access.
+    // We do NOT hold the workspace/index locks during storage I/O — storage
+    // writes can be slow and the watcher must not be starved.
+    //
+    // Deletion reconciliation: the previous storage records that are no longer
+    // in the fresh scan must be removed.  We enumerate what is currently stored
+    // via the live workspace snapshot (held under the outer write-lock, which
+    // prevents concurrent mutations), then delete any `FileId` not present in the
+    // fresh workspace.  The fresh records are written via `put_batch`, and the
+    // scan-complete marker is re-set so the restart guard sees a consistent index.
+    {
+        let mut guard = state.write().map_err(lock_poisoned)?;
+
+        // Collect stale FileIds from the live workspace before the swap.
+        let stale_ids: Vec<crate::domain::FileId> = {
+            let ws = guard.workspace.read().map_err(lock_poisoned)?;
+            ws.snapshot().files.into_iter().map(|f| f.id).collect()
+        };
+
+        // Delete every stale record.  Errors (e.g. already absent) are benign.
+        for id in stale_ids {
+            let _ = guard.storage.delete(id);
+        }
+
+        // Write all fresh records in a single atomic batch.
+        guard
+            .storage
+            .put_batch(&new_files)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        // Re-set the scan-complete marker so restart guard sees a complete index.
+        guard
+            .storage
+            .mark_scan_complete()
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    }
+
+    // Phase 4: swap the rebuilt in-memory structures into the live state.
+    // Acquire workspace→index in that order (matching the watcher lock discipline).
+    {
+        let guard = state.read().map_err(lock_poisoned)?;
+        let mut ws = guard.workspace.write().map_err(lock_poisoned)?;
+        let mut idx = guard.index.write().map_err(lock_poisoned)?;
+        *ws = new_workspace;
+        *idx = new_index;
+    }
+
+    Ok(json!({ "files_indexed": files_indexed }))
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -590,22 +793,22 @@ mod tests {
         NativeToolRegistry::new(state)
     }
 
-    // ── AC1: tools/list shows 7 tools with schemas ────────────────────────────
+    // ── AC1: tools/list shows 8 tools with schemas ────────────────────────────
 
     #[test]
-    fn ac1_tools_list_returns_seven_tower_tools() {
+    fn ac1_tools_list_returns_eight_tower_tools() {
         let reg = make_registry(empty_state());
         let tools = reg.list();
         assert_eq!(
             tools.len(),
-            7,
-            "expected 7 native tools; got {}",
+            8,
+            "expected 8 native tools; got {}",
             tools.len()
         );
     }
 
     #[test]
-    fn ac1_all_seven_tool_names_present() {
+    fn ac1_all_eight_tool_names_present() {
         let reg = make_registry(empty_state());
         let tool_list = reg.list();
         let names: Vec<&str> = tool_list.iter().map(|t| t.name.as_str()).collect();
@@ -617,6 +820,7 @@ mod tests {
             "tower_create_directory",
             "tower_delete_file",
             "tower_global_replace",
+            "tower_reindex",
         ];
         for name in &expected {
             assert!(names.contains(name), "missing tool '{name}'; got {names:?}");
@@ -867,6 +1071,170 @@ mod tests {
             content.contains("server"),
             "content must contain replacement; got: {content}"
         );
+    }
+
+    // ── tower_reindex: no-op on empty fs ─────────────────────────────────────
+
+    #[test]
+    fn reindex_on_empty_state_returns_zero_files_indexed() {
+        let mut reg = make_registry(empty_state());
+        let val = reg.call("tower_reindex", json!({})).unwrap();
+        assert_eq!(
+            val["files_indexed"].as_u64().unwrap_or(99),
+            0,
+            "reindex on empty state must report 0 files_indexed"
+        );
+    }
+
+    // ── tower_reindex: reconciles additions ──────────────────────────────────
+
+    #[test]
+    fn reindex_picks_up_file_added_to_fs_port() {
+        let state = empty_state();
+
+        // Inject a file directly into the fs port (simulating an external add).
+        {
+            let mut guard = state.write().unwrap();
+            guard
+                .fs
+                .write(RelativePath::new("src/new.rs"), b"pub fn new() {}".to_vec())
+                .unwrap();
+        }
+
+        let mut reg = make_registry(Arc::clone(&state));
+        let val = reg.call("tower_reindex", json!({})).unwrap();
+        assert_eq!(
+            val["files_indexed"].as_u64().unwrap_or(0),
+            1,
+            "reindex must report 1 file after adding to fs"
+        );
+
+        // The file must now be findable via the index.
+        let find = reg
+            .call("tower_find_file", json!({ "query": "new" }))
+            .unwrap();
+        let paths = find["paths"].as_array().unwrap();
+        let path_strings: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
+        assert!(
+            path_strings.contains(&"src/new.rs"),
+            "reindexed file must be findable; got {path_strings:?}"
+        );
+    }
+
+    // ── tower_reindex: reconciles deletions ──────────────────────────────────
+
+    #[test]
+    fn reindex_removes_file_deleted_from_fs_port() {
+        // Start with a file in the workspace + fs.
+        let state = state_with_client_file();
+
+        // Remove the file directly from the fs port (simulating an external delete).
+        {
+            let mut guard = state.write().unwrap();
+            guard
+                .fs
+                .delete(&RelativePath::new("src/client.rs"))
+                .unwrap();
+        }
+
+        let mut reg = make_registry(Arc::clone(&state));
+        let val = reg.call("tower_reindex", json!({})).unwrap();
+        assert_eq!(
+            val["files_indexed"].as_u64().unwrap_or(99),
+            0,
+            "reindex must report 0 files after deleting the only file from fs"
+        );
+
+        // The deleted file must no longer be findable.
+        let find = reg
+            .call("tower_find_file", json!({ "query": "client" }))
+            .unwrap();
+        let paths = find["paths"].as_array().unwrap();
+        assert!(
+            paths.is_empty(),
+            "file removed from fs must not be findable after reindex"
+        );
+    }
+
+    // ── tower_reindex: populates real size + content hash ────────────────────
+
+    #[test]
+    fn reindex_populates_real_size_and_content_hash() {
+        let state = empty_state();
+        let content = b"pub fn alpha() -> u32 { 7 }".to_vec();
+        let expected_size = content.len() as u64;
+        {
+            let mut guard = state.write().unwrap();
+            guard
+                .fs
+                .write(RelativePath::new("src/alpha.rs"), content)
+                .unwrap();
+        }
+
+        let mut reg = make_registry(Arc::clone(&state));
+        reg.call("tower_reindex", json!({})).unwrap();
+
+        let guard = state.read().unwrap();
+        let ws = guard.workspace.read().unwrap();
+        let id = ws
+            .get_by_path(&RelativePath::new("src/alpha.rs"))
+            .expect("reindexed file must be in the workspace");
+        let vfile = ws.get(id).expect("slot must be live");
+        assert_eq!(vfile.size, expected_size, "reindex must record real size");
+        assert!(
+            vfile.content_hash.is_some(),
+            "reindex must record a content hash, not None"
+        );
+    }
+
+    // ── tower_reindex: real-disk walk finds files created outside the engine ──
+
+    #[test]
+    fn reindex_walks_real_disk_for_externally_created_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Write a file DIRECTLY to disk — never through the fs port. RealFs::scan()
+        // would NOT report it; only a true recursive walk does.
+        let content = b"pub struct External {}";
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/external.rs"), content).unwrap();
+
+        let state = Arc::new(RwLock::new(EngineState::new(
+            ProjectWorkspace::new(),
+            InvertedIndex::new(),
+            Box::new(InMemoryStorage::new()),
+            Box::new(crate::adapters::fs::RealFs::new(tmp.path())),
+        )));
+
+        let mut reg = make_registry(Arc::clone(&state));
+        let val = reg.call("tower_reindex", json!({})).unwrap();
+        assert_eq!(
+            val["files_indexed"].as_u64().unwrap_or(0),
+            1,
+            "real-disk reindex must find the externally-created file"
+        );
+
+        let find = reg
+            .call("tower_find_file", json!({ "query": "external" }))
+            .unwrap();
+        let paths: Vec<&str> = find["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            paths.contains(&"src/external.rs"),
+            "externally-created file must be findable after reindex; got {paths:?}"
+        );
+
+        let guard = state.read().unwrap();
+        let ws = guard.workspace.read().unwrap();
+        let id = ws
+            .get_by_path(&RelativePath::new("src/external.rs"))
+            .expect("file must be in workspace after reindex");
+        let vfile = ws.get(id).expect("slot must be live");
+        assert_eq!(vfile.size, content.len() as u64, "real size recorded");
+        assert!(vfile.content_hash.is_some(), "content hash recorded");
     }
 
     // ── unknown tool ──────────────────────────────────────────────────────────

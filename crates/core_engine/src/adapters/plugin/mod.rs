@@ -13,12 +13,15 @@
 //! # Security boundary
 //!
 //! The capability linker here is the security perimeter for the plugin system.
-//! Only two host functions are exposed to wasm guests:
+//! Only five host functions are exposed to wasm guests (stage 4a):
 //!
 //! | Symbol | Module | Description |
 //! |--------|--------|-------------|
 //! | `host_log` | `tower_host` | Write a log message to host stderr. |
 //! | `host_read_file` | `tower_host` | Read a workspace file via `FileSystemPort`. |
+//! | `ast_store_put` | `tower_host` | Persist opaque bytes via `AstIndexPort` (opaque key only). |
+//! | `ast_store_get` | `tower_host` | Retrieve opaque bytes via `AstIndexPort` (opaque key only). |
+//! | `host_list_files` | `tower_host` | Enumerate workspace-relative file paths (read-only snapshot). |
 //!
 //! Any other import from `tower_host` causes a link error at instantiation.
 //! WASI (`wasi_snapshot_preview1::*`) is linked but with a zero-capability
@@ -33,7 +36,7 @@ pub mod runtime;
 pub use error::PluginLoadError;
 pub use install::{InstalledPlugin, Scope, global_plugins_dir};
 pub use isolation::{IsolatedSandbox, IsolationConfig, IsolationEngine, MAX_CONSECUTIVE_FAILURES};
-pub use loader::WasmtimeHost;
+pub use loader::{HostDeps, WasmtimeHost};
 pub use runtime::{
     DEFAULT_PLUGINS_SUBDIR, load_plugins_into_registry, production_isolation_config,
     resolve_plugin_dirs, resolve_plugins_dir,

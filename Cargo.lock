@@ -55,9 +55,11 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "ast"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "plugin_sdk",
+ "postcard",
+ "serde",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-php",
@@ -289,6 +291,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "sled",
  "tempfile",
  "wasmtime",

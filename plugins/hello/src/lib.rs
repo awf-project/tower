@@ -60,6 +60,23 @@ impl Plugin for HelloPlugin {
                     schema_json: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#
                         .to_owned(),
                 },
+                ToolDesc {
+                    name: "index_put".to_owned(),
+                    description: "Persist raw bytes under an opaque key via the AST index capability.".to_owned(),
+                    schema_json: r#"{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"}},"required":["key","value"]}"#
+                        .to_owned(),
+                },
+                ToolDesc {
+                    name: "index_get".to_owned(),
+                    description: "Retrieve bytes stored under an opaque key via the AST index capability.".to_owned(),
+                    schema_json: r#"{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}"#
+                        .to_owned(),
+                },
+                ToolDesc {
+                    name: "list_files".to_owned(),
+                    description: "Return the count and paths of all workspace files known to the host.".to_owned(),
+                    schema_json: r#"{"type":"object","properties":{}}"#.to_owned(),
+                },
             ],
             hooks: vec![HookKind::BeforeToolCall],
         }
@@ -70,6 +87,9 @@ impl Plugin for HelloPlugin {
         match name {
             "greet" => greet_impl(args),
             "read_file_echo" => read_file_echo_impl(args),
+            "index_put" => index_put_impl(args),
+            "index_get" => index_get_impl(args),
+            "list_files" => list_files_impl(args),
             other => Err(SdkError::ToolNotFound(other.to_owned())),
         }
     }
@@ -137,6 +157,79 @@ fn read_file_echo_impl(args: Value) -> Result<Value, SdkError> {
     }
 }
 
+/// Persists opaque bytes under an opaque key via the host AST index capability.
+///
+/// # Arguments
+///
+/// `args` must be a [`Value::Map`] with:
+/// - `"key"`: a [`Value::Text`] opaque key (no `/`, no `..`).
+/// - `"value"`: a [`Value::Text`] whose UTF-8 bytes are stored as-is.
+///
+/// # Errors
+///
+/// Returns [`SdkError::InvalidArgs`] for malformed args, [`SdkError::CallFailed`]
+/// on a host-side error (invalid key or write failure).
+#[plugin_export]
+fn index_put_impl(args: Value) -> Result<Value, SdkError> {
+    let key = extract_text_field(&args, "key")?;
+    let value = extract_text_field(&args, "value")?;
+    plugin_sdk::host::ast_store_put(key, value.as_bytes()).map_err(SdkError::CallFailed)?;
+    Ok(Value::Text("ok".to_owned()))
+}
+
+/// Retrieves bytes stored under an opaque key via the host AST index capability.
+///
+/// # Arguments
+///
+/// `args` must be a [`Value::Map`] with:
+/// - `"key"`: a [`Value::Text`] opaque key.
+///
+/// # Return value
+///
+/// Returns [`Value::Text`] with the stored UTF-8 content when the key is present,
+/// or [`Value::Null`] when the key is absent.
+///
+/// # Errors
+///
+/// Returns [`SdkError::InvalidArgs`] for malformed args, [`SdkError::CallFailed`]
+/// if the stored bytes are not valid UTF-8.
+#[plugin_export]
+fn index_get_impl(args: Value) -> Result<Value, SdkError> {
+    let key = extract_text_field(&args, "key")?;
+    match plugin_sdk::host::ast_store_get(key) {
+        Some(bytes) => {
+            let content = String::from_utf8(bytes).map_err(|e| {
+                SdkError::CallFailed(format!("stored value is not valid UTF-8: {e}"))
+            })?;
+            Ok(Value::Text(content))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// Calls `host::list_files()` and returns a map with `count` (integer) and
+/// `paths` (comma-joined string of workspace-relative paths).
+///
+/// Demonstrates the Stage 4a `host_list_files` capability end-to-end. The
+/// `paths` value is joined with `|` so the result is a single `Value::Text`
+/// that is easy to assert in tests without needing structured parsing.
+///
+/// # Return value
+///
+/// `Value::Map` with:
+/// - `"count"`: `Value::Int(n)` — number of indexed files.
+/// - `"paths"`: `Value::Text` — paths joined by `|`, or empty string if none.
+#[plugin_export]
+fn list_files_impl(_args: Value) -> Result<Value, SdkError> {
+    let files = plugin_sdk::host::list_files();
+    let count = files.len() as i64;
+    let joined = files.join("|");
+    Ok(Value::Map(vec![
+        ("count".to_owned(), Value::Integer(count)),
+        ("paths".to_owned(), Value::Text(joined)),
+    ]))
+}
+
 fn extract_text_field<'a>(args: &'a Value, field: &str) -> Result<&'a str, SdkError> {
     match args {
         Value::Map(pairs) => {
@@ -197,11 +290,23 @@ mod tests {
         assert_eq!(manifest.name, "hello", "AC2: name");
         assert_eq!(manifest.version, "0.1.0", "AC2: version");
         assert_eq!(manifest.abi, ABI_VERSION, "AC2: abi == ABI_VERSION");
-        assert_eq!(manifest.tools.len(), 2, "AC2: two tools");
+        assert_eq!(manifest.tools.len(), 5, "AC2: five tools");
         assert_eq!(manifest.tools[0].name, "greet", "AC2: greet tool name");
         assert_eq!(
             manifest.tools[1].name, "read_file_echo",
             "AC2: read_file_echo tool name"
+        );
+        assert_eq!(
+            manifest.tools[2].name, "index_put",
+            "AC2: index_put tool name"
+        );
+        assert_eq!(
+            manifest.tools[3].name, "index_get",
+            "AC2: index_get tool name"
+        );
+        assert_eq!(
+            manifest.tools[4].name, "list_files",
+            "AC2: list_files tool name"
         );
         assert_eq!(manifest.hooks, vec![HookKind::BeforeToolCall], "AC2: hooks");
     }

@@ -434,3 +434,181 @@ macro_rules! filesystem_contract_tests {
         }
     };
 }
+
+/// Expand a full behavioural contract test suite for any [`AstIndexPort`]
+/// implementation.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// core_engine::ast_index_contract_tests!(|| InMemoryAstIndex::new());
+/// ```
+///
+/// The macro accepts a constructor expression — a closure (`|| Foo::new()`) or
+/// a bare function path (`Foo::new`) — that returns a fresh, empty implementor
+/// each time it is called.
+#[macro_export]
+macro_rules! ast_index_contract_tests {
+    ($make:expr_2021) => {
+        mod ast_index_contract {
+            use super::*;
+            use $crate::ports::{AstIndexPort, PortError};
+
+            // ── put / get round-trip ──────────────────────────────────────────
+
+            #[test]
+            fn put_then_get_returns_same_bytes() {
+                let store = ($make)();
+                store.put("index", b"hello world").unwrap();
+                assert_eq!(store.get("index").unwrap(), Some(b"hello world".to_vec()));
+            }
+
+            // ── get-miss returns Ok(None) ─────────────────────────────────────
+
+            #[test]
+            fn get_on_missing_key_returns_none() {
+                let store = ($make)();
+                assert_eq!(store.get("missing").unwrap(), None);
+            }
+
+            // ── overwrite: second put wins ────────────────────────────────────
+
+            #[test]
+            fn put_twice_second_value_wins() {
+                let store = ($make)();
+                store.put("k", b"first").unwrap();
+                store.put("k", b"second").unwrap();
+                assert_eq!(store.get("k").unwrap(), Some(b"second".to_vec()));
+            }
+
+            // ── delete + get ──────────────────────────────────────────────────
+
+            #[test]
+            fn delete_then_get_returns_none() {
+                let store = ($make)();
+                store.put("entry", b"data").unwrap();
+                store.delete("entry").unwrap();
+                assert_eq!(store.get("entry").unwrap(), None);
+            }
+
+            // ── delete missing is idempotent ──────────────────────────────────
+
+            #[test]
+            fn delete_missing_key_is_ok() {
+                let store = ($make)();
+                // Must not error — idempotent.
+                store.delete("never_existed").unwrap();
+            }
+
+            // ── list reflects puts and deletes ────────────────────────────────
+
+            #[test]
+            fn list_reflects_puts() {
+                let store = ($make)();
+                store.put("a", b"1").unwrap();
+                store.put("b", b"2").unwrap();
+                let mut keys = store.list().unwrap();
+                keys.sort();
+                assert_eq!(keys, vec!["a".to_owned(), "b".to_owned()]);
+            }
+
+            #[test]
+            fn list_empty_on_fresh_store() {
+                let store = ($make)();
+                assert_eq!(store.list().unwrap(), Vec::<String>::new());
+            }
+
+            #[test]
+            fn list_excludes_deleted_keys() {
+                let store = ($make)();
+                store.put("keep", b"y").unwrap();
+                store.put("gone", b"n").unwrap();
+                store.delete("gone").unwrap();
+                let keys = store.list().unwrap();
+                assert!(keys.contains(&"keep".to_owned()), "keep must be present");
+                assert!(!keys.contains(&"gone".to_owned()), "gone must be absent");
+            }
+
+            // ── key validation ────────────────────────────────────────────────
+
+            #[test]
+            fn empty_key_is_rejected() {
+                let store = ($make)();
+                assert!(matches!(
+                    store.put("", b"x"),
+                    Err(PortError::InvalidArgs(_))
+                ));
+                assert!(matches!(store.get(""), Err(PortError::InvalidArgs(_))));
+                assert!(matches!(store.delete(""), Err(PortError::InvalidArgs(_))));
+            }
+
+            #[test]
+            fn key_with_slash_is_rejected() {
+                let store = ($make)();
+                assert!(matches!(
+                    store.put("a/b", b"x"),
+                    Err(PortError::InvalidArgs(_))
+                ));
+                assert!(matches!(store.get("a/b"), Err(PortError::InvalidArgs(_))));
+            }
+
+            #[test]
+            fn null_byte_key_is_rejected() {
+                let store = ($make)();
+                assert!(matches!(
+                    store.put("a\0b", b"x"),
+                    Err(PortError::InvalidArgs(_))
+                ));
+                assert!(matches!(store.get("a\0b"), Err(PortError::InvalidArgs(_))));
+                assert!(matches!(
+                    store.delete("a\0b"),
+                    Err(PortError::InvalidArgs(_))
+                ));
+            }
+
+            #[test]
+            fn dotdot_key_is_rejected() {
+                let store = ($make)();
+                assert!(matches!(
+                    store.put("..", b"x"),
+                    Err(PortError::InvalidArgs(_))
+                ));
+            }
+
+            #[test]
+            fn dotdot_prefix_key_is_rejected() {
+                let store = ($make)();
+                assert!(matches!(
+                    store.put("../escape", b"x"),
+                    Err(PortError::InvalidArgs(_))
+                ));
+            }
+
+            // ── binary-safe values ────────────────────────────────────────────
+
+            #[test]
+            fn binary_safe_null_bytes() {
+                let store = ($make)();
+                let data: Vec<u8> = vec![0x00, 0x01, 0xff, 0x00, 0xfe];
+                store.put("bin", &data).unwrap();
+                assert_eq!(store.get("bin").unwrap(), Some(data));
+            }
+
+            #[test]
+            fn binary_safe_non_utf8() {
+                let store = ($make)();
+                // Invalid UTF-8 sequence.
+                let data: Vec<u8> = vec![0x80, 0x81, 0x82, 0xff];
+                store.put("raw", &data).unwrap();
+                assert_eq!(store.get("raw").unwrap(), Some(data));
+            }
+
+            #[test]
+            fn empty_value_round_trips() {
+                let store = ($make)();
+                store.put("empty", b"").unwrap();
+                assert_eq!(store.get("empty").unwrap(), Some(vec![]));
+            }
+        }
+    };
+}

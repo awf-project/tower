@@ -70,12 +70,13 @@
 
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
+use ignore::{Walk, WalkBuilder};
+use sha2::{Digest, Sha256};
 
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
-use crate::domain::virtual_file::{FileMetadata, RelativePath, Timestamp};
+use crate::domain::virtual_file::{ContentHash, FileMetadata, RelativePath, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::ports::StoragePort;
 
@@ -195,22 +196,7 @@ pub(crate) fn scan_with_batch_size(
     let mut batch: Vec<(crate::domain::VirtualFile, Vec<crate::domain::token::Token>)> =
         Vec::with_capacity(batch_size);
 
-    let walker = WalkBuilder::new(root)
-        // Do not follow symlinks — prevents loops (UN2/AC4).
-        .follow_links(false)
-        // Respect .gitignore files (U1/AC2). `require_git(false)` is essential:
-        // by default the ignore crate only applies .gitignore inside a git
-        // repository, so a non-git workspace (or a temp dir) would silently
-        // index ignored paths. A workspace scanner must honor .gitignore
-        // regardless of whether the tree is a git repo.
-        .require_git(false)
-        .git_ignore(true)
-        // Skip hidden files (names starting with '.') (U1).
-        .hidden(true)
-        // Respect .git/info/exclude and the global gitignore.
-        .git_exclude(true)
-        .git_global(true)
-        .build();
+    let walker = workspace_walker(root);
 
     for entry in walker {
         let entry = match entry {
@@ -283,10 +269,11 @@ pub(crate) fn scan_with_batch_size(
             continue;
         }
 
-        // Obtain metadata (size, mtime). A permission error here is not fatal.
-        let metadata = match std::fs::metadata(abs_path) {
-            Ok(m) => file_metadata_from_std(&m),
-            Err(_) => {
+        // Obtain metadata (size, mtime, content hash). A read/permission error
+        // here is not fatal — the file is skipped and recorded.
+        let metadata = match file_metadata_with_content(abs_path) {
+            Some(m) => m,
+            None => {
                 report.skipped_permission.push(abs_path.to_path_buf());
                 continue;
             }
@@ -404,23 +391,103 @@ fn collect_ignore_error_paths(err: &ignore::Error, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Convert a `std::fs::Metadata` value to a domain `FileMetadata`.
+/// Build the shared workspace [`Walk`]er: honours `.gitignore`, skips hidden
+/// files and `.git/`, never follows symlinks (UN2/AC4).
 ///
-/// Modification time is mapped to a `Timestamp(unix_secs)`.  On platforms
-/// where `modified()` is unavailable (WASM, some embedded targets) we fall
-/// back to `Timestamp(0)`.  Content hash is always `None` — the scan only
-/// indexes paths, not content (spec 05b scope, see spec 07 for content grep).
-fn file_metadata_from_std(m: &std::fs::Metadata) -> FileMetadata {
-    let modified = m
-        .modified()
+/// Shared by the initial [`scan`] and by [`collect_workspace_files`] (the forced
+/// `tower_reindex` path) so both walk the tree with identical rules — preventing
+/// the two from drifting apart.
+fn workspace_walker(root: &Path) -> Walk {
+    WalkBuilder::new(root)
+        // Do not follow symlinks — prevents loops (UN2/AC4).
+        .follow_links(false)
+        // Respect .gitignore files (U1/AC2). `require_git(false)` is essential:
+        // by default the ignore crate only applies .gitignore inside a git
+        // repository, so a non-git workspace (or a temp dir) would silently
+        // index ignored paths. A workspace scanner must honor .gitignore
+        // regardless of whether the tree is a git repo.
+        .require_git(false)
+        .git_ignore(true)
+        // Skip hidden files (names starting with '.') (U1).
+        .hidden(true)
+        // Respect .git/info/exclude and the global gitignore.
+        .git_exclude(true)
+        .git_global(true)
+        .build()
+}
+
+/// Recursively walk `root` and return `(path, metadata)` for every eligible
+/// file, with **real** size, mtime and content hash.
+///
+/// This is the disk-walk used by the forced `tower_reindex` tool. Unlike
+/// `RealFs::scan()` (which only reports paths written through the adapter this
+/// session), this performs a true filesystem walk — so it reflects files created
+/// or edited outside the engine. Errors on individual files (permission, vanished
+/// mid-walk, non-UTF-8 name) skip that file and continue.
+pub(crate) fn collect_workspace_files(root: &Path) -> Vec<(RelativePath, FileMetadata)> {
+    let mut out = Vec::new();
+    for entry in workspace_walker(root) {
+        let Ok(entry) = entry else { continue };
+        match entry.file_type() {
+            Some(ft) if ft.is_file() => {}
+            _ => continue,
+        }
+        let abs_path = entry.path();
+        let Ok(rel_os) = abs_path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(rel_raw) = rel_os.to_str() else {
+            continue;
+        };
+        #[cfg(not(windows))]
+        let rel_str: &str = rel_raw;
+        #[cfg(windows)]
+        let rel_str: String = rel_raw.replace('\\', "/");
+        let rel_path = RelativePath::new(rel_str);
+        // Never index shadow-file temp artifacts (UN2/AC5).
+        if is_tmp_artifact(&rel_path) {
+            continue;
+        }
+        if let Some(meta) = file_metadata_with_content(abs_path) {
+            out.push((rel_path, meta));
+        }
+    }
+    out
+}
+
+/// Build a [`FileMetadata`] for the file at `abs_path`, reading its content to
+/// compute a SHA-256 [`ContentHash`].
+///
+/// `size` is the authoritative content length, `modified` the mtime mapped to a
+/// `Timestamp(unix_secs)` (or `0` where unavailable). Returns `None` if the file
+/// cannot be stat'd or read (permission, vanished mid-walk).
+///
+/// Reading content (rather than just `stat`) is what wires `content_hash`; the
+/// trade-off is one read per file. The initial scan is guarded by
+/// `is_scan_complete`, so this cost is paid once per fresh index, not per restart.
+fn file_metadata_with_content(abs_path: &Path) -> Option<FileMetadata> {
+    let std_meta = std::fs::metadata(abs_path).ok()?;
+    let bytes = std::fs::read(abs_path).ok()?;
+    Some(FileMetadata {
+        size: bytes.len() as u64,
+        modified: modified_from_std(&std_meta),
+        content_hash: Some(content_hash_of(&bytes)),
+    })
+}
+
+/// Map a `std::fs::Metadata` modification time to a domain [`Timestamp`].
+fn modified_from_std(m: &std::fs::Metadata) -> Timestamp {
+    m.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| Timestamp(d.as_secs()))
-        .unwrap_or(Timestamp(0));
+        .unwrap_or(Timestamp(0))
+}
 
-    FileMetadata {
-        size: m.len(),
-        modified,
-        content_hash: None,
-    }
+/// Compute the SHA-256 [`ContentHash`] of `bytes`.
+pub(crate) fn content_hash_of(bytes: &[u8]) -> ContentHash {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    ContentHash::new(out)
 }

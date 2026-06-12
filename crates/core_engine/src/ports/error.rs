@@ -26,6 +26,13 @@ pub enum PortError {
     WriteFailed(String),
     /// A read operation failed.
     ReadFailed(String),
+    /// The caller supplied an argument that violates the port's preconditions
+    /// (e.g. an empty key, a key containing `/` or `..`).
+    ///
+    /// The `String` carries a human-readable reason. This variant is
+    /// intentionally distinct from [`WriteFailed`] so callers can distinguish
+    /// programmer errors (bad key) from runtime I/O errors.
+    InvalidArgs(String),
 }
 
 impl core::fmt::Display for PortError {
@@ -34,6 +41,7 @@ impl core::fmt::Display for PortError {
             Self::NotFound => write!(f, "key or path not found"),
             Self::WriteFailed(reason) => write!(f, "write failed: {reason}"),
             Self::ReadFailed(reason) => write!(f, "read failed: {reason}"),
+            Self::InvalidArgs(reason) => write!(f, "invalid arguments: {reason}"),
         }
     }
 }

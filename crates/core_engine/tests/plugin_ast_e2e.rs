@@ -42,7 +42,9 @@ use std::sync::{Arc, RwLock};
 use core_engine::adapters::mcp::merged_registry::MergedRegistry;
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::registry::ToolRegistry;
-use core_engine::adapters::{InMemoryFs, InMemoryStorage, WasmtimeHost};
+use core_engine::adapters::{
+    HostDeps, InMemoryAstIndex, InMemoryFs, InMemoryStorage, WasmtimeHost,
+};
 use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::plugin_host::PluginHostRegistry;
@@ -109,8 +111,13 @@ fn fs_with(path: &str, content: &[u8]) -> Arc<InMemoryFs> {
 /// A second empty `EngineState` is wired for the native tool side (not used by
 /// these tests — we only exercise the plugin tool path).
 fn merged_registry_with_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
-    let fs_port: Arc<dyn core_engine::ports::FileSystemPort + Send + Sync> = fs;
-    let instance = WasmtimeHost::load(ast_wasm(), fs_port).expect("ast must load");
+    let deps = HostDeps {
+        fs: fs as Arc<dyn core_engine::ports::FileSystemPort + Send + Sync>,
+        ast_index: Arc::new(InMemoryAstIndex::new())
+            as Arc<dyn core_engine::ports::AstIndexPort + Send + Sync>,
+        workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+    };
+    let instance = WasmtimeHost::load(ast_wasm(), deps).expect("ast must load");
 
     let mut plugin_registry = PluginHostRegistry::new();
     plugin_registry
@@ -138,15 +145,23 @@ fn merged_registry_with_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
 /// manifest, proving the plugin ABI surface is forward-compatible.
 #[test]
 fn ac4_ac5_ast_loads_and_declares_both_tools() {
-    let instance = WasmtimeHost::load(ast_wasm(), Arc::new(InMemoryFs::new())).expect("must load");
+    let instance = WasmtimeHost::load(
+        ast_wasm(),
+        HostDeps {
+            fs: Arc::new(InMemoryFs::new()),
+            ast_index: Arc::new(InMemoryAstIndex::new()),
+            workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+        },
+    )
+    .expect("must load");
 
     let manifest = instance.manifest();
     assert_eq!(manifest.name, "ast", "plugin name must be 'ast'");
     assert_eq!(manifest.abi, plugin_sdk::ABI_VERSION, "ABI must match");
     assert_eq!(
         manifest.tools.len(),
-        2,
-        "manifest must declare exactly 2 tools"
+        4,
+        "manifest must declare exactly 4 tools"
     );
 
     let tool_names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
@@ -158,7 +173,19 @@ fn ac4_ac5_ast_loads_and_declares_both_tools() {
         tool_names.contains(&"find_symbols"),
         "manifest must have find_symbols, got: {tool_names:?}"
     );
-    assert!(manifest.hooks.is_empty(), "no hooks declared");
+    assert!(
+        tool_names.contains(&"search_symbols"),
+        "manifest must have search_symbols, got: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"reindex"),
+        "manifest must have reindex, got: {tool_names:?}"
+    );
+    assert_eq!(
+        manifest.hooks,
+        vec![plugin_sdk::HookKind::FileChanged],
+        "manifest must subscribe to FileChanged hook"
+    );
 }
 
 /// AC5 (Drop & Play): `tools/list` via `MergedRegistry` exposes both namespaced
@@ -178,6 +205,14 @@ fn ac5_tools_list_exposes_both_ast_tools() {
     assert!(
         tool_names.contains(&"tower_ast_find_symbols"),
         "AC5: tools/list must contain tower_ast_find_symbols, got: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"tower_ast_search_symbols"),
+        "AC5: tools/list must contain tower_ast_search_symbols, got: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"tower_ast_reindex"),
+        "AC5: tools/list must contain tower_ast_reindex, got: {tool_names:?}"
     );
 }
 
@@ -737,5 +772,133 @@ fn bug01_zero_byte_rust_file_returns_empty_items_not_trap() {
     assert!(
         items.is_empty(),
         "BUG-01: zero-byte file must yield empty items list, got: {result_str}"
+    );
+}
+
+// ── Cold full reindex e2e ─────────────────────────────────────────────────────
+//
+// Proves that `tower_ast_reindex` enumerates the workspace, parses every file,
+// and populates the symbol index — without any prior get_outline/find_symbols
+// call on those files. This is the whole point of force-reindex: covering files
+// that were never individually opened.
+//
+// Harness wiring:
+//   - `InMemoryFs` is populated with 2 Rust files containing known symbols.
+//   - `ProjectWorkspace` is pre-populated with the same 2 paths so that
+//     `host_list_files` (which reads the workspace, not the fs) returns them.
+//   - Both are bundled into `HostDeps` for `WasmtimeHost::load`.
+//
+// Failure mode proof: if `reindex` is removed from the plugin and replaced by
+// a no-op (or the search is called before reindex), `search_symbols` returns
+// an empty match list because the thread-local index is empty — the test
+// assertion on >= 1 match would fail, proving the test is not vacuous.
+
+/// Source for the two cold-reindex fixture files.
+const ALPHA_SOURCE: &[u8] = b"pub fn alpha_fn() -> u32 { 42 }";
+const BETA_SOURCE: &[u8] = b"pub struct BetaStruct { value: u32 }";
+
+/// Build a `MergedRegistry` with a pre-populated workspace so `host_list_files`
+/// returns the given paths, AND an `InMemoryFs` with the same files so
+/// `host_read_file` can serve their content.
+///
+/// Accepts an `Arc<RwLock<ProjectWorkspace>>` so the caller can insert paths
+/// before passing it here.
+fn merged_registry_with_ast_and_workspace(
+    fs: Arc<InMemoryFs>,
+    workspace: Arc<RwLock<ProjectWorkspace>>,
+) -> MergedRegistry {
+    let deps = HostDeps {
+        fs: fs as Arc<dyn core_engine::ports::FileSystemPort + Send + Sync>,
+        ast_index: Arc::new(InMemoryAstIndex::new())
+            as Arc<dyn core_engine::ports::AstIndexPort + Send + Sync>,
+        workspace,
+    };
+    let instance = WasmtimeHost::load(ast_wasm(), deps).expect("ast must load");
+
+    let mut plugin_registry = PluginHostRegistry::new();
+    plugin_registry
+        .register(instance)
+        .expect("ast plugin must register");
+
+    let engine_state = Arc::new(RwLock::new(EngineState::new(
+        ProjectWorkspace::new(),
+        InvertedIndex::new(),
+        Box::new(InMemoryStorage::new()),
+        Box::new(InMemoryFs::new()),
+    )));
+    MergedRegistry::new(engine_state, Arc::new(RwLock::new(plugin_registry)))
+}
+
+/// Cold full reindex: `tower_ast_reindex` builds the index from scratch over all
+/// workspace files; `tower_ast_search_symbols` then finds symbols that were never
+/// individually opened via get_outline or find_symbols.
+///
+/// This is the primary behavioural proof for the reindex tool.
+#[test]
+fn cold_reindex_populates_index_for_all_workspace_files() {
+    // 1. Build an InMemoryFs with two Rust files.
+    let mut fs = InMemoryFs::new();
+    fs.write(RelativePath::new("src/alpha.rs"), ALPHA_SOURCE.to_vec())
+        .expect("write alpha");
+    fs.write(RelativePath::new("src/beta.rs"), BETA_SOURCE.to_vec())
+        .expect("write beta");
+    let fs = Arc::new(fs);
+
+    // 2. Build a ProjectWorkspace with the same two paths.
+    //    `host_list_files` reads the workspace, not the fs, so both must agree.
+    let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+    {
+        use core_engine::domain::FileMetadata;
+        let mut ws = workspace.write().expect("workspace lock");
+        ws.insert(RelativePath::new("src/alpha.rs"), FileMetadata::default())
+            .expect("insert alpha");
+        ws.insert(RelativePath::new("src/beta.rs"), FileMetadata::default())
+            .expect("insert beta");
+    }
+
+    // 3. Build the registry with the populated workspace + fs.
+    let mut registry = merged_registry_with_ast_and_workspace(fs, workspace);
+
+    // 4. Call reindex — no prior get_outline / find_symbols on these files.
+    let reindex_result = registry
+        .call("tower_ast_reindex", serde_json::json!({}))
+        .expect("tower_ast_reindex must succeed");
+
+    let indexed_files = reindex_result["indexed_files"]
+        .as_i64()
+        .expect("indexed_files must be an integer");
+    assert!(
+        indexed_files >= 2,
+        "reindex must report at least 2 indexed files, got: {reindex_result}"
+    );
+
+    // 5. Search for symbols that were NEVER individually opened.
+    //    If reindex did not run, the index is empty and both searches return [].
+    let alpha_result = registry
+        .call(
+            "tower_ast_search_symbols",
+            serde_json::json!({ "name": "alpha_fn" }),
+        )
+        .expect("search alpha_fn must succeed");
+    let alpha_matches = alpha_result["matches"]
+        .as_array()
+        .expect("matches must be array");
+    assert!(
+        !alpha_matches.is_empty(),
+        "alpha_fn must be found after reindex without prior get_outline: {alpha_result}"
+    );
+
+    let beta_result = registry
+        .call(
+            "tower_ast_search_symbols",
+            serde_json::json!({ "name": "BetaStruct" }),
+        )
+        .expect("search BetaStruct must succeed");
+    let beta_matches = beta_result["matches"]
+        .as_array()
+        .expect("matches must be array");
+    assert!(
+        !beta_matches.is_empty(),
+        "BetaStruct must be found after reindex without prior get_outline: {beta_result}"
     );
 }

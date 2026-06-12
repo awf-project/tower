@@ -259,7 +259,17 @@ fn walk_top_level(node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>) {
                 if let Some(item) = extract_named_item(child, source, OutlineKind::Module) {
                     items.push(item);
                 }
-                // Don't recurse into mod bodies — they're separate compilation units.
+                // Decision: recurse into inline mod bodies so that symbols declared
+                // inside `mod foo { ... }` are included in the outline.
+                // Why: an exhaustive structural index must surface every reachable
+                //      definition regardless of module nesting depth.
+                // Trade-off: collected names are unqualified (e.g. `inner_fn`, not
+                //      `outer::inner_fn`).  Full qualification is deferred to the
+                //      indexing stage when the path context is available.
+                // Note: `mod foo;` (file module — no brace body) has no
+                //      `declaration_list` child, so the find() call returns None and
+                //      recursion is silently skipped — correct behaviour.
+                walk_mod_body(child, source, items);
             }
             "type_item" => {
                 if let Some(item) = extract_named_item(child, source, OutlineKind::TypeAlias) {
@@ -286,6 +296,26 @@ fn walk_top_level(node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>) {
             _ => {}
         }
     }
+}
+
+/// Walk items inside an inline `mod_item` declaration block.
+///
+/// An inline module (`mod foo { ... }`) has a `declaration_list` child whose
+/// children are the same set of item kinds accepted by `walk_top_level`.
+/// We recurse `walk_top_level` into that block so nested functions, structs,
+/// impl blocks, and sub-modules are all included in the outline.
+///
+/// `mod foo;` (file module — no braces) produces no `declaration_list` child;
+/// the `.find()` returns `None` and this function is a no-op.
+fn walk_mod_body(mod_node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>) {
+    let body = mod_node
+        .children(&mut mod_node.walk())
+        .find(|n| n.kind() == "declaration_list");
+
+    let Some(body) = body else { return };
+    // Reuse walk_top_level: the grammar inside an inline module body is identical
+    // to source-file top-level — the same node kinds appear at both levels.
+    walk_top_level(body, source, items);
 }
 
 /// Walk methods inside an `impl_item` declaration block.
@@ -380,27 +410,11 @@ fn extract_impl_item(node: Node<'_>, source: &[u8]) -> OutlineItem {
     }
 }
 
-/// Extract the source text covered by `node`, trimming to a reasonable length.
-///
-/// Used for names and type fragments — never for body text (U1 enforced by
-/// only calling this on name/type nodes, not body nodes).
-fn extract_text(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let bytes = source.get(node.start_byte()..node.end_byte())?;
-    let text = std::str::from_utf8(bytes).ok()?;
-    // Cap at 256 bytes: names longer than this are pathological / generated code.
-    // Prevents a DoS if a malformed file has a huge "name" span.
-    let capped = if text.len() > 256 {
-        // Trim to last valid UTF-8 char boundary.
-        let mut end = 256;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        &text[..end]
-    } else {
-        text
-    };
-    Some(capped.to_owned())
-}
+// Decision: extract_text moved to crate::text::extract_text (shared with symbols.rs).
+// Why: the function was byte-identical in both modules — consolidate to one copy.
+// Trade-off: a use alias is needed in each module; the logic is no longer co-located
+//            with the comment explaining the 256-byte cap (see text.rs instead).
+use crate::text::extract_text;
 
 /// Build a [`Span`] from a tree-sitter node's position information.
 fn node_span(node: Node<'_>) -> Span {
@@ -1209,10 +1223,90 @@ function topLevelFn() {}
         );
     }
 
-    /// Round-trip: get_outline emits kind=class for PHP class declarations;
-    /// a caller using that kind in find_symbols must get a result (not
-    /// NotApplicable). Previously outline emitted kind=struct, but Struct is not
-    /// in PHP's kind_applicable() set, making the round-trip silently broken.
+    // ── Rust inline module recursion (Fix 3) ─────────────────────────────────
+
+    /// Inline `mod outer { fn inner_fn() {} struct InnerStruct {} mod nested { fn deep() {} } }`
+    /// must surface `inner_fn`, `InnerStruct`, and `deep` (multi-level recursion).
+    #[test]
+    fn rust_inline_mod_items_appear_in_outline() {
+        let source = br#"
+mod outer {
+    fn inner_fn() {}
+    struct InnerStruct {}
+    mod nested {
+        fn deep() {}
+    }
+}
+"#;
+        let result = parse_outline(source, "test.rs");
+        let outline = match result {
+            OutlineResult::Parsed(o) => o,
+            OutlineResult::Unsupported { language } => {
+                panic!("expected Parsed, got Unsupported({language})")
+            }
+        };
+
+        let items: Vec<(&str, &str)> = outline
+            .items
+            .iter()
+            .map(|i| (i.kind.as_str(), i.name.as_str()))
+            .collect();
+
+        assert!(
+            items.iter().any(|&(k, n)| k == "module" && n == "outer"),
+            "outer module must be in outline, got: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|&(k, n)| k == "function" && n == "inner_fn"),
+            "inner_fn inside mod outer must be in outline, got: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|&(k, n)| k == "struct" && n == "InnerStruct"),
+            "InnerStruct inside mod outer must be in outline, got: {items:?}"
+        );
+        assert!(
+            items.iter().any(|&(k, n)| k == "module" && n == "nested"),
+            "nested module must be in outline, got: {items:?}"
+        );
+        assert!(
+            items.iter().any(|&(k, n)| k == "function" && n == "deep"),
+            "deep inside mod nested (multi-level) must be in outline, got: {items:?}"
+        );
+    }
+
+    /// File modules (`mod foo;` — no braces) must not cause a panic or spurious
+    /// items, but do surface as a module entry in the outline.
+    #[test]
+    fn rust_file_mod_declaration_no_panic() {
+        let source = b"mod external;";
+        let result = parse_outline(source, "test.rs");
+        let outline = match result {
+            OutlineResult::Parsed(o) => o,
+            OutlineResult::Unsupported { language } => {
+                panic!("expected Parsed, got Unsupported({language})")
+            }
+        };
+        let items: Vec<(&str, &str)> = outline
+            .items
+            .iter()
+            .map(|i| (i.kind.as_str(), i.name.as_str()))
+            .collect();
+        assert!(
+            items.iter().any(|&(k, n)| k == "module" && n == "external"),
+            "file mod declaration must appear as module in outline, got: {items:?}"
+        );
+        // No spurious extra items — only the module header itself.
+        assert_eq!(
+            items.len(),
+            1,
+            "file mod declaration must produce exactly one outline item, got: {items:?}"
+        );
+    }
+
     #[test]
     fn php_class_outline_kind_matches_find_symbols_kind() {
         use crate::symbols::{SymbolKind, SymbolResult, find_symbols};
