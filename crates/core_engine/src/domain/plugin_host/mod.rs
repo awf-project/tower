@@ -24,23 +24,25 @@
 //! `PluginHostPort` is object-safe and requires `&self` on `on_file_indexed` /
 //! `on_file_changed` so the domain can hold a `&dyn PluginHostPort`. Meanwhile,
 //! `PluginInstance::deliver_hook` requires `&mut self` (exclusive wasm instance
-//! access). The registry bridges these by wrapping each instance in a
-//! `Mutex<Box<dyn PluginInstance>>`, which is both `Send + Sync`.
+//! access). The registry bridges these by owning each instance in its own
+//! worker thread and communicating through a bounded `SyncSender<Command>`
+//! mailbox. The registry holds only the `Send + Sync` sender; the `&mut self`
+//! instance lives behind the channel, accessed exclusively by its worker.
 //!
-//! Decision: `Mutex` over `RefCell` because `EventProcessor` stores
-//! `Box<dyn PluginHostPort + Send + Sync>`. A single-threaded `RefCell` would
-//! not satisfy `Sync`. The Mutex is uncontended in practice (fan-out is
-//! sequential within one thread) so there is no performance concern.
-//! Trade-off: slightly higher overhead per hook vs. `RefCell`; acceptable.
+//! Decision: per-plugin worker thread + mailbox over `Mutex<Box<dyn ...>>`.
+//! Why: a slow or trapping hook handler no longer blocks `call_tool` (or other
+//! plugins) on a shared lock — each plugin drains its own queue, and tool calls
+//! are served ahead of hooks within a drain (see `worker.rs`). Backpressure is
+//! bounded by `PLUGIN_MAILBOX_CAPACITY`.
+//! Trade-off: hook delivery is now asynchronous — the watcher thread enqueues
+//! and returns immediately rather than observing completion.
 //!
 //! # Error handling
 //!
-//! `deliver_hook` failures are isolated per-plugin (UN1): if one instance errors,
-//! the error is logged to stderr and delivery continues to the remaining instances.
-//! A single bad plugin cannot block others.
+//! `deliver_hook` failures are isolated per-plugin (UN1): each worker logs its
+//! own errors to stderr and keeps draining. A single bad plugin cannot block
+//! others — they run on independent threads.
 #![forbid(unsafe_code)]
-
-use std::sync::Mutex;
 
 use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, ToolDesc, Value};
 
@@ -49,8 +51,6 @@ use crate::ports::PluginHostPort;
 
 mod worker;
 
-// Consumed by the registry refactor (Task 2); unused until then.
-#[allow(unused_imports)]
 pub(crate) use worker::{Command, PLUGIN_MAILBOX_CAPACITY, run_worker};
 
 // ── PluginId ─────────────────────────────────────────────────────────────────
@@ -243,14 +243,15 @@ impl std::error::Error for RegistrationError {}
 ///
 /// # Object safety
 ///
-/// The trait is intentionally object-safe so the registry can store
-/// `Vec<Mutex<Box<dyn PluginInstance>>>` and dispatch through dynamic dispatch.
+/// The trait is intentionally object-safe so each instance can be boxed,
+/// moved into its worker thread, and dispatched through dynamic dispatch.
 ///
 /// # Mutability contract
 ///
 /// `call_tool` and `deliver_hook` take `&mut self` because wasm instance
 /// execution requires exclusive access to the instance's linear memory and
-/// call stack. The registry provides this exclusivity via a `Mutex` per instance.
+/// call stack. The registry provides this exclusivity by giving each instance
+/// its own worker thread, the sole owner of the `&mut` instance.
 pub trait PluginInstance: Send {
     /// Return the manifest this plugin declared at load time.
     ///
@@ -318,19 +319,37 @@ pub trait PluginInstance: Send {
 /// // No plugins registered — declared_tools is empty (OP1 / AC3).
 /// assert!(registry.declared_tools().is_empty());
 /// ```
+/// One plugin: its (immutable) manifest plus the channel to its worker thread.
+///
+/// `tx` and `join` are `Option` so `Drop` can drop all senders *first* (waking
+/// every worker to drain), then join — avoiding a hang where a worker never sees
+/// disconnection.
+struct PluginHandle {
+    manifest: PluginManifest,
+    tx: Option<std::sync::mpsc::SyncSender<Command>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PluginHandle {
+    fn sender(&self) -> &std::sync::mpsc::SyncSender<Command> {
+        self.tx.as_ref().expect("sender present before shutdown")
+    }
+}
+
 pub struct PluginHostRegistry {
-    // Decision: Mutex<Box<dyn PluginInstance>> per slot.
-    // Why: PluginHostPort takes &self (object-safety), but deliver_hook needs
-    //      &mut self. Mutex provides interior mutability that is Send+Sync.
-    // Trade-off: each hook delivery acquires/releases one Mutex per subscribed
-    //            instance, sequential — no contention in practice.
-    instances: Vec<Mutex<Box<dyn PluginInstance>>>,
+    // Decision: per-plugin worker thread, reached through a bounded SyncSender.
+    // Why: PluginHostPort takes &self (object-safety) but deliver_hook needs
+    //      &mut self. The instance lives in its worker thread; the registry
+    //      holds only the Send+Sync sender. A slow/trapping hook no longer
+    //      blocks tool calls or other plugins on a shared lock.
+    // Trade-off: hook delivery is asynchronous (enqueue-and-return).
+    handles: Vec<PluginHandle>,
 }
 
 impl std::fmt::Debug for PluginHostRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginHostRegistry")
-            .field("plugin_count", &self.instances.len())
+            .field("plugin_count", &self.handles.len())
             .finish()
     }
 }
@@ -342,7 +361,7 @@ impl PluginHostRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            instances: Vec::new(),
+            handles: Vec::new(),
         }
     }
 
@@ -397,18 +416,29 @@ impl PluginHostRegistry {
         //      any tools/call for its tools silently routes to the first — UN1.
         // Trade-off: hot-reload must use a different name or remove the old plugin
         //      first; this is an acceptable constraint for the current design.
-        let duplicate = self.instances.iter().any(|slot| {
-            slot.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .manifest()
-                .name
-                == new_name
-        });
-        if duplicate {
+        if self.handles.iter().any(|h| h.manifest.name == new_name) {
             return Err(RegistrationError::DuplicateName(new_name));
         }
 
-        self.instances.push(Mutex::new(instance));
+        // Cache the immutable manifest in the handle, then move the instance into
+        // its worker thread. The registry never touches the instance again — all
+        // dispatch goes through `tx`.
+        let manifest = instance.manifest().clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Command>(PLUGIN_MAILBOX_CAPACITY);
+        let worker_name = manifest.name.clone();
+        let join = std::thread::Builder::new()
+            .name(format!("tower-plugin-{worker_name}"))
+            .spawn(move || {
+                let mut instance = instance;
+                run_worker(instance.as_mut(), rx, &worker_name);
+            })
+            .expect("failed to spawn plugin worker thread");
+
+        self.handles.push(PluginHandle {
+            manifest,
+            tx: Some(tx),
+            join: Some(join),
+        });
         Ok(())
     }
 
@@ -430,24 +460,16 @@ impl PluginHostRegistry {
     /// assert!(registry.declared_tools().is_empty());
     /// ```
     pub fn declared_tools(&self) -> Vec<(PluginId, ToolDesc)> {
-        self.instances
+        // Reads the cached manifest — no locking, no worker contact. The manifest
+        // is immutable for the plugin's lifetime so this never races the worker.
+        self.handles
             .iter()
-            .flat_map(|slot| {
-                // Lock is held briefly to read the manifest — no I/O inside.
-                // Decision: recover poisoned mutex instead of panicking.
-                // Why: a wasm trap inside deliver_hook (11c) can poison the
-                //      mutex; recovering the inner value preserves UN1 isolation
-                //      (one bad plugin must not block declared_tools for others).
-                // Trade-off: we expose potentially partially-written state, but
-                //      PluginInstance::manifest() is read-only so this is safe.
-                let instance = slot.lock().unwrap_or_else(|p| p.into_inner());
-                let id = PluginId::new(instance.manifest().name.clone());
-                instance
-                    .manifest()
+            .flat_map(|h| {
+                let id = PluginId::new(h.manifest.name.clone());
+                h.manifest
                     .tools
                     .iter()
-                    .map(|tool| (id.clone(), tool.clone()))
-                    .collect::<Vec<_>>()
+                    .map(move |tool| (id.clone(), tool.clone()))
             })
             .collect()
     }
@@ -456,8 +478,10 @@ impl PluginHostRegistry {
     /// matches `plugin_id_str` (spec 12b routing).
     ///
     /// This is the single point where the MCP adapter layer (12b) calls into a
-    /// specific plugin instance. The call goes through the per-instance `Mutex`
-    /// so it is exclusive — no concurrent tool calls on the same instance.
+    /// specific plugin instance. The call is sent as a `Command::CallTool` to the
+    /// plugin's worker and the caller blocks on the reply channel. Tool calls are
+    /// served ahead of queued hooks within the worker's drain (see `worker.rs`),
+    /// so an interactive call is not starved by a file-churn backlog.
     ///
     /// Fault isolation is transparent: if the instance is wrapped in an
     /// `IsolatedSandbox` (11d), the sandbox catches any wasm trap and returns
@@ -467,6 +491,9 @@ impl PluginHostRegistry {
     /// # Errors
     ///
     /// - [`PluginHostError::ToolNotFound`] — no registered plugin has the given `plugin_id_str`.
+    /// - [`PluginHostError::CallFailed`] — the plugin's worker thread is gone
+    ///   (sender disconnected or reply channel dropped). This maps to a
+    ///   non-fatal `ToolError::ExecutionFailed` in the MCP adapter.
     /// - Any [`PluginHostError`] variant returned by the matching plugin instance.
     ///
     /// # Examples
@@ -484,15 +511,24 @@ impl PluginHostRegistry {
         tool_name: &str,
         args: plugin_sdk::Value,
     ) -> Result<plugin_sdk::Value, PluginHostError> {
-        for slot in &self.instances {
-            // Recover a poisoned mutex (see declared_tools rationale) rather
-            // than propagating a panic to the MCP request handler.
-            let mut instance = slot.lock().unwrap_or_else(|p| p.into_inner());
-            if instance.manifest().name == plugin_id_str {
-                return instance.call_tool(tool_name, args);
-            }
-        }
-        Err(PluginHostError::ToolNotFound(plugin_id_str.to_owned()))
+        let handle = self
+            .handles
+            .iter()
+            .find(|h| h.manifest.name == plugin_id_str)
+            .ok_or_else(|| PluginHostError::ToolNotFound(plugin_id_str.to_owned()))?;
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        handle
+            .sender()
+            .send(Command::CallTool {
+                tool: tool_name.to_owned(),
+                args,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginHostError::CallFailed("plugin worker unavailable".to_owned()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| PluginHostError::CallFailed("plugin worker dropped reply".to_owned()))?
     }
 
     // ── Private fan-out helper ────────────────────────────────────────────────
@@ -502,30 +538,29 @@ impl PluginHostRegistry {
     /// `make_payload` is called once per subscribed instance so each instance
     /// receives an independent clone of the payload (no shared mutable state).
     ///
-    /// Errors from individual instances are logged to stderr and do not
-    /// propagate (UN1). The fan-out continues to the next instance regardless.
+    /// Delivery is asynchronous: each subscribed plugin's command is enqueued on
+    /// its worker mailbox and this method returns without waiting for the handler
+    /// to run. The worker logs and isolates per-plugin errors (UN1).
     ///
-    /// # Latency note
+    /// # Backpressure
     ///
-    /// This method holds the per-instance `Mutex` for the entire duration of
-    /// `deliver_hook`. With `IsolatedSandbox` wrapping each instance, a hook
-    /// handler that runs until fuel exhaustion will hold the lock for up to
-    /// ~`DEFAULT_FUEL_BUDGET` wasm instructions (roughly ≤100 ms at 1 BIPS).
-    /// During that window any concurrent `call_tool` on the same instance blocks
-    /// on the same lock. This is bounded by fuel and acceptable for the current
-    /// synchronous fan-out design.
+    /// The send is blocking on a bounded `SyncSender` (`PLUGIN_MAILBOX_CAPACITY`).
+    /// If a plugin's worker has fallen behind, the calling (watcher) thread blocks
+    /// until the worker drains one slot — backpressure rather than unbounded
+    /// memory growth. A worker whose mailbox has been closed (thread gone) yields
+    /// a send error, which is logged and skipped so the remaining plugins still
+    /// receive the hook.
     fn fan_out(&self, kind: &HookKind, make_payload: impl Fn() -> HookPayload) {
-        for slot in &self.instances {
-            // Recover poisoned mutexes (see declared_tools rationale).
-            // A wasm trap from 11c can poison the lock; UN1 requires fan-out
-            // to continue to remaining instances regardless.
-            let mut instance = slot.lock().unwrap_or_else(|p| p.into_inner());
-            if instance.manifest().hooks.contains(kind) {
+        for handle in &self.handles {
+            if handle.manifest.hooks.contains(kind) {
                 let payload = make_payload();
-                if let Err(e) = instance.deliver_hook(kind.clone(), payload) {
+                if let Err(e) = handle.sender().send(Command::Hook {
+                    kind: kind.clone(),
+                    payload,
+                }) {
                     eprintln!(
-                        "[tower] plugin '{}' hook delivery error ({kind:?}): {e}",
-                        instance.manifest().name
+                        "[tower] plugin '{}' mailbox closed: {e}",
+                        handle.manifest.name
                     );
                 }
             }
@@ -536,6 +571,25 @@ impl PluginHostRegistry {
 impl Default for PluginHostRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for PluginHostRegistry {
+    /// Shut down every worker cleanly: drop all senders first so each worker sees
+    /// disconnection and exits after draining its mailbox, then join them.
+    ///
+    /// The two passes matter: joining before dropping a later handle's sender
+    /// would deadlock — a worker only exits once its sender is gone, and the
+    /// senders live in handles we have not yet visited.
+    fn drop(&mut self) {
+        for handle in &mut self.handles {
+            handle.tx.take();
+        }
+        for handle in &mut self.handles {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
     }
 }
 
@@ -666,6 +720,23 @@ mod tests {
         FileId::new_for_testing(0, 0)
     }
 
+    /// Poll `cond` until it returns true or `timeout` elapses.
+    ///
+    /// Hook delivery is asynchronous (each plugin runs on its own worker thread),
+    /// so a test cannot assert delivery synchronously after `on_file_*`. This
+    /// polls instead of using a fixed sleep, returning early once the condition
+    /// holds.
+    fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
     // ── TDD step 1 RED→GREEN: subscribed vs unsubscribed (AC1) ───────────────
 
     /// AC1: A plugin subscribed to FileChanged receives the hook; one that is
@@ -689,18 +760,23 @@ mod tests {
 
         registry.on_file_changed(file_id(), &file_path("src/lib.rs"));
 
-        let sub_calls = subscribed_delivered.lock().unwrap();
-        assert_eq!(
-            sub_calls.len(),
-            1,
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                subscribed_delivered.lock().unwrap().len() == 1
+            }),
             "subscribed plugin must receive exactly 1 call"
         );
+
+        let sub_calls = subscribed_delivered.lock().unwrap();
         assert_eq!(
             sub_calls[0].0,
             HookKind::FileChanged,
             "must receive FileChanged hook"
         );
+        drop(sub_calls);
 
+        // The subscribed delivery has landed; the unsubscribed plugin shares the
+        // same fan-out call site, so by now it has been skipped (not enqueued).
         let unsub_calls = not_subscribed_delivered.lock().unwrap();
         assert_eq!(
             unsub_calls.len(),
@@ -722,8 +798,13 @@ mod tests {
 
         registry.on_file_indexed(file_id(), &file_path("src/main.rs"));
 
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                delivered.lock().unwrap().len() == 1
+            }),
+            "must receive exactly 1 FileIndexed call"
+        );
         let calls = delivered.lock().unwrap();
-        assert_eq!(calls.len(), 1, "must receive exactly 1 FileIndexed call");
         match &calls[0].1 {
             HookPayload::FileIndexed { path } => {
                 assert_eq!(path, "src/main.rs", "path in payload must match");
@@ -835,12 +916,12 @@ mod tests {
         // Must not propagate the failing plugin's error.
         registry.on_file_changed(file_id(), &file_path("src/lib.rs"));
 
-        let calls = good_delivered.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            1,
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                good_delivered.lock().unwrap().len() == 1
+            }),
             "good plugin must still receive the hook despite the failing plugin: got {} calls",
-            calls.len()
+            good_delivered.lock().unwrap().len()
         );
     }
 
@@ -862,8 +943,12 @@ mod tests {
 
         registry.on_file_indexed(file_id(), &file_path("changed.rs"));
 
-        let calls = good_delivered.lock().unwrap();
-        assert_eq!(calls.len(), 1, "first plugin must have received the hook");
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                good_delivered.lock().unwrap().len() == 1
+            }),
+            "first plugin must have received the hook"
+        );
     }
 
     // ── Additional coverage ───────────────────────────────────────────────────
@@ -886,8 +971,14 @@ mod tests {
         registry.on_file_indexed(file_id(), &file_path("a.rs"));
         registry.on_file_changed(file_id(), &file_path("b.rs"));
 
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                delivered.lock().unwrap().len() == 2
+            }),
+            "must receive 2 hook deliveries"
+        );
         let calls = delivered.lock().unwrap();
-        assert_eq!(calls.len(), 2, "must receive 2 hook deliveries");
+        // FIFO within the single worker preserves enqueue order.
         assert_eq!(calls[0].0, HookKind::FileIndexed);
         assert_eq!(calls[1].0, HookKind::FileChanged);
     }
@@ -905,6 +996,12 @@ mod tests {
 
         registry.on_file_changed(file_id(), &file_path("src/domain/mod.rs"));
 
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                !delivered.lock().unwrap().is_empty()
+            }),
+            "hook must be delivered"
+        );
         let calls = delivered.lock().unwrap();
         match &calls[0].1 {
             HookPayload::FileChanged { path } => {

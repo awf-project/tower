@@ -5,12 +5,8 @@
 //! (stable priority), so interactive MCP calls stay responsive during file
 //! churn. See `docs/superpowers/specs/2026-06-13-internal-plugin-queue-design.md`.
 //!
-//! The registry refactor (Task 2) is the only crate-internal consumer of
-//! `Command`, `PLUGIN_MAILBOX_CAPACITY`, and `run_worker`; until it lands they
-//! are exercised solely by this module's tests, hence the module-level
-//! `dead_code` allowance.
-// TODO(task-2): remove once the registry consumes Command/run_worker/PLUGIN_MAILBOX_CAPACITY
-#![allow(dead_code)]
+//! The registry (`mod.rs`) is the crate-internal consumer of `Command`,
+//! `PLUGIN_MAILBOX_CAPACITY`, and `run_worker`.
 
 use std::sync::mpsc::{Receiver, Sender};
 
