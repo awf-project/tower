@@ -9,9 +9,10 @@
 //!      default           → [<xdg-data>/tower/plugins, <ws>/.tower/plugins]
 //!                          (global FIRST, local LAST → local wins on collision)
 //!    IsolationEngine::new()                      ← fuel + epoch + ticker (11d)
-//!    load_plugins_into_registry(dirs, engine, fs_port, config)
+//!    load_plugins_into_registry(dirs, engine, deps, config, disabled)
 //!      phase 1: for each dir, for each *.wasm (sorted):
-//!        IsolatedSandbox::load(engine, path, fs_port, config)   ← 11c/11d path
+//!        file stem in `disabled` → eprintln info + SKIP (never instantiated)
+//!        IsolatedSandbox::load(engine, path, deps, config)   ← 11c/11d path
 //!          Err(load)    → eprintln warning + SKIP (never abort)
 //!      phase 2: decide_shadowing (local overrides global by name) then:
 //!        Keep         → registry.register(Box::new(sandbox))    ← 11b
@@ -170,6 +171,7 @@ pub fn load_plugins_into_registry(
     engine: &IsolationEngine,
     deps: HostDeps,
     config: IsolationConfig,
+    disabled: &[String],
 ) -> PluginHostRegistry {
     let mut registry = PluginHostRegistry::new();
 
@@ -193,6 +195,12 @@ pub fn load_plugins_into_registry(
         wasm_paths.sort();
 
         for path in wasm_paths {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && disabled.iter().any(|d| d == stem)
+            {
+                eprintln!("tower: info — plugin '{stem}' disabled by .tower/config.toml");
+                continue;
+            }
             match IsolatedSandbox::load(engine.engine(), &path, deps.clone(), config.clone()) {
                 Ok(sandbox) => loaded.push((dir_idx, path, sandbox)),
                 Err(e) => {

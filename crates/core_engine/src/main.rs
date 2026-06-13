@@ -51,6 +51,7 @@ use core_engine::adapters::SledStorageAdapter;
 use core_engine::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
+use core_engine::adapters::config;
 use core_engine::adapters::fs::scan::{init_towerignore, warn_if_towerignore_absent};
 use core_engine::adapters::fs::{RealFs, workspace_scan};
 use core_engine::adapters::mcp::native_tools::EngineState;
@@ -221,6 +222,10 @@ fn run() -> Result<(), String> {
     // ── Step 1: resolve workspace root ────────────────────────────────────────
     let workspace_root = resolve_workspace_root();
 
+    // Load the local project config (.tower/config.toml) early so a malformed
+    // file fails fast before any DB or watcher work. Absent file → defaults.
+    let tower_config = config::load(&workspace_root).map_err(|e| e.to_string())?;
+
     // Warn on EVERY boot when the sole ignore source is absent — not only on a
     // fresh scan. The scan's restart guard short-circuits subsequent boots, so a
     // warning placed inside the scan path would never fire after the first run,
@@ -343,6 +348,7 @@ fn run() -> Result<(), String> {
         &isolation_engine,
         plugin_deps,
         production_isolation_config(),
+        &tower_config.plugins.disabled,
     );
     let plugin_count = plugin_host.declared_tools().len();
     if plugin_count > 0 {

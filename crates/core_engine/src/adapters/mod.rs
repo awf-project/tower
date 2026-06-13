@@ -10,6 +10,10 @@
 /// Real adapter: [`ast_index::XdgAstIndexAdapter`].
 /// In-memory fake: [`InMemoryAstIndex`].
 pub mod ast_index;
+/// Local project configuration (`.tower/config.toml`).
+///
+/// Infra: reads `std::fs` and parses `toml`. The domain never sees it.
+pub mod config;
 pub mod fs;
 pub mod in_memory_ast_index;
 pub mod in_memory_fs;

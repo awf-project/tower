@@ -89,6 +89,10 @@ or the e2e suite silently passes against a stale binary — a false green.
   and joint with file-record writes (spec 04b).
 - Tree-sitter-in-WASM is the #1 technical risk: it is gated behind the feasibility spike (`12a`) with an
   explicit escalation path. Do not silently weaken the requirement.
+- **Local config**: `<workspace>/.tower/config.toml` (TOML) holds per-project settings.
+  Currently only `[plugins] disabled = ["<file-stem>"]`, which skips loading the named
+  `*.wasm` (matched on file stem, in every scope) before instantiation. Absent file →
+  defaults; malformed file → startup fails (exit 1). Parser: `adapters/config`.
 
 ## ZPM Project Memory
 

@@ -128,6 +128,7 @@ fn ast_plugin_dir_exposes_native_and_ast_tools() {
         &engine,
         deps_with_rust_source(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     let listed = names(&merged);
@@ -167,6 +168,7 @@ fn ast_get_outline_round_trips_through_merged_registry() {
         &engine,
         deps_with_rust_source(),
         production_isolation_config(),
+        &[],
     );
     let mut merged = merged(registry);
 
@@ -204,6 +206,7 @@ fn malformed_wasm_is_skipped_rest_served() {
         &engine,
         deps_with_rust_source(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     let listed = names(&merged);
@@ -231,6 +234,7 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
         &engine,
         deps_with_rust_source(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     let listed = names(&merged);
@@ -260,6 +264,7 @@ fn missing_plugins_dir_serves_only_native_tools() {
         &engine,
         empty_deps(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     assert_eq!(merged.list().len(), 8, "missing dir → 8 native tools only");
@@ -275,6 +280,7 @@ fn empty_plugins_dir_serves_only_native_tools() {
         &engine,
         empty_deps(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     assert_eq!(merged.list().len(), 8, "empty dir → 8 native tools only");
@@ -295,6 +301,7 @@ fn global_plugin_reachable_with_empty_local_scope() {
         &engine,
         deps_with_rust_source(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     let listed = names(&merged);
@@ -322,6 +329,7 @@ fn local_scope_overrides_global_same_name() {
         &engine,
         deps_with_rust_source(),
         production_isolation_config(),
+        &[],
     );
     let merged = merged(registry);
     let listed = names(&merged);
@@ -341,5 +349,73 @@ fn local_scope_overrides_global_same_name() {
             .count(),
         4,
         "exactly the 4 ast tools, not duplicated: {listed:?}"
+    );
+}
+
+// ── AC: a plugin whose file stem is in `disabled` is never loaded ─────────
+
+#[test]
+fn disabled_plugin_contributes_no_tools() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    drop_wasm(tmp.path(), "hello.wasm", env!("HELLO_PLUGIN_WASM"));
+
+    let engine = IsolationEngine::new().expect("isolation engine");
+    let registry = load_plugins_into_registry(
+        &[tmp.path().to_path_buf()],
+        &engine,
+        empty_deps(),
+        production_isolation_config(),
+        &["hello".to_string()],
+    );
+
+    assert!(
+        registry.declared_tools().is_empty(),
+        "a plugin listed in `disabled` must contribute no tools"
+    );
+}
+
+#[test]
+fn non_disabled_plugin_loads_normally() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    drop_wasm(tmp.path(), "hello.wasm", env!("HELLO_PLUGIN_WASM"));
+
+    let engine = IsolationEngine::new().expect("isolation engine");
+    let registry = load_plugins_into_registry(
+        &[tmp.path().to_path_buf()],
+        &engine,
+        empty_deps(),
+        production_isolation_config(),
+        &[],
+    );
+
+    assert!(
+        !registry.declared_tools().is_empty(),
+        "an enabled plugin must contribute at least one tool"
+    );
+}
+
+/// The disabled filter applies in EVERY scope, not just the local one: a plugin
+/// living in the higher-precedence-ordered (global) scope is still skipped when
+/// its stem is in `disabled`. This guards the spec's "a project can disable a
+/// globally-installed plugin" claim.
+#[test]
+fn disabled_plugin_skipped_in_non_local_scope() {
+    let global = tempfile::tempdir().expect("global tempdir");
+    let local = tempfile::tempdir().expect("local tempdir");
+    // hello lives in the FIRST (global) scope; local is empty.
+    drop_wasm(global.path(), "hello.wasm", env!("HELLO_PLUGIN_WASM"));
+
+    let engine = IsolationEngine::new().expect("isolation engine");
+    let registry = load_plugins_into_registry(
+        &[global.path().to_path_buf(), local.path().to_path_buf()],
+        &engine,
+        empty_deps(),
+        production_isolation_config(),
+        &["hello".to_string()],
+    );
+
+    assert!(
+        registry.declared_tools().is_empty(),
+        "a disabled plugin must be skipped even when it lives in a non-local scope"
     );
 }
