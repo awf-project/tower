@@ -9,6 +9,7 @@
 //! `Command`, `PLUGIN_MAILBOX_CAPACITY`, and `run_worker`; until it lands they
 //! are exercised solely by this module's tests, hence the module-level
 //! `dead_code` allowance.
+// TODO(task-2): remove once the registry consumes Command/run_worker/PLUGIN_MAILBOX_CAPACITY
 #![allow(dead_code)]
 
 use std::sync::mpsc::{Receiver, Sender};
@@ -138,6 +139,7 @@ mod tests {
             &self.manifest
         }
         fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value, PluginHostError> {
+            self.delivered.lock().unwrap().push("<tool>".to_owned());
             Ok(Value::Null)
         }
         fn deliver_hook(
@@ -197,8 +199,13 @@ mod tests {
         let mut plugin = ProbePlugin::new(vec![HookKind::FileChanged], Arc::clone(&delivered));
         plugin.sleep = Duration::from_millis(20);
         let (tx, rx) = sync_channel::<Command>(PLUGIN_MAILBOX_CAPACITY);
-        let handle = std::thread::spawn(move || run_worker(&mut plugin, rx, "probe"));
 
+        // Fill the whole batch BEFORE the worker runs. The priority guarantee
+        // only holds within a single drain; if the worker's blocking `recv`
+        // returned a hook before the tool call was queued, that hook would run
+        // first and the test would flake. With every command already buffered,
+        // the first drain sees the whole batch and the stable sort puts the
+        // single tool call first, deterministically.
         for i in 0..5 {
             tx.send(changed(&format!("f{i}.rs"))).unwrap();
         }
@@ -211,9 +218,20 @@ mod tests {
         .unwrap();
         drop(tx);
 
+        let handle = std::thread::spawn(move || run_worker(&mut plugin, rx, "probe"));
+
         let reply = reply_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(reply, Ok(Value::Null)));
         handle.join().unwrap();
+
+        // The tool call recorded "<tool>" into the same ordered log the hooks
+        // use. It must appear first, with the hooks following in FIFO order.
+        let got = delivered.lock().unwrap().clone();
+        assert_eq!(got.first().map(String::as_str), Some("<tool>"));
+        let want: Vec<String> = std::iter::once("<tool>".to_owned())
+            .chain((0..5).map(|i| format!("f{i}.rs")))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]
