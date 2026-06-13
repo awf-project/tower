@@ -83,9 +83,13 @@ use core_engine::ports::{FileSystemPort, PluginHostPort, StoragePort};
 ///
 /// # Trade-off
 ///
-/// Each `on_file_changed` / `on_file_indexed` call acquires a read lock on the
-/// registry. This is bounded by the per-plugin `Mutex` inside
-/// `PluginHostRegistry` and is safe to do from the watcher thread.
+/// Each `on_file_changed` / `on_file_indexed` call takes the registry `RwLock`
+/// **read** guard and enqueues onto every subscribed plugin's bounded mailbox;
+/// the actual work runs on each plugin's own worker thread. The mailbox send is
+/// a blocking, backpressuring send, but since every hot-path consumer also takes
+/// a read guard, concurrent readers never contend — MCP reads are never starved.
+/// The only thing a full mailbox could block is a future `register()` writer,
+/// which is startup-only. Safe to call from the watcher thread.
 struct SharedPluginHost(Arc<RwLock<PluginHostRegistry>>);
 
 impl PluginHostPort for SharedPluginHost {
