@@ -1314,26 +1314,31 @@ mod tests {
     fn backpressure_preserves_every_event() {
         use std::time::Duration;
 
-        // A plugin slow enough that a 200-event burst cannot drain instantly; sends
-        // backpressure on the bounded mailbox but must never drop.
+        // Send MORE events than the mailbox holds, so the bounded `SyncSender::send`
+        // must block on a full buffer (the actual backpressure path) — yet every
+        // event must still be delivered, never dropped. A per-hook sleep keeps the
+        // worker slower than the producer, guaranteeing the buffer fills.
+        let total = super::PLUGIN_MAILBOX_CAPACITY + 200;
         let plugin = RecordingPlugin::slow(
             "slow",
             vec![HookKind::FileChanged],
-            Duration::from_millis(2),
+            Duration::from_millis(1),
         );
         let log = Arc::clone(&plugin.delivered);
 
         let mut registry = PluginHostRegistry::new();
         registry.register(Box::new(plugin)).unwrap();
 
-        for i in 0..200 {
+        for i in 0..total {
             registry.on_file_changed(file_id(), &file_path(&format!("f{i}.rs")));
         }
 
-        let ok = wait_until(Duration::from_secs(15), || log.lock().unwrap().len() == 200);
+        let ok = wait_until(Duration::from_secs(30), || {
+            log.lock().unwrap().len() == total
+        });
         assert!(
             ok,
-            "expected all 200 events, got {}",
+            "expected all {total} events, got {}",
             log.lock().unwrap().len()
         );
     }
