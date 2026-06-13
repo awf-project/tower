@@ -20,17 +20,25 @@
 //!
 //! # Walker decision
 //!
-//! The [`ignore`] crate (ripgrep's) is used because it handles `.gitignore`
-//! pattern matching, hidden files (dot-prefix), and symlink-loop detection in a
-//! single well-tested crate. The alternative (walkdir + manual gitignore) would
-//! require re-implementing everything the ignore crate already does correctly.
+//! The [`ignore`] crate (ripgrep's) is used because it handles ignore-pattern
+//! matching (same syntax as `.gitignore`, including `!` negation and cascading
+//! per-directory files), hidden files (dot-prefix), and symlink-loop detection
+//! in a single well-tested crate. The alternative (walkdir + a hand-rolled
+//! ignore parser) would re-implement everything the crate already does
+//! correctly.
 //!
-//! # Ignore rules
+//! # Ignore rules — authoritative and independent of git
 //!
-//! - `.git/` is always skipped (implicit in the ignore crate's `WalkBuilder`).
+//! tower's walker is the source of truth for what gets indexed and is
+//! **deliberately independent of git**: `.gitignore`, `.git/info/exclude` and
+//! the global gitignore are **not** consulted. The sole ignore source is a
+//! dedicated [`.towerignore`](TOWERIGNORE_FILE_NAME) file (same syntax as
+//! `.gitignore`, with `!` negation and cascading per-directory files).
+//!
+//! - `.git/` is always skipped (structural, implicit in `WalkBuilder`).
 //! - Hidden files (names starting with `.`) are skipped via `hidden(true)`.
-//! - `.gitignore` patterns are respected via `add_gitignore(true)` (default).
-//! - Caller-supplied extra excludes extend the ignore stack.
+//! - `.towerignore` patterns are honored via `add_custom_ignore_filename`.
+//! - `.gitignore` / git excludes are explicitly disabled.
 //!
 //! # Restart / no-rescan
 //!
@@ -186,6 +194,11 @@ pub(crate) fn scan_with_batch_size(
         });
     }
 
+    // NOTE: the absent-.towerignore warning is intentionally NOT emitted here.
+    // The binary's `run()` warns unconditionally on every boot (the scan's
+    // restart guard above would otherwise silence the warning on subsequent
+    // boots). `collect_workspace_files` (the forced reindex path) keeps its own
+    // warn since it is a separate, on-demand trigger.
     let mut report = ScanReport::default();
 
     // Accumulate (VirtualFile, tokens) pairs; flush every `batch_size` files.
@@ -391,29 +404,80 @@ fn collect_ignore_error_paths(err: &ignore::Error, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Build the shared workspace [`Walk`]er: honours `.gitignore`, skips hidden
-/// files and `.git/`, never follows symlinks (UN2/AC4).
+/// File name of tower's dedicated, git-independent ignore file.
+pub const TOWERIGNORE_FILE_NAME: &str = ".towerignore";
+
+/// Default `.towerignore` content written by `tower init`.
+///
+/// Authoritative and independent of `.gitignore`; same syntax, with `!` to
+/// re-include. Secrets are excluded so they are never fed to the agent/LLM.
+pub const DEFAULT_TOWERIGNORE: &str = "# tower index ignore — authoritative, independent of .gitignore.\n# Same syntax as .gitignore. Negate with ! to re-include a path.\n\n# Build artifacts\ntarget/\nnode_modules/\ndist/\nvendor/\n\n# Secrets (must never be fed to the agent/LLM)\n*.key\n*.pem\n.env\n.env.*\nsecrets/\n";
+
+/// Build the shared workspace [`Walk`]er. tower's walker is authoritative and
+/// **independent of git**: `.gitignore`, `.git/info/exclude` and the global
+/// gitignore are NOT consulted. The sole ignore source is [`.towerignore`]
+/// (`TOWERIGNORE_FILE_NAME`), which uses the same syntax (with `!` negation and
+/// cascading per-directory files). Hidden files and `.git/` are skipped; symlinks
+/// are never followed (UN2/AC4).
 ///
 /// Shared by the initial [`scan`] and by [`collect_workspace_files`] (the forced
 /// `tower_reindex` path) so both walk the tree with identical rules — preventing
-/// the two from drifting apart.
+/// the two from drifting apart. The absent-`.towerignore` warning lives in the
+/// public entry points (not here) so it is emitted exactly once, not per caller.
 fn workspace_walker(root: &Path) -> Walk {
     WalkBuilder::new(root)
         // Do not follow symlinks — prevents loops (UN2/AC4).
         .follow_links(false)
-        // Respect .gitignore files (U1/AC2). `require_git(false)` is essential:
-        // by default the ignore crate only applies .gitignore inside a git
-        // repository, so a non-git workspace (or a temp dir) would silently
-        // index ignored paths. A workspace scanner must honor .gitignore
-        // regardless of whether the tree is a git repo.
+        // `require_git(false)`: apply custom-ignore rules even outside a git repo.
         .require_git(false)
-        .git_ignore(true)
-        // Skip hidden files (names starting with '.') (U1).
+        // Git is NOT consulted — tower honors only .towerignore.
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        // The sole ignore source: .towerignore (same syntax as .gitignore,
+        // with `!` negation and cascading per-directory files).
+        .add_custom_ignore_filename(TOWERIGNORE_FILE_NAME)
+        // Skip hidden files (names starting with '.') (U1). .git/ stays
+        // auto-skipped structurally by the crate.
         .hidden(true)
-        // Respect .git/info/exclude and the global gitignore.
-        .git_exclude(true)
-        .git_global(true)
         .build()
+}
+
+/// Emit a warning if `<root>/.towerignore` does not exist.
+///
+/// Indexing proceeds normally when the file is absent (everything except `.git/`
+/// and hidden files is indexed). Called from the binary's `run()` on every boot
+/// (so the warning is not silenced by the scan restart guard) and from
+/// [`collect_workspace_files`] (the on-demand forced-reindex path). It is NOT
+/// called from [`scan`] or `workspace_walker` to avoid double-warning on a fresh
+/// boot.
+///
+/// Convention: `eprintln!` is the project's warning channel in this crate (no
+/// `tracing` dependency).
+pub fn warn_if_towerignore_absent(root: &Path) {
+    if !root.join(TOWERIGNORE_FILE_NAME).exists() {
+        eprintln!(
+            "tower: warning — no {TOWERIGNORE_FILE_NAME} found at {}; \
+             indexing all non-hidden files. Run `tower init` to scaffold one.",
+            root.display()
+        );
+    }
+}
+
+/// Scaffold a default [`.towerignore`](DEFAULT_TOWERIGNORE) at `root`.
+///
+/// Refuses to overwrite an existing file: returns `Err` if `<root>/.towerignore`
+/// already exists, leaving it untouched. Backs `tower init`.
+pub fn init_towerignore(root: &Path) -> std::io::Result<PathBuf> {
+    let path = root.join(TOWERIGNORE_FILE_NAME);
+    if path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists; refusing to overwrite", path.display()),
+        ));
+    }
+    std::fs::write(&path, DEFAULT_TOWERIGNORE)?;
+    Ok(path)
 }
 
 /// Recursively walk `root` and return `(path, metadata)` for every eligible
@@ -425,6 +489,9 @@ fn workspace_walker(root: &Path) -> Walk {
 /// or edited outside the engine. Errors on individual files (permission, vanished
 /// mid-walk, non-UTF-8 name) skip that file and continue.
 pub(crate) fn collect_workspace_files(root: &Path) -> Vec<(RelativePath, FileMetadata)> {
+    // Warn once if the sole ignore source is absent (see warn_if_towerignore_absent).
+    warn_if_towerignore_absent(root);
+
     let mut out = Vec::new();
     for entry in workspace_walker(root) {
         let Ok(entry) = entry else { continue };

@@ -5,6 +5,12 @@
 //! ```text
 //!  WatchEvent (injectable) ──channel──► EventProcessor::process_event
 //!                                              │
+//!         Filter (parity with scan walker):    │
+//!           tmp-artifact? → drop                │
+//!           is root .towerignore? → rebuild matcher, drop
+//!           hidden (any '.'-component)? → drop  │
+//!           ignored (root .towerignore)? → drop │
+//!                                              │
 //!               ┌───────────────────────────────┼────────────────────────┐
 //!               │ Create  → ws.insert + idx.insert + storage.put         │
 //!               │ Modify  → ws.update (in-place) + delta reindex + put   │
@@ -42,6 +48,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use ignore::Match;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+
+use crate::adapters::fs::scan::TOWERIGNORE_FILE_NAME;
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
@@ -82,6 +92,11 @@ pub struct EventProcessor {
     index: Arc<RwLock<InvertedIndex>>,
     storage: Box<dyn StoragePort + Send>,
     plugin_host: Box<dyn PluginHostPort + Send + Sync>,
+    /// Compiled matcher for the ROOT `.towerignore` (the canonical location
+    /// `tower init` writes). Rebuilt whenever an event touches that file so
+    /// subsequent events honor the latest rules. Falls back to
+    /// [`Gitignore::empty`] when the file is absent or fails to parse.
+    ignore_matcher: Gitignore,
 }
 
 impl std::fmt::Debug for EventProcessor {
@@ -110,12 +125,14 @@ impl EventProcessor {
         storage: Box<dyn StoragePort + Send>,
         plugin_host: Box<dyn PluginHostPort + Send + Sync>,
     ) -> Self {
+        let ignore_matcher = build_ignore_matcher(&root);
         Self {
             root,
             workspace,
             index,
             storage,
             plugin_host,
+            ignore_matcher,
         }
     }
 
@@ -149,6 +166,18 @@ impl EventProcessor {
 
         // UN2/AC5: never index shadow-file temp artifacts as real user files.
         if is_tmp_artifact(&rel_path) {
+            return Ok(());
+        }
+
+        // An event on the root .towerignore rebuilds the matcher so subsequent
+        // events honor the new rules. The file itself is hidden — never indexed.
+        if Self::is_root_towerignore(&rel_path) {
+            self.rebuild_ignore_matcher();
+            return Ok(());
+        }
+
+        // Parity with the scan walker: skip hidden paths and .towerignore matches.
+        if self.is_excluded(&rel_path) {
             return Ok(());
         }
 
@@ -227,6 +256,20 @@ impl EventProcessor {
             return Ok(());
         }
 
+        // An event on the root .towerignore rebuilds the matcher so subsequent
+        // events honor the new rules. The file itself is hidden — never indexed.
+        if Self::is_root_towerignore(&rel_path) {
+            self.rebuild_ignore_matcher();
+            return Ok(());
+        }
+
+        // Parity with the scan walker: a path that is hidden or now matches an
+        // ignore rule must not be indexed. If it was previously tracked (e.g. a
+        // later .towerignore edit now covers it), remove it instead of updating.
+        if self.is_excluded(&rel_path) {
+            return self.handle_delete(abs_path);
+        }
+
         let metadata = read_metadata(&abs_path);
         let new_tokens = tokenize(rel_path.as_str());
 
@@ -279,6 +322,14 @@ impl EventProcessor {
         let Some(rel_path) = self.to_relative(&abs_path) else {
             return Ok(());
         };
+
+        // Deleting the root .towerignore rebuilds the matcher (it now matches
+        // nothing). The file is hidden, so it was never tracked — nothing to
+        // remove from the VFS.
+        if Self::is_root_towerignore(&rel_path) {
+            self.rebuild_ignore_matcher();
+            return Ok(());
+        }
 
         // ── Write lock ────────────────────────────────────────────────────────
         // `rel_path` is cloned before the lock is taken so it is available for
@@ -342,6 +393,13 @@ impl EventProcessor {
         let from_rel = self.to_relative(&from);
         let to_rel = self.to_relative(&to);
 
+        // If the source is the root .towerignore, its rules are moving away —
+        // rebuild the matcher from disk so subsequent events stop honoring the
+        // removed file. Destination handling below still applies to `to`.
+        if from_rel.as_ref().is_some_and(Self::is_root_towerignore) {
+            self.rebuild_ignore_matcher();
+        }
+
         // If the destination is outside the root, fall back to a plain delete.
         let Some(to_rel_path) = to_rel else {
             if from_rel.is_some() {
@@ -353,6 +411,26 @@ impl EventProcessor {
         // UN2/AC5: if the destination is a tmp artifact, never insert it into
         // the VFS. Treat it as a delete of the source (the real file moved away).
         if is_tmp_artifact(&to_rel_path) {
+            if from_rel.is_some() {
+                return self.handle_delete(from);
+            }
+            return Ok(());
+        }
+
+        // If the destination is the root .towerignore, rebuild the matcher and
+        // treat the source as moved away (delete it if it was tracked). The
+        // .towerignore file itself is hidden and never indexed.
+        if Self::is_root_towerignore(&to_rel_path) {
+            self.rebuild_ignore_matcher();
+            if from_rel.is_some() {
+                return self.handle_delete(from);
+            }
+            return Ok(());
+        }
+
+        // Parity with the scan walker: if the destination is hidden or matches an
+        // ignore rule, never insert it. Treat it as a delete of the source.
+        if self.is_excluded(&to_rel_path) {
             if from_rel.is_some() {
                 return self.handle_delete(from);
             }
@@ -431,6 +509,47 @@ impl EventProcessor {
         Ok(())
     }
 
+    // ── Ignore / hidden filtering (parity with the scan walker) ────────────────
+
+    /// `true` if `rel_path` is the root `.towerignore` file itself.
+    fn is_root_towerignore(rel_path: &RelativePath) -> bool {
+        rel_path.as_str() == TOWERIGNORE_FILE_NAME
+    }
+
+    /// Rebuild the ignore matcher from the current on-disk root `.towerignore`.
+    fn rebuild_ignore_matcher(&mut self) {
+        self.ignore_matcher = build_ignore_matcher(&self.root);
+    }
+
+    /// `true` if any component of `rel_path` starts with '.', mirroring the
+    /// scan walker's `hidden(true)`. Covers `.git/`, dotfiles, `.env`/`.env.*`
+    /// and the `.towerignore` file itself.
+    fn is_hidden(rel_path: &RelativePath) -> bool {
+        rel_path
+            .as_str()
+            .split('/')
+            .any(|component| component.starts_with('.'))
+    }
+
+    /// `true` if `rel_path` is excluded by the root `.towerignore`, honoring
+    /// `!` negation. A file under an ignored directory is caught via
+    /// `matched_path_or_any_parents`. Un-anchored globs (e.g. `*.key`) match at
+    /// any depth, which is why a root-only matcher closes the secret hole.
+    fn is_ignored(&self, rel_path: &RelativePath) -> bool {
+        match self
+            .ignore_matcher
+            .matched_path_or_any_parents(rel_path.as_str(), false)
+        {
+            Match::Ignore(_) => true,
+            Match::Whitelist(_) | Match::None => false,
+        }
+    }
+
+    /// `true` if `rel_path` must be excluded from the index (hidden OR ignored).
+    fn is_excluded(&self, rel_path: &RelativePath) -> bool {
+        Self::is_hidden(rel_path) || self.is_ignored(rel_path)
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Convert an absolute path to a workspace-relative [`RelativePath`].
@@ -452,6 +571,22 @@ impl EventProcessor {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a [`Gitignore`] matcher from the ROOT `.towerignore` only — the
+/// canonical location `tower init` writes.
+///
+/// Falls back to [`Gitignore::empty`] when the file is absent or fails to
+/// parse, so a malformed ignore file never causes the watcher to index nothing
+/// (or to panic). Nested per-directory `.towerignore` files are intentionally
+/// out of scope (the un-anchored-glob behaviour makes a root-only matcher
+/// sufficient to close the secret hole).
+fn build_ignore_matcher(root: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(root);
+    // `add` returns Some(err) on a parse error; the file simply contributes no
+    // globs in that case. A None return means success (or absent file).
+    let _ = builder.add(root.join(TOWERIGNORE_FILE_NAME));
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
 
 /// Read filesystem metadata for an absolute path.
 ///
@@ -1066,6 +1201,290 @@ mod tests {
         assert!(
             ws_guard.get_by_path(&tmp_rel).is_none(),
             ".~tmp must never be inserted into the VFS on Rename"
+        );
+    }
+
+    /// Rename whose destination matches an ignore rule must delete the source and
+    /// never insert the destination (rename-into-secret regression net).
+    #[test]
+    fn rename_into_ignored_path_deletes_source_and_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "*.key\n");
+
+        let src = root.join("foo.rs");
+        std::fs::write(&src, b"x").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+        processor
+            .process_event(WatchEvent::Create(src.clone()))
+            .unwrap();
+        assert_eq!(ws.read().unwrap().snapshot().files.len(), 1);
+
+        let dst = root.join("src").join("deploy.key");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        processor
+            .process_event(WatchEvent::Rename { from: src, to: dst })
+            .unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            "rename onto an ignored path must delete the source and not index the destination"
+        );
+    }
+
+    /// Renaming the root `.towerignore` *away* must rebuild the matcher so its
+    /// rules stop applying to subsequent events (source-side rebuild).
+    #[test]
+    fn rename_towerignore_away_rebuilds_matcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "*.key\n");
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+
+        // While .towerignore exists, a *.key is excluded.
+        let key = root.join("a.key");
+        std::fs::write(&key, b"k").unwrap();
+        processor.process_event(WatchEvent::Create(key)).unwrap();
+        assert_eq!(ws.read().unwrap().snapshot().files.len(), 0);
+
+        // Rename .towerignore away (rules move off-tree). The fs change precedes
+        // the event, mirroring the real watcher's ordering.
+        let ti = root.join(".towerignore");
+        let backup = root.join("backup.txt");
+        std::fs::rename(&ti, &backup).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: ti,
+                to: backup,
+            })
+            .unwrap();
+
+        // Now a *.key must be indexed — the matcher was rebuilt to empty.
+        let key2 = root.join("b.key");
+        std::fs::write(&key2, b"k").unwrap();
+        processor.process_event(WatchEvent::Create(key2)).unwrap();
+
+        // backup.txt (the rename destination) + b.key.
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            2,
+            "after .towerignore is renamed away, its rules must no longer apply"
+        );
+    }
+
+    // ── .towerignore / hidden-file filtering (security hole closure) ──────────
+
+    /// Helper: write a `.towerignore` at `root` with the given content.
+    fn write_towerignore(root: &Path, content: &str) {
+        std::fs::write(root.join(".towerignore"), content).unwrap();
+    }
+
+    /// A file under a directory matched by `.towerignore` (via a parent match)
+    /// must NOT be indexed by the watcher.
+    #[test]
+    fn create_secret_under_ignored_dir_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "secrets/\n");
+
+        let secret = root.join("secrets").join("api.key");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, b"TOPSECRET").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root);
+        processor.process_event(WatchEvent::Create(secret)).unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            "secret under an ignored directory must never be indexed"
+        );
+    }
+
+    /// An un-anchored glob like `*.key` must match at ANY depth — proving a
+    /// root-only matcher closes the secret hole without nested .towerignore.
+    #[test]
+    fn create_key_file_at_depth_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "*.key\n");
+
+        let nested = root.join("src").join("deploy.key");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"KEYDATA").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root);
+        processor.process_event(WatchEvent::Create(nested)).unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            "un-anchored *.key must match at depth and never be indexed"
+        );
+    }
+
+    /// Hidden files/dirs (any component starting with '.') must never be indexed,
+    /// matching the scan's `hidden(true)` — covers `.env` and `.git/config`.
+    #[test]
+    fn create_hidden_paths_are_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let dotenv = root.join(".env");
+        std::fs::write(&dotenv, b"SECRET=1").unwrap();
+        let gitcfg = root.join(".git").join("config");
+        std::fs::create_dir_all(gitcfg.parent().unwrap()).unwrap();
+        std::fs::write(&gitcfg, b"[core]").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root);
+        processor.process_event(WatchEvent::Create(dotenv)).unwrap();
+        processor.process_event(WatchEvent::Create(gitcfg)).unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            "hidden paths (.env, .git/config) must never be indexed"
+        );
+    }
+
+    /// Control: a normal, non-ignored, non-hidden file IS indexed.
+    #[test]
+    fn create_normal_file_is_indexed_with_filters_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "secrets/\n*.key\n");
+
+        let main = root.join("src").join("main.rs");
+        std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+        std::fs::write(&main, b"fn main(){}").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root);
+        processor.process_event(WatchEvent::Create(main)).unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            1,
+            "a normal file must still be indexed when filters are active"
+        );
+    }
+
+    /// Negation: `!logs/keep.log` re-includes a file otherwise excluded by
+    /// `logs/*`. The kept file is indexed; the debug log is not.
+    #[test]
+    fn negation_reincludes_whitelisted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "logs/*\n!logs/keep.log\n");
+
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let keep = logs.join("keep.log");
+        let debug = logs.join("debug.log");
+        std::fs::write(&keep, b"keep").unwrap();
+        std::fs::write(&debug, b"debug").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root);
+        processor.process_event(WatchEvent::Create(keep)).unwrap();
+        processor.process_event(WatchEvent::Create(debug)).unwrap();
+
+        let ws_guard = ws.read().unwrap();
+        let snapshot = ws_guard.snapshot();
+        let paths: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.contains(&"logs/keep.log"),
+            "whitelisted logs/keep.log must be indexed; got {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"logs/debug.log"),
+            "logs/debug.log must remain ignored; got {paths:?}"
+        );
+    }
+
+    /// Modify-becomes-ignored: a tracked file that, after a `.towerignore` edit,
+    /// now matches an ignore rule must be REMOVED on the next Modify event.
+    #[test]
+    fn modify_becomes_ignored_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // No matching rule initially.
+        write_towerignore(&root, "# empty\n");
+
+        let file = root.join("a.rs");
+        std::fs::write(&file, b"v1").unwrap();
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+        processor
+            .process_event(WatchEvent::Create(file.clone()))
+            .unwrap();
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            1,
+            "setup: a.rs indexed"
+        );
+
+        // Edit .towerignore so a.rs is now ignored, then rebuild via the
+        // .towerignore event, then Modify a.rs.
+        write_towerignore(&root, "a.rs\n");
+        processor
+            .process_event(WatchEvent::Modify(root.join(".towerignore")))
+            .unwrap();
+        std::fs::write(&file, b"v2").unwrap();
+        processor.process_event(WatchEvent::Modify(file)).unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            "a.rs now matching ignore must be removed on Modify"
+        );
+    }
+
+    /// Matcher rebuild: after a Modify on the root `.towerignore` adds `build/`,
+    /// a subsequent Create under `build/` is NOT indexed.
+    #[test]
+    fn towerignore_event_rebuilds_matcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "# empty\n");
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+
+        // Rewrite .towerignore to add build/ and fire the rebuild event.
+        write_towerignore(&root, "build/\n");
+        processor
+            .process_event(WatchEvent::Modify(root.join(".towerignore")))
+            .unwrap();
+
+        let built = root.join("build").join("x.rs");
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, b"x").unwrap();
+        processor.process_event(WatchEvent::Create(built)).unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            "after rebuild, files under newly-ignored build/ must not be indexed"
+        );
+    }
+
+    /// The `.towerignore` file itself must never be indexed (it is hidden).
+    #[test]
+    fn towerignore_file_itself_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_towerignore(&root, "# empty\n");
+
+        let (mut processor, ws, _idx) = make_processor(root.clone());
+        processor
+            .process_event(WatchEvent::Create(root.join(".towerignore")))
+            .unwrap();
+
+        assert_eq!(
+            ws.read().unwrap().snapshot().files.len(),
+            0,
+            ".towerignore is hidden and must never be indexed"
         );
     }
 

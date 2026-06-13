@@ -51,6 +51,7 @@ use core_engine::adapters::SledStorageAdapter;
 use core_engine::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
+use core_engine::adapters::fs::scan::{init_towerignore, warn_if_towerignore_absent};
 use core_engine::adapters::fs::{RealFs, workspace_scan};
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::{MergedRegistry, serve};
@@ -105,6 +106,15 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(String::as_str) == Some("plugin") {
         if let Err(e) = run_plugin_cli(&args[2..]) {
+            eprintln!("tower: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // `init` may appear after global flags (e.g. `tower --workspace-dir <p> init`),
+    // mirroring how resolve_workspace_root scans all args, so detect it anywhere.
+    if args.iter().skip(1).any(|a| a == "init") {
+        if let Err(e) = run_init() {
             eprintln!("tower: {e}");
             std::process::exit(1);
         }
@@ -170,6 +180,24 @@ fn run_plugin_cli(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Handle `tower init`: scaffold a default `.towerignore` at the workspace root.
+///
+/// tower's file walker is authoritative and independent of git: it consults only
+/// `.towerignore` (never `.gitignore`). `tower init` writes a sensible default.
+/// It refuses to overwrite an existing `.towerignore` (returns an error; the
+/// caller exits non-zero) so user edits are never clobbered.
+fn run_init() -> Result<(), String> {
+    let root = resolve_workspace_root();
+    match init_towerignore(&root) {
+        Ok(path) => {
+            println!("created {}", path.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!("{e}")),
+        Err(e) => Err(format!("failed to write .towerignore: {e}")),
+    }
+}
+
 /// The directory backing a [`Scope`]: local is `<workspace>/.tower/plugins`,
 /// global is the XDG data dir (absent only without HOME/XDG base dirs).
 fn scope_dir(scope: Scope) -> Result<PathBuf, String> {
@@ -192,6 +220,14 @@ fn first_positional(args: &[String]) -> Option<&str> {
 fn run() -> Result<(), String> {
     // ── Step 1: resolve workspace root ────────────────────────────────────────
     let workspace_root = resolve_workspace_root();
+
+    // Warn on EVERY boot when the sole ignore source is absent — not only on a
+    // fresh scan. The scan's restart guard short-circuits subsequent boots, so a
+    // warning placed inside the scan path would never fire after the first run,
+    // hiding the security-relevant "indexing everything" default. Emitted here
+    // (independent of the is_scan_complete guard) so the operator is reminded
+    // each time the watcher will live-index all non-hidden files.
+    warn_if_towerignore_absent(&workspace_root);
 
     // ── Step 2: open sled database ────────────────────────────────────────────
     let db_path = workspace_root.join(".tower").join("db");

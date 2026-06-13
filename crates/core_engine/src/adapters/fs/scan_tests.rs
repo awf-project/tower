@@ -137,17 +137,61 @@ mod scan_integration {
         );
     }
 
-    // ── AC2: .gitignore exclusion ─────────────────────────────────────────────
+    // ── .gitignore is NOT consulted; .towerignore is the sole source ──────────
 
-    /// AC2 — given a .gitignore excluding `target/`, scan must not index any
-    /// file under target/.
+    /// The walker is authoritative and independent of git: a `.gitignore`
+    /// excluding `target/` must NO LONGER exclude it. The file under target/
+    /// gets indexed because `.gitignore` is not consulted.
     #[test]
-    fn ac2_gitignore_excludes_target_directory() {
+    fn gitignore_is_not_consulted() {
         let workspace_dir = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
 
-        // .gitignore says: ignore target/
+        // .gitignore says: ignore target/ — but tower must ignore this file.
         write_file(workspace_dir.path(), ".gitignore", b"target/\n");
+
+        write_file(workspace_dir.path(), "src/main.rs", b"fn main() {}");
+        write_file(
+            workspace_dir.path(),
+            "target/debug/mybin",
+            b"\x7fELF binary",
+        );
+
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+        let report = scan(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        let snapshot = workspace.snapshot();
+        let paths: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+
+        // target/ must now BE indexed — .gitignore is no longer consulted.
+        // (.gitignore itself is hidden, dot-prefixed, so it is not indexed.)
+        assert!(
+            paths.iter().any(|p| p.contains("target")),
+            "target/ must be indexed (.gitignore not consulted); got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("main.rs")),
+            "src/main.rs must be indexed; got {paths:?}"
+        );
+        assert_eq!(
+            report.indexed, 2,
+            "both src/main.rs and target/debug/mybin indexed; {report:?}"
+        );
+    }
+
+    /// A `.towerignore` containing `target/` DOES exclude target/.
+    #[test]
+    fn towerignore_excludes_target_directory() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        write_file(workspace_dir.path(), ".towerignore", b"target/\n");
 
         write_file(workspace_dir.path(), "src/main.rs", b"fn main() {}");
         write_file(
@@ -170,7 +214,8 @@ mod scan_integration {
         )
         .unwrap();
 
-        // Only main.rs should be indexed (.gitignore and target/ skipped).
+        // Only main.rs should be indexed (.towerignore excludes target/;
+        // .towerignore itself is hidden, dot-prefixed).
         assert_eq!(
             report.indexed, 1,
             "only src/main.rs should be indexed; {report:?}"
@@ -186,6 +231,130 @@ mod scan_integration {
         assert!(
             paths.iter().any(|p| p.ends_with("main.rs")),
             "src/main.rs must be indexed; got {paths:?}"
+        );
+    }
+
+    /// `.towerignore` negation works: exclude the contents of `logs/` but
+    /// re-include a specific file with `!`.
+    ///
+    /// Pattern note: the contents are excluded with `logs/*`, not `logs/`.
+    /// Under gitignore semantics (which the `ignore` crate implements) a pattern
+    /// matching a *directory* (`logs/`) prunes the whole subtree, so a later
+    /// `!logs/keep.log` can never re-include a descendant — "it is not possible
+    /// to re-include a file if a parent directory of that file is excluded".
+    /// `logs/*` excludes the entries without pruning the directory, so the
+    /// negation re-includes `keep.log` as intended.
+    #[test]
+    fn towerignore_negation_re_includes_path() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        write_file(
+            workspace_dir.path(),
+            ".towerignore",
+            b"logs/*\n!logs/keep.log\n",
+        );
+
+        write_file(workspace_dir.path(), "src/main.rs", b"fn main() {}");
+        write_file(workspace_dir.path(), "logs/debug.log", b"noise");
+        write_file(workspace_dir.path(), "logs/keep.log", b"important");
+
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+        scan(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        let snapshot = workspace.snapshot();
+        let paths: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+
+        assert!(
+            paths.iter().any(|p| p.ends_with("logs/keep.log")),
+            "logs/keep.log must be re-included by negation; got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with("logs/debug.log")),
+            "logs/debug.log must be excluded; got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("main.rs")),
+            "src/main.rs must be indexed; got {paths:?}"
+        );
+    }
+
+    /// Absent `.towerignore`: indexing proceeds normally — all non-hidden files
+    /// are indexed (everything except .git/ and hidden files). The scan emits a
+    /// one-time warning via eprintln (behaviour asserted: files still indexed).
+    #[test]
+    fn scan_without_towerignore_indexes_all_non_hidden_files() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        // No .towerignore present.
+        write_file(workspace_dir.path(), "src/main.rs", b"fn main() {}");
+        write_file(workspace_dir.path(), "target/debug/mybin", b"binary");
+
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+        let report = scan(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        // Without a .towerignore, nothing is filtered — both files indexed.
+        assert_eq!(
+            report.indexed, 2,
+            "all non-hidden files indexed when no .towerignore; {report:?}"
+        );
+        let snapshot = workspace.snapshot();
+        let paths: Vec<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("main.rs")),
+            "src/main.rs must be indexed; got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("target")),
+            "target/ must be indexed (no .towerignore); got {paths:?}"
+        );
+    }
+
+    // ── tower init scaffold ───────────────────────────────────────────────────
+
+    /// `tower init` writes a default `.towerignore` with the canonical content;
+    /// a second init must NOT overwrite the existing file.
+    #[test]
+    fn init_creates_towerignore_and_does_not_overwrite() {
+        use crate::adapters::fs::scan::{DEFAULT_TOWERIGNORE, init_towerignore};
+
+        let workspace_dir = TempDir::new().unwrap();
+        let path = workspace_dir.path().join(".towerignore");
+
+        // First init creates the file with the default content.
+        init_towerignore(workspace_dir.path()).expect("first init must succeed");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written, DEFAULT_TOWERIGNORE,
+            "first init must write the default content verbatim"
+        );
+
+        // Tamper with the file to prove the second init does not clobber it.
+        std::fs::write(&path, b"user edits\n").unwrap();
+
+        // Second init must refuse to overwrite.
+        let second = init_towerignore(workspace_dir.path());
+        assert!(
+            second.is_err(),
+            "second init must refuse to overwrite existing .towerignore"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, "user edits\n",
+            "second init must not clobber the existing file"
         );
     }
 
