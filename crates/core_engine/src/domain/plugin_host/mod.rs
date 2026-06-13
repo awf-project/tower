@@ -644,6 +644,8 @@ mod tests {
         manifest: PluginManifest,
         /// All (kind, payload) pairs delivered to this instance.
         delivered: Arc<Mutex<Vec<(HookKind, HookPayload)>>>,
+        /// Per-hook artificial delay, to simulate a slow plugin in concurrency tests.
+        sleep: std::time::Duration,
     }
 
     impl RecordingPlugin {
@@ -657,7 +659,15 @@ mod tests {
                     hooks,
                 },
                 delivered: Arc::new(Mutex::new(Vec::new())),
+                sleep: std::time::Duration::ZERO,
             }
+        }
+
+        /// A `RecordingPlugin` that sleeps `sleep` on every `deliver_hook`.
+        fn slow(name: &str, hooks: Vec<HookKind>, sleep: std::time::Duration) -> Self {
+            let mut plugin = Self::new(name, hooks, vec![]);
+            plugin.sleep = sleep;
+            plugin
         }
     }
 
@@ -675,6 +685,9 @@ mod tests {
             kind: HookKind,
             payload: HookPayload,
         ) -> Result<(), PluginHostError> {
+            if self.sleep > std::time::Duration::ZERO {
+                std::thread::sleep(self.sleep);
+            }
             self.delivered.lock().unwrap().push((kind, payload));
             Ok(())
         }
@@ -1292,6 +1305,94 @@ mod tests {
             result_b,
             Value::Text("plugin_b".to_owned()),
             "plugin_b/greet must route to plugin_b"
+        );
+    }
+
+    // ── Concurrency & backpressure (internal mailbox) ─────────────────────────
+
+    #[test]
+    fn backpressure_preserves_every_event() {
+        use std::time::Duration;
+
+        // A plugin slow enough that a 200-event burst cannot drain instantly; sends
+        // backpressure on the bounded mailbox but must never drop.
+        let plugin = RecordingPlugin::slow(
+            "slow",
+            vec![HookKind::FileChanged],
+            Duration::from_millis(2),
+        );
+        let log = Arc::clone(&plugin.delivered);
+
+        let mut registry = PluginHostRegistry::new();
+        registry.register(Box::new(plugin)).unwrap();
+
+        for i in 0..200 {
+            registry.on_file_changed(file_id(), &file_path(&format!("f{i}.rs")));
+        }
+
+        let ok = wait_until(Duration::from_secs(15), || log.lock().unwrap().len() == 200);
+        assert!(
+            ok,
+            "expected all 200 events, got {}",
+            log.lock().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn slow_plugin_does_not_block_a_fast_one() {
+        use std::time::Duration;
+
+        let slow = RecordingPlugin::slow(
+            "slow",
+            vec![HookKind::FileChanged],
+            Duration::from_millis(50),
+        );
+        let fast = RecordingPlugin::new("fast", vec![HookKind::FileChanged], vec![]);
+        let slow_log = Arc::clone(&slow.delivered);
+        let fast_log = Arc::clone(&fast.delivered);
+
+        let mut registry = PluginHostRegistry::new();
+        registry.register(Box::new(slow)).unwrap();
+        registry.register(Box::new(fast)).unwrap();
+
+        for i in 0..10 {
+            registry.on_file_changed(file_id(), &file_path(&format!("f{i}.rs")));
+        }
+
+        // The fast plugin (no sleep) finishes its 10 well before the slow plugin
+        // (10 × 50ms = 500ms) does — proving the workers run concurrently.
+        let fast_done = wait_until(Duration::from_secs(2), || {
+            fast_log.lock().unwrap().len() == 10
+        });
+        assert!(fast_done, "fast plugin was blocked by the slow plugin");
+        assert!(
+            slow_log.lock().unwrap().len() < 10,
+            "slow plugin should still be draining while the fast one is already done"
+        );
+    }
+
+    #[test]
+    fn drop_drains_pending_events_before_join() {
+        use std::time::Duration;
+
+        let plugin = RecordingPlugin::slow(
+            "slow",
+            vec![HookKind::FileChanged],
+            Duration::from_millis(2),
+        );
+        let log = Arc::clone(&plugin.delivered);
+
+        let mut registry = PluginHostRegistry::new();
+        registry.register(Box::new(plugin)).unwrap();
+        for i in 0..20 {
+            registry.on_file_changed(file_id(), &file_path(&format!("f{i}.rs")));
+        }
+        drop(registry); // Drop drops the sender (worker drains) then joins
+
+        assert_eq!(
+            log.lock().unwrap().len(),
+            20,
+            "Drop must drain all pending events before joining"
         );
     }
 }
