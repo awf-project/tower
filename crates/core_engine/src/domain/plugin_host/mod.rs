@@ -540,7 +540,8 @@ impl PluginHostRegistry {
     ///
     /// Delivery is asynchronous: each subscribed plugin's command is enqueued on
     /// its worker mailbox and this method returns without waiting for the handler
-    /// to run. The worker logs and isolates per-plugin errors (UN1).
+    /// to *run* (it does block if the mailbox is full — see Backpressure). The
+    /// worker logs and isolates per-plugin errors (UN1).
     ///
     /// # Backpressure
     ///
@@ -581,6 +582,13 @@ impl Drop for PluginHostRegistry {
     /// The two passes matter: joining before dropping a later handle's sender
     /// would deadlock — a worker only exits once its sender is gone, and the
     /// senders live in handles we have not yet visited.
+    ///
+    /// The join is intentionally **unbounded**: stable `std` has no timed join,
+    /// and termination is already bounded in practice. Once disconnected a worker
+    /// drains-and-discards its queued hooks fast; only the single *in-flight*
+    /// `deliver_hook`/`call_tool` can delay the join, and that call is capped by
+    /// the `IsolatedSandbox` fuel + epoch deadline. A timed join would add a
+    /// completion-channel solely for shutdown — not worth the complexity here.
     fn drop(&mut self) {
         for handle in &mut self.handles {
             handle.tx.take();
