@@ -43,6 +43,16 @@ impl Command {
     }
 }
 
+/// True when a call result carries the permanent quarantine fault, regardless of
+/// which command produced it. Lets both arms flip the worker's fast-path flag on
+/// the first such fault.
+fn is_quarantine_fault<T>(result: &Result<T, PluginHostError>) -> bool {
+    matches!(
+        result,
+        Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined))
+    )
+}
+
 /// Drive one plugin instance until all senders are dropped.
 ///
 /// Blocks on `recv`; once woken, drains every immediately-available command into
@@ -70,20 +80,23 @@ pub(crate) fn run_worker(instance: &mut dyn PluginInstance, rx: Receiver<Command
                     } else {
                         instance.call_tool(&tool, args)
                     };
+                    // A tool call can be the first crossing into quarantine; flip
+                    // the fast-path flag before forwarding so queued hooks drain.
+                    if is_quarantine_fault(&result) {
+                        quarantined = true;
+                    }
                     let _ = reply.send(result); // caller may have dropped the receiver
                 }
                 Command::Hook { kind, payload } => {
                     if quarantined {
                         continue; // drain-and-discard
                     }
-                    if let Err(e) = instance.deliver_hook(kind.clone(), payload) {
+                    let result = instance.deliver_hook(kind.clone(), payload);
+                    if let Err(e) = &result {
                         eprintln!("[tower] plugin '{name}' hook delivery error ({kind:?}): {e}");
-                        if matches!(
-                            e,
-                            PluginHostError::PluginFault(PluginFaultKind::Quarantined)
-                        ) {
-                            quarantined = true;
-                        }
+                    }
+                    if is_quarantine_fault(&result) {
+                        quarantined = true;
                     }
                 }
             }
@@ -109,6 +122,7 @@ mod tests {
         delivered: Arc<Mutex<Vec<String>>>,
         sleep: Duration,
         quarantine_after: Option<usize>,
+        quarantine_on_call: bool,
         seen: Arc<Mutex<usize>>,
     }
 
@@ -125,6 +139,7 @@ mod tests {
                 delivered,
                 sleep: Duration::ZERO,
                 quarantine_after: None,
+                quarantine_on_call: false,
                 seen: Arc::new(Mutex::new(0)),
             }
         }
@@ -135,6 +150,9 @@ mod tests {
             &self.manifest
         }
         fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value, PluginHostError> {
+            if self.quarantine_on_call {
+                return Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined));
+            }
             self.delivered.lock().unwrap().push("<tool>".to_owned());
             Ok(Value::Null)
         }
@@ -245,6 +263,45 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(delivered.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn quarantine_triggered_by_tool_call_discards_subsequent_hooks() {
+        // Pre-load: one tool call that quarantines, then several hooks. Because the
+        // whole batch is enqueued before the worker drains, the stable sort runs the
+        // tool call first; it quarantines the worker, so the following hooks must be
+        // discarded (not recorded).
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let mut plugin = ProbePlugin::new(vec![HookKind::FileChanged], Arc::clone(&delivered));
+        plugin.quarantine_on_call = true;
+        let (tx, rx) = sync_channel::<Command>(PLUGIN_MAILBOX_CAPACITY);
+
+        // Enqueue hooks + one tool call, THEN spawn the worker so the whole batch is
+        // present on the first drain (tool call sorts ahead of the hooks).
+        for i in 0..5 {
+            tx.send(changed(&format!("f{i}.rs"))).unwrap();
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(Command::CallTool {
+            tool: "boom".to_owned(),
+            args: Value::Null,
+            reply: reply_tx,
+        })
+        .unwrap();
+        drop(tx);
+        let handle = std::thread::spawn(move || run_worker(&mut plugin, rx, "probe"));
+
+        // The tool call replies with the Quarantined fault...
+        let reply = reply_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            reply,
+            Err(PluginHostError::PluginFault(PluginFaultKind::Quarantined))
+        ));
+        handle.join().unwrap();
+
+        // ...and because it ran first and quarantined the worker, NONE of the 5 hooks
+        // were recorded.
+        assert_eq!(delivered.lock().unwrap().len(), 0);
     }
 
     #[test]
