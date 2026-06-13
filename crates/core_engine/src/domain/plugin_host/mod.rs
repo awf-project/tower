@@ -47,6 +47,12 @@ use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, ToolDesc, V
 use crate::domain::{FileId, RelativePath};
 use crate::ports::PluginHostPort;
 
+mod worker;
+
+// Consumed by the registry refactor (Task 2); unused until then.
+#[allow(unused_imports)]
+pub(crate) use worker::{Command, PLUGIN_MAILBOX_CAPACITY, run_worker};
+
 // ── PluginId ─────────────────────────────────────────────────────────────────
 
 /// A stable identifier for a registered plugin, derived from its manifest name.
