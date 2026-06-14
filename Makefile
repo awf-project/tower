@@ -19,6 +19,10 @@ WASM_FIXTURES := hello fixture_abi_mismatch fixture_panic_plugin \
                  fixture_loop_plugin fixture_loop_hook_plugin
 FIXTURE_FLAGS := $(addprefix -p ,$(WASM_FIXTURES))
 
+# fmt (pure-Rust guest) — local install artifacts.
+FMT_WASM_RELEASE  := target/$(WASM_TARGET)/release/fmt.wasm
+PLUGINS_DIR_LOCAL := .tower/plugins
+
 .DEFAULT_GOAL := help
 
 ## ---------------------------------------------------------------------------
@@ -63,6 +67,14 @@ wasm-ast-release: ## Build ast for wasm (release; smaller/faster — use for dep
 	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
 	cargo build -p ast --target $(WASM_TARGET) --release
 
+.PHONY: wasm-fmt
+wasm-fmt: ## Build fmt for wasm (debug; pure Rust — no WASI SDK needed)
+	cargo build -p fmt --target $(WASM_TARGET)
+
+.PHONY: wasm-fmt-release
+wasm-fmt-release: ## Build fmt for wasm (release; for deployment)
+	cargo build -p fmt --target $(WASM_TARGET) --release
+
 ## ---------------------------------------------------------------------------
 ## Quality gate (same order as CI — see docs/development.md)
 ## ---------------------------------------------------------------------------
@@ -79,21 +91,26 @@ clippy: ## Lint, warnings as errors (CI step 2)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: test
-test: wasm-fixtures wasm-ast ## Run host-side tests (builds wasm first)
+test: wasm-fixtures wasm-ast wasm-fmt ## Run host-side tests (builds wasm first)
 	cargo test
 
 .PHONY: test-ast
 test-ast: ## Run ast host-side tests
 	cargo test -p ast
 
+.PHONY: test-fmt
+test-fmt: ## Run fmt host-side tests
+	cargo test -p fmt
+
 .PHONY: deny
 deny: ## License & advisory policy
 	cargo deny check
 
 .PHONY: gate
-gate: fmt-check clippy wasm-fixtures wasm-ast ## Full quality gate (fmt+clippy+wasm+tests+deny)
+gate: fmt-check clippy wasm-fixtures wasm-ast wasm-fmt ## Full quality gate (fmt+clippy+wasm+tests+deny)
 	cargo test
 	cargo test -p ast
+	cargo test -p fmt
 	cargo deny check
 
 ## ---------------------------------------------------------------------------
@@ -115,6 +132,12 @@ install: release ## Build release and install tower to $(INSTALL_DIR)
 	@mkdir -p "$(INSTALL_DIR)"
 	install -m 0755 target/release/$(BIN) "$(INSTALL_DIR)/$(BIN)"
 	@echo "installed $(BIN) -> $(INSTALL_DIR)/$(BIN)"
+
+.PHONY: install-fmt
+install-fmt: wasm-fmt-release ## Install fmt (release) into the local scope (<ws>/.tower/plugins) — restart tower to load
+	@mkdir -p "$(PLUGINS_DIR_LOCAL)"
+	install -m 0644 "$(FMT_WASM_RELEASE)" "$(PLUGINS_DIR_LOCAL)/fmt.wasm"
+	@echo "installed fmt -> $(PLUGINS_DIR_LOCAL)/fmt.wasm (restart tower to load)"
 
 ## ---------------------------------------------------------------------------
 ## Housekeeping

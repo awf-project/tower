@@ -25,6 +25,9 @@ testing = []
 # a large random search space (DoD: determinism property test).
 proptest = "1"
 tempfile = "3.27.0"
+# Self-dependency with `testing` feature so integration tests in tests/ can use
+# test-only helpers like `FileId::new_for_testing` (gated on that feature).
+core_engine = { path = ".", features = ["testing"] }
 
 [dependencies]
 # Decision: plugin_sdk provides PluginManifest, ToolDesc, HookKind, HookPayload

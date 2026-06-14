@@ -17,7 +17,7 @@
 //! the SDK still compiles for host-side tests; calling them on the host target
 //! will panic.
 //!
-//! # Current capability surface (spec 11c / stage 4a)
+//! # Current capability surface (spec 11c / stage 4a + spec 13a)
 //!
 //! | Symbol | Description |
 //! |--------|-------------|
@@ -26,6 +26,7 @@
 //! | `ast_store_put` | Persist opaque bytes under an opaque key via AstIndexPort. |
 //! | `ast_store_get` | Retrieve bytes previously stored under an opaque key. |
 //! | `host_list_files` | Enumerate all workspace-relative file paths as a postcard `Vec<String>`. |
+//! | `host_request_format` | Enqueue a format job for a workspace path (spec 13a); returns 0=Accepted, 1=Dropped. |
 //!
 //! # Wire protocol for `host_read_file`
 //!
@@ -117,6 +118,12 @@ pub mod ffi {
         //   Returns: 0=ok (out_len bytes of postcard payload), 2=error.
         //   rc=1 is intentionally unused.
         pub fn host_list_files(out_ptr: *mut *mut u8, out_len_ptr: *mut u32) -> u32;
+        // host_request_format(path_ptr, path_len) -> u32 (spec 13a):
+        //   Enqueue a format job for the workspace-relative path. Returns
+        //   immediately (never blocks the guest). Only executables configured
+        //   in [plugins.formatter.tools.*] are reachable — no arbitrary exec.
+        //   Returns: 0=Accepted, 1=Dropped (queue full or path in backoff).
+        pub fn host_request_format(path_ptr: *const u8, path_len: usize) -> u32;
     }
 
     // ── Host-target stubs ────────────────────────────────────────────────────
@@ -171,6 +178,17 @@ pub mod ffi {
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn host_list_files(_out_ptr: *mut *mut u8, _out_len_ptr: *mut u32) -> u32 {
         panic!("host_list_files is only available inside a wasm32 guest");
+    }
+
+    /// Host stub for `host_request_format` on non-wasm targets.
+    ///
+    /// Returns `1` (Dropped) rather than panicking so host-side unit tests
+    /// for the `fmt` plugin compile and run without a wasm runtime.
+    /// On wasm32 the real capability is used.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn host_request_format(_path_ptr: *const u8, _path_len: usize) -> u32 {
+        1 // Dropped — stub only; no real queue on the host target
     }
 }
 
@@ -467,6 +485,60 @@ pub fn list_files() -> Vec<String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         panic!("host_list_files is only available inside a wasm32 guest");
+    }
+}
+
+/// Result returned by [`request_format`].
+///
+/// On non-wasm targets the stub always returns [`FormatResult::Dropped`]
+/// so host-side unit tests of the `fmt` plugin compile without a wasm runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatResult {
+    /// The host accepted the request; a format job was enqueued.
+    Accepted,
+    /// The format queue was full or the path is in backoff.
+    /// The caller should not retry immediately.
+    Dropped,
+}
+
+/// Request that the host format the given workspace-relative path.
+///
+/// This is the **only** way a wasm guest can trigger external formatting.
+/// The host enqueues a job on the bounded `FormatQueue` and returns immediately
+/// — no formatting happens on the calling thread (U1).
+///
+/// Only executables defined in `[plugins.formatter.tools.*]` are reachable.
+/// An unknown extension is a no-op (not a `Dropped`); `Dropped` only means
+/// the queue was full or the path is in backoff (U9).
+///
+/// On non-wasm targets returns `FormatResult::Dropped` (stub).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Inside a wasm32 plugin:
+/// match plugin_sdk::host::request_format("src/main.rs") {
+///     plugin_sdk::host::FormatResult::Accepted => {}
+///     plugin_sdk::host::FormatResult::Dropped  => {
+///         plugin_sdk::host::log("fmt: queue full, skipping");
+///     }
+/// }
+/// ```
+pub fn request_format(path: &str) -> FormatResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Safety: path is a valid UTF-8 &str; we pass pointer + len correctly.
+        let rc = unsafe { ffi::host_request_format(path.as_ptr(), path.len()) };
+        if rc == 0 {
+            FormatResult::Accepted
+        } else {
+            FormatResult::Dropped
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = path;
+        FormatResult::Dropped // stub — no queue on host target
     }
 }
 

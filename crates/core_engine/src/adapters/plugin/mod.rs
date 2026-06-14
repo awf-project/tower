@@ -13,7 +13,7 @@
 //! # Security boundary
 //!
 //! The capability linker here is the security perimeter for the plugin system.
-//! Only five host functions are exposed to wasm guests (stage 4a):
+//! Only six host functions are exposed to wasm guests (stage 4a):
 //!
 //! | Symbol | Module | Description |
 //! |--------|--------|-------------|
@@ -22,6 +22,7 @@
 //! | `ast_store_put` | `tower_host` | Persist opaque bytes via `AstIndexPort` (opaque key only). |
 //! | `ast_store_get` | `tower_host` | Retrieve opaque bytes via `AstIndexPort` (opaque key only). |
 //! | `host_list_files` | `tower_host` | Enumerate workspace-relative file paths (read-only snapshot). |
+//! | `host_request_format` | `tower_host` | Enqueue a format job; returns 0=Accepted, 1=Dropped (spec 13a). |
 //!
 //! Any other import from `tower_host` causes a link error at instantiation.
 //! WASI (`wasi_snapshot_preview1::*`) is linked but with a zero-capability

@@ -35,6 +35,7 @@
 //! - `LOOP_PLUGIN_WASM`           → `target/wasm32-wasip1/debug/fixture_loop_plugin.wasm`
 //! - `LOOP_HOOK_PLUGIN_WASM`      → `target/wasm32-wasip1/debug/fixture_loop_hook_plugin.wasm`
 //! - `PLUGIN_AST_WASM`            → `target/wasm32-wasip1/debug/ast.wasm`
+//! - `PLUGIN_FMT_WASM`            → `target/wasm32-wasip1/debug/fmt.wasm`
 //!
 //! `FORBIDDEN_HOST_IMPORT_WASM` points at a `.wat` text file. wasmtime's default
 //! features include the `wat` crate, so `Module::from_file` assembles it
@@ -104,6 +105,11 @@ fn main() {
         wasm_profile_dir.join("ast.wasm").display()
     );
 
+    println!(
+        "cargo:rustc-env=PLUGIN_FMT_WASM={}",
+        wasm_profile_dir.join("fmt.wasm").display()
+    );
+
     // Re-run if fixture sources change (for incremental correctness in IDE).
     println!("cargo:rerun-if-changed=../../plugins/hello/src/lib.rs");
     println!("cargo:rerun-if-changed=../../plugins/fixtures/fixture_abi_mismatch/src/lib.rs");
@@ -115,6 +121,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../plugins/ast/src/lib.rs");
     println!("cargo:rerun-if-changed=../../plugins/ast/src/outline.rs");
     println!("cargo:rerun-if-changed=../../plugins/ast/src/symbols.rs");
+    println!("cargo:rerun-if-changed=../../plugins/fmt/src/lib.rs");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_import.wasm");
     println!("cargo:rerun-if-changed=tests/fixtures/forbidden_host_import.wat");
 }

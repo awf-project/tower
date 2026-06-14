@@ -116,6 +116,7 @@ fn merged_registry_with_ast(fs: Arc<InMemoryFs>) -> MergedRegistry {
         ast_index: Arc::new(InMemoryAstIndex::new())
             as Arc<dyn core_engine::ports::AstIndexPort + Send + Sync>,
         workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+        format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
     };
     let instance = WasmtimeHost::load(ast_wasm(), deps).expect("ast must load");
 
@@ -151,6 +152,7 @@ fn ac4_ac5_ast_loads_and_declares_both_tools() {
             fs: Arc::new(InMemoryFs::new()),
             ast_index: Arc::new(InMemoryAstIndex::new()),
             workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+            format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
         },
     )
     .expect("must load");
@@ -812,6 +814,7 @@ fn merged_registry_with_ast_and_workspace(
         ast_index: Arc::new(InMemoryAstIndex::new())
             as Arc<dyn core_engine::ports::AstIndexPort + Send + Sync>,
         workspace,
+        format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
     };
     let instance = WasmtimeHost::load(ast_wasm(), deps).expect("ast must load");
 

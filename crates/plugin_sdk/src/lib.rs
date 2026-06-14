@@ -81,6 +81,8 @@ pub use types::{
     CallRequest, CallResponse, HookEnvelope, HookKind, HookPayload, PluginManifest, SdkError,
     ToolDesc, Value,
 };
+// Format capability result (spec 13a).
+pub use host::FormatResult;
 
 /// The current ABI version of the plugin SDK.
 ///

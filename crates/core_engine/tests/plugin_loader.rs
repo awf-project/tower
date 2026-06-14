@@ -77,6 +77,7 @@ fn empty_deps() -> HostDeps {
         fs: empty_fs(),
         ast_index: empty_ast_index(),
         workspace: empty_workspace(),
+        format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
     }
 }
 
@@ -204,6 +205,7 @@ fn ac2_host_read_file_round_trips_content() {
             fs,
             ast_index: empty_ast_index(),
             workspace: empty_workspace(),
+            format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
         },
     )
     .expect("AC2: hello must load");
@@ -238,6 +240,7 @@ fn ac2_host_read_file_rejects_traversal_path() {
             fs,
             ast_index: empty_ast_index(),
             workspace: empty_workspace(),
+            format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
         },
     )
     .expect("AC2: hello must load");
@@ -266,6 +269,7 @@ fn ac2_host_read_file_rejects_absolute_path() {
             fs,
             ast_index: empty_ast_index(),
             workspace: empty_workspace(),
+            format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
         },
     )
     .expect("AC2: hello must load");
@@ -441,6 +445,7 @@ fn stage3b_index_put_then_get_round_trips_bytes() {
             fs: empty_fs(),
             ast_index: Arc::clone(&ast_index),
             workspace: empty_workspace(),
+            format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
         },
     )
     .expect("stage3b: hello must load");
@@ -549,6 +554,7 @@ fn stage4a_list_files_returns_workspace_paths() {
         fs: empty_fs(),
         ast_index: empty_ast_index(),
         workspace: Arc::clone(&workspace),
+        format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
     };
 
     let mut instance = WasmtimeHost::load(hello_wasm(), deps).expect("stage4a: hello must load");

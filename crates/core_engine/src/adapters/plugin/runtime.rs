@@ -173,7 +173,13 @@ pub fn load_plugins_into_registry(
     config: IsolationConfig,
     disabled: &[String],
 ) -> PluginHostRegistry {
-    let mut registry = PluginHostRegistry::new();
+    // Share the format queue's echo-suppression set with the broadcaster so a
+    // formatter write does not re-trigger plugin_fmt (loop break). A no-op queue
+    // returns None → plain registry.
+    let mut registry = match deps.format_queue.shared_echo_set() {
+        Some(echo_set) => PluginHostRegistry::with_echo_suppression(echo_set),
+        None => PluginHostRegistry::new(),
+    };
 
     // ── Phase 1: scan every scope (in order) and load each *.wasm. ──────────────
     let mut loaded: Vec<(usize, PathBuf, IsolatedSandbox)> = Vec::new();

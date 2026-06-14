@@ -187,22 +187,33 @@ fn run_plugin_cli(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Handle `tower init`: scaffold a default `.towerignore` at the workspace root.
+/// Handle `tower init`: scaffold a default `.towerignore` and `.tower/config.toml`
+/// at the workspace root.
 ///
 /// tower's file walker is authoritative and independent of git: it consults only
 /// `.towerignore` (never `.gitignore`). `tower init` writes a sensible default.
 /// It refuses to overwrite an existing `.towerignore` (returns an error; the
-/// caller exits non-zero) so user edits are never clobbered.
+/// caller exits non-zero) so user edits are never clobbered. The `config.toml`
+/// seed (default formatter tools) is best-effort: a pre-existing config is left
+/// untouched rather than failing the command.
 fn run_init() -> Result<(), String> {
     let root = resolve_workspace_root();
-    match init_towerignore(&root) {
-        Ok(path) => {
-            println!("created {}", path.display());
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!("{e}")),
-        Err(e) => Err(format!("failed to write .towerignore: {e}")),
+    let ignore = match init_towerignore(&root) {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(format!("{e}")),
+        Err(e) => return Err(format!("failed to write .towerignore: {e}")),
+    };
+    println!("created {}", ignore.display());
+
+    // Seed `.tower/config.toml` with default formatter tools. A pre-existing
+    // config is left untouched (note, not an error) so re-running `tower init`
+    // after a `.towerignore` was removed still behaves predictably.
+    match config::init_config(&root) {
+        Ok(path) => println!("created {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => println!("note: {e}"),
+        Err(e) => return Err(format!("failed to write .tower/config.toml: {e}")),
     }
+    Ok(())
 }
 
 /// The directory backing a [`Scope`]: local is `<workspace>/.tower/plugins`,
@@ -355,10 +366,20 @@ fn run() -> Result<(), String> {
         .map_err(|_| "engine state lock poisoned".to_string())?
         .workspace_arc();
 
+    // Real format queue: workers run the external formatters declared in
+    // .tower/config.toml and share their echo-suppression set with the registry
+    // (loop break). No threads start until host_request_format enqueues a job.
+    let format_queue: Arc<dyn core_engine::adapters::formatter::FormatQueuePort + Send + Sync> =
+        Arc::new(core_engine::adapters::formatter::FormatQueue::new(
+            tower_config.plugins.formatter.clone(),
+            workspace_root.clone(),
+        ));
+
     let plugin_deps = HostDeps {
         fs: plugin_fs,
         ast_index: plugin_ast_index,
         workspace: plugin_workspace,
+        format_queue,
     };
 
     let plugin_host = load_plugins_into_registry(

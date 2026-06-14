@@ -44,10 +44,25 @@
 //! others — they run on independent threads.
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, ToolDesc, Value};
 
 use crate::domain::{FileId, RelativePath};
 use crate::ports::PluginHostPort;
+
+/// The manifest name of the formatter plugin.
+///
+/// Echo suppression in `fan_out` compares each handle's `manifest.name`
+/// against this constant. If the plugin is not loaded, no entries are ever
+/// in the echo set for it, so the suppression check fires but is always a
+/// miss — correct degraded behaviour with no special casing needed.
+///
+/// Decision: hardcoded constant in the adapter layer (not a domain concept).
+/// Why: echo suppression is a hosting-policy concern, not a domain rule.
+/// Trade-off: renaming the plugin requires updating this constant.
+const FMT_PLUGIN_NAME: &str = "fmt";
 
 mod worker;
 
@@ -344,6 +359,22 @@ pub struct PluginHostRegistry {
     //      blocks tool calls or other plugins on a shared lock.
     // Trade-off: hook delivery is asynchronous (enqueue-and-return).
     handles: Vec<PluginHandle>,
+
+    /// Echo-suppression set for the `fmt` plugin (spec 13a UN3/AC5).
+    ///
+    /// Paths inserted here by the format worker (after a successful atomic write)
+    /// are suppressed from being re-delivered to the `fmt` plugin as a
+    /// `FileChanged` hook — breaking the format→watch→format loop.
+    ///
+    /// Other subscribers (e.g. `ast`) still receive the event.
+    ///
+    /// The set is a plain `HashMap<String, ()>` behind `Arc<Mutex>` — a
+    /// stdlib-only type with no coupling to the adapter infrastructure.
+    ///
+    /// Perf assumption: the Mutex critical section is sub-microsecond
+    /// (contains check + optional remove), so the watcher thread is not
+    /// meaningfully starved under high file-churn.
+    echo_set: Arc<Mutex<HashMap<String, ()>>>,
 }
 
 impl std::fmt::Debug for PluginHostRegistry {
@@ -358,10 +389,30 @@ impl PluginHostRegistry {
     /// Create an empty registry (no plugins registered).
     ///
     /// Lifecycle hooks are no-ops until at least one plugin is registered (OP1).
+    /// Echo suppression is disabled (no echo set); suitable for tests and
+    /// deployments without the `fmt` plugin.
     #[must_use]
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),
+            echo_set: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create an empty registry pre-wired with an echo-suppression set (spec 13a).
+    ///
+    /// The `echo_set` `Arc` is shared with the `FormatQueue` (adapter layer).
+    /// The format worker inserts path entries into the set before each atomic
+    /// rename; `fan_out` consumes them to suppress re-delivery to `plugin_fmt`.
+    ///
+    /// Call this instead of `new()` when the `fmt` plugin is loaded and a
+    /// `FormatQueue` is active. The two Arcs must point to the same allocation
+    /// so that worker inserts are visible to the broadcaster.
+    #[must_use]
+    pub fn with_echo_suppression(echo_set: Arc<Mutex<HashMap<String, ()>>>) -> Self {
+        Self {
+            handles: Vec::new(),
+            echo_set,
         }
     }
 
@@ -551,19 +602,37 @@ impl PluginHostRegistry {
     /// memory growth. A worker whose mailbox has been closed (thread gone) yields
     /// a send error, which is logged and skipped so the remaining plugins still
     /// receive the hook.
-    fn fan_out(&self, kind: &HookKind, make_payload: impl Fn() -> HookPayload) {
+    fn fan_out(&self, kind: &HookKind, path: &str, make_payload: impl Fn() -> HookPayload) {
         for handle in &self.handles {
-            if handle.manifest.hooks.contains(kind) {
-                let payload = make_payload();
-                if let Err(e) = handle.sender().send(Command::Hook {
-                    kind: kind.clone(),
-                    payload,
-                }) {
-                    eprintln!(
-                        "[tower] plugin '{}' mailbox closed: {e}",
-                        handle.manifest.name
-                    );
+            if !handle.manifest.hooks.contains(kind) {
+                continue;
+            }
+
+            // Echo suppression (spec 13a UN3/AC5): if this is a FileChanged event
+            // for a path the format worker just wrote, skip delivery to `plugin_fmt`
+            // only. All other subscribers still receive it.
+            //
+            // The echo_set entry is consumed on first delivery attempt for `fmt`
+            // (single-flight: at most one outstanding write per path at a time).
+            // Perf: the Mutex critical section is a contains + optional remove
+            // — sub-microsecond; the watcher thread is not starved.
+            if *kind == HookKind::FileChanged && handle.manifest.name == FMT_PLUGIN_NAME {
+                let mut es = self.echo_set.lock().unwrap_or_else(|p| p.into_inner());
+                if es.remove(path).is_some() {
+                    // Entry found and consumed — suppress this delivery.
+                    continue;
                 }
+            }
+
+            let payload = make_payload();
+            if let Err(e) = handle.sender().send(Command::Hook {
+                kind: kind.clone(),
+                payload,
+            }) {
+                eprintln!(
+                    "[tower] plugin '{}' mailbox closed: {e}",
+                    handle.manifest.name
+                );
             }
         }
     }
@@ -608,8 +677,10 @@ impl PluginHostPort for PluginHostRegistry {
     /// Unsubscribed instances and errors are handled per EV2 / UN1 respectively.
     fn on_file_indexed(&self, _id: FileId, path: &RelativePath) {
         let path_str = path.as_str().to_owned();
-        self.fan_out(&HookKind::FileIndexed, || HookPayload::FileIndexed {
-            path: path_str.clone(),
+        self.fan_out(&HookKind::FileIndexed, &path_str, || {
+            HookPayload::FileIndexed {
+                path: path_str.clone(),
+            }
         });
     }
 
@@ -619,8 +690,10 @@ impl PluginHostPort for PluginHostRegistry {
     /// Unsubscribed instances and errors are handled per EV2 / UN1 respectively.
     fn on_file_changed(&self, _id: FileId, path: &RelativePath) {
         let path_str = path.as_str().to_owned();
-        self.fan_out(&HookKind::FileChanged, || HookPayload::FileChanged {
-            path: path_str.clone(),
+        self.fan_out(&HookKind::FileChanged, &path_str, || {
+            HookPayload::FileChanged {
+                path: path_str.clone(),
+            }
         });
     }
 }
@@ -1373,6 +1446,124 @@ mod tests {
         assert!(
             slow_log.lock().unwrap().len() < 10,
             "slow plugin should still be draining while the fast one is already done"
+        );
+    }
+
+    // ── RED-5 → GREEN-5: echo suppression (AC5 / UN3) ─────────────────────────
+
+    /// GREEN-5 / AC5: Given two plugins ('fmt' and 'ast') both subscribed to
+    /// FileChanged, and an echo_set entry for path "src/main.rs", then:
+    /// - 'fmt' does NOT receive the hook (echo-suppressed)
+    /// - 'ast' DOES receive the hook
+    #[test]
+    fn echo_suppression_suppresses_fmt_delivers_others() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let echo_set: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Pre-seed the echo set with the path to suppress.
+        echo_set
+            .lock()
+            .unwrap()
+            .insert("src/main.rs".to_owned(), ());
+
+        // 'fmt' plugin subscribed to FileChanged.
+        let fmt_plugin = RecordingPlugin::new("fmt", vec![HookKind::FileChanged], vec![]);
+        let fmt_delivered = Arc::clone(&fmt_plugin.delivered);
+
+        // 'ast' plugin subscribed to FileChanged.
+        let ast_plugin = RecordingPlugin::new("ast", vec![HookKind::FileChanged], vec![]);
+        let ast_delivered = Arc::clone(&ast_plugin.delivered);
+
+        let mut registry = PluginHostRegistry::with_echo_suppression(Arc::clone(&echo_set));
+        registry
+            .register(Box::new(fmt_plugin))
+            .expect("fmt registration must succeed");
+        registry
+            .register(Box::new(ast_plugin))
+            .expect("ast registration must succeed");
+
+        registry.on_file_changed(file_id(), &file_path("src/main.rs"));
+
+        // 'ast' must receive the hook.
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                ast_delivered.lock().unwrap().len() == 1
+            }),
+            "ast plugin must receive FileChanged"
+        );
+
+        // 'fmt' must NOT receive it (echo-suppressed).
+        // Give a short window then assert still zero.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            fmt_delivered.lock().unwrap().len(),
+            0,
+            "fmt plugin must be echo-suppressed"
+        );
+
+        // The echo_set entry must have been consumed.
+        assert!(
+            echo_set.lock().unwrap().is_empty(),
+            "echo_set entry must be consumed after suppression"
+        );
+    }
+
+    /// GREEN-5: A second FileChanged for the same path (no echo_set entry) is
+    /// delivered normally to 'fmt' (entry was consumed on first delivery).
+    #[test]
+    fn echo_suppression_only_fires_once_per_entry() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let echo_set: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        echo_set
+            .lock()
+            .unwrap()
+            .insert("src/main.rs".to_owned(), ());
+
+        let fmt_plugin = RecordingPlugin::new("fmt", vec![HookKind::FileChanged], vec![]);
+        let fmt_delivered = Arc::clone(&fmt_plugin.delivered);
+
+        let mut registry = PluginHostRegistry::with_echo_suppression(Arc::clone(&echo_set));
+        registry.register(Box::new(fmt_plugin)).unwrap();
+
+        // First fire: suppressed.
+        registry.on_file_changed(file_id(), &file_path("src/main.rs"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            fmt_delivered.lock().unwrap().len(),
+            0,
+            "first event must be suppressed"
+        );
+
+        // Second fire: no echo_set entry → delivered normally.
+        registry.on_file_changed(file_id(), &file_path("src/main.rs"));
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                fmt_delivered.lock().unwrap().len() == 1
+            }),
+            "second event must be delivered to fmt"
+        );
+    }
+
+    /// GREEN-5: echo suppression with registry created via `new()` (no echo set
+    /// pre-seeded) delivers to all plugins normally.
+    #[test]
+    fn no_echo_suppression_without_pre_seeded_entry() {
+        let fmt_plugin = RecordingPlugin::new("fmt", vec![HookKind::FileChanged], vec![]);
+        let fmt_delivered = Arc::clone(&fmt_plugin.delivered);
+
+        let mut registry = PluginHostRegistry::new(); // no echo_set seeded
+        registry.register(Box::new(fmt_plugin)).unwrap();
+
+        registry.on_file_changed(file_id(), &file_path("src/main.rs"));
+
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                fmt_delivered.lock().unwrap().len() == 1
+            }),
+            "fmt must receive hook when echo_set is empty"
         );
     }
 

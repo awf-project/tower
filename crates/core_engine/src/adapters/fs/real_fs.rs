@@ -161,17 +161,12 @@ impl FileSystemPort for RealFs {
             abs.with_file_name(file_name)
         };
 
-        // Step 2: write all bytes and fsync.
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::File::create(&tmp_path).map_err(|e| map_io_error(e, true))?;
-            file.write_all(&bytes).map_err(|e| map_io_error(e, true))?;
-            // Flush kernel buffers to durable storage before the rename (U3).
-            file.sync_all().map_err(|e| map_io_error(e, true))?;
-        }
-
-        // Step 3: atomic rename over the destination (POSIX rename(2)).
-        std::fs::rename(&tmp_path, &abs).map_err(|e| map_io_error(e, true))?;
+        // Steps 2-3: write all bytes, fsync, atomic rename via shared primitive.
+        // Decision: delegate to `durable_write` (adapters::fs::atomic) so the
+        // create+sync+rename sequence is defined in exactly one place.
+        // Trade-off: one extra indirection, but eliminates the risk of the two
+        // sites (RealFs and FormatWorker) diverging on fsync or error handling.
+        super::durable_write(&abs, &tmp_path, &bytes).map_err(|e| map_io_error(e, true))?;
 
         self.known_paths.insert(path);
         Ok(())

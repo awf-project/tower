@@ -281,6 +281,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "core_engine"
 version = "0.1.0"
 dependencies = [
+ "core_engine",
  "crossbeam-channel",
  "directories",
  "ignore",
@@ -696,6 +697,14 @@ name = "fixture_panic_plugin"
 version = "0.1.0"
 dependencies = [
  "plugin_sdk",
+]
+
+[[package]]
+name = "fmt"
+version = "0.1.0"
+dependencies = [
+ "plugin_sdk",
+ "postcard",
 ]
 
 [[package]]

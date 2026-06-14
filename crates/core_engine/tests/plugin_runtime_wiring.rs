@@ -104,6 +104,7 @@ fn empty_deps() -> HostDeps {
         fs: Arc::new(InMemoryFs::new()),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+        format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
     }
 }
 
@@ -112,6 +113,7 @@ fn deps_with_rust_source() -> HostDeps {
         fs: fs_with_rust_source(),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         workspace: Arc::new(RwLock::new(ProjectWorkspace::new())),
+        format_queue: Arc::new(core_engine::adapters::formatter::NoOpFormatQueue),
     }
 }
 

@@ -65,8 +65,11 @@
 //! | other (read context)   | `ReadFailed(reason)`    |
 //! | other (write context)  | `WriteFailed(reason)`   |
 
+mod atomic;
 mod real_fs;
 pub mod scan;
+
+pub(crate) use atomic::durable_write;
 
 pub use real_fs::RealFs;
 pub use scan::{ScanReport, scan as workspace_scan};

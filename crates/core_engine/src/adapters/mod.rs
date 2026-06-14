@@ -14,6 +14,11 @@ pub mod ast_index;
 ///
 /// Infra: reads `std::fs` and parses `toml`. The domain never sees it.
 pub mod config;
+/// Host-side format queue and worker pool (spec 13a).
+///
+/// Outbound capability surface: `host_request_format(path)` → `Accepted | Dropped`.
+/// Adapter only (imports `std::fs`, `std::process::Command`); never imported by domain.
+pub mod formatter;
 pub mod fs;
 pub mod in_memory_ast_index;
 pub mod in_memory_fs;

@@ -7,6 +7,7 @@ members = [
     # Plugins (wasm32-wasip1) live under plugins/, separate from the engine + SDK.
     "plugins/ast",
     "plugins/hello",
+    "plugins/fmt",
     # Test-only fixtures (specs 11c/11d), grouped under plugins/fixtures/ and
     # excluded from default-members so host builds/tests ignore them.
     "plugins/fixtures/fixture_abi_mismatch",

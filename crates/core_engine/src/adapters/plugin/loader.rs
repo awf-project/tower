@@ -41,10 +41,10 @@
 //! filesystem, network, or environment access.
 //!
 //! The **only** real capability surface is our explicit `tower_host` allow-list
-//! (five functions: `host_log`, `host_read_file`, `ast_store_put`,
-//! `ast_store_get`, and `host_list_files`). Any other `tower_host`
-//! import — whether from an attacker or a misconfigured plugin — produces a
-//! `LinkError` at instantiation time (AC3 / UN2).
+//! (six functions: `host_log`, `host_read_file`, `ast_store_put`,
+//! `ast_store_get`, `host_list_files`, and `host_request_format`). Any other
+//! `tower_host` import — whether from an attacker or a misconfigured plugin —
+//! produces a `LinkError` at instantiation time (AC3 / UN2).
 //!
 //! # Unsafe surface
 //!
@@ -68,6 +68,7 @@ use wasmtime_wasi::p1::{WasiP1Ctx, add_to_linker_sync};
 use plugin_sdk::__private::BUFFER_HEADER_LEN;
 use plugin_sdk::{ABI_VERSION, HookKind, HookPayload, PluginManifest, Value};
 
+use crate::adapters::formatter::{EnqueueResult, FormatQueuePort};
 use crate::domain::RelativePath;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{PluginHostError, PluginInstance};
@@ -79,7 +80,7 @@ use super::error::PluginLoadError;
 
 /// All host-side dependencies injected into a plugin sandbox at load time.
 ///
-/// Bundling the three Arcs into one struct avoids positional-arg churn each
+/// Bundling the Arcs into one struct avoids positional-arg churn each
 /// time a new capability is added. The struct is `Clone` so `IsolatedSandbox`
 /// can pass it to recreated instances without re-acquiring from call sites.
 ///
@@ -88,7 +89,7 @@ use super::error::PluginLoadError;
 /// updating every call site signature; the bundle touches the same call sites
 /// once and is stable thereafter.
 /// Trade-off: a thin wrapper type with no behaviour — acceptable because the
-/// alternative is repeating three Arc<dyn Trait> params everywhere.
+/// alternative is repeating four Arc<dyn Trait> params everywhere.
 #[derive(Clone)]
 pub struct HostDeps {
     /// Outbound filesystem port — file-read capability for `host_read_file`.
@@ -105,6 +106,12 @@ pub struct HostDeps {
     /// The same `Arc<RwLock<ProjectWorkspace>>` the MCP handlers and the
     /// watcher use, so `list_files` always reflects live indexing state.
     pub workspace: Arc<RwLock<ProjectWorkspace>>,
+    /// Format queue — non-blocking enqueue for `host_request_format` (spec 13a).
+    ///
+    /// Decision: `Arc<dyn FormatQueuePort + Send + Sync>` so callers that do
+    /// not need formatting can supply `Arc::new(formatter::NoOpFormatQueue)`
+    /// without any thread or config overhead. Existing tests compile unchanged.
+    pub format_queue: Arc<dyn FormatQueuePort + Send + Sync>,
 }
 
 // ── HostState ─────────────────────────────────────────────────────────────────
@@ -141,12 +148,13 @@ pub(crate) struct WasmStoreData {
 ///
 /// # Security boundary
 ///
-/// The linker exposes exactly five host functions under the `"tower_host"` module:
+/// The linker exposes exactly six host functions under the `"tower_host"` module:
 /// - `host_log`: log to host stderr.
 /// - `host_read_file`: read a workspace-relative file via [`FileSystemPort`].
 /// - `ast_store_put`: persist opaque bytes under an opaque key via [`AstIndexPort`].
 /// - `ast_store_get`: retrieve bytes from [`AstIndexPort`] by opaque key.
 /// - `host_list_files`: enumerate all workspace-relative file paths (read-only snapshot).
+/// - `host_request_format`: enqueue a format job; returns 0=Accepted, 1=Dropped (spec 13a).
 ///
 /// Any other `"tower_host"` import causes an instantiation link error (AC3).
 /// WASI syscalls are linked but with a zero-capability context so they are
@@ -338,6 +346,32 @@ impl WasmtimeHost {
             )
             .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
 
+        // ── tower_host::host_request_format ──────────────────────────────────
+        // Allow-listed capability #6: non-blocking format-job enqueue (spec 13a).
+        //
+        // The guest passes a workspace-relative path string. The host decodes
+        // the path, validates it (same security rules as host_read_file), and
+        // enqueues a format job on the bounded FormatQueue — returning immediately.
+        // The guest never calls a raw subprocess or touches the filesystem.
+        //
+        // Signature: (path_ptr: i32, path_len: i32) -> i32
+        // Returns: 0=Accepted, 1=Dropped (queue full or path in backoff)
+        //
+        // Security: only executables configured in [plugins.formatter.tools.*]
+        // are reachable — there is no `host_exec` escape hatch (U9).
+        linker
+            .func_wrap(
+                "tower_host",
+                "host_request_format",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 path_ptr: i32,
+                 path_len: i32|
+                 -> i32 {
+                    host_request_format_impl(&mut caller, path_ptr, path_len)
+                },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
         // ── 5. Instantiate ───────────────────────────────────────────────────
         // A guest importing a function NOT in the above allow-list and NOT in
         // wasi_snapshot_preview1 will fail here with LinkError (AC3 / UN2).
@@ -497,6 +531,19 @@ impl WasmtimeHost {
                  out_ptr: i32,
                  out_len_ptr: i32|
                  -> i32 { host_list_files_impl(&mut caller, out_ptr, out_len_ptr) },
+            )
+            .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
+
+        linker
+            .func_wrap(
+                "tower_host",
+                "host_request_format",
+                |mut caller: wasmtime::Caller<'_, WasmStoreData>,
+                 path_ptr: i32,
+                 path_len: i32|
+                 -> i32 {
+                    host_request_format_impl(&mut caller, path_ptr, path_len)
+                },
             )
             .map_err(|e| PluginLoadError::LinkError(e.to_string()))?;
 
@@ -907,6 +954,55 @@ fn host_list_files_impl(
     }
 
     0 // ok
+}
+
+// ── host_request_format implementation ───────────────────────────────────────
+
+/// Extracted `host_request_format` logic. Decodes the workspace-relative path
+/// from guest memory, validates it (same security rules as `host_read_file`),
+/// and enqueues a format job via the `FormatQueuePort`.
+///
+/// Returns 0=Accepted, 1=Dropped (queue full or path in backoff).
+///
+/// Security: only executables in `[plugins.formatter.tools.*]` are reachable.
+/// The guest cannot supply an arbitrary command — the queue looks up the tool
+/// based on the file extension, and only configured tools execute.
+fn host_request_format_impl(
+    caller: &mut wasmtime::Caller<'_, WasmStoreData>,
+    path_ptr: i32,
+    path_len: i32,
+) -> i32 {
+    let path_ptr = path_ptr as u32 as usize;
+    let path_len = path_len as u32 as usize;
+
+    // Decode the workspace-relative path from guest memory (bounds-checked).
+    let path_str: String = {
+        let mem = match caller.get_export("memory") {
+            Some(wasmtime::Extern::Memory(m)) => m,
+            _ => return 1, // Dropped — no memory export
+        };
+        let data = mem.data(&*caller);
+        let slice = match data.get(path_ptr..path_ptr.saturating_add(path_len)) {
+            Some(s) => s,
+            None => return 1, // Dropped — out of bounds
+        };
+        match std::str::from_utf8(slice) {
+            Ok(s) => s.to_owned(),
+            Err(_) => return 1, // Dropped — invalid UTF-8
+        }
+    };
+
+    // Security: reject dangerous paths (same rules as host_read_file traversal prevention).
+    if path_str.is_empty() || path_str.starts_with('/') || path_str.contains("..") {
+        return 1; // Dropped — rejected path
+    }
+
+    // Clone the format_queue Arc before calling enqueue (borrow discipline).
+    let queue = Arc::clone(&caller.data().host.deps.format_queue);
+    match queue.enqueue(path_str) {
+        EnqueueResult::Accepted => 0,
+        EnqueueResult::Dropped => 1,
+    }
 }
 
 // ── Guest memory helpers ──────────────────────────────────────────────────────
