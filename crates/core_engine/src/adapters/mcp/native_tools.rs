@@ -81,7 +81,7 @@ use crate::domain::virtual_file::FileMetadata;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::inbound::{FileMutationUseCase, SearchUseCase};
-use crate::ports::{FileSystemPort, NoOpPluginHost, StoragePort};
+use crate::ports::{FileSystemPort, NoOpPluginHost, PluginHostPort, StoragePort};
 
 // ── EngineState ───────────────────────────────────────────────────────────────
 
@@ -107,6 +107,11 @@ pub struct EngineState {
     pub index: Arc<RwLock<InvertedIndex>>,
     pub storage: Box<dyn StoragePort + Send + Sync>,
     pub fs: Box<dyn FileSystemPort + Send + Sync>,
+    /// Plugin lifecycle hook receiver. Defaults to a no-op until the real
+    /// plugin host is injected via [`EngineState::set_plugin_host`] (the host
+    /// is built after `EngineState` in `main.rs`). Wired so MCP-driven
+    /// mutations broadcast `on_file_changed` to plugins (e.g. the AST plugin).
+    plugin_host: Arc<dyn PluginHostPort + Send + Sync>,
 }
 
 impl EngineState {
@@ -126,7 +131,17 @@ impl EngineState {
             index: Arc::new(RwLock::new(index)),
             storage,
             fs,
+            plugin_host: Arc::new(NoOpPluginHost),
         }
+    }
+
+    /// Inject the real plugin host after construction.
+    ///
+    /// `EngineState` is built before the plugin registry in `main.rs`, so the
+    /// host cannot be passed to [`EngineState::new`]; it is set here once the
+    /// registry exists. Until then the no-op host is used.
+    pub fn set_plugin_host(&mut self, host: Arc<dyn PluginHostPort + Send + Sync>) {
+        self.plugin_host = host;
     }
 
     /// Return a clone of the workspace `Arc` for sharing with the watcher.
@@ -459,12 +474,13 @@ fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
     let mut idx = idx_arc.write().map_err(lock_poisoned)?;
     // Split the &mut EngineState into independent field borrows.
     let engine = &mut *guard;
+    let plugin_host = Arc::clone(&engine.plugin_host);
     let mut svc = FileMutationService::new(
         engine.fs.as_mut(),
         &mut ws,
         &mut idx,
         engine.storage.as_mut(),
-        &NoOpPluginHost,
+        plugin_host.as_ref(),
     );
     svc.create_file(rel, bytes)
         .map_err(domain_err_to_tool_error)?;
@@ -485,12 +501,13 @@ fn call_create_directory(
     let mut ws = ws_arc.write().map_err(lock_poisoned)?;
     let mut idx = idx_arc.write().map_err(lock_poisoned)?;
     let engine = &mut *guard;
+    let plugin_host = Arc::clone(&engine.plugin_host);
     let mut svc = FileMutationService::new(
         engine.fs.as_mut(),
         &mut ws,
         &mut idx,
         engine.storage.as_mut(),
-        &NoOpPluginHost,
+        plugin_host.as_ref(),
     );
     svc.create_directory(rel)
         .map_err(domain_err_to_tool_error)?;
@@ -508,12 +525,13 @@ fn call_delete_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
     let mut ws = ws_arc.write().map_err(lock_poisoned)?;
     let mut idx = idx_arc.write().map_err(lock_poisoned)?;
     let engine = &mut *guard;
+    let plugin_host = Arc::clone(&engine.plugin_host);
     let mut svc = FileMutationService::new(
         engine.fs.as_mut(),
         &mut ws,
         &mut idx,
         engine.storage.as_mut(),
-        &NoOpPluginHost,
+        plugin_host.as_ref(),
     );
     svc.delete_file(&rel).map_err(domain_err_to_tool_error)?;
 
@@ -530,12 +548,13 @@ fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<
     let mut ws = ws_arc.write().map_err(lock_poisoned)?;
     let mut idx = idx_arc.write().map_err(lock_poisoned)?;
     let engine = &mut *guard;
+    let plugin_host = Arc::clone(&engine.plugin_host);
     let mut svc = FileMutationService::new(
         engine.fs.as_mut(),
         &mut ws,
         &mut idx,
         engine.storage.as_mut(),
-        &NoOpPluginHost,
+        plugin_host.as_ref(),
     );
     let report = svc
         .global_replace(target, replacement)
@@ -791,6 +810,64 @@ mod tests {
 
     fn make_registry(state: Arc<RwLock<EngineState>>) -> NativeToolRegistry {
         NativeToolRegistry::new(state)
+    }
+
+    // ── Plugin-host notification on MCP mutations ─────────────────────────────
+
+    use std::sync::Mutex;
+
+    use crate::domain::FileId;
+    use crate::ports::PluginHostPort;
+
+    /// Records every `on_file_changed` / `on_file_indexed` call so tests can
+    /// assert the domain broadcast actually reached the host.
+    #[derive(Default)]
+    struct RecordingPluginHost {
+        changed: Mutex<Vec<String>>,
+        indexed: Mutex<Vec<String>>,
+    }
+
+    impl PluginHostPort for RecordingPluginHost {
+        fn on_file_indexed(&self, _id: FileId, path: &RelativePath) {
+            self.indexed.lock().unwrap().push(path.as_str().to_owned());
+        }
+        fn on_file_changed(&self, _id: FileId, path: &RelativePath) {
+            self.changed.lock().unwrap().push(path.as_str().to_owned());
+        }
+    }
+
+    /// MCP create/delete must notify the real plugin host (regression: handlers
+    /// previously hard-coded `&NoOpPluginHost`, so the AST plugin never learned
+    /// of MCP-driven mutations and its cross-file index went stale).
+    #[test]
+    fn mcp_mutations_notify_plugin_host() {
+        let state = empty_state();
+        let host = Arc::new(RecordingPluginHost::default());
+        state
+            .write()
+            .unwrap()
+            .set_plugin_host(Arc::clone(&host) as Arc<dyn PluginHostPort + Send + Sync>);
+
+        let mut reg = make_registry(Arc::clone(&state));
+
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/lib.rs", "content": "fn lib() {}" }),
+        )
+        .expect("create_file should succeed");
+
+        reg.call("tower_delete_file", json!({ "path": "src/lib.rs" }))
+            .expect("delete_file should succeed");
+
+        let changed = host.changed.lock().unwrap();
+        assert!(
+            changed.iter().any(|p| p == "src/lib.rs"),
+            "create_file must broadcast on_file_changed; got {changed:?}"
+        );
+        assert!(
+            changed.iter().filter(|p| *p == "src/lib.rs").count() >= 2,
+            "delete_file must also broadcast on_file_changed; got {changed:?}"
+        );
     }
 
     // ── AC1: tools/list shows 8 tools with schemas ────────────────────────────

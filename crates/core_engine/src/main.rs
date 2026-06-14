@@ -367,6 +367,19 @@ fn run() -> Result<(), String> {
     }
     let plugin_host = Arc::new(RwLock::new(plugin_host));
 
+    // Inject the real plugin host into the shared EngineState so MCP-driven
+    // mutations (create/delete/global_replace) broadcast `on_file_changed` to
+    // plugins. Without this the handlers would keep their no-op default and the
+    // AST plugin's cross-file index would go stale after MCP deletes/edits.
+    {
+        let host: Arc<dyn PluginHostPort + Send + Sync> =
+            Arc::new(SharedPluginHost(Arc::clone(&plugin_host)));
+        state
+            .write()
+            .map_err(|_| "engine state lock poisoned".to_string())?
+            .set_plugin_host(host);
+    }
+
     // ── Step 5b: spawn the filesystem watcher for live VFS sync ───────────────
     //
     // Decision: always-on, fail-fast at startup.
