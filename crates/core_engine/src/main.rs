@@ -52,7 +52,9 @@ use core_engine::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
 use core_engine::adapters::config;
-use core_engine::adapters::fs::scan::{init_towerignore, warn_if_towerignore_absent};
+use core_engine::adapters::fs::scan::{
+    init_towerignore, reconcile_pruned, warn_if_towerignore_absent,
+};
 use core_engine::adapters::fs::{RealFs, workspace_scan};
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::{MergedRegistry, serve};
@@ -268,6 +270,18 @@ fn run() -> Result<(), String> {
         }
         (fresh_workspace, fresh_index)
     } else {
+        // Scan already complete: sled state is loaded verbatim. Reconcile it
+        // against the current filesystem so ghosts (files deleted while down,
+        // entries indexed before an ignore rule existed, foreign temp files)
+        // are pruned. Path-only walk — does not read or re-hash file contents,
+        // keeping startup cheap on large repos. Additions are out of scope (the
+        // live watcher and tower_reindex cover offline-added files).
+        let mut workspace = workspace;
+        let mut index = index;
+        let pruned = reconcile_pruned(&workspace_root, &mut workspace, &mut index, &mut storage);
+        if pruned > 0 {
+            eprintln!("tower: reconciled index — {pruned} stale entries pruned");
+        }
         (workspace, index)
     };
 

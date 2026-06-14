@@ -900,4 +900,113 @@ mod scan_integration {
             "no .git paths must appear; got {paths:?}"
         );
     }
+
+    // ── Startup reconciliation: prune stale entries against the filesystem ────
+
+    use crate::adapters::fs::scan::reconcile_pruned;
+    use crate::domain::token::tokenize;
+    use crate::domain::virtual_file::{FileMetadata, RelativePath};
+
+    /// Insert `rel` into workspace + index + storage exactly the way `scan`
+    /// does (FileId from the workspace, path tokens into the index, record into
+    /// storage), so the triple is internally consistent before reconciliation.
+    fn track(
+        rel: &str,
+        workspace: &mut ProjectWorkspace,
+        index: &mut InvertedIndex,
+        storage: &mut dyn StoragePort,
+    ) {
+        let path = RelativePath::new(rel);
+        let id = workspace
+            .insert(path.clone(), FileMetadata::default())
+            .unwrap();
+        index.insert(id, &tokenize(path.as_str()));
+        let file = workspace.get(id).unwrap().clone();
+        storage.put(file).unwrap();
+    }
+
+    /// A tracked path that no longer exists on disk must be pruned; real files
+    /// on disk must survive. Path-only — no content read.
+    #[test]
+    fn reconcile_prunes_path_missing_on_disk() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        write_file(workspace_dir.path(), "keep_a.rs", b"fn a() {}");
+        write_file(workspace_dir.path(), "keep_b.rs", b"fn b() {}");
+
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+
+        track("keep_a.rs", &mut workspace, &mut index, &mut storage);
+        track("keep_b.rs", &mut workspace, &mut index, &mut storage);
+        // Ghost: never written to disk — a stale entry surviving from a prior boot.
+        let ghost = "gone.rs.tmp.999.dead";
+        track(ghost, &mut workspace, &mut index, &mut storage);
+
+        let pruned = reconcile_pruned(
+            workspace_dir.path(),
+            &mut workspace,
+            &mut index,
+            &mut storage,
+        );
+
+        assert_eq!(pruned, 1, "exactly the ghost entry must be pruned");
+        assert!(
+            workspace.get_by_path(&RelativePath::new(ghost)).is_none(),
+            "ghost path must be removed from the workspace"
+        );
+        assert!(
+            workspace
+                .get_by_path(&RelativePath::new("keep_a.rs"))
+                .is_some(),
+            "keep_a.rs must still be tracked"
+        );
+        assert!(
+            workspace
+                .get_by_path(&RelativePath::new("keep_b.rs"))
+                .is_some(),
+            "keep_b.rs must still be tracked"
+        );
+    }
+
+    /// A tracked path that EXISTS on disk but is now matched by `.towerignore`
+    /// must be pruned (proves now-ignored paths are dropped, not only
+    /// missing-on-disk ones).
+    #[test]
+    fn reconcile_prunes_now_ignored_path() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+
+        write_file(workspace_dir.path(), ".towerignore", b"ignored/\n");
+        write_file(workspace_dir.path(), "keep.rs", b"fn keep() {}");
+        write_file(workspace_dir.path(), "ignored/x.rs", b"fn x() {}");
+
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+
+        track("keep.rs", &mut workspace, &mut index, &mut storage);
+        // Tracked from a prior boot before the ignore rule existed; file is on
+        // disk but now matches .towerignore, so the walk no longer surfaces it.
+        track("ignored/x.rs", &mut workspace, &mut index, &mut storage);
+
+        let pruned = reconcile_pruned(
+            workspace_dir.path(),
+            &mut workspace,
+            &mut index,
+            &mut storage,
+        );
+
+        assert_eq!(pruned, 1, "the now-ignored entry must be pruned");
+        assert!(
+            workspace
+                .get_by_path(&RelativePath::new("ignored/x.rs"))
+                .is_none(),
+            "now-ignored path must be removed from the workspace"
+        );
+        assert!(
+            workspace
+                .get_by_path(&RelativePath::new("keep.rs"))
+                .is_some(),
+            "keep.rs must still be tracked"
+        );
+    }
 }

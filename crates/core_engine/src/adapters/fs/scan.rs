@@ -522,6 +522,75 @@ pub(crate) fn collect_workspace_files(root: &Path) -> Vec<(RelativePath, FileMet
     out
 }
 
+/// Prune index/workspace/storage entries whose path is no longer present in a
+/// fresh ignore-aware walk of `root` (deleted on disk, or now matched by
+/// `.towerignore`/hidden rules). Path-only — does NOT read file contents.
+///
+/// Returns the number of stale entries pruned. Additions are out of scope:
+/// the live watcher and `tower_reindex` handle newly-discovered files.
+///
+/// Run once at startup on a normal (scan-already-complete) boot, where the
+/// persisted sled state is loaded verbatim and would otherwise carry ghosts:
+/// files deleted while the server was down, entries indexed by an older code
+/// version before an ignore rule existed, or foreign temp files indexed live
+/// then deleted offline. Without this, `find_file` returns paths that no longer
+/// resolve on disk.
+pub fn reconcile_pruned(
+    root: &Path,
+    workspace: &mut ProjectWorkspace,
+    index: &mut InvertedIndex,
+    storage: &mut dyn StoragePort,
+) -> usize {
+    // 1. Build the set of currently-valid workspace-relative paths via the same
+    //    walker the scan uses (ignore + hidden aware). Path-only: no read/hash.
+    //    Mirrors collect_workspace_files's walk + path derivation, minus the
+    //    metadata read.
+    let mut present: std::collections::HashSet<RelativePath> = std::collections::HashSet::new();
+    for entry in workspace_walker(root) {
+        let Ok(entry) = entry else { continue };
+        match entry.file_type() {
+            Some(ft) if ft.is_file() => {}
+            _ => continue,
+        }
+        let abs_path = entry.path();
+        let Ok(rel_os) = abs_path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(rel_raw) = rel_os.to_str() else {
+            continue;
+        };
+        #[cfg(not(windows))]
+        let rel_str: &str = rel_raw;
+        #[cfg(windows)]
+        let rel_str: String = rel_raw.replace('\\', "/");
+        let rel_path = RelativePath::new(rel_str);
+        // Never treat shadow-file temp artifacts as valid (UN2/AC5) — leaving
+        // them out means any tracked tmp artifact is pruned too.
+        if is_tmp_artifact(&rel_path) {
+            continue;
+        }
+        present.insert(rel_path);
+    }
+
+    // 2. Drop every tracked path absent from that set. Snapshot first so we are
+    //    not iterating the workspace while mutating it.
+    let mut pruned = 0;
+    for file in workspace.snapshot().files {
+        if present.contains(&file.path) {
+            continue;
+        }
+        let id = file.id;
+        // remove() can only fail on a stale handle, which the snapshot rules out.
+        let _ = workspace.remove(id);
+        index.remove(id);
+        // A missing storage record is benign — the in-memory state is now the
+        // source of truth and the next persist will reconcile sled.
+        let _ = storage.delete(id);
+        pruned += 1;
+    }
+    pruned
+}
+
 /// Build a [`FileMetadata`] for the file at `abs_path`, reading its content to
 /// compute a SHA-256 [`ContentHash`].
 ///
