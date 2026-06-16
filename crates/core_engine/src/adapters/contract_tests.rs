@@ -11,8 +11,13 @@
 //! - GREEN: `InMemoryStorage` / `InMemoryFs` implementations made them pass.
 //! - REFACTOR: the contract logic lives in the macros, not duplicated here.
 
-use crate::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage, XdgAstIndexAdapter};
-use crate::{ast_index_contract_tests, filesystem_contract_tests, storage_contract_tests};
+use crate::adapters::{
+    InMemoryAstIndex, InMemoryCodeIntel, InMemoryFs, InMemoryStorage, XdgAstIndexAdapter,
+};
+use crate::{
+    ast_index_contract_tests, codeintel_contract_tests, filesystem_contract_tests,
+    navigation_contract_tests, storage_contract_tests,
+};
 
 // Expand StoragePort contract suite against InMemoryStorage.
 storage_contract_tests!(InMemoryStorage::new);
@@ -55,6 +60,20 @@ mod xdg {
 
     ast_index_contract_tests!(make_xdg_adapter);
 }
+
+// ── CodeIntelligencePort contract suite ──────────────────────────────────────
+//
+// The in-memory fake must pass the same behavioural contract as any future
+// real adapter (e.g. LspClientAdapter for rust-analyzer).
+
+// In-memory fake — zero I/O, deterministic marker-based analyzer.
+codeintel_contract_tests!(InMemoryCodeIntel::new, "//!ERR");
+
+// ── NavigationPort contract suite ─────────────────────────────────────────────
+//
+// The in-memory fake must pass the shared navigation contract; the real
+// LspClientAdapter is exercised by the gated rust-analyzer e2e suite.
+navigation_contract_tests!(InMemoryCodeIntel::new);
 
 // ── Dependency-inversion proof (spec U1 / EV1 / TDD step 5) ─────────────────
 //

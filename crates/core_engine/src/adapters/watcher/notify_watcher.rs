@@ -43,8 +43,9 @@
 //! This ensures the watcher thread never brings down the host process.
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -55,7 +56,7 @@ use super::error::WatcherError;
 use super::event_processor::{EventProcessor, WatchEvent};
 use crate::domain::index::InvertedIndex;
 use crate::domain::workspace::ProjectWorkspace;
-use crate::ports::{PluginHostPort, StoragePort};
+use crate::ports::{DocumentSyncPort, NoOpDocumentSync, PluginHostPort, StoragePort};
 
 /// Capacity of the internal event channel.
 ///
@@ -135,6 +136,33 @@ impl NotifyWatcherAdapter {
         storage: Box<dyn StoragePort + Send>,
         plugin_host: Box<dyn PluginHostPort + Send + Sync>,
     ) -> Result<Self, WatcherError> {
+        Self::with_document_sync(
+            root,
+            workspace,
+            index,
+            storage,
+            plugin_host,
+            Arc::new(NoOpDocumentSync),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+    }
+
+    /// Like [`new`](Self::new), but also wires a language-server document-sync
+    /// sink and the shared formatter `echo_set` into the `EventProcessor`
+    /// (spec 14b live sync + echo suppression).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`new`](Self::new).
+    pub fn with_document_sync(
+        root: PathBuf,
+        workspace: Arc<RwLock<ProjectWorkspace>>,
+        index: Arc<RwLock<InvertedIndex>>,
+        storage: Box<dyn StoragePort + Send>,
+        plugin_host: Box<dyn PluginHostPort + Send + Sync>,
+        doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
+        echo_set: Arc<Mutex<HashMap<String, ()>>>,
+    ) -> Result<Self, WatcherError> {
         let (tx, rx): (Sender<WatchEvent>, Receiver<WatchEvent>) = bounded(CHANNEL_CAPACITY);
 
         // Clone root for the notify callback closure.
@@ -180,7 +208,8 @@ impl NotifyWatcherAdapter {
             .map_err(WatcherError::NotifyWatch)?;
 
         // Spawn the worker thread that drains the channel.
-        let mut processor = EventProcessor::new(root, workspace, index, storage, plugin_host);
+        let mut processor = EventProcessor::new(root, workspace, index, storage, plugin_host)
+            .with_document_sync(doc_sync, echo_set);
 
         // Decision: wrap each per-event invocation in `catch_unwind` so that a
         // panicking `PluginHostPort` or `StoragePort` implementation does not

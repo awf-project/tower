@@ -18,6 +18,7 @@
 //! error terminates the loop.
 
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -25,6 +26,29 @@ use super::{
     registry::ToolRegistry,
     types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId, ToolError},
 };
+use crate::adapters::lsp::pool::DiagnosticsReader;
+use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
+
+// ── Push types ────────────────────────────────────────────────────────────────
+
+/// A server-initiated diagnostics push event, bridged from the LSP layer via
+/// `mpsc`. Carries only the URI and generation — no MCP-specific types, so this
+/// struct lives cleanly in the transport without importing LSP internals.
+pub struct PushEvent {
+    pub uri: String,
+    pub generation: u64,
+}
+
+/// Unified serve-loop message: a stdin line or a push event.
+///
+/// Decision 3: one blocking `mpsc` channel replaces the `try_recv + sleep(1ms)`
+/// poll. A stdin-reader thread sends `Stdin` lines; the push forwarder sends
+/// `Push` events. The serve loop does a blocking `recv()` — no polling, no
+/// latency floor. `Disconnected` → clean shutdown.
+enum ServeInput {
+    Stdin(String),
+    Push(PushEvent),
+}
 
 // ── MCP capability shape (spec EV1/AC1) ──────────────────────────────────────
 
@@ -159,9 +183,11 @@ fn dispatch(req: JsonRpcRequest, registry: &mut dyn ToolRegistry) -> DispatchRes
 
 /// Handle the `initialize` handshake (spec EV1/AC1).
 ///
-/// Responds with server info and capability advertisement. We advertise the
-/// `tools` capability (listing and calling). Additional capabilities (e.g.
-/// `resources`, `prompts`) are omitted until needed.
+/// Responds with server info and capability advertisement. We advertise:
+/// - `tools`: listing and calling tools.
+/// - `resources`: subscribable resource endpoints (`subscribe: true`).
+///   `listChanged: false` — the resource list is static (one entry per
+///   configured language) and never changes at runtime.
 fn handle_initialize(id: Option<RequestId>) -> DispatchResult {
     let result = json!({
         "protocolVersion": "2024-11-05",
@@ -170,7 +196,8 @@ fn handle_initialize(id: Option<RequestId>) -> DispatchResult {
             "version": SERVER_VERSION,
         },
         "capabilities": {
-            "tools": {}
+            "tools": {},
+            "resources": { "subscribe": true, "listChanged": false }
         }
     });
     DispatchResult::Ok(JsonRpcResponse::ok(id, result))
@@ -223,6 +250,252 @@ fn handle_tools_call(
         }
         Err(ToolError::ResourceNotFound(msg)) => {
             DispatchResult::Err(JsonRpcError::resource_not_found(id, &msg))
+        }
+    }
+}
+
+// ── Resource handlers ─────────────────────────────────────────────────────────
+
+/// Handle `resources/list` — one static entry per configured language.
+///
+/// URIs come from `SessionPool::resource_uris()`, computed at construction time.
+/// No pool lock is needed here; the list never changes at runtime.
+fn handle_resources_list(id: Option<RequestId>, resource_uris: &[String]) -> DispatchResult {
+    let resources: Vec<Value> = resource_uris
+        .iter()
+        .map(|uri| {
+            json!({
+                "uri": uri,
+                "name": uri,
+                "mimeType": "application/json"
+            })
+        })
+        .collect();
+    DispatchResult::Ok(JsonRpcResponse::ok(id, json!({ "resources": resources })))
+}
+
+/// Handle `resources/read` — fully wired via `DiagnosticsReader` (Decision 4).
+///
+/// Returns the last published diagnostics from `SharedState` without re-running
+/// `check`. Never spawns; never blocks. Always returns `supported: true`; an
+/// unconfigured extension simply yields an empty `diagnostics` list.
+fn handle_resources_read(
+    id: Option<RequestId>,
+    params: Value,
+    diag_reader: &Arc<dyn DiagnosticsReader>,
+) -> DispatchResult {
+    let uri = match params.get("uri").and_then(Value::as_str) {
+        Some(u) => u.to_owned(),
+        None => {
+            return DispatchResult::Err(JsonRpcError::invalid_params(id, "missing uri"));
+        }
+    };
+    let diags = diag_reader.diagnostics_for(&uri);
+    // Diagnostic does not derive Serialize; use the same manual serialiser as
+    // lsp_tools::diagnostic_to_json so the JSON shapes are identical (AC6).
+    let diags_json: Vec<Value> = diags
+        .iter()
+        .map(crate::adapters::mcp::lsp_tools::diagnostic_to_json)
+        .collect();
+    DispatchResult::Ok(JsonRpcResponse::ok(
+        id,
+        json!({
+            "supported": true,
+            "uri": uri,
+            "diagnostics": diags_json
+        }),
+    ))
+}
+
+/// Handle `resources/subscribe` — record the URI in the subscription registry.
+fn handle_resources_subscribe(
+    id: Option<RequestId>,
+    params: Value,
+    sub_reg: &Arc<Mutex<SubscriptionRegistry>>,
+) -> DispatchResult {
+    if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+        sub_reg
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .subscribe(uri);
+    }
+    DispatchResult::Ok(JsonRpcResponse::ok(id, Value::Null))
+}
+
+/// Handle `resources/unsubscribe` — remove the URI from the subscription registry.
+fn handle_resources_unsubscribe(
+    id: Option<RequestId>,
+    params: Value,
+    sub_reg: &Arc<Mutex<SubscriptionRegistry>>,
+) -> DispatchResult {
+    if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+        sub_reg
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unsubscribe(uri);
+    }
+    DispatchResult::Ok(JsonRpcResponse::ok(id, Value::Null))
+}
+
+/// Dispatch a request handling both tool and resource methods.
+fn dispatch_with_resources(
+    req: JsonRpcRequest,
+    registry: &mut dyn ToolRegistry,
+    sub_reg: &Arc<Mutex<SubscriptionRegistry>>,
+    diag_reader: &Arc<dyn DiagnosticsReader>,
+    resource_uris: &[String],
+) -> DispatchResult {
+    let id = req.id.clone();
+
+    if id.is_none() {
+        return DispatchResult::Notification;
+    }
+
+    if req.jsonrpc != "2.0" {
+        return DispatchResult::Err(JsonRpcError::invalid_request(id, "jsonrpc must be \"2.0\""));
+    }
+
+    match req.method.as_str() {
+        "initialize" => handle_initialize(id),
+        "tools/list" => handle_tools_list(id, registry),
+        "tools/call" => handle_tools_call(id, req.params, registry),
+        "resources/list" => handle_resources_list(id, resource_uris),
+        "resources/read" => handle_resources_read(id, req.params, diag_reader),
+        "resources/subscribe" => handle_resources_subscribe(id, req.params, sub_reg),
+        "resources/unsubscribe" => handle_resources_unsubscribe(id, req.params, sub_reg),
+        _ => DispatchResult::Err(JsonRpcError::method_not_found(id, &req.method)),
+    }
+}
+
+/// Serve MCP requests from `reader` and emit push notifications from `push_rx`.
+///
+/// # Architecture (Decision 3 — unified blocking channel)
+///
+/// A dedicated stdin-reader thread sends `ServeInput::Stdin(line)` lines.
+/// The push forwarder (in `main.rs`) sends `ServeInput::Push(event)` via
+/// `push_rx`. The serve loop does a blocking `recv()` on a single `mpsc`
+/// channel — no `try_recv`, no `sleep`, no latency floor.
+/// `Disconnected` → clean shutdown.
+///
+/// # resources/read (Decision 4)
+///
+/// Fully wired via `diag_reader`: returns the last published diagnostics
+/// from `SharedState` without re-running `check`. No "supported:false" stub.
+///
+/// # Parameters
+///
+/// - `push_rx`: when `None`, push events are never sent (stdin-only mode).
+/// - `resource_uris`: static list from `SessionPool::resource_uris()`.
+///
+/// # Errors
+///
+/// Returns `Err` only on an unrecoverable write I/O error.
+pub fn serve_with_push<R, W>(
+    reader: R,
+    mut writer: W,
+    registry: &mut dyn ToolRegistry,
+    sub_reg: Arc<Mutex<SubscriptionRegistry>>,
+    diag_reader: Arc<dyn DiagnosticsReader>,
+    resource_uris: Vec<String>,
+    push_rx: Option<std::sync::mpsc::Receiver<PushEvent>>,
+) -> Result<(), std::io::Error>
+where
+    R: std::io::Read + Send + 'static,
+    W: Write,
+{
+    use std::sync::mpsc;
+
+    // Unified channel: carries both stdin lines and push events.
+    let (serve_tx, serve_rx) = mpsc::channel::<ServeInput>();
+
+    // Stdin-reader thread: wraps `reader` in a BufReader and sends each line.
+    let stdin_tx = serve_tx.clone();
+    std::thread::spawn(move || {
+        let buf = std::io::BufReader::new(reader);
+        for line_result in buf.lines() {
+            match line_result {
+                Ok(line) => {
+                    if stdin_tx.send(ServeInput::Stdin(line)).is_err() {
+                        break; // Serve loop exited.
+                    }
+                }
+                Err(_) => break, // EOF or I/O error.
+            }
+        }
+        // Dropping stdin_tx contributes to disconnecting serve_rx.
+    });
+
+    // Push forwarder thread: bridges `push_rx` → `ServeInput::Push`.
+    // Only spawned when push_rx is Some (production). Skipped in tests that
+    // supply only stdin events.
+    if let Some(push_rx) = push_rx {
+        let push_tx = serve_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = push_rx.recv() {
+                if push_tx.send(ServeInput::Push(event)).is_err() {
+                    break; // Serve loop exited.
+                }
+            }
+            // Dropping push_tx contributes to disconnecting serve_rx.
+        });
+    }
+
+    // Drop the original sender so serve_rx disconnects when both feeder
+    // threads exit (no dangling sender keeping the channel alive).
+    drop(serve_tx);
+
+    // Serve loop: blocking recv — wakes immediately on any input.
+    loop {
+        match serve_rx.recv() {
+            Ok(ServeInput::Stdin(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<JsonRpcRequest>(&line) {
+                    Err(_) => {
+                        let id = try_extract_id(&line);
+                        write_error(&mut writer, JsonRpcError::parse_error(id))?;
+                    }
+                    Ok(req) => {
+                        let response = dispatch_with_resources(
+                            req,
+                            registry,
+                            &sub_reg,
+                            &diag_reader,
+                            &resource_uris,
+                        );
+                        match response {
+                            DispatchResult::Ok(r) => write_response(&mut writer, r)?,
+                            DispatchResult::Err(e) => write_error(&mut writer, e)?,
+                            DispatchResult::Notification => {}
+                        }
+                    }
+                }
+            }
+            Ok(ServeInput::Push(event)) => {
+                let subscribed = sub_reg
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_subscribed(&event.uri);
+                if subscribed {
+                    let notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/resources/updated",
+                        "params": {
+                            "uri": event.uri,
+                            "generation": event.generation
+                        }
+                    });
+                    let line = serde_json::to_string(&notification).unwrap_or_default();
+                    writeln!(writer, "{line}")?;
+                    writer.flush()?;
+                }
+            }
+            // Both feeder threads exited: EOF from client + push channel closed.
+            Err(mpsc::RecvError) => {
+                sub_reg.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                return Ok(());
+            }
         }
     }
 }

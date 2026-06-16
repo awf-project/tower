@@ -45,8 +45,9 @@
 //! *outside* the lock so readers are not blocked during disk I/O.
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -57,7 +58,7 @@ use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, RelativePath, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
-use crate::ports::{PluginHostPort, StoragePort};
+use crate::ports::{DocumentSyncPort, NoOpDocumentSync, PluginHostPort, StoragePort};
 
 // ── WatchEvent ────────────────────────────────────────────────────────────────
 
@@ -97,6 +98,14 @@ pub struct EventProcessor {
     /// subsequent events honor the latest rules. Falls back to
     /// [`Gitignore::empty`] when the file is absent or fails to parse.
     ignore_matcher: Gitignore,
+    /// Mirrors file lifecycle into a resident language server (spec 14b).
+    /// Defaults to [`NoOpDocumentSync`] when no server is configured.
+    doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
+    /// Formatter echo set (spec 13a), shared with the `FormatQueue`. A Modify
+    /// for a path present here is a formatter-induced write — its `didChange`
+    /// is suppressed (UN1) so formatter output never churns diagnostics. Peeked
+    /// here (non-consuming); the plugin host's `fan_out` consumes the entry.
+    echo_set: Arc<Mutex<HashMap<String, ()>>>,
 }
 
 impl std::fmt::Debug for EventProcessor {
@@ -133,7 +142,33 @@ impl EventProcessor {
             storage,
             plugin_host,
             ignore_matcher,
+            doc_sync: Arc::new(NoOpDocumentSync),
+            echo_set: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach a language-server document-sync sink and the shared formatter
+    /// `echo_set` (spec 14b). Without this the processor uses
+    /// [`NoOpDocumentSync`] and an empty echo set (no LSP sync, no suppression).
+    #[must_use]
+    pub fn with_document_sync(
+        mut self,
+        doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
+        echo_set: Arc<Mutex<HashMap<String, ()>>>,
+    ) -> Self {
+        self.doc_sync = doc_sync;
+        self.echo_set = echo_set;
+        self
+    }
+
+    /// `true` if `rel_path` is a formatter-induced write (present in the shared
+    /// `echo_set`). Non-consuming peek — the plugin host's `fan_out` removes the
+    /// entry, so the peek must precede that call within an event (UN1 ordering).
+    fn is_echo(&self, rel_path: &RelativePath) -> bool {
+        self.echo_set
+            .lock()
+            .map(|set| set.contains_key(rel_path.as_str()))
+            .unwrap_or(false)
     }
 
     /// Process a single [`WatchEvent`].
@@ -230,6 +265,13 @@ impl EventProcessor {
         // Storage I/O outside the lock (ST1).
         self.storage.put(virtual_file)?;
 
+        // 14b EV1: open the document on the resident language server.
+        if self.doc_sync.serves(&rel_path)
+            && let Ok(text) = std::fs::read_to_string(&abs_path)
+        {
+            self.doc_sync.document_opened(&rel_path, &text);
+        }
+
         // OP1: broadcast after VFS update commits.
         self.plugin_host.on_file_changed(file_id, &rel_path);
 
@@ -311,6 +353,16 @@ impl EventProcessor {
         // Storage I/O outside the lock (ST1).
         self.storage.put(virtual_file)?;
 
+        // 14b EV1/UN1: push the new content to the language server, unless this
+        // Modify is a formatter echo. The echo peek precedes `on_file_changed`
+        // below (which consumes the echo entry for the fmt plugin).
+        if self.doc_sync.serves(&rel_path)
+            && !self.is_echo(&rel_path)
+            && let Ok(text) = std::fs::read_to_string(&abs_path)
+        {
+            self.doc_sync.document_changed(&rel_path, &text);
+        }
+
         // OP1: broadcast after VFS update commits.
         self.plugin_host.on_file_changed(file_id, &rel_path);
 
@@ -365,6 +417,11 @@ impl EventProcessor {
         match self.storage.delete(file_id) {
             Ok(()) | Err(crate::ports::PortError::NotFound) => {}
             Err(e) => return Err(e),
+        }
+
+        // 14b: close the document on the language server.
+        if self.doc_sync.serves(&rel_path) {
+            self.doc_sync.document_closed(&rel_path);
         }
 
         // OP1: broadcast after VFS update commits (delete side).
@@ -499,6 +556,17 @@ impl EventProcessor {
             }
         }
         self.storage.put(to_virtual_file)?;
+
+        // 14b: mirror the rename to the language server — close the source
+        // document, open the destination with its current content.
+        if self.doc_sync.serves(&from_rel_path) {
+            self.doc_sync.document_closed(&from_rel_path);
+        }
+        if self.doc_sync.serves(&to_rel_path)
+            && let Ok(text) = std::fs::read_to_string(&to)
+        {
+            self.doc_sync.document_opened(&to_rel_path, &text);
+        }
 
         // OP1: broadcast after VFS update commits.
         if let Some(fid) = from_file_id {
@@ -667,6 +735,141 @@ mod tests {
         Arc<RwLock<InvertedIndex>>,
     ) {
         make_processor_with_plugin(root, Box::new(NoOpPluginHost))
+    }
+
+    // ── Document-sync wiring (spec 14b) ───────────────────────────────────────
+
+    /// Records the document-sync calls the processor makes, for `.rs` files only.
+    #[derive(Default)]
+    struct RecordingDocSync {
+        opened: Mutex<Vec<String>>,
+        changed: Mutex<Vec<String>>,
+        closed: Mutex<Vec<String>>,
+    }
+
+    impl DocumentSyncPort for RecordingDocSync {
+        fn serves(&self, path: &RelativePath) -> bool {
+            path.as_str().ends_with(".rs")
+        }
+        fn document_opened(&self, path: &RelativePath, _text: &str) {
+            self.opened.lock().unwrap().push(path.as_str().to_owned());
+        }
+        fn document_changed(&self, path: &RelativePath, _text: &str) {
+            self.changed.lock().unwrap().push(path.as_str().to_owned());
+        }
+        fn document_closed(&self, path: &RelativePath) {
+            self.closed.lock().unwrap().push(path.as_str().to_owned());
+        }
+    }
+
+    fn make_processor_with_doc_sync(
+        root: PathBuf,
+        doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
+        echo_set: Arc<Mutex<HashMap<String, ()>>>,
+    ) -> EventProcessor {
+        let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+        let index = Arc::new(RwLock::new(InvertedIndex::new()));
+        let storage = Box::new(InMemoryStorage::new());
+        EventProcessor::new(root, workspace, index, storage, Box::new(NoOpPluginHost))
+            .with_document_sync(doc_sync, echo_set)
+    }
+
+    /// EV1: a Create for a served file opens it on the server.
+    #[test]
+    fn create_opens_document_on_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("a.rs");
+        std::fs::write(&file, b"fn main() {}").unwrap();
+
+        let sync = Arc::new(RecordingDocSync::default());
+        let echo: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = make_processor_with_doc_sync(root, Arc::clone(&sync) as _, echo);
+
+        proc.process_event(WatchEvent::Create(file)).unwrap();
+
+        assert_eq!(*sync.opened.lock().unwrap(), vec!["a.rs".to_owned()]);
+    }
+
+    /// AC5/EV1: a Modify pushes the new content as `didChange`.
+    #[test]
+    fn modify_syncs_changed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("a.rs");
+        std::fs::write(&file, b"fn main() {}").unwrap();
+
+        let sync = Arc::new(RecordingDocSync::default());
+        let echo: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = make_processor_with_doc_sync(root, Arc::clone(&sync) as _, echo);
+
+        proc.process_event(WatchEvent::Create(file.clone()))
+            .unwrap();
+        std::fs::write(&file, b"fn main() { let x = 1; }").unwrap();
+        proc.process_event(WatchEvent::Modify(file)).unwrap();
+
+        assert_eq!(*sync.changed.lock().unwrap(), vec!["a.rs".to_owned()]);
+    }
+
+    /// AC6/UN1: a Modify for a path in the echo set is NOT synced.
+    #[test]
+    fn echo_suppressed_modify_does_not_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("a.rs");
+        std::fs::write(&file, b"fn main() {}").unwrap();
+
+        let sync = Arc::new(RecordingDocSync::default());
+        let echo: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        echo.lock().unwrap().insert("a.rs".to_owned(), ());
+        let mut proc = make_processor_with_doc_sync(root, Arc::clone(&sync) as _, echo);
+
+        proc.process_event(WatchEvent::Create(file.clone()))
+            .unwrap();
+        std::fs::write(&file, b"fn main() { let x = 1; }").unwrap();
+        proc.process_event(WatchEvent::Modify(file)).unwrap();
+
+        assert!(
+            sync.changed.lock().unwrap().is_empty(),
+            "formatter-echo Modify must not emit a document_changed"
+        );
+    }
+
+    /// A Delete closes the document on the server.
+    #[test]
+    fn delete_closes_document_on_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("a.rs");
+        std::fs::write(&file, b"fn main() {}").unwrap();
+
+        let sync = Arc::new(RecordingDocSync::default());
+        let echo: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = make_processor_with_doc_sync(root, Arc::clone(&sync) as _, echo);
+
+        proc.process_event(WatchEvent::Create(file.clone()))
+            .unwrap();
+        std::fs::remove_file(&file).unwrap();
+        proc.process_event(WatchEvent::Delete(file)).unwrap();
+
+        assert_eq!(*sync.closed.lock().unwrap(), vec!["a.rs".to_owned()]);
+    }
+
+    /// A file whose language has no server (`serves` false) is never synced.
+    #[test]
+    fn unserved_extension_is_not_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file = root.join("notes.md");
+        std::fs::write(&file, b"# hi").unwrap();
+
+        let sync = Arc::new(RecordingDocSync::default());
+        let echo: Arc<Mutex<HashMap<String, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut proc = make_processor_with_doc_sync(root, Arc::clone(&sync) as _, echo);
+
+        proc.process_event(WatchEvent::Create(file)).unwrap();
+
+        assert!(sync.opened.lock().unwrap().is_empty());
     }
 
     /// Helper: run `find_file` against current index+workspace state.

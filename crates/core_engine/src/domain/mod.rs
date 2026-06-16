@@ -4,6 +4,7 @@
 //! in this module is constructible and assertable without any I/O (spec U3/AC4).
 #![forbid(unsafe_code)]
 
+pub mod code_intel;
 pub mod error;
 pub mod file_id;
 pub mod grep;

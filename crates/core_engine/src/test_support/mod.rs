@@ -435,6 +435,151 @@ macro_rules! filesystem_contract_tests {
     };
 }
 
+/// Expand the behavioural contract suite for any [`CodeIntelligencePort`].
+///
+/// The `$make` expression must return a fresh implementor. The `$marker`
+/// expression is a `&str` line the backend treats as an error (the fake uses
+/// `"//!ERR"`; the rust-analyzer adapter uses a real broken statement). This
+/// lets one suite cover both a synthetic fake and a real language server.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// codeintel_contract_tests!(|| InMemoryCodeIntel::new(), "//!ERR");
+/// ```
+#[macro_export]
+macro_rules! codeintel_contract_tests {
+    ($make:expr_2021, $marker:expr_2021) => {
+        mod codeintel_contract {
+            use super::*;
+            use $crate::domain::RelativePath;
+            use $crate::domain::code_intel::Severity;
+            use $crate::ports::{CodeIntelError, CodeIntelligencePort};
+
+            #[test]
+            fn clean_text_returns_no_diagnostics() {
+                let ci = ($make)();
+                let diags = ci
+                    .check(&RelativePath::new("src/clean.rs"), "fn main() {}")
+                    .expect("clean .rs must be supported");
+                assert!(
+                    diags.is_empty(),
+                    "clean text must report no diagnostics; got {diags:?}"
+                );
+            }
+
+            #[test]
+            fn broken_text_returns_an_error_diagnostic() {
+                let ci = ($make)();
+                let text = format!("fn main() {{ {} }}", $marker);
+                let diags = ci
+                    .check(&RelativePath::new("src/broken.rs"), &text)
+                    .expect("broken .rs must be supported");
+                assert!(
+                    diags.iter().any(|d| d.severity == Severity::Error),
+                    "broken text must yield at least one Error diagnostic; got {diags:?}"
+                );
+            }
+
+            #[test]
+            fn unsupported_extension_returns_unsupported() {
+                let ci = ($make)();
+                let err = ci
+                    .check(&RelativePath::new("notes.txt"), "anything")
+                    .expect_err("a .txt file must have no backend");
+                assert_eq!(err, CodeIntelError::Unsupported);
+            }
+
+            #[test]
+            fn re_check_is_idempotent() {
+                let ci = ($make)();
+                let text = format!("fn main() {{ {} }}", $marker);
+                let first = ci.check(&RelativePath::new("src/x.rs"), &text).unwrap();
+                let second = ci.check(&RelativePath::new("src/x.rs"), &text).unwrap();
+                assert_eq!(first, second, "re-check of identical input must match");
+            }
+        }
+    };
+}
+
+/// Expand the shared behavioural contract for any [`NavigationPort`].
+///
+/// The `$make` expression must return a fresh implementor. The contract covers
+/// the guarantees the in-memory fake and a real language server share without a
+/// running backend: every method on an unsupported extension returns
+/// `Unsupported`, and a supported file never errors on a well-formed query.
+/// Backend-specific results (cross-file definition, etc.) are covered by the
+/// gated e2e suite, not here.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// navigation_contract_tests!(|| InMemoryCodeIntel::new());
+/// ```
+#[macro_export]
+macro_rules! navigation_contract_tests {
+    ($make:expr_2021) => {
+        mod navigation_contract {
+            use super::*;
+            use $crate::domain::RelativePath;
+            use $crate::domain::code_intel::Position;
+            use $crate::ports::{CodeIntelError, NavigationPort};
+
+            const ORIGIN: Position = Position {
+                line: 0,
+                character: 0,
+            };
+
+            #[test]
+            fn definition_on_unsupported_extension_is_unsupported() {
+                let nav = ($make)();
+                assert_eq!(
+                    nav.definition(&RelativePath::new("notes.txt"), "x", ORIGIN)
+                        .unwrap_err(),
+                    CodeIntelError::Unsupported
+                );
+            }
+
+            #[test]
+            fn references_on_unsupported_extension_is_unsupported() {
+                let nav = ($make)();
+                assert_eq!(
+                    nav.references(&RelativePath::new("notes.txt"), "x", ORIGIN)
+                        .unwrap_err(),
+                    CodeIntelError::Unsupported
+                );
+            }
+
+            #[test]
+            fn hover_on_unsupported_extension_is_unsupported() {
+                let nav = ($make)();
+                assert_eq!(
+                    nav.hover(&RelativePath::new("notes.txt"), "x", ORIGIN)
+                        .unwrap_err(),
+                    CodeIntelError::Unsupported
+                );
+            }
+
+            #[test]
+            fn document_symbols_on_unsupported_extension_is_unsupported() {
+                let nav = ($make)();
+                assert_eq!(
+                    nav.document_symbols(&RelativePath::new("notes.txt"), "x")
+                        .unwrap_err(),
+                    CodeIntelError::Unsupported
+                );
+            }
+
+            #[test]
+            fn definition_on_supported_file_does_not_error() {
+                let nav = ($make)();
+                nav.definition(&RelativePath::new("src/a.rs"), "fn main() {}", ORIGIN)
+                    .expect("a supported file must not error on a well-formed query");
+            }
+        }
+    };
+}
+
 /// Expand a full behavioural contract test suite for any [`AstIndexPort`]
 /// implementation.
 ///

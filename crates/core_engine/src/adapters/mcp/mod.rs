@@ -33,8 +33,12 @@
 //! The transport only calls `registry.list()` and `registry.call()` — it never
 //! needs to be changed when new tools arrive.
 
+pub mod chain_registry;
+pub mod lsp_support;
+pub mod lsp_tools;
 pub mod merged_registry;
 pub mod native_tools;
+pub mod nav_tools;
 pub mod registry;
 pub mod transport;
 pub mod types;
@@ -42,7 +46,7 @@ pub mod types;
 pub use merged_registry::MergedRegistry;
 pub use native_tools::{EngineState, NativeToolRegistry};
 pub use registry::ToolRegistry;
-pub use transport::serve;
+pub use transport::{PushEvent, serve, serve_with_push};
 pub use types::{ToolDesc, ToolError};
 
 #[cfg(test)]

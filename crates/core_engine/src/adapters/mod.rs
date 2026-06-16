@@ -21,8 +21,14 @@ pub mod config;
 pub mod formatter;
 pub mod fs;
 pub mod in_memory_ast_index;
+pub mod in_memory_code_intel;
 pub mod in_memory_fs;
 pub mod in_memory_storage;
+/// LSP client adapter: Content-Length framing + `LspClientAdapter` implementing
+/// `CodeIntelligencePort` by driving a resident language server (MVP: rust-analyzer).
+///
+/// Adapter only — domain must not import this module.
+pub mod lsp;
 /// MCP JSON-RPC 2.0 stdio transport (spec 10a).
 ///
 /// Protocol plumbing only — tool handlers live in spec 10b, plugin tool
@@ -40,6 +46,7 @@ pub mod watcher;
 pub use ast_index::XdgAstIndexAdapter;
 pub use fs::RealFs;
 pub use in_memory_ast_index::InMemoryAstIndex;
+pub use in_memory_code_intel::InMemoryCodeIntel;
 pub use in_memory_fs::InMemoryFs;
 pub use in_memory_storage::InMemoryStorage;
 pub use plugin::{

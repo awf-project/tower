@@ -484,3 +484,223 @@ fn non_utf8_frame_returns_parse_error_and_loop_continues() {
         "loop must survive the bad frame: {responses:?}"
     );
 }
+
+// ── Task 6: resources capability + serve_with_push ───────────────────────────
+
+use std::sync::{Arc, Mutex};
+
+use crate::adapters::lsp::pool::DiagnosticsReader;
+use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
+use crate::adapters::mcp::transport::{PushEvent, serve_with_push};
+use crate::domain::code_intel::Diagnostic;
+
+struct NullDiagReader;
+impl DiagnosticsReader for NullDiagReader {
+    fn diagnostics_for(&self, _uri: &str) -> Vec<Diagnostic> {
+        vec![]
+    }
+}
+
+fn null_reader() -> Arc<dyn DiagnosticsReader> {
+    Arc::new(NullDiagReader)
+}
+
+fn empty_sub_reg() -> Arc<Mutex<SubscriptionRegistry>> {
+    Arc::new(Mutex::new(SubscriptionRegistry::new()))
+}
+
+#[test]
+fn initialize_advertises_resources_capability() {
+    let responses = run_serve(&initialize_request(1), &mut EmptyRegistry);
+    let caps = &responses[0]["result"]["capabilities"];
+    assert!(
+        caps.get("resources").is_some(),
+        "resources capability must be advertised"
+    );
+    assert_eq!(caps["resources"]["subscribe"], true);
+}
+
+#[test]
+fn push_event_emitted_as_notifications_resources_updated() {
+    use std::io::Cursor;
+    use std::sync::mpsc;
+
+    // Subscribe the URI, then send a push event. The serve loop must emit
+    // notifications/resources/updated and then exit when channels disconnect.
+    let reader = Cursor::new(b"");
+    let mut output = Vec::<u8>::new();
+    let sub_reg = empty_sub_reg();
+    {
+        sub_reg.lock().unwrap().subscribe("file:///w/src/main.rs");
+    }
+    let (push_tx, push_rx) = mpsc::channel::<PushEvent>();
+    push_tx
+        .send(PushEvent {
+            uri: "file:///w/src/main.rs".to_owned(),
+            generation: 3,
+        })
+        .unwrap();
+    // Dropping push_tx causes the push forwarder to exit; combined with EOF
+    // on reader the unified serve_rx disconnects → clean shutdown.
+    drop(push_tx);
+
+    serve_with_push(
+        reader,
+        &mut output,
+        &mut EmptyRegistry,
+        sub_reg,
+        null_reader(),
+        vec![],
+        Some(push_rx),
+    )
+    .unwrap();
+
+    let written = String::from_utf8(output).unwrap();
+    assert!(
+        written.contains("notifications/resources/updated"),
+        "push notification must be emitted; got: {written}"
+    );
+    assert!(written.contains("file:///w/src/main.rs"));
+}
+
+#[test]
+fn push_event_dropped_when_uri_not_subscribed() {
+    use std::io::Cursor;
+    use std::sync::mpsc;
+
+    // URI is NOT subscribed — push event must be silently dropped.
+    let reader = Cursor::new(b"");
+    let mut output = Vec::<u8>::new();
+    let (push_tx, push_rx) = mpsc::channel::<PushEvent>();
+    push_tx
+        .send(PushEvent {
+            uri: "file:///w/src/main.rs".to_owned(),
+            generation: 1,
+        })
+        .unwrap();
+    drop(push_tx);
+
+    serve_with_push(
+        reader,
+        &mut output,
+        &mut EmptyRegistry,
+        empty_sub_reg(),
+        null_reader(),
+        vec![],
+        Some(push_rx),
+    )
+    .unwrap();
+
+    let written = String::from_utf8(output).unwrap();
+    assert!(
+        !written.contains("notifications/resources/updated"),
+        "un-subscribed URI must not emit push; got: {written}"
+    );
+}
+
+#[test]
+fn resources_read_returns_diagnostics_from_reader() {
+    use crate::domain::code_intel::{Diagnostic, Position, Range, Severity};
+    use std::io::Cursor;
+
+    struct CannedReader;
+    impl DiagnosticsReader for CannedReader {
+        fn diagnostics_for(&self, _: &str) -> Vec<Diagnostic> {
+            vec![Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 1,
+                    },
+                },
+                severity: Severity::Error,
+                message: "canned error".to_owned(),
+                source: None,
+                code: None,
+            }]
+        }
+    }
+
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\
+                   \"params\":{\"uri\":\"file:///w/main.rs\"}}\n";
+    let reader = Cursor::new(request.as_bytes());
+    let mut output = Vec::<u8>::new();
+
+    serve_with_push(
+        reader,
+        &mut output,
+        &mut EmptyRegistry,
+        empty_sub_reg(),
+        Arc::new(CannedReader) as Arc<dyn DiagnosticsReader>,
+        vec![],
+        None,
+    )
+    .unwrap();
+
+    let written = String::from_utf8(output).unwrap();
+    assert!(
+        written.contains("canned error"),
+        "resources/read must return live diagnostics; got: {written}"
+    );
+    assert!(written.contains("\"supported\":true"));
+}
+
+#[test]
+fn resources_subscribe_returns_null_result() {
+    use std::io::Cursor;
+
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\
+                   \"params\":{\"uri\":\"file:///w/main.rs\"}}\n";
+    let reader = Cursor::new(request.as_bytes());
+    let mut output = Vec::<u8>::new();
+
+    serve_with_push(
+        reader,
+        &mut output,
+        &mut EmptyRegistry,
+        empty_sub_reg(),
+        null_reader(),
+        vec![],
+        None,
+    )
+    .unwrap();
+
+    let written = String::from_utf8(output).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+    assert!(
+        resp.get("result").is_some(),
+        "subscribe must return a result: {written}"
+    );
+    assert_eq!(resp["result"], serde_json::Value::Null);
+}
+
+#[test]
+fn resources_list_returns_configured_entries() {
+    use std::io::Cursor;
+
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/list\",\
+                   \"params\":{}}\n";
+    let reader = Cursor::new(request.as_bytes());
+    let mut output = Vec::<u8>::new();
+
+    serve_with_push(
+        reader,
+        &mut output,
+        &mut EmptyRegistry,
+        empty_sub_reg(),
+        null_reader(),
+        vec!["lsp://rust/diagnostics".to_owned()],
+        None,
+    )
+    .unwrap();
+
+    let written = String::from_utf8(output).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+    let resources = resp["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0]["uri"], "lsp://rust/diagnostics");
+}

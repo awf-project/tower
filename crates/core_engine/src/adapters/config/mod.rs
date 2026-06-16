@@ -3,9 +3,13 @@
 //! Infrastructure concern (reads `std::fs`, parses `toml`). Lives in `adapters/`;
 //! the domain never imports it. First feature: disabling plugins by file stem.
 //! Second feature (spec 13a): `[plugins.formatter.tools.<id>]` for external formatters.
+//! Third feature (LSP plan 1, Task 6): `[lsp]` table parsed via `parse_lsp_config`.
 //!
 //! Absent file → `TowerConfig::default()` (silent). Present but unreadable or
 //! invalid (bad TOML / unknown key) → `Err` → the binary fails fast (exit 1).
+
+pub mod lsp;
+pub use lsp::{LspConfig, LspServerConfig, parse_lsp_config};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,6 +24,13 @@ use serde::Deserialize;
 pub struct TowerConfig {
     #[serde(default)]
     pub plugins: PluginConfig,
+    /// `[lsp]` section — language-server bindings (LSP plan 1, Task 8).
+    ///
+    /// Absent → `LspConfig::default()` (empty; no servers). Populated by
+    /// wiring in `main.rs`; production code reads `config.lsp` directly
+    /// rather than calling `parse_lsp_config` again.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 /// `[plugins]` section.
@@ -426,5 +437,49 @@ extensions = ["rs"]
         let cfg = load(tmp.path()).expect("combined config is valid");
         assert_eq!(cfg.plugins.disabled, vec!["ast"]);
         assert!(cfg.plugins.formatter.tools.contains_key("rustfmt"));
+    }
+
+    // ── LSP section coexists with plugins section (Task 8 / Step B) ─────────
+
+    /// A config file that contains BOTH an existing `[plugins]` section AND
+    /// `[lsp.rust]` must load without a `deny_unknown_fields` error now that
+    /// `TowerConfig` has an `lsp: LspConfig` field.
+    #[test]
+    fn lsp_and_plugins_coexist_in_tower_config() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+[plugins]
+disabled = ["ast"]
+
+[lsp.rust]
+command = "rust-analyzer"
+extensions = ["rs"]
+"#,
+        );
+        let cfg = load(tmp.path()).expect("[lsp] section must not cause deny_unknown_fields error");
+        // Existing section still parses.
+        assert_eq!(cfg.plugins.disabled, vec!["ast"]);
+        // LSP section is accessible through the loaded TowerConfig.
+        let server = cfg
+            .lsp
+            .for_extension("rs")
+            .expect("lsp.for_extension('rs') must resolve after load()");
+        assert_eq!(server.command, "rust-analyzer");
+        // New field: absent idle_timeout_secs yields None (backward-compat guard).
+        assert!(cfg.lsp.idle_timeout.is_none());
+    }
+
+    /// Absent `[lsp]` section still produces an empty `LspConfig` (no regression).
+    #[test]
+    fn absent_lsp_section_yields_empty_lsp_config() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[plugins]\ndisabled = []\n");
+        let cfg = load(tmp.path()).expect("config without [lsp] must load");
+        assert!(
+            cfg.lsp.servers.is_empty(),
+            "absent [lsp] must yield empty LspConfig"
+        );
     }
 }

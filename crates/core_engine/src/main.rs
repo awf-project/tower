@@ -56,8 +56,12 @@ use core_engine::adapters::fs::scan::{
     init_towerignore, reconcile_pruned, warn_if_towerignore_absent,
 };
 use core_engine::adapters::fs::{RealFs, workspace_scan};
+use core_engine::adapters::lsp::pool::SessionPool;
+use core_engine::adapters::mcp::chain_registry::ChainRegistry;
+use core_engine::adapters::mcp::lsp_tools::{LspToolRegistry, SubscriptionRegistry};
 use core_engine::adapters::mcp::native_tools::EngineState;
-use core_engine::adapters::mcp::{MergedRegistry, serve};
+use core_engine::adapters::mcp::nav_tools::NavToolRegistry;
+use core_engine::adapters::mcp::{MergedRegistry, PushEvent, serve_with_push};
 use core_engine::adapters::plugin::{
     DEFAULT_PLUGINS_SUBDIR, HostDeps, IsolationEngine, Scope, global_plugins_dir, install,
     load_plugins_into_registry, production_isolation_config, resolve_plugin_dirs,
@@ -68,6 +72,7 @@ use core_engine::domain::plugin_host::PluginHostRegistry;
 use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::domain::{FileId, RelativePath};
 use core_engine::ports::AstIndexPort;
+use core_engine::ports::CodeIntelligencePort;
 use core_engine::ports::{FileSystemPort, PluginHostPort, StoragePort};
 
 // ── SharedPluginHost ──────────────────────────────────────────────────────────
@@ -375,6 +380,13 @@ fn run() -> Result<(), String> {
             workspace_root.clone(),
         ));
 
+    // Capture the formatter echo set before `format_queue` is moved into the
+    // plugin deps. Shared with the watcher so formatter-induced writes do not
+    // trigger a spurious `didChange` to the language server (spec 14b UN1).
+    let echo_set = format_queue
+        .shared_echo_set()
+        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
+
     let plugin_deps = HostDeps {
         fs: plugin_fs,
         ast_index: plugin_ast_index,
@@ -415,6 +427,44 @@ fn run() -> Result<(), String> {
             .set_plugin_host(host);
     }
 
+    // ── Step 5a-bis: push bridge + session pool ────────────────────────────────
+    //
+    // Decision 3: unified blocking ServeInput channel. Architecture:
+    //
+    //   LspClientAdapter dispatcher
+    //     --DiagnosticsEvent(mpsc::Sender)--> diag_rx
+    //       --PushEvent--> serve_with_push unified channel (internal)
+    //
+    // The forwarder thread (diag_rx → push_tx) is spawned here. serve_with_push
+    // receives push_rx and internally bridges Push events into the unified channel.
+    use core_engine::adapters::lsp::DiagnosticsEvent;
+    use core_engine::adapters::lsp::pool::RealSpawner;
+
+    let (diag_tx, diag_rx) = std::sync::mpsc::channel::<DiagnosticsEvent>();
+    let (push_tx, push_rx) = std::sync::mpsc::channel::<PushEvent>();
+    let sub_reg = Arc::new(std::sync::Mutex::new(SubscriptionRegistry::new()));
+
+    // Forwarder: DiagnosticsEvent → PushEvent.
+    // Exits cleanly when diag_rx disconnects (SessionPool dropped or all sessions evicted).
+    std::thread::spawn(move || {
+        while let Ok(event) = diag_rx.recv() {
+            // Ignore send error: MCP serve loop may have already exited.
+            let _ = push_tx.send(PushEvent {
+                uri: event.uri,
+                generation: event.generation,
+            });
+        }
+    });
+
+    // Build the pool with push_tx so each spawned session gets a clone of the
+    // diagnostics sender wired at spawn time (RealSpawner → LspClientAdapter::spawn).
+    let lsp_pool = Arc::new(SessionPool::with_spawner(
+        tower_config.lsp.clone(),
+        workspace_root.clone(),
+        Arc::new(RealSpawner),
+        Some(diag_tx),
+    ));
+
     // ── Step 5b: spawn the filesystem watcher for live VFS sync ───────────────
     //
     // Decision: always-on, fail-fast at startup.
@@ -442,14 +492,23 @@ fn run() -> Result<(), String> {
         .index_arc();
     let watcher_plugin_host = Box::new(SharedPluginHost(Arc::clone(&plugin_host)));
 
+    // 14b: the watcher mirrors live file edits into the language server. The
+    // pool's DocumentSyncPort impl routes events to the appropriate per-language
+    // session, and the formatter echo set prevents formatter writes from
+    // churning diagnostics.
+    let doc_sync: Arc<dyn core_engine::ports::DocumentSyncPort + Send + Sync> =
+        Arc::clone(&lsp_pool) as _;
+
     // `_watcher` is intentionally bound (not `_`) so the Drop impl runs at the
     // end of `run()` — dropping it earlier would stop live sync.
-    let _watcher = NotifyWatcherAdapter::new(
+    let _watcher = NotifyWatcherAdapter::with_document_sync(
         workspace_root.clone(),
         watcher_workspace,
         watcher_index,
         Box::new(storage_for_watcher),
         watcher_plugin_host,
+        doc_sync,
+        Arc::clone(&echo_set),
     )
     .map_err(|e| format!("failed to start filesystem watcher: {e}"))?;
 
@@ -463,14 +522,44 @@ fn run() -> Result<(), String> {
     // tools. A missing/empty plugins dir leaves it serving exactly the natives.
     // Lock stdin/stdout for the duration of the serve loop.
     // BufReader/BufWriter ensure line-oriented I/O matches the framing spec.
-    let mut registry = MergedRegistry::new(Arc::clone(&state), plugin_host);
+    let merged_registry = MergedRegistry::new(Arc::clone(&state), plugin_host);
 
-    let stdin = std::io::stdin();
+    // ── Step 6b: code-intelligence + navigation tools from the session pool ───
+    //
+    // The pool implements all three port traits. When no language is configured,
+    // or when an extension is not handled, it returns Unsupported — identical
+    // behaviour to the old None/InMemoryCodeIntel path.
+    let code_intel: Arc<dyn CodeIntelligencePort> = Arc::clone(&lsp_pool) as _;
+    let nav: Option<Arc<dyn core_engine::ports::NavigationPort>> = Some(Arc::clone(&lsp_pool) as _);
+
+    let lsp_registry = LspToolRegistry::new(Arc::clone(&state), code_intel);
+    let nav_registry = NavToolRegistry::new(Arc::clone(&state), nav);
+
+    // Compose: ChainRegistry tries merged → tower_lsp_diagnostics → navigation.
+    // `list` concatenates all surfaces; `call` routes by first-non-NotFound.
+    let mut served_registry = ChainRegistry::new(vec![
+        Box::new(merged_registry),
+        Box::new(lsp_registry),
+        Box::new(nav_registry),
+    ]);
+
+    // resource_uris: static list from config (one entry per language).
+    // diag_reader: pulls last-published diagnostics for resources/read (AC6).
+    let resource_uris: Vec<String> = lsp_pool.resource_uris();
+    let diag_reader: Arc<dyn core_engine::adapters::lsp::pool::DiagnosticsReader> =
+        Arc::clone(&lsp_pool) as _;
+
+    // serve_with_push requires R: Send + 'static (the reader moves into a thread).
+    // BufReader<Stdin> satisfies both; StdinLock<'_> does not (lifetime).
     let stdout = std::io::stdout();
-    serve(
-        BufReader::new(stdin.lock()),
+    serve_with_push(
+        BufReader::new(std::io::stdin()),
         BufWriter::new(stdout.lock()),
-        &mut registry,
+        &mut served_registry,
+        sub_reg,
+        diag_reader,
+        resource_uris,
+        Some(push_rx),
     )
     .map_err(|e| format!("serve loop I/O error: {e}"))
 }

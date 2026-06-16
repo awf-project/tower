@@ -33,8 +33,11 @@
 //! free of `sled`, `std::fs`, `wasmtime`, and `notify` (AC4).
 
 pub mod ast_index;
+pub mod code_intel;
+pub mod document_sync;
 pub mod error;
 pub mod filesystem;
+pub mod navigation;
 pub mod plugin;
 pub mod storage;
 
@@ -42,8 +45,11 @@ pub mod storage;
 pub mod inbound;
 
 pub use ast_index::{AstIndexPort, validate_key as validate_ast_index_key};
+pub use code_intel::{CodeIntelError, CodeIntelligencePort};
+pub use document_sync::{DocumentSyncPort, NoOpDocumentSync};
 pub use error::PortError;
 pub use filesystem::FileSystemPort;
 pub use inbound::{FileMutationUseCase, FileReplaceError, Match, SearchUseCase, TxReport};
+pub use navigation::NavigationPort;
 pub use plugin::{NoOpPluginHost, PluginHostPort};
 pub use storage::StoragePort;
