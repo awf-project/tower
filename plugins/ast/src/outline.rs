@@ -162,6 +162,16 @@ pub fn is_rust_hint(hint: &str) -> bool {
     SupportedLanguage::from_hint(hint) == Some(SupportedLanguage::Rust)
 }
 
+// ── Test-only instrumentation ───────────────────────────────────────────────
+//
+// Counts `parse_outline` invocations. Gated behind `cfg(test)` → zero cost in
+// production builds. Used by the REQ-1 regression test to prove that callers
+// holding an already-parsed `Outline` do not trigger a second tree-sitter parse.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARSE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Parse `source` and extract a structural outline.
@@ -175,6 +185,10 @@ pub fn is_rust_hint(hint: &str) -> bool {
 /// This function is infallible. Tree-sitter's error-tolerant parser always
 /// produces a tree (UN1/AC3); the walker skips nodes it cannot interpret.
 pub fn parse_outline(source: &[u8], language_hint: &str) -> OutlineResult {
+    // Test-only: count parse invocations (REQ-1 regression guard).
+    #[cfg(test)]
+    PARSE_COUNT.with(|c| c.set(c.get() + 1));
+
     let lang = match SupportedLanguage::from_hint(language_hint) {
         Some(l) => l,
         None => {

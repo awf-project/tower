@@ -78,6 +78,9 @@ pub mod symbols;
 pub(crate) mod text;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use plugin_sdk::{
     ABI_VERSION, HookKind, HookPayload, Plugin, PluginManifest, SdkError, ToolDesc, Value,
@@ -93,6 +96,30 @@ use crate::index::SymbolIndex;
 // the host store on first access).
 thread_local! {
     static INDEX: RefCell<Option<SymbolIndex>> = const { RefCell::new(None) };
+}
+
+// ── Content-hash dedup (REQ-2) ────────────────────────────────────────────────
+//
+// Maps workspace-relative path → hash of the last indexed byte slice.
+//
+// Decision: separate thread_local, NOT a field on SymbolIndex.
+// Why: DefaultHasher is per-process randomized (std guarantee since Rust 1.36).
+//      A persisted hash would never match after a warm restart, making dedup
+//      silently dead on every startup. Keeping it in-memory (non-persisted) is
+//      the only correct design.
+// Trade-off: the dedup is lost on restart; that is acceptable — the cost of one
+//            extra parse+persist per path after restart is negligible compared to
+//            the savings within a session (e.g. formatter-echo FileChanged loops).
+thread_local! {
+    static CONTENT_HASHES: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+}
+
+/// Hash a byte slice using the same `DefaultHasher` approach used in
+/// `crates/core_engine/src/adapters/lsp/documents.rs`.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Access (and lazy-load) the symbol index.
@@ -146,6 +173,11 @@ fn load_index_from_store() -> SymbolIndex {
 /// Trade-off: O(n) serialisation cost on every mutation. For a large workspace
 ///            (thousands of files) consider a write-behind cache or delta protocol.
 fn persist_index(idx: &SymbolIndex) {
+    // Test instrumentation: count how many times persist is called.
+    // Gated behind cfg(test) — zero cost in production builds.
+    #[cfg(test)]
+    PERSIST_COUNT.with(|c| c.set(c.get() + 1));
+
     #[cfg(target_arch = "wasm32")]
     {
         let bytes = idx.to_bytes();
@@ -171,37 +203,126 @@ fn reindex_path(path: &str) {
     reindex_with_content(path, bytes_opt.as_deref());
 }
 
-/// Re-index `path` with already-read content bytes.
+/// Re-index `path` with already-read content bytes, applying content-hash dedup.
 ///
-/// Avoids a second `read_file` call when the tool impl has already read the
-/// file. If `content` is `None` the path is removed from the index.
+/// # REQ-2: content-hash dedup
+///
+/// If `content` is `Some(bytes)` and the hash of `bytes` matches the hash stored
+/// in `CONTENT_HASHES` for this path, the call is a no-op: no parse, no persist.
+/// This suppresses redundant work for formatter-echo FileChanged loops.
+///
+/// If `content` is `None` (file deleted), the path is removed from the index and
+/// the hash entry is cleared — but only if the path is actually present in the
+/// index (avoids a spurious persist for a deletion of a never-indexed file).
+///
+/// # REQ-1: no double-parse
+///
+/// When content is new/changed, parse once here then hand the `Outline` to
+/// `reindex_with_preparsed_outline` which does NOT parse again.
 fn reindex_with_content(path: &str, content: Option<&[u8]>) {
     match content {
         Some(bytes) => {
-            let outline = match outline::parse_outline(bytes, path) {
-                outline::OutlineResult::Parsed(o) => o,
-                // Unsupported language: nothing to index; remove stale entries.
-                outline::OutlineResult::Unsupported { .. } => {
-                    with_index(|idx| {
-                        idx.remove_file(path);
-                        persist_index(idx);
+            let new_hash = hash_bytes(bytes);
+
+            // Short-circuit: same content as last index → nothing to do.
+            let already_current =
+                CONTENT_HASHES.with(|m| m.borrow().get(path).copied() == Some(new_hash));
+            if already_current {
+                return;
+            }
+
+            match outline::parse_outline(bytes, path) {
+                outline::OutlineResult::Parsed(o) => {
+                    // Store hash before indexing so re-entrant calls (if any) are safe.
+                    CONTENT_HASHES.with(|m| {
+                        m.borrow_mut().insert(path.to_owned(), new_hash);
                     });
-                    return;
+                    reindex_with_preparsed_outline(path, &o);
                 }
-            };
-            with_index(|idx| {
-                idx.index_file(path, &outline);
-                persist_index(idx);
-            });
+                outline::OutlineResult::Unsupported { .. } => {
+                    // Unsupported language: remove stale entries only if present.
+                    let was_indexed = with_index(|idx| {
+                        idx.by_path.contains_key(path).then(|| {
+                            idx.remove_file(path);
+                        })
+                    })
+                    .is_some();
+                    if was_indexed {
+                        // Remove the stale hash too.
+                        CONTENT_HASHES.with(|m| {
+                            m.borrow_mut().remove(path);
+                        });
+                        with_index(|idx| persist_index(idx));
+                    }
+                }
+            }
         }
         None => {
-            // File not found or deleted: remove its entries.
-            with_index(|idx| {
-                idx.remove_file(path);
-                persist_index(idx);
+            // File deleted: remove entries only if the path is present.
+            // Decision: guard the persist behind a contains_key check so that
+            // deleting a never-indexed path does not trigger a spurious persist.
+            let was_present = with_index(|idx| {
+                if idx.by_path.contains_key(path) {
+                    idx.remove_file(path);
+                    true
+                } else {
+                    false
+                }
             });
+            // Always clear the hash for the path (even if not in the index) so
+            // a subsequent re-create of the file is not suppressed by a stale hash.
+            CONTENT_HASHES.with(|m| {
+                m.borrow_mut().remove(path);
+            });
+            if was_present {
+                with_index(|idx| persist_index(idx));
+            }
         }
     }
+}
+
+/// Index `path` using an already-parsed `Outline` — no parse call made here.
+///
+/// # REQ-1
+///
+/// Callers that already hold a parsed `Outline` (e.g. `get_outline`,
+/// `find_symbols`) must use this function instead of `reindex_with_content` to
+/// avoid a second tree-sitter parse of the same bytes.
+///
+/// The content-hash dedup in `CONTENT_HASHES` is intentionally NOT checked here:
+/// the caller has already parsed the file for its own return value, so the index
+/// should always be brought up to date with the outline in hand.
+fn reindex_with_preparsed_outline(path: &str, outline: &outline::Outline) {
+    with_index(|idx| {
+        idx.index_file(path, outline);
+        persist_index(idx);
+    });
+}
+
+/// Build a fresh symbol index and content-hash map from a set of `(path, bytes)`.
+///
+/// Used by the `reindex` tool to rebuild from the canonical file list. Returns
+/// both the index and the per-path content hashes so the caller can REPLACE the
+/// `CONTENT_HASHES` dedup map atomically. Repopulating it (rather than merely
+/// clearing it) means the first FileChanged for an unchanged file after a full
+/// reindex is correctly deduped (REQ-2) instead of triggering a redundant
+/// parse+persist. Files whose language is unsupported are skipped — they get no
+/// index entry and no hash entry, which also prunes stale hashes for paths that
+/// are no longer indexable.
+///
+/// Pure (no host calls) so it is exercised by host unit tests; the wasm-only
+/// `reindex` wiring just feeds it the bytes read via the host capability.
+#[cfg(any(target_arch = "wasm32", test))]
+fn build_fresh_index(files: &[(String, Vec<u8>)]) -> (SymbolIndex, HashMap<String, u64>) {
+    let mut index = SymbolIndex::default();
+    let mut hashes = HashMap::new();
+    for (path, bytes) in files {
+        if let outline::OutlineResult::Parsed(o) = outline::parse_outline(bytes, path) {
+            index.index_file(path, &o);
+            hashes.insert(path.clone(), hash_bytes(bytes));
+        }
+    }
+    (index, hashes)
 }
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
@@ -313,18 +434,26 @@ fn ast_get_outline_impl(args: Value) -> Result<Value, SdkError> {
     let content = plugin_sdk::host::read_file(path)
         .ok_or_else(|| SdkError::CallFailed(format!("host could not read file: {path}")))?;
 
+    // Parse once — the result is both returned to the caller and handed to the
+    // index, eliminating the double-parse that existed when reindex_with_content
+    // was called with raw bytes (REQ-1).
     let result = outline::parse_outline(&content, path);
-
-    // Index-as-you-go: update the index with the content we already read.
-    // On the host target (tests) reindex_with_content is a no-op for persist.
-    reindex_with_content(path, Some(&content));
 
     let value = match result {
         outline::OutlineResult::Unsupported { language } => Value::Map(vec![
             ("unsupported".to_owned(), Value::Bool(true)),
             ("language".to_owned(), Value::Text(language)),
         ]),
-        outline::OutlineResult::Parsed(o) => o.to_sdk_value(),
+        outline::OutlineResult::Parsed(ref o) => {
+            // Index-as-you-go: reuse the outline we already parsed (REQ-1).
+            // Also updates CONTENT_HASHES so a subsequent FileChanged for the
+            // same bytes is a no-op (REQ-2).
+            CONTENT_HASHES.with(|m| {
+                m.borrow_mut().insert(path.to_owned(), hash_bytes(&content));
+            });
+            reindex_with_preparsed_outline(path, o);
+            o.to_sdk_value()
+        }
     };
 
     Ok(value)
@@ -372,8 +501,16 @@ fn ast_find_symbols_impl(args: Value) -> Result<Value, SdkError> {
     let content = plugin_sdk::host::read_file(path)
         .ok_or_else(|| SdkError::CallFailed(format!("host could not read file: {path}")))?;
 
-    // Index-as-you-go: reuse the content already read.
-    reindex_with_content(path, Some(&content));
+    // Index-as-you-go: parse the outline once for indexing, then let
+    // find_symbols do its own independent parse for symbol matching (REQ-1).
+    // Avoids the extra parse that reindex_with_content(path, Some(&content))
+    // would trigger internally.
+    if let outline::OutlineResult::Parsed(ref o) = outline::parse_outline(&content, path) {
+        CONTENT_HASHES.with(|m| {
+            m.borrow_mut().insert(path.to_owned(), hash_bytes(&content));
+        });
+        reindex_with_preparsed_outline(path, o);
+    }
 
     let result = symbols::find_symbols(&content, path, symbol_name, kind);
 
@@ -474,23 +611,20 @@ fn ast_reindex_impl() -> Result<Value, SdkError> {
     {
         let paths = plugin_sdk::host::list_files();
 
-        // Build a fresh index — do not start from the existing thread-local so
-        // that entries for deleted files are automatically pruned.
-        let mut fresh_index = SymbolIndex::default();
-        let mut indexed_files: i64 = 0;
-
+        // Read each listed file, skipping any that vanished between list and read.
+        let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(paths.len());
         for path in &paths {
-            let Some(bytes) = plugin_sdk::host::read_file(path) else {
-                // File disappeared between list_files and read_file — skip it.
-                continue;
-            };
-            if let outline::OutlineResult::Parsed(o) = outline::parse_outline(&bytes, path) {
-                fresh_index.index_file(path, &o);
-                indexed_files += 1;
+            if let Some(bytes) = plugin_sdk::host::read_file(path) {
+                files.push((path.clone(), bytes));
             }
-            // Unsupported language: skip (not indexable).
         }
 
+        // Build a fresh index + content-hash map from the canonical file list so
+        // that entries for deleted files are automatically pruned. `indexed_files`
+        // is the count of files actually indexed — equal to the hash-map size,
+        // since a hash entry is inserted for exactly each Parsed (indexable) file.
+        let (fresh_index, fresh_hashes) = build_fresh_index(&files);
+        let indexed_files = fresh_hashes.len() as i64;
         let total_symbols: i64 = fresh_index
             .by_path
             .values()
@@ -502,6 +636,12 @@ fn ast_reindex_impl() -> Result<Value, SdkError> {
             *cell.borrow_mut() = Some(fresh_index.clone());
         });
         persist_index(&fresh_index);
+
+        // Replace (not merely clear) the content-hash dedup map: repopulating it
+        // with the freshly indexed files means a subsequent identical FileChanged
+        // is correctly deduped (REQ-2), while stale entries for deleted/unindexable
+        // files are dropped (they are simply absent from fresh_hashes).
+        CONTENT_HASHES.with(|m| *m.borrow_mut() = fresh_hashes);
 
         Ok(Value::Map(vec![
             ("indexed_files".to_owned(), Value::Integer(indexed_files)),
@@ -560,6 +700,19 @@ fn extract_optional_text_field(args: &Value, field: &str) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+// ── Test-only instrumentation ─────────────────────────────────────────────────
+//
+// Thread-local counters gated behind `#[cfg(test)]` so they carry zero cost
+// in production (wasm32 or host release) builds.  The `persist_index` function
+// increments PERSIST_COUNT; `reindex_with_content` increments it via the same
+// call.  Tests reset both counters before each assertion.
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PERSIST_COUNT: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 // ── Host-side tests (lib-level: AstPlugin API + call_tool dispatch) ───────────
@@ -782,6 +935,139 @@ mod tests {
         assert_eq!(
             extract_optional_text_field(&args, "kind"),
             Some("function".to_owned())
+        );
+    }
+
+    // ── RED tests: REQ-1 (no double-parse) ───────────────────────────────────
+    //
+    // Prove the new API exists: `reindex_with_preparsed_outline(path, &Outline)`.
+    // Today this FAILS TO COMPILE because the function does not exist.
+    // After REQ-1 is implemented it compiles and runs without re-parsing.
+
+    #[test]
+    fn req1_reindex_accepts_preparsed_outline() {
+        // RED: reindex_with_preparsed_outline does not exist yet → compile error.
+        // GREEN: this function exists and does NOT call parse_outline internally.
+        let source = b"pub fn foo() {}";
+        let outline = match outline::parse_outline(source, "t.rs") {
+            outline::OutlineResult::Parsed(o) => o,
+            outline::OutlineResult::Unsupported { language } => {
+                panic!("expected Parsed, got Unsupported({language})")
+            }
+        };
+        INDEX.with(|c| *c.borrow_mut() = Some(SymbolIndex::default()));
+
+        // REQ-1 regression guard: reset the parse counter AFTER the setup parse
+        // above, then assert that handing an already-parsed outline to the index
+        // does NOT trigger a second tree-sitter parse. Without this guard, a
+        // regression that re-parses internally would pass silently.
+        outline::PARSE_COUNT.with(|c| c.set(0));
+        reindex_with_preparsed_outline("t.rs", &outline);
+        let parses = outline::PARSE_COUNT.with(|c| c.get());
+        assert_eq!(
+            parses, 0,
+            "REQ-1: reindex_with_preparsed_outline must not call parse_outline; got {parses}"
+        );
+
+        // Verify the index was updated (the symbol is now searchable).
+        with_index(|idx| {
+            let hits = idx.search("foo", Some("function"));
+            assert_eq!(
+                hits.len(),
+                1,
+                "REQ-1: indexed symbol must be findable after reindex_with_preparsed_outline"
+            );
+        });
+    }
+
+    // ── REQ-2: full reindex repopulates (not just clears) the hash map ───────
+
+    #[test]
+    fn reindex_builds_fresh_hashes_and_prunes_unsupported() {
+        // build_fresh_index must populate a hash entry for every indexable file
+        // (so a post-reindex identical FileChanged is deduped, REQ-2) and must
+        // omit unsupported files (pruning stale hashes for non-indexable paths).
+        let files = vec![
+            ("src/a.rs".to_owned(), b"pub fn alpha() {}".to_vec()),
+            ("notes.md".to_owned(), b"# not indexable".to_vec()),
+        ];
+        let (index, hashes) = build_fresh_index(&files);
+
+        assert!(
+            hashes.contains_key("src/a.rs"),
+            "REQ-2: indexable file must have a content-hash entry after reindex"
+        );
+        assert!(
+            !hashes.contains_key("notes.md"),
+            "unsupported file must not get a hash entry (stale-hash pruning)"
+        );
+        assert_eq!(
+            index.search("alpha", Some("function")).len(),
+            1,
+            "fresh index must contain the indexed symbol"
+        );
+    }
+
+    // ── RED tests: REQ-2 (no persist on unchanged content) ───────────────────
+    //
+    // Prove that a second identical FileChanged does NOT call persist_index.
+    // Today reindex_with_content ALWAYS persists → PERSIST_COUNT == 1 on second
+    // call → assertion fails.  After REQ-2 the hash map dedup skips persist.
+
+    #[test]
+    fn req2_second_identical_content_does_not_persist() {
+        INDEX.with(|c| *c.borrow_mut() = Some(SymbolIndex::default()));
+        PERSIST_COUNT.with(|c| c.set(0));
+
+        let source = b"pub fn bar() {}";
+
+        // First call: must index and persist (acceptable).
+        reindex_with_content("src/bar.rs", Some(source));
+        // (we do not assert the first count — only the second matters)
+
+        // Second call with IDENTICAL bytes: must NOT persist.
+        PERSIST_COUNT.with(|c| c.set(0));
+        reindex_with_content("src/bar.rs", Some(source));
+        let count = PERSIST_COUNT.with(|c| c.get());
+
+        assert_eq!(
+            count, 0,
+            "REQ-2: identical content must skip persist_index; got {count} persist calls"
+        );
+        // TODAY: count == 1 → test FAILS (no hash dedup exists yet).
+    }
+
+    #[test]
+    fn req2_delete_absent_path_does_not_persist() {
+        INDEX.with(|c| *c.borrow_mut() = Some(SymbolIndex::default()));
+        PERSIST_COUNT.with(|c| c.set(0));
+
+        // None on a path that was never indexed → must not persist.
+        reindex_with_content("src/never_seen.rs", None);
+        let count = PERSIST_COUNT.with(|c| c.get());
+
+        assert_eq!(
+            count, 0,
+            "REQ-2: deleting an absent path must not call persist_index; got {count} persist calls"
+        );
+        // TODAY: count == 1 → test FAILS (None branch always persists).
+    }
+
+    #[test]
+    fn req2_content_hash_map_is_populated_after_first_index() {
+        // RED: CONTENT_HASHES thread_local does not exist yet → compile error.
+        // GREEN: after first reindex_with_content the hash map contains an entry
+        //        for the path so the second call can short-circuit.
+        INDEX.with(|c| *c.borrow_mut() = Some(SymbolIndex::default()));
+        CONTENT_HASHES.with(|m| m.borrow_mut().clear());
+
+        let source = b"pub fn baz() {}";
+        reindex_with_content("src/baz.rs", Some(source));
+
+        let has_entry = CONTENT_HASHES.with(|m| m.borrow().contains_key("src/baz.rs"));
+        assert!(
+            has_entry,
+            "REQ-2: CONTENT_HASHES must contain an entry for the path after reindex_with_content"
         );
     }
 }
