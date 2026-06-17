@@ -76,7 +76,7 @@ use serde_json::{Value, json};
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
 use crate::domain::index::{FileSearch, InvertedIndex};
-use crate::domain::mutation::FileMutationService;
+use crate::domain::mutation::{FileMutationService, compute_content_version};
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::FileMetadata;
 use crate::domain::workspace::ProjectWorkspace;
@@ -276,7 +276,9 @@ fn tool_search_text_desc() -> ToolDesc {
 fn tool_read_file_desc() -> ToolDesc {
     ToolDesc {
         name: "tower_read_file".to_owned(),
-        description: "Read the raw UTF-8 content of a file at the given workspace-relative path."
+        description: "Read the raw UTF-8 content of a file at the given workspace-relative path. \
+            Pass with_version: true to receive a `version` field (hex SHA-256) alongside `content` \
+            for use as an expected_version in a subsequent mutating call (spec 18 optimistic CAS)."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -284,6 +286,11 @@ fn tool_read_file_desc() -> ToolDesc {
                 "path": {
                     "type": "string",
                     "description": "Workspace-relative path to the file to read."
+                },
+                "with_version": {
+                    "type": "boolean",
+                    "description": "When true, include a `version` field (hex SHA-256) in the \
+                        response for use as an optimistic concurrency token."
                 }
             },
             "required": ["path"]
@@ -294,7 +301,10 @@ fn tool_read_file_desc() -> ToolDesc {
 fn tool_create_file_desc() -> ToolDesc {
     ToolDesc {
         name: "tower_create_file".to_owned(),
-        description: "Create or overwrite a file at the given path with the provided content."
+        description: "Create or overwrite a file at the given path with the provided content. \
+            Supply expected_version (hex SHA-256 from a prior tower_read_file with with_version:true) \
+            to enable optimistic compare-and-swap: the write is rejected with a precondition error \
+            if the file changed since you read it."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -306,6 +316,12 @@ fn tool_create_file_desc() -> ToolDesc {
                 "content": {
                     "type": "string",
                     "description": "UTF-8 content to write to the file."
+                },
+                "expected_version": {
+                    "type": "string",
+                    "description": "Optional hex SHA-256 of the expected current file content. \
+                        When supplied the write is conditional: rejected with PreconditionFailed \
+                        if the file has changed."
                 }
             },
             "required": ["path", "content"]
@@ -351,7 +367,11 @@ fn tool_delete_file_desc() -> ToolDesc {
 fn tool_global_replace_desc() -> ToolDesc {
     ToolDesc {
         name: "tower_global_replace".to_owned(),
-        description: "Replace every occurrence of a target string with a replacement string across all indexed files.".to_owned(),
+        description: "Replace every occurrence of a target string with a replacement string across \
+            all indexed files. Supply expected_versions (a JSON object mapping workspace-relative \
+            paths to hex SHA-256 hashes) to apply per-file optimistic CAS guards: files whose \
+            content has changed appear in the errors array while non-conflicting files still commit."
+            .to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -362,6 +382,13 @@ fn tool_global_replace_desc() -> ToolDesc {
                 "replacement": {
                     "type": "string",
                     "description": "The string to substitute in place of every occurrence of target."
+                },
+                "expected_versions": {
+                    "type": "object",
+                    "description": "Optional map of path → hex SHA-256. When present, each listed \
+                        file is checked under the write-lock before being written; a mismatch \
+                        records a conflict in TxReport.errors without blocking other files.",
+                    "additionalProperties": { "type": "string" }
                 }
             },
             "required": ["target", "replacement"]
@@ -376,7 +403,9 @@ fn tool_edit_range_desc() -> ToolDesc {
             replacement string, splicing it into the current content and committing atomically. \
             Both start_byte and end_byte must fall on UTF-8 character boundaries. \
             end_byte must be ≤ the file length. start_byte must be ≤ end_byte. \
-            An empty replacement deletes the span; start_byte == end_byte inserts without removing."
+            An empty replacement deletes the span; start_byte == end_byte inserts without removing. \
+            Supply expected_version (hex SHA-256 from a prior tower_read_file with with_version:true) \
+            to enable optimistic compare-and-swap."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -398,6 +427,12 @@ fn tool_edit_range_desc() -> ToolDesc {
                 "replacement": {
                     "type": "string",
                     "description": "UTF-8 text that replaces bytes [start_byte, end_byte)."
+                },
+                "expected_version": {
+                    "type": "string",
+                    "description": "Optional hex SHA-256 of the expected current file content. \
+                        When supplied the edit is conditional: rejected with PreconditionFailed \
+                        if the file has changed since the version was read."
                 }
             },
             "required": ["path", "start_byte", "end_byte", "replacement"]
@@ -473,12 +508,75 @@ fn call_search_text(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
 fn call_read_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let path = require_str(&args, "path")?;
     let rel = RelativePath::new(path);
+    // opt-in: absent or false → legacy response shape (AC4/U1)
+    let with_version = args
+        .get("with_version")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // Only `fs` is needed here; take the outer read-lock for fs access.
     let guard = state.read().map_err(lock_poisoned)?;
     let bytes = guard.fs.read(&rel).map_err(port_err_to_tool_error)?;
     let content = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(json!({ "content": content }))
+
+    if with_version {
+        // Compute SHA-256 over the raw bytes (OP1).
+        // The hash is computed here in the adapter, using the same bytes
+        // already read through the port — no extra I/O, no domain import of
+        // std::fs (the bytes came through FileSystemPort::read).
+        let version = compute_content_version(&bytes);
+        Ok(json!({ "content": content, "version": version }))
+    } else {
+        // Legacy shape: exactly `{content}` — no version key (U1/AC4).
+        Ok(json!({ "content": content }))
+    }
+}
+
+/// Parse an optional `expected_version` CAS guard (spec 18).
+///
+/// Absent (or JSON `null`) → `Ok(None)`: the write is unconditional (U2). A
+/// present **string** → `Ok(Some)`. A present non-string is a *malformed* guard:
+/// we reject it with [`ToolError::InvalidArgs`] (fail-closed) rather than
+/// silently dropping it to an unconditional write, which would defeat the very
+/// safety property the guard exists to provide.
+fn optional_version(args: &Value, key: &str) -> Result<Option<String>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(ToolError::InvalidArgs(format!(
+            "`{key}` must be a string (hex SHA-256 version); got {other}"
+        ))),
+    }
+}
+
+/// Parse the optional per-file `expected_versions` map for global-replace CAS.
+///
+/// Absent (or `null`) → empty map (unconditional). Present must be a JSON object
+/// whose values are all strings; any other shape — a non-object, or a non-string
+/// value — is a malformed guard and is rejected with [`ToolError::InvalidArgs`]
+/// (fail-closed), never silently ignored.
+fn optional_version_map(
+    args: &Value,
+    key: &str,
+) -> Result<std::collections::HashMap<RelativePath, String>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(std::collections::HashMap::new()),
+        Some(Value::Object(obj)) => {
+            let mut map = std::collections::HashMap::with_capacity(obj.len());
+            for (k, v) in obj {
+                let s = v.as_str().ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "`{key}[\"{k}\"]` must be a string (hex SHA-256 version); got {v}"
+                    ))
+                })?;
+                map.insert(RelativePath::new(k), s.to_owned());
+            }
+            Ok(map)
+        }
+        Some(other) => Err(ToolError::InvalidArgs(format!(
+            "`{key}` must be an object mapping path → version string; got {other}"
+        ))),
+    }
 }
 
 /// Map a [`PortError`] to a [`ToolError`], preserving the stable not-found code.
@@ -498,6 +596,8 @@ fn port_err_to_tool_error(err: crate::ports::PortError) -> ToolError {
 fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let path = require_str(&args, "path")?;
     let content = require_str(&args, "content")?;
+    // Optional CAS guard: absent → unconditional write (U2); malformed → reject.
+    let expected_version = optional_version(&args, "expected_version")?;
 
     let rel = RelativePath::new(path);
     let bytes = content.as_bytes().to_vec();
@@ -521,7 +621,7 @@ fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
         engine.storage.as_mut(),
         plugin_host.as_ref(),
     );
-    svc.create_file(rel, bytes)
+    svc.create_file_cas(rel, bytes, expected_version)
         .map_err(domain_err_to_tool_error)?;
 
     Ok(json!({ "created": true }))
@@ -580,6 +680,9 @@ fn call_delete_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
 fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let target = require_str(&args, "target")?;
     let replacement = require_str(&args, "replacement")?;
+    // Optional per-file CAS guards: absent → unconditional write (U2); a
+    // malformed map (non-object, or non-string value) is rejected, not ignored.
+    let expected_versions = optional_version_map(&args, "expected_versions")?;
 
     let mut guard = state.write().map_err(lock_poisoned)?;
     let ws_arc = Arc::clone(&guard.workspace);
@@ -596,7 +699,7 @@ fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<
         plugin_host.as_ref(),
     );
     let report = svc
-        .global_replace(target, replacement)
+        .global_replace_cas(target, replacement, expected_versions)
         .map_err(domain_err_to_tool_error)?;
 
     let errors_json: Vec<Value> = report
@@ -617,6 +720,8 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
     let start_byte = require_usize(&args, "start_byte")?;
     let end_byte = require_usize(&args, "end_byte")?;
     let replacement = require_str(&args, "replacement")?;
+    // Optional CAS guard: absent → unconditional write (U2); malformed → reject.
+    let expected_version = optional_version(&args, "expected_version")?;
 
     let rel = RelativePath::new(path);
 
@@ -635,7 +740,7 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
         plugin_host.as_ref(),
     );
     let report = svc
-        .edit_range(&rel, start_byte, end_byte, replacement)
+        .edit_range_cas(&rel, start_byte, end_byte, replacement, expected_version)
         .map_err(domain_err_to_tool_error)?;
 
     let errors_json: Vec<Value> = report
@@ -852,6 +957,7 @@ fn domain_err_to_tool_error(err: DomainError) -> ToolError {
     match err {
         DomainError::NotFound => ToolError::ResourceNotFound(err.to_string()),
         DomainError::InvalidRange(_) => ToolError::InvalidArgs(err.to_string()),
+        DomainError::VersionConflict { .. } => ToolError::PreconditionFailed(err.to_string()),
         other => ToolError::ExecutionFailed(other.to_string()),
     }
 }
@@ -875,6 +981,7 @@ mod tests {
 
     use super::{EngineState, NativeToolRegistry};
     use crate::adapters::mcp::registry::ToolRegistry;
+    use crate::adapters::mcp::types::ToolError;
     use crate::adapters::{InMemoryFs, InMemoryStorage};
     use crate::domain::RelativePath;
     use crate::domain::index::InvertedIndex;
@@ -1740,5 +1847,514 @@ mod tests {
             err,
             crate::adapters::mcp::types::ToolError::NotFound(_)
         ));
+    }
+
+    // ── Spec 18: CAS (compare-and-swap) MCP integration ──────────────────────
+
+    /// AC4: `tower_read_file` without `with_version` returns exactly `{content}` —
+    /// no `version` key present (backward-compatible, U1).
+    #[test]
+    fn read_file_without_with_version_has_no_version_key() {
+        let state = state_with_client_file();
+        let mut reg = make_registry(state);
+
+        let val = reg
+            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .unwrap();
+
+        assert!(val.get("content").is_some(), "must have content");
+        assert!(
+            val.get("version").is_none(),
+            "must NOT have version key when with_version is absent; got {val}"
+        );
+    }
+
+    /// OP1: `tower_read_file` with `with_version: true` includes `version` as a
+    /// 64-char lowercase hex string alongside `content`.
+    #[test]
+    fn read_file_with_version_true_returns_hex_sha256() {
+        let state = state_with_client_file();
+        let mut reg = make_registry(state);
+
+        let val = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs", "with_version": true }),
+            )
+            .unwrap();
+
+        assert!(val.get("content").is_some(), "must have content");
+        let version = val["version"].as_str().expect("must have version string");
+        assert_eq!(version.len(), 64, "version must be 64 hex chars");
+        assert!(
+            version.chars().all(|c| c.is_ascii_hexdigit()),
+            "version must be lowercase hex; got {version}"
+        );
+    }
+
+    /// The version returned by `with_version: true` is stable across identical
+    /// reads (same bytes → same hash).
+    #[test]
+    fn read_file_with_version_is_stable() {
+        let state = state_with_client_file();
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let v1 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let v2 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        assert_eq!(v1, v2, "hash must be stable across identical reads");
+    }
+
+    /// AC1: read v0, `tower_create_file` with `expected_version=v0` on unchanged
+    /// file → commits.
+    #[test]
+    fn cas_create_file_matching_version_commits() {
+        let state = state_with_client_file();
+        let mut reg = make_registry(Arc::clone(&state));
+
+        // Read current version.
+        let v0 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Write with matching version — must succeed.
+        let result = reg.call(
+            "tower_create_file",
+            json!({
+                "path": "src/client.rs",
+                "content": "fn client_v2() {}",
+                "expected_version": v0
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "CAS create_file with correct version must commit; got {result:?}"
+        );
+
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "fn client_v2() {}");
+    }
+
+    /// AC2: A reads v0; B writes (now v1); A tries `expected_version=v0` →
+    /// PreconditionFailed, file stays at B's content.
+    #[test]
+    fn cas_create_file_stale_version_returns_precondition_failed() {
+        let state = state_with_client_file();
+        let mut reg = make_registry(Arc::clone(&state));
+
+        // A reads v0.
+        let v0 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // B writes — changes the file.
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/client.rs", "content": "fn modified_by_b() {}" }),
+        )
+        .unwrap();
+
+        // A tries to write with stale v0.
+        let err = reg
+            .call(
+                "tower_create_file",
+                json!({
+                    "path": "src/client.rs",
+                    "content": "fn a_write() {}",
+                    "expected_version": v0
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::adapters::mcp::types::ToolError::PreconditionFailed(_)
+            ),
+            "stale CAS must return PreconditionFailed; got {err:?}"
+        );
+
+        // File must still hold B's content.
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .unwrap();
+        assert_eq!(
+            read["content"].as_str().unwrap(),
+            "fn modified_by_b() {}",
+            "file must retain B's content after A's rejected CAS"
+        );
+    }
+
+    /// AC3: `tower_create_file` without `expected_version` overwrites
+    /// unconditionally — legacy path intact.
+    #[test]
+    fn cas_create_file_no_version_is_unconditional() {
+        let state = state_with_client_file();
+        let mut reg = make_registry(Arc::clone(&state));
+
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/client.rs", "content": "fn unconditional() {}" }),
+        )
+        .expect("no expected_version → must always succeed");
+
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "fn unconditional() {}");
+    }
+
+    /// AC1 variant for `tower_edit_range`: matching version → commits.
+    #[test]
+    fn cas_edit_range_matching_version_commits() {
+        let state = state_with_file("src/edit_cas.rs", "fn main() {}");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let v0 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/edit_cas.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let result = reg.call(
+            "tower_edit_range",
+            json!({
+                "path": "src/edit_cas.rs",
+                "start_byte": 3,
+                "end_byte": 7,
+                "replacement": "run",
+                "expected_version": v0
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "matching CAS edit_range must commit; got {result:?}"
+        );
+
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/edit_cas.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "fn run() {}");
+    }
+
+    /// AC2 variant for `tower_edit_range`: stale version → PreconditionFailed, no write.
+    #[test]
+    fn cas_edit_range_stale_version_returns_precondition_failed() {
+        let state = state_with_file("src/edit_stale.rs", "fn original() {}");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        // Read v0 before B changes it.
+        let v0 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/edit_stale.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // B changes the file.
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/edit_stale.rs", "content": "fn modified() {}" }),
+        )
+        .unwrap();
+
+        // A tries edit_range with stale v0.
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/edit_stale.rs",
+                    "start_byte": 0,
+                    "end_byte": 0,
+                    "replacement": "// stale ",
+                    "expected_version": v0
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::adapters::mcp::types::ToolError::PreconditionFailed(_)
+            ),
+            "stale edit_range CAS must return PreconditionFailed; got {err:?}"
+        );
+
+        // File must hold the content B wrote.
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/edit_stale.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "fn modified() {}");
+    }
+
+    /// AC5: two concurrent CAS writers with the same expected_version — exactly
+    /// one commits, the other gets PreconditionFailed.
+    ///
+    /// Serialised sequentially here (the write-lock already serialises real
+    /// concurrent calls in production; this proves the under-lock recompute path).
+    #[test]
+    fn cas_exactly_one_winner_two_writers_same_version() {
+        let state = state_with_file("src/race.rs", "shared content");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let v0 = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/race.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Writer A commits.
+        let a_result = reg.call(
+            "tower_create_file",
+            json!({
+                "path": "src/race.rs",
+                "content": "writer_a",
+                "expected_version": v0.clone()
+            }),
+        );
+        assert!(a_result.is_ok(), "writer A must win; got {a_result:?}");
+
+        // Writer B (same stale v0) must lose.
+        let b_err = reg
+            .call(
+                "tower_create_file",
+                json!({
+                    "path": "src/race.rs",
+                    "content": "writer_b",
+                    "expected_version": v0
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                b_err,
+                crate::adapters::mcp::types::ToolError::PreconditionFailed(_)
+            ),
+            "writer B must get PreconditionFailed; got {b_err:?}"
+        );
+
+        // Final content must be A's.
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/race.rs" }))
+            .unwrap();
+        assert_eq!(
+            read["content"].as_str().unwrap(),
+            "writer_a",
+            "A's write must be the winner"
+        );
+    }
+
+    /// AC6: `tower_global_replace` with `expected_versions` where one file
+    /// drifted → that file is in errors; non-conflicting file still commits.
+    #[test]
+    fn cas_global_replace_per_file_conflict_in_errors() {
+        let state = empty_state();
+        let mut reg = make_registry(Arc::clone(&state));
+
+        // Create two files.
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/a.rs", "content": "let x = foo;" }),
+        )
+        .unwrap();
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/b.rs", "content": "let y = foo;" }),
+        )
+        .unwrap();
+
+        // Read v0 for file b.
+        let v0_b = reg
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/b.rs", "with_version": true }),
+            )
+            .unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Externally modify b so v0_b is stale.
+        reg.call(
+            "tower_create_file",
+            json!({ "path": "src/b.rs", "content": "let y = BAR;" }),
+        )
+        .unwrap();
+
+        // Run global_replace with stale guard on b.
+        let val = reg
+            .call(
+                "tower_global_replace",
+                json!({
+                    "target": "foo",
+                    "replacement": "bar",
+                    "expected_versions": { "src/b.rs": v0_b }
+                }),
+            )
+            .unwrap();
+
+        // File a (no guard) must have been replaced.
+        assert_eq!(
+            val["files_changed"].as_u64().unwrap(),
+            1,
+            "only a must be changed; got {val}"
+        );
+
+        let a_read = reg
+            .call("tower_read_file", json!({ "path": "src/a.rs" }))
+            .unwrap();
+        assert_eq!(a_read["content"].as_str().unwrap(), "let x = bar;");
+
+        // File b must appear in errors.
+        let errors = val["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "b must be in errors; got {val}");
+        assert_eq!(errors[0]["path"].as_str().unwrap(), "src/b.rs");
+
+        // File b's content must be unchanged (external write preserved).
+        let b_read = reg
+            .call("tower_read_file", json!({ "path": "src/b.rs" }))
+            .unwrap();
+        assert_eq!(b_read["content"].as_str().unwrap(), "let y = BAR;");
+    }
+
+    /// A malformed `expected_version` (non-string) must be rejected with
+    /// InvalidArgs — a safety guard that fails open would silently downgrade to
+    /// an unconditional write and clobber a concurrent writer.
+    #[test]
+    fn cas_create_file_non_string_version_is_rejected() {
+        let state = state_with_file("src/x.rs", "v0");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let err = reg
+            .call(
+                "tower_create_file",
+                json!({ "path": "src/x.rs", "content": "v1", "expected_version": 123 }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(_)),
+            "non-string expected_version must be InvalidArgs; got {err:?}"
+        );
+        // The file must be untouched — the malformed call wrote nothing.
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/x.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "v0");
+    }
+
+    /// Same fail-closed rule for `tower_edit_range`.
+    #[test]
+    fn cas_edit_range_non_string_version_is_rejected() {
+        let state = state_with_file("src/y.rs", "abcdef");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/y.rs",
+                    "start_byte": 0,
+                    "end_byte": 1,
+                    "replacement": "Z",
+                    "expected_version": true
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(_)),
+            "non-string expected_version must be InvalidArgs; got {err:?}"
+        );
+    }
+
+    /// `expected_versions` with a non-string value is a malformed guard map and
+    /// must be rejected, not silently degraded to an unconditional replace.
+    #[test]
+    fn cas_global_replace_non_string_version_value_is_rejected() {
+        let state = state_with_file("src/z.rs", "foo");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let err = reg
+            .call(
+                "tower_global_replace",
+                json!({
+                    "target": "foo",
+                    "replacement": "bar",
+                    "expected_versions": { "src/z.rs": 42 }
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(_)),
+            "non-string version value must be InvalidArgs; got {err:?}"
+        );
+        // Nothing was replaced.
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/z.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "foo");
+    }
+
+    /// `expected_versions` that is not even an object is rejected.
+    #[test]
+    fn cas_global_replace_non_object_versions_is_rejected() {
+        let state = state_with_file("src/w.rs", "foo");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let err = reg
+            .call(
+                "tower_global_replace",
+                json!({
+                    "target": "foo",
+                    "replacement": "bar",
+                    "expected_versions": "not-an-object"
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(_)),
+            "non-object expected_versions must be InvalidArgs; got {err:?}"
+        );
     }
 }

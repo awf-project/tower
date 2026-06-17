@@ -162,13 +162,21 @@ fn definition_resolves_across_files() {
         character: 12,
     };
 
+    // The loop rides out rust-analyzer's warm-up. While it indexes, a request
+    // may return empty *or* exceed REQUEST_BUDGET and surface as a transient
+    // backend error (seen under `cargo test --workspace`, where several e2e
+    // tests each spawn a rust-analyzer and contend for CPU). Both mean "not
+    // ready yet": retry. A genuine error is re-raised on the final attempt.
     let mut locs = Vec::new();
-    for _ in 0..10 {
-        locs = adapter
-            .definition(&lib, &text, call_site)
-            .expect("definition");
-        if !locs.is_empty() {
-            break;
+    for attempt in 0..10 {
+        match adapter.definition(&lib, &text, call_site) {
+            Ok(found) if !found.is_empty() => {
+                locs = found;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) if attempt < 9 => {}
+            Err(e) => panic!("definition: {e:?}"),
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -194,14 +202,21 @@ fn references_include_cross_file_use_site() {
         character: 8,
     };
 
+    // See `definition_resolves_across_files`: tolerate transient warm-up errors
+    // (empty result or a REQUEST_BUDGET timeout under load) and retry.
     let mut refs = Vec::new();
-    for _ in 0..10 {
-        refs = adapter
-            .references(&thing, &text, def_site)
-            .expect("references");
-        if refs.iter().any(|l| l.path.as_str() == "src/lib.rs") {
-            break;
+    for attempt in 0..10 {
+        match adapter.references(&thing, &text, def_site) {
+            Ok(found) => {
+                refs = found;
+                if refs.iter().any(|l| l.path.as_str() == "src/lib.rs") {
+                    break;
+                }
+            }
+            Err(_) if attempt < 9 => {}
+            Err(e) => panic!("references: {e:?}"),
         }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
     assert!(
         refs.iter().any(|l| l.path.as_str() == "src/lib.rs"),
@@ -225,11 +240,18 @@ fn hover_returns_contents() {
         character: 12,
     };
 
+    // See `definition_resolves_across_files`: tolerate transient warm-up errors
+    // (empty result or a REQUEST_BUDGET timeout under load) and retry.
     let mut hover = None;
-    for _ in 0..10 {
-        hover = adapter.hover(&lib, &text, call_site).expect("hover");
-        if hover.is_some() {
-            break;
+    for attempt in 0..10 {
+        match adapter.hover(&lib, &text, call_site) {
+            Ok(Some(h)) => {
+                hover = Some(h);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) if attempt < 9 => {}
+            Err(e) => panic!("hover: {e:?}"),
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }

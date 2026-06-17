@@ -63,6 +63,8 @@
 //! Per-file FS-level atomicity is already guaranteed by the shadow-file rename.
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
+
 use rayon::prelude::*;
 
 use crate::domain::mutation::atomic_write;
@@ -131,6 +133,30 @@ impl<'a> GlobalReplaceService<'a> {
         replacement: &str,
         dry_run: bool,
     ) -> Result<TxReport, DomainError> {
+        self.execute_excluding(target, replacement, dry_run, &HashSet::new())
+    }
+
+    /// Like [`execute`](Self::execute) but skips every path in `excluded` during
+    /// both the dry-run count and the commit phase.
+    ///
+    /// This is the shared engine behind the optimistic-CAS global replace
+    /// (spec 18): the caller pre-computes the set of paths whose content version
+    /// drifted under the write-lock and passes them here, so conflicting files
+    /// are left untouched while every other match still commits — reusing this
+    /// service's parallel read/apply, atomic shadow-file writes, and batched
+    /// storage flush instead of re-implementing them.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`execute`](Self::execute): per-file failures land in
+    /// `TxReport::errors`, not the `Err` path.
+    pub fn execute_excluding(
+        &mut self,
+        target: &str,
+        replacement: &str,
+        dry_run: bool,
+        excluded: &HashSet<RelativePath>,
+    ) -> Result<TxReport, DomainError> {
         // ── Phase 1: parallel read + apply ────────────────────────────────────
         //
         // Collect a snapshot of all live FileIds (O(n) read, no lock held during
@@ -192,6 +218,12 @@ impl<'a> GlobalReplaceService<'a> {
         // reproducible regardless of Rayon scheduling order.
         let mut patches = patches;
         patches.sort_by(|a, b| a.path.cmp(&b.path));
+
+        // Drop patches the caller excluded (CAS conflicts — spec 18). Skipped
+        // here so neither the dry-run count nor the commit phase touches them.
+        if !excluded.is_empty() {
+            patches.retain(|p| !excluded.contains(&p.path));
+        }
 
         // ── Dry-run: return report without touching any state ─────────────────
         if dry_run {

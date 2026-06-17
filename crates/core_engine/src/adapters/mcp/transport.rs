@@ -251,6 +251,9 @@ fn handle_tools_call(
         Err(ToolError::ResourceNotFound(msg)) => {
             DispatchResult::Err(JsonRpcError::resource_not_found(id, &msg))
         }
+        Err(ToolError::PreconditionFailed(msg)) => {
+            DispatchResult::Err(JsonRpcError::precondition_failed(id, &msg))
+        }
     }
 }
 

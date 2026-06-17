@@ -1,4 +1,4 @@
-//! `FileMutationUseCase` implementation — spec 08.
+//! `FileMutationUseCase` implementation — spec 08 and spec 18 (CAS).
 //!
 //! # Wireframe
 //!
@@ -54,6 +54,9 @@ pub use file_mutation::FileMutationService;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod cas_tests;
+
 /// Write `content` to `path` using the spec-08 shadow-file atomic pattern.
 ///
 /// 1. Write to `<path>.tmp_write` via the FS port.
@@ -96,6 +99,44 @@ pub fn atomic_write(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Compute the hex-encoded SHA-256 content version of `bytes`.
+///
+/// This is the canonical version representation used by the optimistic CAS
+/// mechanism (spec 18). The result is a 64-character lowercase hex string.
+///
+/// # Design decision
+///
+/// The hash is computed from raw bytes, not from a `ContentHash` value object,
+/// because the CAS check must operate on the **live** bytes read through the
+/// `FileSystemPort` at mutation time — never on the cached `content_hash` field
+/// in `VirtualFile` (which the watcher sets to `None` on Modify events and is
+/// therefore unreliable as a freshness signal).
+///
+/// The `sha2` crate is already a declared dependency (spec 15 content hashing).
+/// No new infrastructure import enters the domain: the SHA-256 computation is
+/// pure CPU work on a `&[u8]` that the domain already holds after reading
+/// through the port.
+///
+/// # Examples
+///
+/// ```rust
+/// use core_engine::domain::mutation::compute_content_version;
+/// let v = compute_content_version(b"hello");
+/// assert_eq!(v.len(), 64);
+/// assert!(v.chars().all(|c| c.is_ascii_hexdigit()));
+/// ```
+pub fn compute_content_version(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for byte in digest {
+        s.push(HEX[(byte >> 4) as usize] as char);
+        s.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// Return `true` if `path` is a shadow-file temp artifact that must not be

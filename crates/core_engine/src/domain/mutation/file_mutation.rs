@@ -1,13 +1,16 @@
 //! `FileMutationService` — concrete implementation of [`FileMutationUseCase`].
 #![forbid(unsafe_code)]
 
+use std::collections::{HashMap, HashSet};
+
 use crate::domain::index::InvertedIndex;
+use crate::domain::mutation::compute_content_version;
 use crate::domain::refactor::GlobalReplaceService;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
-use crate::ports::inbound::{FileMutationUseCase, TxReport};
+use crate::ports::inbound::{FileMutationUseCase, FileReplaceError, TxReport};
 use crate::ports::{FileSystemPort, PluginHostPort, PortError, StoragePort};
 
 // ── FileMutationService ───────────────────────────────────────────────────────
@@ -472,6 +475,112 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
             replacements: 1,
             errors: vec![],
         })
+    }
+
+    fn create_file_cas(
+        &mut self,
+        path: RelativePath,
+        content: Vec<u8>,
+        expected_version: Option<String>,
+    ) -> Result<(), DomainError> {
+        if let Some(want) = expected_version {
+            // Read the live bytes to compute the current version. A missing file
+            // is itself a conflict: the caller expected a specific version but it
+            // is gone. We report `actual = ""` — an unambiguous "absent" sentinel
+            // (a real SHA-256 hash is always 64 hex chars) — rather than NotFound,
+            // so the caller treats it uniformly as "re-read and retry".
+            let actual = match self.fs.read(&path) {
+                Ok(bytes) => compute_content_version(&bytes),
+                Err(PortError::NotFound) => String::new(),
+                Err(e) => return Err(port_err_to_domain(e)),
+            };
+            if actual != want {
+                return Err(DomainError::VersionConflict {
+                    expected: want,
+                    actual,
+                });
+            }
+        }
+        self.create_file(path, content)
+    }
+
+    fn edit_range_cas(
+        &mut self,
+        path: &RelativePath,
+        start_byte: usize,
+        end_byte: usize,
+        replacement: &str,
+        expected_version: Option<String>,
+    ) -> Result<TxReport, DomainError> {
+        if let Some(want) = expected_version {
+            // Check VFS first so we surface NotFound cleanly (same as edit_range).
+            if self.workspace.get_by_path(path).is_none() {
+                return Err(DomainError::NotFound);
+            }
+            let current_bytes = self.fs.read(path).map_err(port_err_to_domain)?;
+            let actual = compute_content_version(&current_bytes);
+            if actual != want {
+                return Err(DomainError::VersionConflict {
+                    expected: want,
+                    actual,
+                });
+            }
+        }
+        self.edit_range(path, start_byte, end_byte, replacement)
+    }
+
+    fn global_replace_cas(
+        &mut self,
+        target: &str,
+        replacement: &str,
+        expected_versions: HashMap<RelativePath, String>,
+    ) -> Result<TxReport, DomainError> {
+        if expected_versions.is_empty() {
+            return self.global_replace(target, replacement);
+        }
+
+        // Phase 1 (under the write-lock): check each guarded path's live version.
+        // A drifted hash — or a guarded path we cannot read — is a conflict: it is
+        // recorded in the report and excluded from the write phase. Untracked
+        // paths are never written by global_replace, so a guard on one is vacuous
+        // and is skipped without manufacturing an error.
+        let mut cas_errors: Vec<FileReplaceError> = Vec::new();
+        let mut conflicting: HashSet<RelativePath> = HashSet::new();
+        for (guarded_path, want) in &expected_versions {
+            if self.workspace.get_by_path(guarded_path).is_none() {
+                continue;
+            }
+            match self.fs.read(guarded_path) {
+                Ok(bytes) => {
+                    let actual = compute_content_version(&bytes);
+                    if &actual != want {
+                        cas_errors.push(FileReplaceError {
+                            path: guarded_path.clone(),
+                            reason: format!("version conflict: expected {want}, actual {actual}"),
+                        });
+                        conflicting.insert(guarded_path.clone());
+                    }
+                }
+                Err(e) => {
+                    cas_errors.push(FileReplaceError {
+                        path: guarded_path.clone(),
+                        reason: format!("could not read file for CAS check: {e}"),
+                    });
+                    conflicting.insert(guarded_path.clone());
+                }
+            }
+        }
+
+        // Phase 2: delegate to the canonical replace engine, excluding conflicts.
+        // Reuses its parallel read/apply, atomic shadow-file writes, and batched
+        // storage flush rather than re-implementing them here (spec 18 REFACTOR).
+        let mut report = GlobalReplaceService::new(self.fs, self.workspace, self.storage)
+            .execute_excluding(target, replacement, false, &conflicting)?;
+
+        // Merge the CAS conflicts into the report, preserving deterministic order.
+        report.errors.extend(cas_errors);
+        report.errors.sort();
+        Ok(report)
     }
 }
 

@@ -174,6 +174,23 @@ impl JsonRpcError {
         }
     }
 
+    /// Build a `PreconditionFailed` response (optimistic CAS conflict, spec 18).
+    ///
+    /// Uses server-defined code `-32009` (JSON-RPC 2.0 range `-32000..=-32099`).
+    /// Clients branch on this stable code to detect "file changed since you read
+    /// it" without parsing the error string.
+    pub fn precondition_failed(id: Option<RequestId>, detail: &str) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            error: ErrorObject {
+                code: -32009,
+                message: format!("Precondition failed: {detail}"),
+                data: None,
+            },
+            id,
+        }
+    }
+
     /// Build an `InvalidRequest` response (e.g. wrong `jsonrpc` version, JSON-RPC 2.0 §4).
     pub fn invalid_request(id: Option<RequestId>, detail: &str) -> Self {
         Self {
@@ -251,6 +268,13 @@ pub enum ToolError {
     /// name). Maps to server-defined code `-32002` so clients can branch on
     /// "resource not found" without parsing the error message (spec 10b AC5).
     ResourceNotFound(String),
+    /// Optimistic concurrency precondition failed: the caller's expected version
+    /// did not match the file's current version at write time (spec 18).
+    ///
+    /// Maps to server-defined code `-32009`. The message carries both the
+    /// `expected` and `actual` hashes so the client can surface a meaningful
+    /// "file changed since you read it" diagnostic without parsing the string.
+    PreconditionFailed(String),
 }
 
 impl core::fmt::Display for ToolError {
@@ -260,6 +284,7 @@ impl core::fmt::Display for ToolError {
             Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
             Self::ExecutionFailed(msg) => write!(f, "tool execution failed: {msg}"),
             Self::ResourceNotFound(msg) => write!(f, "resource not found: {msg}"),
+            Self::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
         }
     }
 }

@@ -188,6 +188,34 @@ pub trait FileMutationUseCase {
         replacement: &str,
     ) -> Result<TxReport, DomainError>;
 
+    /// Create or overwrite the file at `path` with `content`, with an optional
+    /// optimistic concurrency guard (spec 18).
+    ///
+    /// When `expected_version` is `Some(hex)`, the domain recomputes the current
+    /// SHA-256 hash of the file **under the write-lock** before writing. If the
+    /// hash does not match, no write occurs and
+    /// [`DomainError::VersionConflict`] is returned.
+    ///
+    /// When `expected_version` is `None`, the write is unconditional (legacy
+    /// behaviour — U2).
+    ///
+    /// If the target file does not exist while `expected_version` is `Some`, the
+    /// guard fails with [`DomainError::VersionConflict`] whose `actual` is the
+    /// empty string (an unambiguous "absent" sentinel) — never `NotFound` — so a
+    /// caller treats a vanished file the same as any other drift: re-read, retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::VersionConflict`] on CAS mismatch (including an
+    /// absent file under a `Some` guard).
+    /// Returns [`DomainError::IoError`] on write failure.
+    fn create_file_cas(
+        &mut self,
+        path: RelativePath,
+        content: Vec<u8>,
+        expected_version: Option<String>,
+    ) -> Result<(), DomainError>;
+
     /// Replace the byte range `[start_byte, end_byte)` in the file at `path`
     /// with `replacement` (spec 17 — surgical range edit).
     ///
@@ -243,5 +271,55 @@ pub trait FileMutationUseCase {
         start_byte: usize,
         end_byte: usize,
         replacement: &str,
+    ) -> Result<TxReport, DomainError>;
+
+    /// Surgical range edit with an optional optimistic concurrency guard
+    /// (spec 18).
+    ///
+    /// Identical to [`edit_range`] except that when `expected_version` is
+    /// `Some(hex)`, the domain re-reads and hashes the file **under the
+    /// write-lock** and rejects the mutation with
+    /// [`DomainError::VersionConflict`] if the hash has changed since the
+    /// caller's read (AC1–AC3, U3).
+    ///
+    /// When `expected_version` is `None`, behaviour is identical to `edit_range`
+    /// (unconditional — U2).
+    ///
+    /// # Errors
+    ///
+    /// All errors of [`edit_range`] plus:
+    ///
+    /// | Condition                    | Error variant                          |
+    /// |------------------------------|----------------------------------------|
+    /// | CAS hash mismatch            | [`DomainError::VersionConflict`]       |
+    ///
+    /// [`edit_range`]: FileMutationUseCase::edit_range
+    fn edit_range_cas(
+        &mut self,
+        path: &RelativePath,
+        start_byte: usize,
+        end_byte: usize,
+        replacement: &str,
+        expected_version: Option<String>,
+    ) -> Result<TxReport, DomainError>;
+
+    /// Global find-and-replace with per-file optimistic concurrency guards
+    /// (spec 18, AC6).
+    ///
+    /// Identical to [`global_replace`] except that when `expected_version` is
+    /// `Some(hex)`, each file is checked under the write-lock before being
+    /// written. Files whose hash has drifted are recorded as
+    /// [`FileReplaceError`] entries in `TxReport::errors` while non-conflicting
+    /// files still commit (partial semantics, AC6).
+    ///
+    /// When `expected_version` is `None`, behaviour is identical to
+    /// `global_replace` (unconditional — U2).
+    ///
+    /// [`global_replace`]: FileMutationUseCase::global_replace
+    fn global_replace_cas(
+        &mut self,
+        target: &str,
+        replacement: &str,
+        expected_versions: std::collections::HashMap<RelativePath, String>,
     ) -> Result<TxReport, DomainError>;
 }

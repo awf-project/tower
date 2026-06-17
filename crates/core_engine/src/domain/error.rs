@@ -35,6 +35,25 @@ pub enum DomainError {
     /// No write, VFS update, index update, storage mutation, or broadcast is
     /// performed when this error is returned (UN1/AC3/AC4).
     InvalidRange(String),
+    /// Optimistic concurrency check failed: the file's current content hash does
+    /// not match the caller's expected version.
+    ///
+    /// Introduced in spec 18 (compare-and-swap writes). The `expected` field is
+    /// the hex SHA-256 the caller read earlier; `actual` is the hash recomputed
+    /// under the write-lock at mutation time. No filesystem change has been made.
+    ///
+    /// The caller must re-read the file, incorporate any changes made by the
+    /// winning writer, and retry the mutation.
+    VersionConflict {
+        /// The hex SHA-256 the caller expected (from a prior `read_file` with
+        /// `with_version: true`).
+        expected: String,
+        /// The hex SHA-256 actually present at mutation time (under the lock),
+        /// or the empty string when the target file does not exist (a real
+        /// SHA-256 hash is always 64 hex chars, so `""` unambiguously means
+        /// "absent").
+        actual: String,
+    },
 }
 
 impl core::fmt::Display for DomainError {
@@ -45,6 +64,9 @@ impl core::fmt::Display for DomainError {
             Self::NotFound => write!(f, "path or entity not found in workspace"),
             Self::IoError(reason) => write!(f, "I/O error: {reason}"),
             Self::InvalidRange(reason) => write!(f, "invalid byte range: {reason}"),
+            Self::VersionConflict { expected, actual } => {
+                write!(f, "version conflict: expected {expected}, actual {actual}")
+            }
         }
     }
 }
