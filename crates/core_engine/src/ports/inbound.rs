@@ -187,4 +187,61 @@ pub trait FileMutationUseCase {
         target: &str,
         replacement: &str,
     ) -> Result<TxReport, DomainError>;
+
+    /// Replace the byte range `[start_byte, end_byte)` in the file at `path`
+    /// with `replacement` (spec 17 — surgical range edit).
+    ///
+    /// # Wireframe
+    ///
+    /// ```text
+    ///  edit_range(path, start_byte, end_byte, replacement):
+    ///    bytes  ← FileSystemPort.read(path)           ← must exist (not create)
+    ///    validate 0 ≤ start ≤ end ≤ len               ← DomainError::InvalidRange
+    ///    validate start and end on UTF-8 char boundary ← DomainError::InvalidRange
+    ///    spliced ← bytes[0..start] ++ replacement ++ bytes[end..]
+    ///    atomic_write(fs, path, spliced)               ← shadow-file pattern
+    ///         │
+    ///         ├─ workspace.update (stable FileId)      ┐
+    ///         ├─ index.remove + index.insert           ├─ VFS + index in sync
+    ///         ├─ storage.put                           ┘
+    ///         └─ plugin_host.on_file_changed           ← broadcast after commit
+    /// ```
+    ///
+    /// # Contract
+    ///
+    /// - **Existing files only**: `path` must already be tracked in the VFS.
+    ///   Returns [`DomainError::NotFound`] when the path is absent (UN2).
+    /// - **Range validation (UN1/AC3/AC4)**: both `start_byte` and `end_byte`
+    ///   must satisfy `0 ≤ start ≤ end ≤ file_len`, and both must fall on a
+    ///   UTF-8 character boundary of the current file content. Any violation
+    ///   returns [`DomainError::InvalidRange`] and leaves the file **unchanged**.
+    /// - **Byte-exact (U2)**: the spliced content is
+    ///   `bytes[..start] ++ replacement.as_bytes() ++ bytes[end..]`. No
+    ///   normalisation, no re-encoding, no formatting.
+    /// - **Atomicity (AC2)**: the write goes through the spec-08 shadow-file
+    ///   primitive (`atomic_write`) — a crash mid-write never corrupts the target.
+    /// - **Empty replacement** deletes the span; an equal `start == end` inserts
+    ///   without removing any content.
+    ///
+    /// # Return value
+    ///
+    /// Returns a [`TxReport`] with `files_changed: 1`, `replacements: 1`, and
+    /// an empty `errors` vec on success.  A single-file edit either fully
+    /// succeeds or returns an `Err` — partial failure is not possible here.
+    ///
+    /// # Errors
+    ///
+    /// | Condition                              | Error variant                  |
+    /// |----------------------------------------|--------------------------------|
+    /// | `path` not in VFS                      | [`DomainError::NotFound`]      |
+    /// | `end > len` or `start > end`           | [`DomainError::InvalidRange`]  |
+    /// | `start`/`end` not on char boundary     | [`DomainError::InvalidRange`]  |
+    /// | FS read/write failure                  | [`DomainError::IoError`]       |
+    fn edit_range(
+        &mut self,
+        path: &RelativePath,
+        start_byte: usize,
+        end_byte: usize,
+        replacement: &str,
+    ) -> Result<TxReport, DomainError>;
 }

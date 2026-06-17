@@ -87,6 +87,73 @@ impl<'ws> FileMutationService<'ws> {
             plugin_host,
         }
     }
+
+    /// Shared "commit an indexed full-file write" tail (spec 17 REFACTOR).
+    ///
+    /// Shared commit tail for a full-file rewrite of an **already-tracked**
+    /// file. Called only by [`FileMutationUseCase::edit_range`], which resolves
+    /// the live `file_id` before computing the spliced bytes. Performs:
+    ///
+    /// 1. Atomically write `content` to disk via the spec-08 shadow-file pattern.
+    /// 2. Update VFS metadata in-place on the existing slot (stable `FileId`).
+    /// 3. Delta-reindex (remove old tokens + insert new).
+    /// 4. `storage.put` to persist the updated `VirtualFile` record.
+    /// 5. Broadcast `on_file_changed` to the plugin host.
+    ///
+    /// [`FileMutationUseCase::create_file`] does **not** route through this
+    /// helper: it has upsert semantics (insert-or-update via `workspace.insert`
+    /// with a `DuplicatePath` fallback) and keeps its own inline commit sequence.
+    /// This helper deliberately handles only the update-existing case, so it
+    /// takes a pre-resolved `file_id` and calls `workspace.update` directly.
+    ///
+    /// # Arguments
+    ///
+    /// - `path`    — workspace-relative path (used for tokenisation + broadcast).
+    /// - `file_id` — pre-resolved, live `FileId` for the existing VFS slot.
+    /// - `content` — the full new file bytes to write and commit.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `atomic_write` failures as `DomainError::IoError` and
+    /// `storage.put` failures likewise.
+    fn commit_indexed_write(
+        &mut self,
+        path: &RelativePath,
+        file_id: crate::domain::FileId,
+        content: Vec<u8>,
+    ) -> Result<(), DomainError> {
+        // Step A: shadow-file write + atomic rename.
+        super::atomic_write(self.fs, path, content).map_err(DomainError::IoError)?;
+
+        // Step B: VFS — update metadata in-place (stable FileId; the slot is
+        // already live for both create_file's overwrite branch and edit_range).
+        let metadata = FileMetadata {
+            size: 0,
+            modified: Timestamp(0),
+            content_hash: None,
+        };
+        self.workspace
+            .update(file_id, metadata)
+            .expect("file_id is live — update must succeed");
+
+        // Step C: delta-reindex.
+        let tokens = tokenize(path.as_str());
+        self.index.remove(file_id);
+        self.index.insert(file_id, &tokens);
+
+        // Step D: persist the updated VirtualFile record.
+        let virtual_file = self
+            .workspace
+            .get(file_id)
+            .expect("just updated — slot must be live")
+            .clone();
+        self.storage.put(virtual_file).map_err(port_err_to_domain)?;
+
+        // Step E: broadcast.
+        self.plugin_host.on_file_changed(file_id, path);
+
+        Ok(())
+    }
 }
 
 impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
@@ -301,6 +368,110 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
             replacement,
             true,
         )
+    }
+
+    /// Replace the byte range `[start_byte, end_byte)` with `replacement`
+    /// (spec 17 — surgical range edit).
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Read current bytes via `FileSystemPort::read`.
+    /// 2. Validate range: `0 ≤ start ≤ end ≤ len` and both on UTF-8 char
+    ///    boundaries — return [`DomainError::InvalidRange`] without touching
+    ///    the file if validation fails.
+    /// 3. Splice: `bytes[..start] ++ replacement ++ bytes[end..]`.
+    /// 4. Atomic write via the spec-08 shadow-file primitive.
+    /// 5. Commit: update VFS metadata + delta-reindex + `storage.put` +
+    ///    broadcast `on_file_changed`.
+    ///
+    /// # Errors
+    ///
+    /// See [`FileMutationUseCase::edit_range`] for the full error table.
+    fn edit_range(
+        &mut self,
+        path: &RelativePath,
+        start_byte: usize,
+        end_byte: usize,
+        replacement: &str,
+    ) -> Result<TxReport, DomainError> {
+        // ── Step 1: read current bytes ─────────────────────────────────────────
+        //
+        // We read through the FS port rather than the VFS so we always have
+        // the actual on-disk bytes (same source as `atomic_write` will target).
+        // The FS port returns `PortError::NotFound` if the file does not exist
+        // on disk; however, we want to surface the "not tracked in VFS" case
+        // first (the spec's UN2 requirement states "edit_range edits existing
+        // files ONLY; never creates"). Check the workspace before reading.
+        let file_id = self
+            .workspace
+            .get_by_path(path)
+            .ok_or(DomainError::NotFound)?;
+
+        let bytes = self.fs.read(path).map_err(port_err_to_domain)?;
+
+        // ── Step 2: validate range ─────────────────────────────────────────────
+        //
+        // Both `start_byte` and `end_byte` must satisfy:
+        //   0 ≤ start ≤ end ≤ bytes.len()
+        // AND the content must be valid UTF-8 with both positions on char boundaries.
+        //
+        // Decision: validate UTF-8 on the full file bytes first (a single pass),
+        // then check char boundaries with `str::is_char_boundary`. This avoids
+        // indexing into potentially invalid UTF-8 with raw byte offsets.
+        //
+        // Trade-off: if the stored file is not valid UTF-8 (e.g. a binary blob),
+        // we return `InvalidRange` with a clear message rather than silently
+        // corrupting the file. The spec states replacement is a UTF-8 string
+        // and the result must stay valid UTF-8.
+        let len = bytes.len();
+
+        if start_byte > end_byte {
+            return Err(DomainError::InvalidRange(format!(
+                "start ({start_byte}) must be ≤ end ({end_byte})"
+            )));
+        }
+        if end_byte > len {
+            return Err(DomainError::InvalidRange(format!(
+                "end ({end_byte}) exceeds file length ({len})"
+            )));
+        }
+
+        // Validate UTF-8 and char boundaries in one step.
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
+            DomainError::InvalidRange(format!(
+                "target file is not UTF-8 text; edit_range only edits text files ({e})"
+            ))
+        })?;
+
+        if !text.is_char_boundary(start_byte) {
+            return Err(DomainError::InvalidRange(format!(
+                "start byte {start_byte} is not on a UTF-8 character boundary"
+            )));
+        }
+        if !text.is_char_boundary(end_byte) {
+            return Err(DomainError::InvalidRange(format!(
+                "end byte {end_byte} is not on a UTF-8 character boundary"
+            )));
+        }
+
+        // ── Step 3: splice ────────────────────────────────────────────────────
+        //
+        // Concatenate three segments: prefix | replacement | suffix.
+        // All three are valid UTF-8 (prefix/suffix at char boundaries, replacement
+        // from JSON string), so the result is guaranteed valid UTF-8.
+        let mut spliced = Vec::with_capacity(start_byte + replacement.len() + (len - end_byte));
+        spliced.extend_from_slice(&bytes[..start_byte]);
+        spliced.extend_from_slice(replacement.as_bytes());
+        spliced.extend_from_slice(&bytes[end_byte..]);
+
+        // ── Step 4 & 5: atomic write + commit ────────────────────────────────
+        self.commit_indexed_write(path, file_id, spliced)?;
+
+        Ok(TxReport {
+            files_changed: 1,
+            replacements: 1,
+            errors: vec![],
+        })
     }
 }
 

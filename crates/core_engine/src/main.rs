@@ -518,8 +518,9 @@ fn run() -> Result<(), String> {
     );
 
     // ── Step 6: serve native + plugin tools over real stdin/stdout ────────────
-    // MergedRegistry exposes the 7 native tower_* tools plus namespaced plugin
+    // MergedRegistry exposes the 9 native tower_* tools plus namespaced plugin
     // tools. A missing/empty plugins dir leaves it serving exactly the natives.
+    // (The 4 tower_lsp_* code-intelligence tools are chained in at step 6b below.)
     // Lock stdin/stdout for the duration of the serve loop.
     // BufReader/BufWriter ensure line-oriented I/O matches the framing spec.
     let merged_registry = MergedRegistry::new(Arc::clone(&state), plugin_host);

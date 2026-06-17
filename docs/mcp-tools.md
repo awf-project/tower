@@ -81,8 +81,9 @@ version and capability advertisement.
 
 ### 2. tools/list
 
-Enumerate every available tool. The response lists all 7 native `tower_*` tools
-plus any namespaced plugin tools (e.g. `"tower_ast_get_outline"`) that are loaded.
+Enumerate every available tool. The response lists the 9 native `tower_*` tools,
+the 4 always-present code-intelligence tools (`tower_lsp_*`), plus any namespaced
+plugin tools (e.g. `"tower_ast_get_outline"`, `"tower_fmt_format"`) that are loaded.
 
 **Request**
 
@@ -192,7 +193,7 @@ Codes `-32001` and `-32002` are in the JSON-RPC 2.0 server-defined range
 
 ## Native tools
 
-Seven tools are always available, regardless of which plugins are loaded. Their
+Nine tools are always available, regardless of which plugins are loaded. Their
 names are undecorated (no namespace prefix).
 
 ### tower_find_file
@@ -508,6 +509,204 @@ a `CHANGELOG.txt` entry — all rewritten unconditionally.
 
 ---
 
+### tower_reindex
+
+Force a full rebuild of the VFS and the inverted text-search index from the
+current filesystem. Use after large external changes or to correct drift. Takes
+no arguments.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| _(none)_ | — | — | This tool takes no arguments |
+
+**Returns** `{"files_indexed": uint}`
+
+**Request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 17,
+  "method": "tools/call",
+  "params": { "name": "tower_reindex", "arguments": {} }
+}
+```
+
+**Success response**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [{ "type": "text", "text": "{\"files_indexed\":128}" }]
+  },
+  "id": 17
+}
+```
+
+---
+
+### tower_edit_range
+
+Surgical byte-range edit of an **existing** file: splice
+`[start_byte, end_byte) := replacement` into the current content and commit the
+full result through the same atomic shadow-file path as `tower_create_file`. This
+is the precise alternative to a whole-file `tower_create_file` rewrite or an
+ambiguous `tower_global_replace`. Pairs naturally with `tower_ast_read_symbol`:
+read a symbol's `start_byte`/`end_byte`, then edit exactly that span.
+
+The replacement is applied **byte-exact** — no normalization and no implicit
+formatting (run `tower_fmt_format` separately if you want formatting).
+
+| Field         | Type    | Required | Description                                                        |
+|---------------|---------|----------|--------------------------------------------------------------------|
+| `path`        | string  | yes      | Workspace-relative path of the existing file to edit               |
+| `start_byte`  | integer | yes      | Start of the replaced range (inclusive), `≥ 0`                     |
+| `end_byte`    | integer | yes      | End of the replaced range (exclusive), `≥ start_byte`             |
+| `replacement` | string  | yes      | UTF-8 text spliced in place of `[start_byte, end_byte)`            |
+
+**Returns** `{"files_changed": uint, "replacements": uint, "errors": [{"path": string, "reason": string}]}`
+— on success, `{"files_changed": 1, "replacements": 1, "errors": []}`.
+
+**Validation (no write on failure)**
+
+- The range must satisfy `0 ≤ start_byte ≤ end_byte ≤ file_length`, and both
+  offsets must fall on UTF-8 character boundaries. A bad range (out of bounds,
+  `start > end`, mid-codepoint split, or a non-UTF-8 target file) returns
+  `-32602 InvalidParams` and the file is left untouched.
+- A missing file returns `-32002 ResourceNotFound`. `tower_edit_range` edits
+  existing files only; it never creates (use `tower_create_file` for that).
+- An empty `replacement` deletes the span; `start_byte == end_byte` inserts
+  without deleting (a pure insertion, including append at end-of-file).
+
+**Request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 18,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_edit_range",
+    "arguments": {
+      "path": "src/lib.rs",
+      "start_byte": 100,
+      "end_byte": 160,
+      "replacement": "pub fn handle() -> Result<()> { Ok(()) }"
+    }
+  }
+}
+```
+
+**Success response**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [{ "type": "text", "text": "{\"files_changed\":1,\"replacements\":1,\"errors\":[]}" }]
+  },
+  "id": 18
+}
+```
+
+---
+
+## Code-intelligence tools (LSP)
+
+Four `tower_lsp_*` tools surface language-server intelligence over the same
+`tools/call` interface. They are **always present** in `tools/list`, even when no
+language server is configured for the workspace. When there is no backend, or when
+the file's language is not supported by the configured server, each tool returns a
+normal result with `"supported": false` (and an empty payload) rather than an
+error — so an agent can branch on that flag and fall back to the structural
+`tower_ast_*` tools.
+
+Positions use **zero-based** `line` and `character`, where `character` is a
+**UTF-16 code-unit** column (LSP convention).
+
+### tower_lsp_diagnostics
+
+Run the configured language server over a file's current content and return
+compiler/linter diagnostics. Use after editing a file to verify the change.
+
+| Field  | Type   | Required | Description                                |
+|--------|--------|----------|--------------------------------------------|
+| `path` | string | yes      | Workspace-relative path of the file        |
+
+**Returns**
+
+```json
+{
+  "supported": true,
+  "diagnostics": [
+    {
+      "line": 4, "character": 8, "endLine": 4, "endCharacter": 15,
+      "severity": "error",
+      "message": "cannot find value `foo` in this scope",
+      "source": "rustc",
+      "code": "E0425"
+    }
+  ]
+}
+```
+
+`severity` is one of `error`, `warning`, `information`, `hint`. No backend or
+unsupported language → `{"supported": false, "diagnostics": []}`.
+
+### tower_lsp_definition
+
+Resolve the definition site(s) of the symbol at a position.
+
+| Field       | Type    | Required | Description                                   |
+|-------------|---------|----------|-----------------------------------------------|
+| `path`      | string  | yes      | Workspace-relative path of the file           |
+| `line`      | integer | yes      | Zero-based line number                        |
+| `character` | integer | yes      | Zero-based UTF-16 code-unit column            |
+
+**Returns**
+
+```json
+{
+  "supported": true,
+  "locations": [
+    { "path": "src/lib.rs", "line": 10, "character": 7, "endLine": 10, "endCharacter": 13 }
+  ]
+}
+```
+
+No backend / unsupported → `{"supported": false, "locations": []}`.
+
+### tower_lsp_references
+
+Find all reference sites of the symbol at a position. Same arguments as
+`tower_lsp_definition`. Returns the locations under a `"references"` key:
+`{"supported": true, "references": [ {path, line, character, endLine, endCharacter}, … ]}`.
+No backend / unsupported → `{"supported": false, "references": []}`.
+
+### tower_lsp_hover
+
+Get hover information (type/doc) for the symbol at a position. Same arguments as
+`tower_lsp_definition`.
+
+**Returns**
+
+```json
+{
+  "supported": true,
+  "hover": {
+    "contents": "fn handle() -> Result<()>",
+    "line": 10, "character": 7, "endLine": 10, "endCharacter": 13
+  }
+}
+```
+
+The range fields are present only when the server reports one. No symbol under the
+cursor → `{"supported": true, "hover": null}`. No backend / unsupported →
+`{"supported": false, "hover": null}`.
+
+---
+
 ## Plugin tools and namespacing
 
 Plugin tools are surfaced through the same `tools/list` / `tools/call` interface
@@ -724,6 +923,124 @@ the target language returns `{"matches": []}` (not an error), preserving the
   }
 }
 ```
+
+---
+
+### tower_ast_search_symbols
+
+Search the **cross-file** in-memory symbol index for symbols matching a name and
+optional kind. Unlike `tower_ast_find_symbols` (which parses one named file), this
+queries the workspace-wide index that the plugin builds incrementally as files are
+read (index-as-you-go) and keeps current via `FileChanged` hooks. Returns matches
+across **all** indexed files, each with its `path`.
+
+MCP name: `"tower_ast_search_symbols"`
+
+| Field  | Type   | Required | Description                                                      |
+|--------|--------|----------|------------------------------------------------------------------|
+| `name` | string | yes      | Exact symbol name to search for                                  |
+| `kind` | string | no       | Optional kind filter (same kind values as `find_symbols`)        |
+
+**Returns**
+
+```json
+{
+  "matches": [
+    {
+      "path": "src/lib.rs",
+      "kind": "function",
+      "name": "my_fn",
+      "start_byte": 10, "end_byte": 50,
+      "start_row": 2, "start_col": 0,
+      "end_row": 4, "end_col": 1
+    }
+  ]
+}
+```
+
+Because the index is built as files are read, results reflect only files that have
+been visited (or indexed via `tower_ast_reindex`). Use `tower_ast_reindex` to force
+a full cold build.
+
+---
+
+### tower_ast_reindex
+
+Rebuild the whole-project symbol index by enumerating every workspace file and
+parsing each. Use after large external changes or on a cold cache. Takes no
+arguments.
+
+MCP name: `"tower_ast_reindex"`
+
+| Field    | Type | Required | Description                          |
+|----------|------|----------|--------------------------------------|
+| _(none)_ | —    | —        | This tool takes no arguments         |
+
+**Returns** `{"indexed_files": uint, "symbols": uint}` — the number of files
+indexed and the total number of symbols discovered across them.
+
+---
+
+### tower_ast_read_symbol
+
+Read **only** a named symbol's source span — not the whole file. Resolves the
+symbol and returns the exact byte slice `[start_byte, end_byte)` plus `kind` and
+start/end rows for each match, ordered by `start_byte`. Resolution and slicing
+happen guest-side in a single MCP round-trip. Pairs with `tower_edit_range`: read
+a symbol's span, then write that span. (Spec 16.)
+
+MCP name: `"tower_ast_read_symbol"`
+
+| Field         | Type   | Required | Description                                                       |
+|---------------|--------|----------|-------------------------------------------------------------------|
+| `path`        | string | yes      | Workspace-relative path to the source file                        |
+| `symbol_name` | string | yes      | Name of the symbol to read                                        |
+| `kind`        | string | no       | Optional kind filter to disambiguate same-named symbols           |
+
+**Returns**
+
+```json
+{
+  "matches": [
+    {
+      "kind": "function",
+      "name": "handle",
+      "start_byte": 100, "end_byte": 200,
+      "start_row": 5, "end_row": 12,
+      "content": "pub fn handle() {\n    ...\n}"
+    }
+  ]
+}
+```
+
+A missing file, an unknown symbol (the error names the symbol), or a stale span
+maps to `-32603`. An unrecognised `kind` returns `-32602 InvalidParams`.
+
+---
+
+## Formatter plugin tools
+
+The `fmt` crate (manifest `name = "fmt"`) provides change-driven formatting. It
+subscribes to the `FileChanged` hook (auto-format on write) and additionally
+exposes one on-demand MCP tool. The tool appears in `tools/list` only when the
+plugin is loaded and not listed under `[plugins] disabled` in
+`<workspace>/.tower/config.toml`.
+
+### tower_fmt_format
+
+Enqueue a format job. With a `path`, formats that single file; without one,
+enqueues every workspace file ("format all"). The call returns **promptly after
+enqueuing** — formatting is asynchronous and coalesced host-side; the response
+reports the enqueue tally, not the formatting result.
+
+MCP name: `"tower_fmt_format"`
+
+| Field  | Type   | Required | Description                                                      |
+|--------|--------|----------|------------------------------------------------------------------|
+| `path` | string | no       | Path to enqueue. Omit to enqueue all workspace files             |
+
+**Returns** `{"requested": uint, "accepted": uint, "dropped": uint}` — jobs
+requested, accepted into the queue, and dropped (e.g. queue saturation; no retry).
 
 ---
 

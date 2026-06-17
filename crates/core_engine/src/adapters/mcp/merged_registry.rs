@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!  MergedRegistry
-//!    native: NativeToolRegistry          (7 tower_* tools, spec 10b)
+//!    native: NativeToolRegistry          (9 tower_* tools, spec 10b)
 //!    host:   Arc<RwLock<PluginHostRegistry>>  (declared_tools(), spec 11b)
 //!
 //!  list()   → native.list() ++ plugin tools (namespaced)  [dynamic, no cache]
@@ -95,7 +95,7 @@ use crate::domain::plugin_host::{PluginHostError, PluginHostRegistry};
 ///
 /// let merged = MergedRegistry::new(engine_state, plugin_registry);
 /// let tools = merged.list();
-/// // tools contains 7 native tower_* tools plus any plugin tools.
+/// // tools contains 9 native tower_* tools plus any plugin tools.
 /// ```
 pub struct MergedRegistry {
     native: NativeToolRegistry,
@@ -119,7 +119,7 @@ impl MergedRegistry {
 }
 
 impl ToolRegistry for MergedRegistry {
-    /// Return all tools: 7 native `tower_*` tools plus namespaced plugin tools.
+    /// Return all tools: 9 native `tower_*` tools plus namespaced plugin tools.
     ///
     /// Called once per `tools/list` request; no result is cached. Adding or
     /// removing plugins is reflected immediately in the next call (EV3 / AC5).
@@ -129,7 +129,7 @@ impl ToolRegistry for MergedRegistry {
         // Guard: recover a poisoned lock rather than propagating a panic.
         // Why: a wasm trap during a concurrent call_tool can poison the Mutex
         //      inside PluginHostRegistry. Recovering lets tools/list continue
-        //      serving the 7 native tools even when a plugin sandbox crashed.
+        //      serving the 9 native tools even when a plugin sandbox crashed.
         let host_guard = self
             .host
             .read()
@@ -486,25 +486,25 @@ mod tests {
         MergedRegistry::new(empty_engine_state(), host)
     }
 
-    // ── AC1: fake plugin tool appears in tools/list beside 7 native tools ─────
+    // ── AC1: fake plugin tool appears in tools/list beside 9 native tools ─────
 
     #[test]
     fn ac1_plugin_tool_appears_in_list_beside_native_tools() {
         let reg = merged_with_echo_plugin("my_plugin", "echo");
         let tools = reg.list();
 
-        // 8 native + 1 plugin tool.
+        // 9 native + 1 plugin tool.
         assert_eq!(
             tools.len(),
-            9,
-            "expected 8 native + 1 plugin tool; got {}: {:?}",
+            10,
+            "expected 9 native + 1 plugin tool; got {}: {:?}",
             tools.len(),
             tools.iter().map(|t| &t.name).collect::<Vec<_>>()
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        // All 7 native tools present.
+        // All native tools present.
         for native in &[
             "tower_find_file",
             "tower_search_text",
@@ -513,6 +513,7 @@ mod tests {
             "tower_create_directory",
             "tower_delete_file",
             "tower_global_replace",
+            "tower_edit_range",
         ] {
             assert!(names.contains(native), "native tool '{native}' missing");
         }
@@ -525,10 +526,10 @@ mod tests {
     }
 
     #[test]
-    fn ac1_empty_plugin_host_yields_only_eight_native_tools() {
+    fn ac1_empty_plugin_host_yields_only_nine_native_tools() {
         let mut reg = MergedRegistry::new(empty_engine_state(), empty_plugin_host());
         let tools = reg.list();
-        assert_eq!(tools.len(), 8, "no plugins → 8 native tools only");
+        assert_eq!(tools.len(), 9, "no plugins → 9 native tools only");
         // Sanity: call on a native tool still works.
         let result = reg.call("tower_find_file", json!({ "query": "x" }));
         assert!(result.is_ok());
@@ -750,8 +751,8 @@ mod tests {
         );
         assert_eq!(
             tools_after.len(),
-            8,
-            "only 8 native tools remain after plugin removal"
+            9,
+            "only 9 native tools remain after plugin removal"
         );
     }
 

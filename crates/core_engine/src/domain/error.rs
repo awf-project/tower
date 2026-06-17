@@ -24,6 +24,17 @@ pub enum DomainError {
     /// Introduced in spec 08 so mutation use-cases can surface write/read
     /// failures without mapping them to an unrelated variant.
     IoError(String),
+    /// A byte range supplied to a range-edit operation is invalid.
+    ///
+    /// Introduced in spec 17 (`tower_edit_range`). The inner string describes
+    /// why the range was rejected, e.g.:
+    /// - `end` exceeds the file length,
+    /// - `start > end`,
+    /// - `start` or `end` falls in the middle of a UTF-8 multi-byte sequence.
+    ///
+    /// No write, VFS update, index update, storage mutation, or broadcast is
+    /// performed when this error is returned (UN1/AC3/AC4).
+    InvalidRange(String),
 }
 
 impl core::fmt::Display for DomainError {
@@ -33,6 +44,7 @@ impl core::fmt::Display for DomainError {
             Self::DuplicatePath => write!(f, "path already maps to a live file"),
             Self::NotFound => write!(f, "path or entity not found in workspace"),
             Self::IoError(reason) => write!(f, "I/O error: {reason}"),
+            Self::InvalidRange(reason) => write!(f, "invalid byte range: {reason}"),
         }
     }
 }

@@ -874,7 +874,7 @@ fn spec13c_ac6_disabled_plugin_fmt_format_tool_absent() {
         "13c-AC6: tower_fmt_format must be absent when plugin_fmt is disabled; got: {tool_names:?}"
     );
 
-    // All 8 native tools still present — core unchanged.
+    // All 9 native tools still present — core unchanged.
     for native in &[
         "tower_find_file",
         "tower_search_text",
@@ -883,6 +883,7 @@ fn spec13c_ac6_disabled_plugin_fmt_format_tool_absent() {
         "tower_create_directory",
         "tower_delete_file",
         "tower_global_replace",
+        "tower_edit_range",
     ] {
         assert!(
             tool_names.iter().any(|n| n == native),
@@ -891,7 +892,7 @@ fn spec13c_ac6_disabled_plugin_fmt_format_tool_absent() {
     }
     assert_eq!(
         tool_names.len(),
-        8,
-        "13c-AC6: exactly 8 native tools when plugin_fmt is disabled; got {tool_names:?}"
+        9,
+        "13c-AC6: exactly 9 native tools when plugin_fmt is disabled; got {tool_names:?}"
     );
 }

@@ -3,16 +3,16 @@
 //! These verify the glue that the `tower` binary uses at startup:
 //! discover `*.wasm` in a plugins directory, load each through the 11c/11d
 //! isolated-sandbox path, register them in a [`PluginHostRegistry`], and serve
-//! the result through a [`MergedRegistry`] alongside the 8 native `tower_*` tools.
+//! the result through a [`MergedRegistry`] alongside the 9 native `tower_*` tools.
 //!
 //! # What is exercised
 //!
-//! - A real `ast.wasm` dropped in the dir → `tools/list` exposes the 8
+//! - A real `ast.wasm` dropped in the dir → `tools/list` exposes the 9
 //!   native tools PLUS `tower_ast_get_outline` and `tower_ast_find_symbols`, and a
 //!   `tools/call` to `tower_ast_get_outline` round-trips.
 //! - A malformed `.wasm` and an ABI-mismatched `.wasm` are skipped; startup
 //!   succeeds and still serves the rest.
-//! - No plugins dir / empty plugins dir → exactly the 8 native tools.
+//! - No plugins dir / empty plugins dir → exactly the 9 native tools.
 //!
 //! # Hermetic file reads
 //!
@@ -74,7 +74,7 @@ fn fs_with_rust_source() -> Arc<dyn FileSystemPort + Send + Sync> {
     Arc::new(fs)
 }
 
-/// Empty native engine state — gives the 8 native tools without indexed files.
+/// Empty native engine state — gives the 9 native tools without indexed files.
 fn empty_engine_state() -> Arc<RwLock<EngineState>> {
     Arc::new(RwLock::new(EngineState::new(
         ProjectWorkspace::new(),
@@ -213,11 +213,11 @@ fn malformed_wasm_is_skipped_rest_served() {
     let merged = merged(registry);
     let listed = names(&merged);
 
-    // The good plugin survived; the broken one was skipped (8 native + 5 ast).
+    // The good plugin survived; the broken one was skipped (9 native + 5 ast).
     assert_eq!(
         listed.len(),
-        13,
-        "expected 8 native + 5 ast tools after skipping broken wasm: {listed:?}"
+        14,
+        "expected 9 native + 5 ast tools after skipping broken wasm: {listed:?}"
     );
     assert!(listed.iter().any(|n| n == "tower_ast_get_outline"));
 }
@@ -248,12 +248,12 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
     // No tool from the abi-mismatch fixture leaked in (its name is not "ast").
     assert_eq!(
         listed.len(),
-        13,
-        "expected 8 native + 5 ast tools; abi-mismatch must be skipped: {listed:?}"
+        14,
+        "expected 9 native + 5 ast tools; abi-mismatch must be skipped: {listed:?}"
     );
 }
 
-// ── AC: no plugins dir / empty dir → exactly the 8 native tools ──────────────────
+// ── AC: no plugins dir / empty dir → exactly the 9 native tools ──────────────────
 
 #[test]
 fn missing_plugins_dir_serves_only_native_tools() {
@@ -269,7 +269,7 @@ fn missing_plugins_dir_serves_only_native_tools() {
         &[],
     );
     let merged = merged(registry);
-    assert_eq!(merged.list().len(), 8, "missing dir → 8 native tools only");
+    assert_eq!(merged.list().len(), 9, "missing dir → 9 native tools only");
 }
 
 #[test]
@@ -285,7 +285,7 @@ fn empty_plugins_dir_serves_only_native_tools() {
         &[],
     );
     let merged = merged(registry);
-    assert_eq!(merged.list().len(), 8, "empty dir → 8 native tools only");
+    assert_eq!(merged.list().len(), 9, "empty dir → 9 native tools only");
 }
 
 // ── AC: global scope reachable from a project with an empty local scope ──────────
@@ -312,7 +312,7 @@ fn global_plugin_reachable_with_empty_local_scope() {
         listed.iter().any(|n| n == "tower_ast_get_outline"),
         "a globally-installed plugin must be usable from a project: {listed:?}"
     );
-    assert_eq!(listed.len(), 13, "8 native + 5 ast (global): {listed:?}");
+    assert_eq!(listed.len(), 14, "9 native + 5 ast (global): {listed:?}");
 }
 
 // ── AC: same name in both scopes → local overrides global (collapses to one) ─────
@@ -336,12 +336,12 @@ fn local_scope_overrides_global_same_name() {
     let merged = merged(registry);
     let listed = names(&merged);
 
-    // Shadowing collapsed the duplicate to a single "ast" plugin: 8 native + 5 ast,
-    // NOT 8 + 10. The local copy won (verified deterministically by decide_shadowing
+    // Shadowing collapsed the duplicate to a single "ast" plugin: 9 native + 5 ast,
+    // NOT 9 + 10. The local copy won (verified deterministically by decide_shadowing
     // unit tests in runtime.rs).
     assert_eq!(
         listed.len(),
-        13,
+        14,
         "duplicate name across scopes must collapse to one plugin: {listed:?}"
     );
     assert_eq!(

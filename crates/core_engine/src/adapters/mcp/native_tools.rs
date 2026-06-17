@@ -1,6 +1,6 @@
 //! Native `tower_*` tool handlers — spec 10b.
 //!
-//! Implements all 8 workspace tools and registers them into the 10a
+//! Implements all 9 workspace tools and registers them into the 10a
 //! [`ToolRegistry`]. Each handler follows the same thin pattern:
 //!
 //! ```text
@@ -18,6 +18,7 @@
 //!   tower_create_directory{path}               → FileMutationUseCase.create_directory
 //!   tower_delete_file     {path}               → FileMutationUseCase.delete_file
 //!   tower_global_replace  {target,replacement} → FileMutationUseCase.global_replace
+//!   tower_edit_range      {path,start,end,rep} → FileMutationUseCase.edit_range
 //!   tower_reindex         {}                   → full VFS + text-index rebuild from fs
 //! ```
 //!
@@ -165,7 +166,7 @@ impl EngineState {
 
 // ── NativeToolRegistry ────────────────────────────────────────────────────────
 
-/// [`ToolRegistry`] implementation for the 8 native `tower_*` tools (spec 10b).
+/// [`ToolRegistry`] implementation for the 9 native `tower_*` tools (spec 10b).
 ///
 /// Holds a reference-counted, lock-protected [`EngineState`] so that both this
 /// registry and the filesystem watcher can share the workspace/index/storage/fs
@@ -191,7 +192,7 @@ impl EngineState {
 /// let mut registry = NativeToolRegistry::new(shared);
 ///
 /// let tools = registry.list();
-/// assert_eq!(tools.len(), 8);
+/// assert_eq!(tools.len(), 9);
 /// ```
 pub struct NativeToolRegistry {
     state: Arc<RwLock<EngineState>>,
@@ -215,6 +216,7 @@ impl ToolRegistry for NativeToolRegistry {
             tool_create_directory_desc(),
             tool_delete_file_desc(),
             tool_global_replace_desc(),
+            tool_edit_range_desc(),
             tool_reindex_desc(),
         ]
     }
@@ -228,6 +230,7 @@ impl ToolRegistry for NativeToolRegistry {
             "tower_create_directory" => call_create_directory(&self.state, args),
             "tower_delete_file" => call_delete_file(&self.state, args),
             "tower_global_replace" => call_global_replace(&self.state, args),
+            "tower_edit_range" => call_edit_range(&self.state, args),
             "tower_reindex" => call_reindex(&self.state),
             other => Err(ToolError::NotFound(other.to_owned())),
         }
@@ -362,6 +365,42 @@ fn tool_global_replace_desc() -> ToolDesc {
                 }
             },
             "required": ["target", "replacement"]
+        }),
+    }
+}
+
+fn tool_edit_range_desc() -> ToolDesc {
+    ToolDesc {
+        name: "tower_edit_range".to_owned(),
+        description: "Replace the byte range [start_byte, end_byte) of an existing file with the \
+            replacement string, splicing it into the current content and committing atomically. \
+            Both start_byte and end_byte must fall on UTF-8 character boundaries. \
+            end_byte must be ≤ the file length. start_byte must be ≤ end_byte. \
+            An empty replacement deletes the span; start_byte == end_byte inserts without removing."
+            .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the file to edit."
+                },
+                "start_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Inclusive start of the byte range to replace."
+                },
+                "end_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Exclusive end of the byte range to replace."
+                },
+                "replacement": {
+                    "type": "string",
+                    "description": "UTF-8 text that replaces bytes [start_byte, end_byte)."
+                }
+            },
+            "required": ["path", "start_byte", "end_byte", "replacement"]
         }),
     }
 }
@@ -573,6 +612,45 @@ fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<
     }))
 }
 
+fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
+    let path = require_str(&args, "path")?;
+    let start_byte = require_usize(&args, "start_byte")?;
+    let end_byte = require_usize(&args, "end_byte")?;
+    let replacement = require_str(&args, "replacement")?;
+
+    let rel = RelativePath::new(path);
+
+    let mut guard = state.write().map_err(lock_poisoned)?;
+    let ws_arc = Arc::clone(&guard.workspace);
+    let idx_arc = Arc::clone(&guard.index);
+    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
+    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
+    let engine = &mut *guard;
+    let plugin_host = Arc::clone(&engine.plugin_host);
+    let mut svc = FileMutationService::new(
+        engine.fs.as_mut(),
+        &mut ws,
+        &mut idx,
+        engine.storage.as_mut(),
+        plugin_host.as_ref(),
+    );
+    let report = svc
+        .edit_range(&rel, start_byte, end_byte, replacement)
+        .map_err(domain_err_to_tool_error)?;
+
+    let errors_json: Vec<Value> = report
+        .errors
+        .iter()
+        .map(|e| json!({ "path": e.path.as_str(), "reason": e.reason }))
+        .collect();
+
+    Ok(json!({
+        "files_changed": report.files_changed,
+        "replacements": report.replacements,
+        "errors": errors_json
+    }))
+}
+
 /// Force a full rebuild of the VFS + text-search index from the current filesystem.
 ///
 /// # Algorithm
@@ -729,6 +807,30 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
     })
 }
 
+/// Extract a required non-negative integer field from a JSON args object as `usize`.
+///
+/// Returns `ToolError::InvalidArgs` when:
+/// - the field is absent,
+/// - the value is not a JSON integer,
+/// - the value is negative, or
+/// - the value exceeds `usize::MAX` on the current platform.
+fn require_usize(args: &Value, field: &str) -> Result<usize, ToolError> {
+    let v = args
+        .get(field)
+        .ok_or_else(|| ToolError::InvalidArgs(format!("required field '{field}' is missing")))?;
+    // `as_u64` rejects both non-numbers and negative integers.
+    let n = v.as_u64().ok_or_else(|| {
+        ToolError::InvalidArgs(format!(
+            "required field '{field}' must be a non-negative integer"
+        ))
+    })?;
+    usize::try_from(n).map_err(|_| {
+        ToolError::InvalidArgs(format!(
+            "required field '{field}' value {n} exceeds platform usize::MAX"
+        ))
+    })
+}
+
 /// Map a [`DomainError`] to a [`ToolError`] with a stable, inspectable code.
 ///
 /// # Stable code assignment
@@ -736,14 +838,20 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
 /// | Variant              | ToolError variant       | JSON-RPC code |
 /// |----------------------|-------------------------|---------------|
 /// | `NotFound`           | `ResourceNotFound`      | -32002        |
+/// | `InvalidRange`       | `InvalidArgs`           | -32602        |
 /// | others               | `ExecutionFailed`       | -32603        |
 ///
 /// `DomainError::NotFound` maps to [`ToolError::ResourceNotFound`] which the
 /// transport maps to `-32002`. Clients branch on this stable code to detect
 /// "resource not found" without parsing the error string (spec 10b AC5).
+///
+/// `DomainError::InvalidRange` is a bad-input error (the caller provided an
+/// out-of-bounds or non-char-boundary range), so it maps to `InvalidArgs`
+/// (`-32602`) rather than `ExecutionFailed` (`-32603`).
 fn domain_err_to_tool_error(err: DomainError) -> ToolError {
     match err {
         DomainError::NotFound => ToolError::ResourceNotFound(err.to_string()),
+        DomainError::InvalidRange(_) => ToolError::InvalidArgs(err.to_string()),
         other => ToolError::ExecutionFailed(other.to_string()),
     }
 }
@@ -870,22 +978,22 @@ mod tests {
         );
     }
 
-    // ── AC1: tools/list shows 8 tools with schemas ────────────────────────────
+    // ── AC1: tools/list shows 9 tools with schemas ────────────────────────────
 
     #[test]
-    fn ac1_tools_list_returns_eight_tower_tools() {
+    fn ac1_tools_list_returns_nine_tower_tools() {
         let reg = make_registry(empty_state());
         let tools = reg.list();
         assert_eq!(
             tools.len(),
-            8,
-            "expected 8 native tools; got {}",
+            9,
+            "expected 9 native tools; got {}",
             tools.len()
         );
     }
 
     #[test]
-    fn ac1_all_eight_tool_names_present() {
+    fn ac1_all_nine_tool_names_present() {
         let reg = make_registry(empty_state());
         let tool_list = reg.list();
         let names: Vec<&str> = tool_list.iter().map(|t| t.name.as_str()).collect();
@@ -897,6 +1005,7 @@ mod tests {
             "tower_create_directory",
             "tower_delete_file",
             "tower_global_replace",
+            "tower_edit_range",
             "tower_reindex",
         ];
         for name in &expected {
@@ -1312,6 +1421,313 @@ mod tests {
         let vfile = ws.get(id).expect("slot must be live");
         assert_eq!(vfile.size, content.len() as u64, "real size recorded");
         assert!(vfile.content_hash.is_some(), "content hash recorded");
+    }
+
+    // ── tower_edit_range ──────────────────────────────────────────────────────
+
+    /// Helper: create a file through the MCP `tower_create_file` tool, returning
+    /// a registry ready for further calls.
+    fn state_with_file(path: &str, content: &str) -> Arc<RwLock<EngineState>> {
+        let state = empty_state();
+        let mut reg = make_registry(Arc::clone(&state));
+        reg.call(
+            "tower_create_file",
+            json!({ "path": path, "content": content }),
+        )
+        .expect("setup create_file must succeed");
+        state
+    }
+
+    /// AC1 (success): splice mid-file, report shape correct, content updated,
+    /// surrounding bytes untouched.
+    #[test]
+    fn edit_range_success_splice_and_report() {
+        // "fn main() {}" — replace bytes 3..7 ("main") with "run".
+        let state = state_with_file("src/main.rs", "fn main() {}");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let val = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/main.rs",
+                    "start_byte": 3,
+                    "end_byte": 7,
+                    "replacement": "run"
+                }),
+            )
+            .expect("edit_range must succeed");
+
+        assert_eq!(val["files_changed"].as_u64().unwrap(), 1);
+        assert_eq!(val["replacements"].as_u64().unwrap(), 1);
+        assert!(val["errors"].as_array().unwrap().is_empty());
+
+        // Verify the actual content via tower_read_file.
+        let read = reg
+            .call("tower_read_file", json!({ "path": "src/main.rs" }))
+            .unwrap();
+        assert_eq!(
+            read["content"].as_str().unwrap(),
+            "fn run() {}",
+            "spliced content must be correct; surrounding bytes untouched"
+        );
+    }
+
+    /// AC2 (bad range): end_byte > file length → InvalidArgs, file unchanged.
+    #[test]
+    fn edit_range_end_beyond_len_returns_invalid_args() {
+        // "abc" is 3 bytes; end_byte=10 is out of range.
+        let state = state_with_file("src/bounds.rs", "abc");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/bounds.rs",
+                    "start_byte": 0,
+                    "end_byte": 10,
+                    "replacement": "x"
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
+            "end > len must be InvalidArgs; got {err:?}"
+        );
+
+        // File must be unchanged.
+        let read = make_registry(Arc::clone(&state))
+            .call("tower_read_file", json!({ "path": "src/bounds.rs" }))
+            .unwrap();
+        assert_eq!(read["content"].as_str().unwrap(), "abc");
+    }
+
+    /// AC3 (missing file): path not in VFS → ResourceNotFound.
+    #[test]
+    fn edit_range_missing_file_returns_resource_not_found() {
+        let mut reg = make_registry(empty_state());
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "ghost.rs",
+                    "start_byte": 0,
+                    "end_byte": 0,
+                    "replacement": "x"
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::adapters::mcp::types::ToolError::ResourceNotFound(_)
+            ),
+            "missing file must be ResourceNotFound; got {err:?}"
+        );
+    }
+
+    /// AC4 (bad args): missing start_byte → InvalidArgs.
+    #[test]
+    fn edit_range_missing_start_byte_returns_invalid_args() {
+        let state = state_with_file("src/a.rs", "hello");
+        let mut reg = make_registry(state);
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({ "path": "src/a.rs", "end_byte": 2, "replacement": "x" }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
+            "missing start_byte must be InvalidArgs; got {err:?}"
+        );
+    }
+
+    /// AC4 (bad args): negative start_byte (JSON negative integer) → InvalidArgs.
+    #[test]
+    fn edit_range_negative_start_byte_returns_invalid_args() {
+        let state = state_with_file("src/b.rs", "hello");
+        let mut reg = make_registry(state);
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/b.rs",
+                    "start_byte": -1,
+                    "end_byte": 2,
+                    "replacement": "x"
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
+            "negative start_byte must be InvalidArgs; got {err:?}"
+        );
+    }
+
+    /// AC4 (bad args): non-integer start_byte (JSON string) → InvalidArgs.
+    #[test]
+    fn edit_range_non_integer_start_byte_returns_invalid_args() {
+        let state = state_with_file("src/c.rs", "hello");
+        let mut reg = make_registry(state);
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/c.rs",
+                    "start_byte": "not-a-number",
+                    "end_byte": 2,
+                    "replacement": "x"
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
+            "string start_byte must be InvalidArgs; got {err:?}"
+        );
+    }
+
+    /// AC5 (plugin notification): on_file_changed is broadcast after a successful edit.
+    #[test]
+    fn edit_range_notifies_plugin_host_on_success() {
+        use std::sync::Mutex;
+
+        use crate::domain::FileId;
+        use crate::ports::PluginHostPort;
+
+        #[derive(Default)]
+        struct RecordingHost {
+            changed: Mutex<Vec<String>>,
+        }
+        impl PluginHostPort for RecordingHost {
+            fn on_file_indexed(&self, _id: FileId, _path: &RelativePath) {}
+            fn on_file_changed(&self, _id: FileId, path: &RelativePath) {
+                self.changed.lock().unwrap().push(path.as_str().to_owned());
+            }
+        }
+
+        let state = state_with_file("src/notify.rs", "fn old() {}");
+        let host = Arc::new(RecordingHost::default());
+        state
+            .write()
+            .unwrap()
+            .set_plugin_host(Arc::clone(&host) as Arc<dyn PluginHostPort + Send + Sync>);
+
+        let mut reg = make_registry(Arc::clone(&state));
+        reg.call(
+            "tower_edit_range",
+            json!({
+                "path": "src/notify.rs",
+                "start_byte": 3,
+                "end_byte": 6,
+                "replacement": "new"
+            }),
+        )
+        .expect("edit_range must succeed");
+
+        let changed = host.changed.lock().unwrap();
+        assert!(
+            changed.iter().any(|p| p == "src/notify.rs"),
+            "edit_range must broadcast on_file_changed; got {changed:?}"
+        );
+    }
+
+    // ── TG3: start > end at the MCP layer → InvalidArgs, file unchanged ─────
+
+    /// TG3: `start_byte > end_byte` must return `InvalidArgs` and leave the
+    /// file unchanged. This exercises the MCP argument-to-domain error path for
+    /// the `start > end` validation inside `FileMutationService::edit_range`.
+    #[test]
+    fn edit_range_start_greater_than_end_returns_invalid_args_and_file_unchanged() {
+        let state = state_with_file("src/order_mcp.rs", "abcdef");
+        let mut reg = make_registry(Arc::clone(&state));
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/order_mcp.rs",
+                    "start_byte": 5,
+                    "end_byte": 2,
+                    "replacement": "x"
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
+            "start > end must return InvalidArgs at the MCP layer; got {err:?}"
+        );
+
+        // File must be unchanged.
+        let read = make_registry(Arc::clone(&state))
+            .call("tower_read_file", json!({ "path": "src/order_mcp.rs" }))
+            .unwrap();
+        assert_eq!(
+            read["content"].as_str().unwrap(),
+            "abcdef",
+            "file must be unchanged after rejected start > end edit"
+        );
+    }
+
+    // ── TG4: UTF-8 boundary split at the MCP layer → InvalidArgs, file unchanged
+
+    /// TG4: a `start_byte`/`end_byte` that lands inside a multi-byte UTF-8
+    /// character must return `InvalidArgs` and leave the file unchanged.
+    ///
+    /// `"café"` in UTF-8: 'c'=0x63, 'a'=0x61, 'f'=0x66, 'é'=0xC3 0xA9 — total 5 bytes.
+    /// Byte 3 is the start of 'é' (a char boundary); byte 4 (0xA9) is the second
+    /// byte of 'é' and is NOT a char boundary. Requesting `start_byte=3, end_byte=4`
+    /// splits 'é' in half.
+    #[test]
+    fn edit_range_utf8_boundary_split_returns_invalid_args_and_file_unchanged() {
+        let content = "café"; // 5 bytes: c(1) a(1) f(1) é(2) = 5
+        let state = state_with_file("src/utf8_mcp.rs", content);
+        let mut reg = make_registry(Arc::clone(&state));
+
+        // Sanity: confirm the byte layout is what we expect.
+        assert_eq!(content.len(), 5, "café must be 5 bytes");
+        assert!(
+            !content.is_char_boundary(4),
+            "byte 4 must not be a char boundary in 'café'"
+        );
+
+        let err = reg
+            .call(
+                "tower_edit_range",
+                json!({
+                    "path": "src/utf8_mcp.rs",
+                    "start_byte": 3,
+                    "end_byte": 4,
+                    "replacement": "e"
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
+            "split inside multi-byte char must return InvalidArgs; got {err:?}"
+        );
+
+        // File must be unchanged.
+        let read = make_registry(Arc::clone(&state))
+            .call("tower_read_file", json!({ "path": "src/utf8_mcp.rs" }))
+            .unwrap();
+        assert_eq!(
+            read["content"].as_str().unwrap(),
+            content,
+            "file must be unchanged after rejected UTF-8 boundary split"
+        );
     }
 
     // ── unknown tool ──────────────────────────────────────────────────────────

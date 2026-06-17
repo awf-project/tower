@@ -637,3 +637,350 @@ fn watcher_modify_after_mutation_preserves_file_id() {
         "Modify echo must preserve FileId"
     );
 }
+
+/// Helper: create a file in a fresh in-memory state, returning all components.
+fn make_state_with_file(
+    path: &RelativePath,
+    content: &[u8],
+) -> (InMemoryFs, ProjectWorkspace, InvertedIndex, InMemoryStorage) {
+    let mut fs = InMemoryFs::new();
+    let mut ws = ProjectWorkspace::new();
+    let mut idx = InvertedIndex::new();
+    let mut storage = InMemoryStorage::new();
+    {
+        let mut svc =
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        svc.create_file(path.clone(), content.to_vec()).unwrap();
+    }
+    (fs, ws, idx, storage)
+}
+
+// ── TDD step 1: splice mid-file — surrounding bytes byte-identical (AC1) ──────
+
+/// AC1: Replacing a mid-file span produces the expected spliced content and
+/// leaves the surrounding bytes byte-identical.
+#[test]
+fn edit_range_splice_mid_file_bytes_identical() {
+    let path = RelativePath::new("src/main.rs");
+    // content: "fn main() {}"  (14 bytes, all ASCII)
+    //           0123456789...
+    // We replace bytes 3..7 ("main") with "run".
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"fn main() {}");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let report = svc.edit_range(&path, 3, 7, "run").unwrap();
+
+    // Report shape.
+    assert_eq!(report.files_changed, 1);
+    assert_eq!(report.replacements, 1);
+    assert!(report.errors.is_empty());
+
+    // Physical content.
+    let bytes = fs.read(&path).unwrap();
+    assert_eq!(
+        bytes,
+        b"fn run() {}",
+        "spliced content must equal expected; got {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+/// AC1: Empty replacement (start == end) inserts without removing content.
+#[test]
+fn edit_range_zero_length_span_inserts() {
+    let path = RelativePath::new("src/lib.rs");
+    // Insert "pub " before "fn" at byte 0.
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"fn lib() {}");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    svc.edit_range(&path, 0, 0, "pub ").unwrap();
+
+    let bytes = fs.read(&path).unwrap();
+    assert_eq!(bytes, b"pub fn lib() {}");
+}
+
+/// AC4 (deletion): empty replacement string removes the span.
+#[test]
+fn edit_range_empty_replacement_deletes_span() {
+    let path = RelativePath::new("src/del.rs");
+    // "hello world" → delete " world" (bytes 5..11) → "hello"
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"hello world");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    svc.edit_range(&path, 5, 11, "").unwrap();
+
+    let bytes = fs.read(&path).unwrap();
+    assert_eq!(bytes, b"hello");
+}
+
+// ── TDD step 2: out-of-range validation (AC3/UN1) ────────────────────────────
+
+/// AC3: `end > len` is rejected; file must be unchanged.
+#[test]
+fn edit_range_end_beyond_len_rejected() {
+    let path = RelativePath::new("src/bounds.rs");
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abc");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let err = svc.edit_range(&path, 0, 10, "x").unwrap_err();
+
+    assert!(
+        matches!(err, crate::domain::DomainError::InvalidRange(_)),
+        "end > len must return InvalidRange; got {err:?}"
+    );
+    // File must be unchanged.
+    assert_eq!(fs.read(&path).unwrap(), b"abc");
+}
+
+/// AC3: `start > end` is rejected; file must be unchanged.
+#[test]
+fn edit_range_start_greater_than_end_rejected() {
+    let path = RelativePath::new("src/order.rs");
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abcdef");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let err = svc.edit_range(&path, 4, 2, "x").unwrap_err();
+
+    assert!(
+        matches!(err, crate::domain::DomainError::InvalidRange(_)),
+        "start > end must return InvalidRange; got {err:?}"
+    );
+    assert_eq!(fs.read(&path).unwrap(), b"abcdef");
+}
+
+// ── TDD step 3: UTF-8 boundary validation (AC4/UN1) ──────────────────────────
+
+/// AC4: Splitting in the middle of a multi-byte UTF-8 sequence is rejected.
+///
+/// "héllo" in UTF-8: 'h'=0x68, 'é'=0xC3 0xA9, 'l'=0x6C, 'l'=0x6C, 'o'=0x6F
+/// byte 2 is the second byte of 'é' — not a char boundary.
+#[test]
+fn edit_range_non_utf8_boundary_rejected() {
+    let path = RelativePath::new("src/utf8.rs");
+    let content = "héllo".as_bytes().to_vec();
+    // 'é' occupies bytes 1..3; byte 2 is not a char boundary.
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, &content);
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let err = svc.edit_range(&path, 2, 3, "e").unwrap_err();
+
+    assert!(
+        matches!(err, crate::domain::DomainError::InvalidRange(_)),
+        "non-char-boundary start must return InvalidRange; got {err:?}"
+    );
+    // File must be unchanged.
+    assert_eq!(fs.read(&path).unwrap(), content);
+}
+
+/// AC4: end on a non-char boundary is also rejected.
+#[test]
+fn edit_range_end_non_utf8_boundary_rejected() {
+    let path = RelativePath::new("src/utf8end.rs");
+    let content = "héllo".as_bytes().to_vec();
+    // start=1 ('é' start) but end=2 (mid-'é') — end not on boundary.
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, &content);
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let err = svc.edit_range(&path, 1, 2, "e").unwrap_err();
+
+    assert!(
+        matches!(err, crate::domain::DomainError::InvalidRange(_)),
+        "non-char-boundary end must return InvalidRange; got {err:?}"
+    );
+    assert_eq!(fs.read(&path).unwrap(), content);
+}
+
+// ── TDD step 3b: binary / non-UTF-8 content (TG1) ───────────────────────────
+
+/// TG1: `edit_range` on a file whose bytes are not valid UTF-8 must return
+/// `InvalidRange` and leave the file bytes completely unchanged.
+///
+/// The validation order in the implementation is: bounds check first, then
+/// `str::from_utf8`. With `start=0, end=2` (within bounds for a 5-byte file)
+/// the UTF-8 check fires and rejects the call before any write occurs.
+#[test]
+fn edit_range_binary_content_returns_invalid_range_and_file_unchanged() {
+    let path = RelativePath::new("src/binary.bin");
+    // 0xFF 0xFE are not valid UTF-8; total 5 bytes.
+    let content: &[u8] = b"\xFF\xFE hello";
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, content);
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let err = svc.edit_range(&path, 0, 2, "x").unwrap_err();
+
+    assert!(
+        matches!(err, crate::domain::DomainError::InvalidRange(_)),
+        "non-UTF-8 file content must return InvalidRange; got {err:?}"
+    );
+    // File bytes must be identical — no write happened.
+    assert_eq!(
+        fs.read(&path).unwrap(),
+        content,
+        "file bytes must be unchanged after InvalidRange rejection"
+    );
+}
+
+// ── TDD step 3c: append at EOF and pure insertion (TG2) ──────────────────────
+
+/// TG2a: `start == end == len` is a pure append — no bytes removed.
+///
+/// Content `b"abc"` (3 bytes) + append `"DEF"` at (3, 3) → `b"abcDEF"`.
+/// Report must show `files_changed: 1, replacements: 1` and no errors.
+#[test]
+fn edit_range_append_at_eof_succeeds_and_content_correct() {
+    let path = RelativePath::new("src/append.rs");
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abc");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    let report = svc.edit_range(&path, 3, 3, "DEF").unwrap();
+
+    assert_eq!(report.files_changed, 1);
+    assert_eq!(report.replacements, 1);
+    assert!(report.errors.is_empty());
+
+    let bytes = fs.read(&path).unwrap();
+    assert_eq!(
+        bytes,
+        b"abcDEF",
+        "append at EOF must produce correct content; got {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    // Surrounding (prefix) bytes must be byte-identical.
+    assert_eq!(&bytes[..3], b"abc", "prefix bytes must be untouched");
+}
+
+/// TG2b: pure mid-file insertion (`start == end`, not at EOF).
+///
+/// Content `b"abc"` + insert `"X"` at (1, 1) → `b"aXbc"`.
+/// Verifies surrounding bytes are byte-identical, not just equal in length.
+#[test]
+fn edit_range_mid_file_insertion_surrounding_bytes_identical() {
+    let path = RelativePath::new("src/insert.rs");
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abc");
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+    svc.edit_range(&path, 1, 1, "X").unwrap();
+
+    let bytes = fs.read(&path).unwrap();
+    assert_eq!(
+        bytes,
+        b"aXbc",
+        "mid-file insertion must produce correct content; got {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    // Byte 0 (prefix) and bytes 2..4 (suffix) must be the original bytes.
+    assert_eq!(
+        bytes[0], b'a',
+        "byte before insertion point must be unchanged"
+    );
+    assert_eq!(
+        &bytes[2..],
+        b"bc",
+        "bytes after insertion point must be unchanged"
+    );
+}
+
+// ── TDD step 4: span deletion leaves rest intact (already covered above) ──────
+// (See `edit_range_empty_replacement_deletes_span`)
+
+// ── TDD step 5: missing file → not-found, nothing written (UN2) ──────────────
+
+/// UN2: `edit_range` on a path not in the VFS returns `NotFound`; the FS is
+/// untouched (no `.tmp_write` artifact created).
+#[test]
+fn edit_range_missing_file_returns_not_found() {
+    let mut fs = InMemoryFs::new();
+    let mut ws = ProjectWorkspace::new();
+    let mut idx = InvertedIndex::new();
+    let mut storage = InMemoryStorage::new();
+
+    let mut svc =
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+
+    let err = svc
+        .edit_range(&RelativePath::new("ghost.rs"), 0, 0, "x")
+        .unwrap_err();
+
+    assert!(
+        matches!(err, crate::domain::DomainError::NotFound),
+        "missing path must return NotFound; got {err:?}"
+    );
+    // FS must have no files at all.
+    assert!(
+        fs.scan().is_empty(),
+        "no file must have been written; scan = {:?}",
+        fs.scan()
+    );
+}
+
+// ── TDD step 6: on_file_changed broadcast + index refresh (AC5/EV2) ──────────
+
+/// AC5/EV2: After `edit_range`, `on_file_changed` is broadcast and the index
+/// is updated so a search for the OLD span finds no stale match, while a search
+/// for a token in the NEW content is findable.
+///
+/// Note: the inverted index operates on PATH tokens, not file content. Here we
+/// verify that VFS metadata is stable (FileId unchanged) and that the plugin
+/// host receives the broadcast — content-search staleness is the plugin's
+/// concern (e.g. the AST plugin's on_file_changed re-parses).
+#[test]
+fn edit_range_broadcasts_on_file_changed_and_refreshes_vfs() {
+    use crate::domain::FileId;
+    use crate::ports::PluginHostPort;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingHost {
+        changed: Mutex<Vec<String>>,
+    }
+    impl PluginHostPort for RecordingHost {
+        fn on_file_indexed(&self, _id: FileId, _path: &RelativePath) {}
+        fn on_file_changed(&self, _id: FileId, path: &RelativePath) {
+            self.changed.lock().unwrap().push(path.as_str().to_owned());
+        }
+    }
+
+    let path = RelativePath::new("src/broadcast.rs");
+    let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"fn old() {}");
+
+    let host = RecordingHost::default();
+    let file_id_before = ws.get_by_path(&path).unwrap();
+
+    {
+        let mut svc = FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &host);
+        svc.edit_range(&path, 3, 6, "new").unwrap();
+    }
+
+    // on_file_changed must have been called.
+    let changed = host.changed.lock().unwrap();
+    assert!(
+        changed.iter().any(|p| p == "src/broadcast.rs"),
+        "on_file_changed must be broadcast after edit_range; got {changed:?}"
+    );
+
+    // FileId must be stable (same slot, same generation).
+    let file_id_after = ws.get_by_path(&path).unwrap();
+    assert_eq!(
+        file_id_before, file_id_after,
+        "FileId must be stable after edit_range"
+    );
+
+    // Physical content updated.
+    let bytes = fs.read(&path).unwrap();
+    assert_eq!(
+        bytes,
+        b"fn new() {}",
+        "content must reflect the edit; got {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
