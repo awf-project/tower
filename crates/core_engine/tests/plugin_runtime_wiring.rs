@@ -213,11 +213,11 @@ fn malformed_wasm_is_skipped_rest_served() {
     let merged = merged(registry);
     let listed = names(&merged);
 
-    // The good plugin survived; the broken one was skipped (8 native + 4 ast).
+    // The good plugin survived; the broken one was skipped (8 native + 5 ast).
     assert_eq!(
         listed.len(),
-        12,
-        "expected 8 native + 4 ast tools after skipping broken wasm: {listed:?}"
+        13,
+        "expected 8 native + 5 ast tools after skipping broken wasm: {listed:?}"
     );
     assert!(listed.iter().any(|n| n == "tower_ast_get_outline"));
 }
@@ -248,8 +248,8 @@ fn abi_mismatch_wasm_is_skipped_rest_served() {
     // No tool from the abi-mismatch fixture leaked in (its name is not "ast").
     assert_eq!(
         listed.len(),
-        12,
-        "expected 8 native + 4 ast tools; abi-mismatch must be skipped: {listed:?}"
+        13,
+        "expected 8 native + 5 ast tools; abi-mismatch must be skipped: {listed:?}"
     );
 }
 
@@ -312,7 +312,7 @@ fn global_plugin_reachable_with_empty_local_scope() {
         listed.iter().any(|n| n == "tower_ast_get_outline"),
         "a globally-installed plugin must be usable from a project: {listed:?}"
     );
-    assert_eq!(listed.len(), 12, "8 native + 4 ast (global): {listed:?}");
+    assert_eq!(listed.len(), 13, "8 native + 5 ast (global): {listed:?}");
 }
 
 // ── AC: same name in both scopes → local overrides global (collapses to one) ─────
@@ -336,12 +336,12 @@ fn local_scope_overrides_global_same_name() {
     let merged = merged(registry);
     let listed = names(&merged);
 
-    // Shadowing collapsed the duplicate to a single "ast" plugin: 8 native + 4 ast,
-    // NOT 8 + 8. The local copy won (verified deterministically by decide_shadowing
+    // Shadowing collapsed the duplicate to a single "ast" plugin: 8 native + 5 ast,
+    // NOT 8 + 10. The local copy won (verified deterministically by decide_shadowing
     // unit tests in runtime.rs).
     assert_eq!(
         listed.len(),
-        12,
+        13,
         "duplicate name across scopes must collapse to one plugin: {listed:?}"
     );
     assert_eq!(
@@ -349,8 +349,8 @@ fn local_scope_overrides_global_same_name() {
             .iter()
             .filter(|n| n.starts_with("tower_ast_"))
             .count(),
-        4,
-        "exactly the 4 ast tools, not duplicated: {listed:?}"
+        5,
+        "exactly the 5 ast tools, not duplicated: {listed:?}"
     );
 }
 

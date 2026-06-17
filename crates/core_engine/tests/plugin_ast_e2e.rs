@@ -162,8 +162,8 @@ fn ac4_ac5_ast_loads_and_declares_both_tools() {
     assert_eq!(manifest.abi, plugin_sdk::ABI_VERSION, "ABI must match");
     assert_eq!(
         manifest.tools.len(),
-        4,
-        "manifest must declare exactly 4 tools"
+        5,
+        "manifest must declare exactly 5 tools"
     );
 
     let tool_names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
@@ -182,6 +182,10 @@ fn ac4_ac5_ast_loads_and_declares_both_tools() {
     assert!(
         tool_names.contains(&"reindex"),
         "manifest must have reindex, got: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"read_symbol"),
+        "manifest must have read_symbol, got: {tool_names:?}"
     );
     assert_eq!(
         manifest.hooks,
@@ -215,6 +219,10 @@ fn ac5_tools_list_exposes_both_ast_tools() {
     assert!(
         tool_names.contains(&"tower_ast_reindex"),
         "AC5: tools/list must contain tower_ast_reindex, got: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"tower_ast_read_symbol"),
+        "AC5: tools/list must contain tower_ast_read_symbol, got: {tool_names:?}"
     );
 }
 
@@ -903,5 +911,364 @@ fn cold_reindex_populates_index_for_all_workspace_files() {
     assert!(
         !beta_matches.is_empty(),
         "BetaStruct must be found after reindex without prior get_outline: {beta_result}"
+    );
+}
+
+// ── Spec 16: read_symbol e2e ──────────────────────────────────────────────────
+//
+// All tests route through MergedRegistry → wasm sandbox → ast plugin guest.
+// The host binary is NOT recompiled when only the plugin changes (Drop & Play).
+// Tests use InMemoryFs with controlled content so results are deterministic.
+
+/// Rust source for read_symbol tests.
+///
+/// Designed so that:
+/// - `handle` exists as both a method (inside `impl Counter`) and a free function.
+/// - Two `new` methods appear in two separate impl blocks.
+/// - A struct named `Counter` disambiguates from the free `handle` function via kind filter.
+/// - The file is long enough to prove AC6 (whole-file content is much larger than any symbol).
+const READ_SYMBOL_SOURCE: &[u8] = br#"// Line 1: preamble comment
+// Line 2: preamble comment
+// Line 3: preamble comment
+// Line 4: preamble comment
+// Line 5: preamble comment
+// Line 6: preamble comment
+// Line 7: preamble comment
+// Line 8: preamble comment
+// Line 9: preamble comment
+// Line 10: preamble comment
+// Line 11: preamble comment
+// Line 12: preamble comment
+// Line 13: preamble comment
+// Line 14: preamble comment
+// Line 15: preamble comment
+// Line 16: preamble comment
+// Line 17: preamble comment
+// Line 18: preamble comment
+// Line 19: preamble comment
+// Line 20: preamble comment
+pub struct Counter {
+    value: u32,
+}
+
+impl Counter {
+    pub fn new() -> Self {
+        Self { value: 0 }
+    }
+
+    pub fn handle(&self) -> u32 {
+        self.value
+    }
+}
+
+pub struct Other {
+    x: u32,
+}
+
+impl Other {
+    pub fn new() -> Self {
+        Self { x: 0 }
+    }
+}
+
+pub fn handle() -> u32 {
+    42
+}
+"#;
+
+/// AC1 (spec 16): `handle` method — exact span slice and correct rows returned.
+#[test]
+fn ac1_16_read_symbol_single_match_exact_slice_and_rows() {
+    let fs = fs_with("src/counter.rs", READ_SYMBOL_SOURCE);
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "src/counter.rs",
+        "symbol_name": "handle",
+        "kind": "method"
+    });
+    let result = registry
+        .call("tower_ast_read_symbol", args)
+        .expect("AC1: read_symbol handle method must succeed");
+
+    let matches = result["matches"]
+        .as_array()
+        .expect("AC1: 'matches' must be an array");
+    assert_eq!(
+        matches.len(),
+        1,
+        "AC1: exactly one handle method, got: {result}"
+    );
+
+    let m = &matches[0];
+    assert_eq!(
+        m["kind"].as_str().unwrap_or(""),
+        "method",
+        "AC1: kind must be 'method'"
+    );
+    assert_eq!(
+        m["name"].as_str().unwrap_or(""),
+        "handle",
+        "AC1: name must be 'handle'"
+    );
+
+    // EV1: content is the exact slice — must contain the symbol name.
+    let content = m["content"]
+        .as_str()
+        .expect("AC1: 'content' must be a string");
+    assert!(
+        content.contains("handle"),
+        "AC1: content must contain symbol name, got: {content:?}"
+    );
+    // EV1: content must NOT be empty.
+    assert!(!content.is_empty(), "AC1: content must be non-empty");
+
+    // EV1: start_row and end_row must be present and end_row >= start_row.
+    let start_row = m["start_row"]
+        .as_i64()
+        .expect("AC1: start_row must be integer");
+    let end_row = m["end_row"].as_i64().expect("AC1: end_row must be integer");
+    assert!(
+        end_row >= start_row,
+        "AC1: end_row must be >= start_row, got start={start_row} end={end_row}"
+    );
+    // The handle method is in the lower half of the file (after the 20-line preamble).
+    assert!(
+        start_row >= 20,
+        "AC1: handle method must start after the 20-line preamble, got start_row={start_row}"
+    );
+}
+
+/// AC2 (spec 16): two `new` methods, no kind filter — both returned ordered by start_byte.
+#[test]
+fn ac2_16_read_symbol_multi_match_ordered_by_start_byte() {
+    let fs = fs_with("src/counter.rs", READ_SYMBOL_SOURCE);
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "src/counter.rs",
+        "symbol_name": "new"
+    });
+    let result = registry
+        .call("tower_ast_read_symbol", args)
+        .expect("AC2: read_symbol new (no kind) must succeed");
+
+    let matches = result["matches"]
+        .as_array()
+        .expect("AC2: 'matches' must be an array");
+    assert_eq!(
+        matches.len(),
+        2,
+        "AC2: both `new` methods must be returned, got: {result}"
+    );
+
+    let sb0 = matches[0]["start_byte"]
+        .as_i64()
+        .expect("AC2: start_byte must be integer");
+    let sb1 = matches[1]["start_byte"]
+        .as_i64()
+        .expect("AC2: start_byte must be integer");
+    assert!(
+        sb0 < sb1,
+        "AC2: matches must be ordered by start_byte, got {sb0} then {sb1}"
+    );
+
+    // Each match must carry its own content slice.
+    for (i, m) in matches.iter().enumerate() {
+        let content = m["content"].as_str().expect("AC2: content must be string");
+        assert!(
+            content.contains("new"),
+            "AC2: match {i} content must contain 'new', got: {content:?}"
+        );
+    }
+}
+
+/// AC3 (spec 16): kind="function" excludes a same-named method (and struct).
+#[test]
+fn ac3_16_read_symbol_kind_filter_excludes_other_kinds() {
+    let fs = fs_with("src/counter.rs", READ_SYMBOL_SOURCE);
+    let mut registry = merged_registry_with_ast(fs);
+
+    // `handle` exists as both a free function and a method.
+    // kind=function must return only the free function.
+    let args = serde_json::json!({
+        "path": "src/counter.rs",
+        "symbol_name": "handle",
+        "kind": "function"
+    });
+    let result = registry
+        .call("tower_ast_read_symbol", args)
+        .expect("AC3: read_symbol handle function must succeed");
+
+    let matches = result["matches"]
+        .as_array()
+        .expect("AC3: 'matches' must be an array");
+    assert_eq!(
+        matches.len(),
+        1,
+        "AC3: kind=function must return only the free function, got: {result}"
+    );
+    assert_eq!(
+        matches[0]["kind"].as_str().unwrap_or(""),
+        "function",
+        "AC3: match must be kind 'function'"
+    );
+}
+
+/// AC4 (spec 16): unknown symbol name → tool error naming the symbol; no file content leaks.
+#[test]
+fn ac4_16_read_symbol_unknown_name_returns_error_naming_symbol() {
+    let fs = fs_with("src/counter.rs", READ_SYMBOL_SOURCE);
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "src/counter.rs",
+        "symbol_name": "no_such_symbol_xyz_404"
+    });
+    let result = registry.call("tower_ast_read_symbol", args);
+
+    // Must be an error (UN1).
+    assert!(
+        result.is_err(),
+        "AC4: unknown symbol must return an error, got: {result:?}"
+    );
+
+    // The error message must name the symbol (UN1).
+    let err_str = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_str.contains("no_such_symbol_xyz_404"),
+        "AC4: error must name the symbol, got: {err_str}"
+    );
+}
+
+/// AC6 (spec 16): a 10-line symbol out of a large file returns far fewer bytes than the whole file.
+///
+/// Token-efficiency proof: the `handle` method is ~4 lines; the file is 50+ lines.
+/// The returned content must be dramatically smaller than the raw file.
+#[test]
+fn ac6_16_read_symbol_returns_symbol_span_not_whole_file() {
+    let fs = fs_with("src/counter.rs", READ_SYMBOL_SOURCE);
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "src/counter.rs",
+        "symbol_name": "handle",
+        "kind": "method"
+    });
+    let result = registry
+        .call("tower_ast_read_symbol", args)
+        .expect("AC6: read_symbol must succeed");
+
+    let matches = result["matches"]
+        .as_array()
+        .expect("AC6: matches must be array");
+    assert_eq!(matches.len(), 1, "AC6: one handle method match");
+
+    let content = matches[0]["content"]
+        .as_str()
+        .expect("AC6: content must be string");
+    let file_len = READ_SYMBOL_SOURCE.len();
+
+    // The symbol slice must be substantially smaller than the whole file.
+    // The handle method is ~4 lines; the file is 50+ lines — at least 10x smaller.
+    assert!(
+        content.len() * 10 < file_len,
+        "AC6: symbol content ({} bytes) must be far smaller than whole file ({file_len} bytes)",
+        content.len()
+    );
+
+    // And must still be non-trivial (not empty, contains the body).
+    assert!(
+        content.contains("self.value"),
+        "AC6: content must contain the method body, got: {content:?}"
+    );
+}
+
+/// UN1 (spec 16): empty file path → CallFailed from host, not a panic.
+#[test]
+fn un1_16_read_symbol_missing_file_returns_error() {
+    // File does not exist in the InMemoryFs.
+    let fs = Arc::new(InMemoryFs::new());
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "nonexistent/path.rs",
+        "symbol_name": "anything"
+    });
+    let result = registry.call("tower_ast_read_symbol", args);
+    assert!(
+        result.is_err(),
+        "UN1: missing file must return an error, not succeed"
+    );
+}
+
+/// Invalid kind string → tool error (InvalidArgs propagated via MergedRegistry).
+#[test]
+fn read_symbol_invalid_kind_returns_error() {
+    let fs = fs_with("src/counter.rs", READ_SYMBOL_SOURCE);
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "src/counter.rs",
+        "symbol_name": "handle",
+        "kind": "not_a_real_kind"
+    });
+    let result = registry.call("tower_ast_read_symbol", args);
+    assert!(
+        result.is_err(),
+        "invalid kind must return an error, got: {result:?}"
+    );
+}
+
+/// Fix 2 (RED-first, e2e): `read_symbol` with a `kind` that is inapplicable to
+/// the file's language must return a clear error mentioning applicability — NOT
+/// the misleading "symbol not found" message.
+///
+/// Scenario: Go file + `kind:"impl"`.
+/// `impl` does not exist in Go (`SymbolKind::Impl` is not applicable to
+/// `SupportedLanguage::Go`), so `resolve_symbol_spans` returns `NotApplicable`.
+/// Before this fix, `NotApplicable` collapsed into the empty-`Found` → "symbol
+/// not found" path. After the fix it returns `InvalidArgs` naming the
+/// inapplicability.
+///
+/// The test runs through the full wasm sandbox (MergedRegistry → WasmtimeHost →
+/// ast guest) to prove the fix is present in the compiled `.wasm`.
+#[test]
+fn read_symbol_inapplicable_kind_returns_applicability_error() {
+    // Go source that defines a function named `MyFunc`.
+    // The kind "impl" is not applicable to Go — no `impl` blocks exist.
+    let go_source = br#"package main
+
+func MyFunc() int {
+    return 42
+}
+"#;
+    let fs = fs_with("src/main.go", go_source);
+    let mut registry = merged_registry_with_ast(fs);
+
+    let args = serde_json::json!({
+        "path": "src/main.go",
+        "symbol_name": "MyFunc",
+        "kind": "impl"   // "impl" is not applicable to Go
+    });
+    let result = registry.call("tower_ast_read_symbol", args);
+
+    // Must be an error.
+    assert!(
+        result.is_err(),
+        "Fix 2: inapplicable kind must return an error, got: {result:?}"
+    );
+
+    // The error must NOT say "symbol not found" — that message is misleading
+    // when the real problem is that the kind does not apply to the language.
+    let err_str = format!("{:?}", result.unwrap_err());
+    assert!(
+        !err_str.contains("symbol not found"),
+        "Fix 2: error must NOT say 'symbol not found' for an inapplicable kind, got: {err_str}"
+    );
+    // The error should mention applicability so the client understands the issue.
+    assert!(
+        err_str.contains("applicable") || err_str.contains("impl"),
+        "Fix 2: error must mention applicability or the kind name, got: {err_str}"
     );
 }

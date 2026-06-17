@@ -273,6 +273,93 @@ impl SupportedLanguage {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Resolve symbol spans with an optional kind filter.
+///
+/// This is the entry point for `read_symbol`: it resolves the definition
+/// byte-spans for `symbol_name` in `source`, optionally restricted to a
+/// specific `kind`.
+///
+/// # Behaviour
+///
+/// - `Some(k)` → delegates directly to [`find_symbols`] for the single kind.
+/// - `None` → detects the language; if unsupported returns `Unsupported`.
+///   Otherwise iterates every [`SymbolKind`] variant applicable to the
+///   language (via [`SupportedLanguage::kind_applicable`]), calls
+///   [`find_symbols`] for each, collects all `Found` matches (ignores
+///   `NotApplicable` — those kinds simply contribute zero matches), then
+///   **sorts the merged list by `start_byte`** (EV2/AC2: deterministic order).
+///   Returns `Found(merged)`.
+///
+/// # Trade-off: N parses when kind is absent
+///
+/// When `kind` is `None` this function parses the source once per applicable
+/// kind variant (currently up to 6 for PHP, 11 for Rust). This is acceptable
+/// because `read_symbol` is a single-file, single-call operation: the
+/// N-parse cost is bounded by the fixed number of kind variants, not by file
+/// size, and the operation is not on any hot path (FileChanged / outline
+/// indexing). A shared-tree optimisation would require a significant refactor
+/// of the walker API; the gain does not justify the complexity for this use case.
+///
+/// # Note on merge safety
+///
+/// Each kind maps to distinct tree-sitter node types, so merged matches from
+/// different per-kind calls cannot duplicate the same source span.
+pub fn resolve_symbol_spans(
+    source: &[u8],
+    hint: &str,
+    name: &str,
+    kind: Option<SymbolKind>,
+) -> SymbolResult {
+    match kind {
+        Some(k) => find_symbols(source, hint, name, k),
+        None => {
+            let lang = match SupportedLanguage::from_hint(hint) {
+                Some(l) => l,
+                None => {
+                    return SymbolResult::Unsupported {
+                        language: language_label(hint),
+                    };
+                }
+            };
+
+            // Collect matches across all applicable kinds for this language.
+            // Each kind uses a separate find_symbols call (and therefore a
+            // separate parse). See the trade-off note in the doc comment above.
+            let all_kinds = [
+                SymbolKind::Function,
+                SymbolKind::Struct,
+                SymbolKind::Enum,
+                SymbolKind::Trait,
+                SymbolKind::Impl,
+                SymbolKind::Method,
+                SymbolKind::Module,
+                SymbolKind::TypeAlias,
+                SymbolKind::Const,
+                SymbolKind::Static,
+                SymbolKind::MacroDef,
+                SymbolKind::Class,
+            ];
+
+            let mut merged: Vec<SymbolMatch> = Vec::new();
+            for k in all_kinds {
+                if !lang.kind_applicable(k) {
+                    continue;
+                }
+                if let SymbolResult::Found(mut ms) = find_symbols(source, hint, name, k) {
+                    merged.append(&mut ms);
+                }
+                // NotApplicable is already filtered by kind_applicable above.
+                // Unsupported cannot occur here: lang is known-good.
+            }
+
+            // EV2/AC2: deterministic order by position in the file.
+            merged.sort_by_key(|m| m.start_byte);
+
+            SymbolResult::Found(merged)
+        }
+    }
+}
+
 /// Search `source` for definitions of `symbol_name` with the given `kind`.
 ///
 /// `language_hint` is either a file path (extension used) or a language name.
@@ -1467,5 +1554,215 @@ fn top_level_fn() {}
                 "must have key '{expected}', got {keys:?}"
             );
         }
+    }
+
+    // ── resolve_symbol_spans (spec 16) ────────────────────────────────────────
+
+    /// Rust fixture used for resolve_symbol_spans tests.
+    ///
+    /// Contains:
+    /// - `fn handle()` — AC1: single-match exact slice
+    /// - two `new` methods in separate impls — AC2: multi-match ordered by start_byte
+    /// - `struct Handle` — AC3: kind filter excludes struct when kind=function
+    const RESOLVE_FIXTURE: &[u8] = br#"pub struct Handle {
+    value: u32,
+}
+
+impl Handle {
+    pub fn new() -> Self {
+        Self { value: 0 }
+    }
+
+    pub fn handle(&self) -> u32 {
+        self.value
+    }
+}
+
+pub struct Other {
+    x: u32,
+}
+
+impl Other {
+    pub fn new() -> Self {
+        Self { x: 0 }
+    }
+}
+
+pub fn handle() -> u32 {
+    42
+}
+"#;
+
+    /// AC1 (spec 16): resolve with explicit kind=Method finds `handle` method;
+    /// span bytes refer back into the fixture.
+    #[test]
+    fn ac1_resolve_single_match_exact_span() {
+        let result = resolve_symbol_spans(
+            RESOLVE_FIXTURE,
+            "test.rs",
+            "handle",
+            Some(SymbolKind::Method),
+        );
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "AC1: exactly one `handle` method, got: {matches:?}"
+        );
+        let m = &matches[0];
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.name, "handle");
+        // Span must be valid and non-zero.
+        assert!(
+            m.start_byte < m.end_byte,
+            "AC1: start_byte must be < end_byte"
+        );
+        assert!(
+            m.end_byte <= RESOLVE_FIXTURE.len(),
+            "AC1: end_byte must be within source"
+        );
+        // The sliced content must contain the name.
+        let slice = &RESOLVE_FIXTURE[m.start_byte..m.end_byte];
+        let text = std::str::from_utf8(slice).expect("slice must be valid UTF-8");
+        assert!(
+            text.contains("handle"),
+            "AC1: sliced span must contain the symbol name, got: {text:?}"
+        );
+    }
+
+    /// AC1 (spec 16): free function `handle` found with kind=Function.
+    #[test]
+    fn ac1_resolve_function_kind_finds_free_function() {
+        let result = resolve_symbol_spans(
+            RESOLVE_FIXTURE,
+            "test.rs",
+            "handle",
+            Some(SymbolKind::Function),
+        );
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "AC1: one free `handle` function, got: {matches:?}"
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Function);
+    }
+
+    /// AC2 (spec 16): two `new` methods across two impl blocks, no kind filter —
+    /// both are returned ordered by start_byte (deterministic).
+    #[test]
+    fn ac2_resolve_no_kind_returns_all_matches_ordered_by_start_byte() {
+        let result = resolve_symbol_spans(RESOLVE_FIXTURE, "test.rs", "new", None);
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            2,
+            "AC2: both `new` methods must be returned, got: {matches:?}"
+        );
+        // EV2: ordered by start_byte.
+        assert!(
+            matches[0].start_byte < matches[1].start_byte,
+            "AC2: matches must be ordered by start_byte; got {:?} then {:?}",
+            matches[0].start_byte,
+            matches[1].start_byte
+        );
+        // Both are Method kind.
+        for m in &matches {
+            assert_eq!(
+                m.kind,
+                SymbolKind::Method,
+                "AC2: each `new` must be a Method, got: {m:?}"
+            );
+            assert_eq!(m.name, "new");
+        }
+    }
+
+    /// AC3 (spec 16): kind=Function excludes the `Handle` struct even if same-named.
+    /// Also tests that kind filter restricts `handle` to function (not method).
+    #[test]
+    fn ac3_resolve_kind_filter_excludes_different_kinds() {
+        // `handle` exists as both a free function and a method.
+        // kind=Function must return only the free function.
+        let result = resolve_symbol_spans(
+            RESOLVE_FIXTURE,
+            "test.rs",
+            "handle",
+            Some(SymbolKind::Function),
+        );
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(
+            matches.len(),
+            1,
+            "AC3: kind=Function must return only the free function, got: {matches:?}"
+        );
+        assert_eq!(matches[0].kind, SymbolKind::Function);
+    }
+
+    /// AC3 (spec 16): kind=Function on a name that only exists as a struct → not found (empty).
+    #[test]
+    fn ac3_resolve_kind_filter_struct_name_with_function_kind_empty() {
+        let result = resolve_symbol_spans(
+            RESOLVE_FIXTURE,
+            "test.rs",
+            "Handle",
+            Some(SymbolKind::Function),
+        );
+        let matches = match result {
+            SymbolResult::Found(m) => m,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert!(
+            matches.is_empty(),
+            "AC3: `Handle` is a struct, not a function; must return empty, got: {matches:?}"
+        );
+    }
+
+    /// AC4 (spec 16): unknown symbol name → Found(empty) from resolve_symbol_spans.
+    /// The CallFailed error naming the symbol is the responsibility of ast_read_symbol_impl.
+    #[test]
+    fn ac4_resolve_unknown_symbol_returns_empty_found() {
+        let result = resolve_symbol_spans(RESOLVE_FIXTURE, "test.rs", "no_such_symbol_xyz", None);
+        assert!(
+            matches!(result, SymbolResult::Found(ref m) if m.is_empty()),
+            "AC4: unknown symbol must return empty Found, got {result:?}"
+        );
+    }
+
+    /// Unsupported language → Unsupported regardless of kind.
+    #[test]
+    fn resolve_unsupported_language_returns_unsupported() {
+        let result = resolve_symbol_spans(b"def foo(): pass", "script.py", "foo", None);
+        assert!(
+            matches!(result, SymbolResult::Unsupported { .. }),
+            "unsupported language must return Unsupported, got {result:?}"
+        );
+    }
+
+    /// resolve_symbol_spans with kind=Some delegates to find_symbols (same result).
+    #[test]
+    fn resolve_with_kind_some_delegates_to_find_symbols() {
+        let direct = find_symbols(RESOLVE_FIXTURE, "test.rs", "handle", SymbolKind::Function);
+        let via_resolve = resolve_symbol_spans(
+            RESOLVE_FIXTURE,
+            "test.rs",
+            "handle",
+            Some(SymbolKind::Function),
+        );
+        assert_eq!(
+            direct, via_resolve,
+            "resolve with Some(kind) must produce identical result to find_symbols"
+        );
     }
 }

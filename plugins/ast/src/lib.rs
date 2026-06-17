@@ -1,8 +1,8 @@
 //! `ast` — reference Tree-sitter AST plugin (spec 12c/12d).
 //!
 //! Compiles to `wasm32-wasip1` using the `#[plugin_main]` macro from
-//! `plugin_sdk`. Declares four tools: `get_outline`, `find_symbols`,
-//! `search_symbols`, and `reindex`.
+//! `plugin_sdk`. Declares five tools: `get_outline`, `find_symbols`,
+//! `search_symbols`, `reindex`, and `read_symbol`.
 //!
 //! # Architecture
 //!
@@ -327,10 +327,11 @@ fn build_fresh_index(files: &[(String, Vec<u8>)]) -> (SymbolIndex, HashMap<Strin
 
 // ── Plugin struct ─────────────────────────────────────────────────────────────
 
-/// The AST plugin: exposes `get_outline`, `find_symbols`, `search_symbols`, and
-/// `reindex` with a persistent cross-file symbol index for the workspace.
+/// The AST plugin: exposes `get_outline`, `find_symbols`, `search_symbols`,
+/// `reindex`, and `read_symbol` with a persistent cross-file symbol index for
+/// the workspace.
 ///
-/// Apply `#[plugin_main]` to generate the four wasm export symbols automatically.
+/// Apply `#[plugin_main]` to generate the five wasm export symbols automatically.
 #[plugin_main]
 pub struct AstPlugin;
 
@@ -381,6 +382,17 @@ impl Plugin for AstPlugin {
                         .to_owned(),
                     schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#.to_owned(),
                 },
+                ToolDesc {
+                    name: "read_symbol".to_owned(),
+                    description: "Read only a named symbol's source span from a file — not the \
+                                  whole file. Returns the exact byte slice `[start_byte, \
+                                  end_byte)` plus kind and start/end rows for each match, \
+                                  ordered by start_byte. Supports optional kind filter to \
+                                  disambiguate same-named symbols of different kinds. One \
+                                  MCP round-trip: resolve + slice happen guest-side."
+                        .to_owned(),
+                    schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to read"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["path","symbol_name"]}"#.to_owned(),
+                },
             ],
             hooks: vec![HookKind::FileChanged],
         }
@@ -392,6 +404,7 @@ impl Plugin for AstPlugin {
             "find_symbols" => ast_find_symbols_impl(args),
             "search_symbols" => ast_search_symbols_impl(args),
             "reindex" => ast_reindex_impl(),
+            "read_symbol" => ast_read_symbol_impl(args),
             other => Err(SdkError::ToolNotFound(other.to_owned())),
         }
     }
@@ -564,7 +577,7 @@ fn ast_find_symbols_impl(args: Value) -> Result<Value, SdkError> {
 /// Returns `SdkError::InvalidArgs` if `name` is missing or not a string.
 fn ast_search_symbols_impl(args: Value) -> Result<Value, SdkError> {
     let name = extract_text_field(&args, "name")?;
-    let kind_opt = extract_optional_text_field(&args, "kind");
+    let kind_opt = extract_optional_text_field(&args, "kind")?;
 
     let items: Vec<Value> = with_index(|idx| {
         idx.search(name, kind_opt.as_deref())
@@ -659,6 +672,133 @@ fn ast_reindex_impl() -> Result<Value, SdkError> {
     }
 }
 
+/// Implementation of the `read_symbol` tool.
+///
+/// Returns only the named symbol's source span — not the whole file. One MCP
+/// round-trip: resolve + slice happen guest-side via the existing `host_read_file`
+/// capability and `symbols::resolve_symbol_spans`.
+///
+/// # Arguments (in `args`)
+///
+/// - `path` (required): workspace-relative path to the source file.
+/// - `symbol_name` (required): the symbol name to look up.
+/// - `kind` (optional): restrict to a specific kind; if absent all applicable
+///   kinds are searched and all matches are returned ordered by `start_byte`.
+///
+/// # Return value
+///
+/// ```json
+/// {
+///   "matches": [
+///     {
+///       "kind": "function",
+///       "name": "handle",
+///       "start_byte": 100, "end_byte": 200,
+///       "start_row": 5,    "end_row": 12,
+///       "content": "pub fn handle() {\n    ...\n}"
+///     }
+///   ]
+/// }
+/// ```
+///
+/// # Errors
+///
+/// - `SdkError::InvalidArgs` if required fields are missing/wrong type or an
+///   unrecognised `kind` string is supplied.
+/// - `SdkError::CallFailed` if the host cannot read the file, the symbol is
+///   not found (UN1 — names the symbol), or a span lies outside the file
+///   content (UN2 — stale span guard).
+fn ast_read_symbol_impl(args: Value) -> Result<Value, SdkError> {
+    let path = extract_text_field(&args, "path")?;
+    let symbol_name = extract_text_field(&args, "symbol_name")?;
+
+    // kind is OPTIONAL. If provided but wrong type → InvalidArgs (strict).
+    // If provided but unrecognised string → InvalidArgs.
+    let kind_opt = match extract_optional_text_field(&args, "kind")? {
+        Some(k_str) => {
+            let k = symbols::SymbolKind::parse_kind(&k_str).ok_or_else(|| {
+                SdkError::InvalidArgs(format!(
+                    "unknown symbol kind '{k_str}'; valid: function|struct|enum|trait|impl|\
+                     method|module|type_alias|const|static|macro_def|class"
+                ))
+            })?;
+            Some((k, k_str))
+        }
+        None => None,
+    };
+
+    let content = plugin_sdk::host::read_file(path)
+        .ok_or_else(|| SdkError::CallFailed(format!("host could not read file: {path}")))?;
+
+    // Destructure into the SymbolKind (for the resolver) and the original string
+    // (for the NotApplicable error message below).
+    let (kind_enum_opt, kind_str_opt) = match kind_opt {
+        Some((k, s)) => (Some(k), Some(s)),
+        None => (None, None),
+    };
+
+    let result = symbols::resolve_symbol_spans(&content, path, symbol_name, kind_enum_opt);
+
+    let matches_vec = match result {
+        symbols::SymbolResult::Unsupported { language } => {
+            // Mirror find_symbols convention: return { unsupported: true, language }.
+            return Ok(Value::Map(vec![
+                ("unsupported".to_owned(), Value::Bool(true)),
+                ("language".to_owned(), Value::Text(language)),
+            ]));
+        }
+        symbols::SymbolResult::NotApplicable => {
+            // NotApplicable only occurs when kind=Some(k) and that kind cannot
+            // exist in the file's language (e.g. kind:"impl" on a Go file).
+            // Returning "symbol not found" here is misleading — the symbol
+            // could exist under a different kind. Return a clear error instead.
+            let kind_str = kind_str_opt.as_deref().unwrap_or("<unknown>");
+            return Err(SdkError::InvalidArgs(format!(
+                "kind '{kind_str}' is not applicable to this file's language"
+            )));
+        }
+        symbols::SymbolResult::Found(ms) => ms,
+    };
+
+    // UN1: symbol not found → error naming the symbol.
+    if matches_vec.is_empty() {
+        return Err(SdkError::CallFailed(format!(
+            "symbol not found: {symbol_name}"
+        )));
+    }
+
+    // Slice each match from the file content and build the response.
+    let mut items: Vec<Value> = Vec::with_capacity(matches_vec.len());
+    for m in &matches_vec {
+        // UN2: stale-span guard — bounds-check before slicing.
+        let slice = content.get(m.start_byte..m.end_byte).ok_or_else(|| {
+            SdkError::CallFailed(format!(
+                "symbol span [{}, {}) out of range for file: {path}",
+                m.start_byte, m.end_byte
+            ))
+        })?;
+
+        // U3: byte-exact slice → UTF-8 text (source files must be UTF-8).
+        let content_str = std::str::from_utf8(slice).map_err(|e| {
+            SdkError::CallFailed(format!(
+                "symbol span for '{symbol_name}' contains invalid UTF-8: {e}"
+            ))
+        })?;
+
+        items.push(Value::Map(vec![
+            ("kind".to_owned(), Value::Text(m.kind.as_str().to_owned())),
+            ("name".to_owned(), Value::Text(m.name.clone())),
+            ("start_byte".to_owned(), Value::Integer(m.start_byte as i64)),
+            ("end_byte".to_owned(), Value::Integer(m.end_byte as i64)),
+            ("start_row".to_owned(), Value::Integer(m.start_row as i64)),
+            ("end_row".to_owned(), Value::Integer(m.end_row as i64)),
+            ("content".to_owned(), Value::Text(content_str.to_owned())),
+        ]));
+    }
+
+    Ok(Value::Map(vec![("matches".to_owned(), Value::List(items))]))
+}
+
 // ── Field extraction helpers ──────────────────────────────────────────────────
 
 /// Extract a required `&str`-valued field from a `Value::Map`.
@@ -687,18 +827,23 @@ fn extract_text_field<'a>(args: &'a Value, field: &str) -> Result<&'a str, SdkEr
 
 /// Extract an optional `String`-valued field from a `Value::Map`.
 ///
-/// Returns `None` if the field is absent (not an error); returns `None`
-/// silently if the value is not a string (lenient — treat as absent).
-fn extract_optional_text_field(args: &Value, field: &str) -> Option<String> {
+/// - Field absent → `Ok(None)`.
+/// - Field present and `Value::Text(s)` → `Ok(Some(s))`.
+/// - Field present but NOT a text value → `Err(SdkError::InvalidArgs(...))`.
+///
+/// The strict rejection of a wrong-typed value (e.g. `"kind": 42`) prevents a
+/// client bug from being silently treated as "no filter supplied", which would
+/// turn a targeted search into a broad all-kinds search.
+fn extract_optional_text_field(args: &Value, field: &str) -> Result<Option<String>, SdkError> {
     match args {
-        Value::Map(pairs) => pairs.iter().find(|(k, _)| k == field).and_then(|(_, v)| {
-            if let Value::Text(s) = v {
-                Some(s.clone())
-            } else {
-                None
-            }
-        }),
-        _ => None,
+        Value::Map(pairs) => match pairs.iter().find(|(k, _)| k == field) {
+            None => Ok(None),
+            Some((_, Value::Text(s))) => Ok(Some(s.clone())),
+            Some(_) => Err(SdkError::InvalidArgs(format!(
+                "field '{field}' must be a string"
+            ))),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -722,14 +867,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_declares_four_ast_tools() {
+    fn manifest_declares_five_ast_tools() {
         let manifest = AstPlugin::init();
         assert_eq!(manifest.name, "ast");
         assert_eq!(manifest.abi, ABI_VERSION);
         assert_eq!(
             manifest.tools.len(),
-            4,
-            "manifest must have exactly 4 tools"
+            5,
+            "manifest must have exactly 5 tools"
         );
         let tool_names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
@@ -747,6 +892,10 @@ mod tests {
         assert!(
             tool_names.contains(&"reindex"),
             "manifest must have reindex, got: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"read_symbol"),
+            "manifest must have read_symbol, got: {tool_names:?}"
         );
     }
 
@@ -923,7 +1072,11 @@ mod tests {
     #[test]
     fn extract_optional_text_field_absent_returns_none() {
         let args = Value::Map(vec![("name".to_owned(), Value::Text("foo".to_owned()))]);
-        assert_eq!(extract_optional_text_field(&args, "kind"), None);
+        assert_eq!(
+            extract_optional_text_field(&args, "kind"),
+            Ok(None),
+            "absent field must return Ok(None)"
+        );
     }
 
     #[test]
@@ -934,7 +1087,72 @@ mod tests {
         ]);
         assert_eq!(
             extract_optional_text_field(&args, "kind"),
-            Some("function".to_owned())
+            Ok(Some("function".to_owned())),
+            "present text field must return Ok(Some(s))"
+        );
+    }
+
+    /// Fix 1 (RED-first): a present field with a non-string value (e.g. integer)
+    /// must return `Err(InvalidArgs)`, not silently treat it as absent.
+    ///
+    /// Before this fix the function returned `Option<String>` and `None` for
+    /// wrong-typed values, turning `"kind": 42` into a broad all-kinds search.
+    #[test]
+    fn extract_optional_text_field_wrong_type_returns_invalid_args() {
+        let args = Value::Map(vec![
+            ("name".to_owned(), Value::Text("foo".to_owned())),
+            // Integer where a string is required.
+            ("kind".to_owned(), Value::Integer(42)),
+        ]);
+        let result = extract_optional_text_field(&args, "kind");
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(ref msg)) if msg.contains("kind")),
+            "present non-string field must return Err(InvalidArgs), got {result:?}"
+        );
+    }
+
+    /// Fix 1: search_symbols with a wrong-typed `kind` field (e.g. integer) must
+    /// return InvalidArgs — not silently drop the filter and search all kinds.
+    #[test]
+    fn call_tool_search_symbols_wrong_type_kind_returns_invalid_args() {
+        INDEX.with(|c| *c.borrow_mut() = Some(SymbolIndex::default()));
+
+        let args = Value::Map(vec![
+            ("name".to_owned(), Value::Text("foo".to_owned())),
+            ("kind".to_owned(), Value::Integer(42)),
+        ]);
+        let result = AstPlugin::call_tool("search_symbols", args);
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(_))),
+            "wrong-typed kind must return InvalidArgs for search_symbols, got {result:?}"
+        );
+    }
+
+    /// Fix 2 (RED-first): `read_symbol` with a `kind` inapplicable to the file's
+    /// language must return a clear `InvalidArgs` error mentioning applicability,
+    /// NOT the misleading "symbol not found" message.
+    ///
+    /// This is a host-side test using `ast_read_symbol_impl` directly; the wasm
+    /// path for the same behaviour is exercised by the e2e test
+    /// `read_symbol_inapplicable_kind_returns_applicability_error` in
+    /// `plugin_ast_e2e.rs`.
+    ///
+    /// On the host target `host::read_file` stubs to `None`, so this test cannot
+    /// reach the `resolve_symbol_spans` call. The full language-mismatch path
+    /// (kind=Some(k) → NotApplicable) is exercised end-to-end in the wasm sandbox.
+    /// This unit test covers the InvalidArgs path for wrong-typed `kind`.
+    #[test]
+    fn call_tool_read_symbol_wrong_type_kind_returns_invalid_args() {
+        let args = Value::Map(vec![
+            ("path".to_owned(), Value::Text("src/main.go".to_owned())),
+            ("symbol_name".to_owned(), Value::Text("MyFunc".to_owned())),
+            // Integer where a string is required — Fix 1 must catch this.
+            ("kind".to_owned(), Value::Integer(99)),
+        ]);
+        let result = AstPlugin::call_tool("read_symbol", args);
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(_))),
+            "wrong-typed kind must return InvalidArgs for read_symbol, got {result:?}"
         );
     }
 
@@ -1068,6 +1286,82 @@ mod tests {
         assert!(
             has_entry,
             "REQ-2: CONTENT_HASHES must contain an entry for the path after reindex_with_content"
+        );
+    }
+
+    // ── Host-side dispatch tests for read_symbol ──────────────────────────────
+    //
+    // On the host target host::read_file is a stub returning None, so all
+    // read-path tests assert CallFailed. Pure-logic tests for resolve_symbol_spans
+    // live in symbols::tests.
+
+    #[test]
+    fn call_tool_read_symbol_missing_path_returns_invalid_args() {
+        let args = Value::Map(vec![(
+            "symbol_name".to_owned(),
+            Value::Text("foo".to_owned()),
+        )]);
+        let result = AstPlugin::call_tool("read_symbol", args);
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(_))),
+            "missing path must return InvalidArgs, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn call_tool_read_symbol_missing_symbol_name_returns_invalid_args() {
+        let args = Value::Map(vec![(
+            "path".to_owned(),
+            Value::Text("src/main.rs".to_owned()),
+        )]);
+        let result = AstPlugin::call_tool("read_symbol", args);
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(_))),
+            "missing symbol_name must return InvalidArgs, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn call_tool_read_symbol_invalid_kind_returns_invalid_args() {
+        let args = Value::Map(vec![
+            ("path".to_owned(), Value::Text("src/main.rs".to_owned())),
+            ("symbol_name".to_owned(), Value::Text("Foo".to_owned())),
+            ("kind".to_owned(), Value::Text("not_a_kind".to_owned())),
+        ]);
+        let result = AstPlugin::call_tool("read_symbol", args);
+        assert!(
+            matches!(result, Err(SdkError::InvalidArgs(_))),
+            "unrecognised kind must return InvalidArgs, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn call_tool_read_symbol_host_read_fail_returns_call_failed() {
+        // On the host target, host::read_file is a stub returning None.
+        // read_symbol must return CallFailed, not panic.
+        let args = Value::Map(vec![
+            ("path".to_owned(), Value::Text("src/main.rs".to_owned())),
+            ("symbol_name".to_owned(), Value::Text("Foo".to_owned())),
+        ]);
+        let result = AstPlugin::call_tool("read_symbol", args);
+        assert!(
+            matches!(result, Err(SdkError::CallFailed(_))),
+            "host read failure must return CallFailed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn call_tool_read_symbol_absent_optional_kind_is_ok_up_to_read() {
+        // kind is absent — must not fail with InvalidArgs (kind is optional).
+        // Still gets CallFailed from the host stub, but NOT InvalidArgs.
+        let args = Value::Map(vec![
+            ("path".to_owned(), Value::Text("src/main.rs".to_owned())),
+            ("symbol_name".to_owned(), Value::Text("Foo".to_owned())),
+        ]);
+        let result = AstPlugin::call_tool("read_symbol", args);
+        assert!(
+            !matches!(result, Err(SdkError::InvalidArgs(_))),
+            "absent kind must not produce InvalidArgs: {result:?}"
         );
     }
 }
