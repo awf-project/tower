@@ -1,5 +1,7 @@
 // compile-pass: #[plugin_main] on a valid Plugin impl should compile cleanly.
-use plugin_sdk::{plugin_main, ABI_VERSION, HookKind, HookPayload, Plugin, PluginManifest, SdkError, Value};
+use plugin_sdk::{
+    ABI_VERSION, HookKind, HookPayload, Plugin, PluginManifest, SdkError, Value, plugin_main,
+};
 
 #[plugin_main]
 struct GreetPlugin;
