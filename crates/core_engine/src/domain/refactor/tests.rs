@@ -18,7 +18,7 @@ use crate::domain::mutation::FileMutationService;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{ContentHash, FileId, RelativePath, VirtualFile};
 use crate::ports::inbound::FileMutationUseCase;
-use crate::ports::{FileSystemPort, NoOpPluginHost, PortError, StoragePort};
+use crate::ports::{FileSystemPort, NoOpExtensionHost, PortError, StoragePort};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ fn setup_workspace_with_files(
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         for (p, content) in files {
             svc.create_file(path(p), content.to_vec()).unwrap();
         }
@@ -69,7 +69,7 @@ fn ac1_replace_across_five_files_all_rewritten() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -114,7 +114,7 @@ fn files_without_target_are_not_counted() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -131,7 +131,7 @@ fn multiple_occurrences_per_file_all_replaced() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -152,7 +152,7 @@ fn empty_workspace_returns_zero_report() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -169,7 +169,7 @@ fn pattern_not_found_returns_zero_report() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("zzz", "ZZZ").unwrap()
     };
 
@@ -229,7 +229,7 @@ fn ac2_partial_failure_others_succeed_failure_reported() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.global_replace("foo", "bar").unwrap()
     };
@@ -310,7 +310,7 @@ fn errors_are_sorted_by_path() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.global_replace("foo", "bar").unwrap()
     };
@@ -338,7 +338,7 @@ fn ac4_dry_run_returns_report_without_writing() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace_dry_run("foo", "bar").unwrap()
     };
 
@@ -372,7 +372,7 @@ fn dry_run_empty_workspace_returns_zero_report() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace_dry_run("foo", "bar").unwrap()
     };
 
@@ -397,7 +397,7 @@ fn ac5_search_text_finds_no_stale_matches_after_replace() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("oldterm", "newterm").unwrap();
     }
 
@@ -432,7 +432,7 @@ fn ev2_vfs_entries_present_after_replace() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap();
     }
 
@@ -462,7 +462,7 @@ fn report_counts_each_occurrence_not_each_file() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -527,7 +527,7 @@ fn put_batch_failure_after_fs_writes_returns_ok_with_report() {
             &mut ws,
             &mut idx,
             &mut fail_storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.create_file(path("a.rs"), b"foo first".to_vec())
             .unwrap();
@@ -541,7 +541,7 @@ fn put_batch_failure_after_fs_writes_returns_ok_with_report() {
             &mut ws,
             &mut idx,
             &mut fail_storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         // Must return Ok even though put_batch fails.
         svc.global_replace("foo", "bar")
@@ -623,7 +623,7 @@ fn ac3_rename_failure_leaves_original_intact() {
     let plain_fs = {
         let mut fs = InMemoryFs::new();
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path("safe.rs"), b"foo safe".to_vec())
             .unwrap();
         svc.create_file(path("guarded.rs"), b"foo guarded".to_vec())
@@ -643,7 +643,7 @@ fn ac3_rename_failure_leaves_original_intact() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.global_replace("foo", "bar").unwrap()
     };

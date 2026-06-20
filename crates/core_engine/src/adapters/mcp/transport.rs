@@ -26,8 +26,37 @@ use super::{
     registry::ToolRegistry,
     types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId, ToolError},
 };
-use crate::adapters::lsp::pool::DiagnosticsReader;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
+
+// ── DiagnosticsReader trait ───────────────────────────────────────────────────
+
+/// One-method read-only trait threaded into the transport for `resources/read`.
+///
+/// In the sidecar-extension model diagnostics are pushed via the extension's
+/// `notify/resourceUpdated` host-call rather than polled from a language-server
+/// pool.  The transport still accepts a `dyn DiagnosticsReader` so the
+/// `resources/read` path returns an authoritative (possibly empty) answer.
+///
+/// Implement on any type that can produce a diagnostic list for a given LSP URI.
+pub trait DiagnosticsReader: Send + Sync {
+    /// Return the last published diagnostics for the given LSP URI, or `[]`
+    /// when no live session exists for that URI's extension.
+    fn diagnostics_for(&self, uri: &str) -> Vec<crate::domain::code_intel::Diagnostic>;
+}
+
+/// A no-op [`DiagnosticsReader`] that always returns an empty diagnostics list.
+///
+/// Used in the sidecar-extension model (spec 28+) where diagnostics are pushed
+/// via the extension's `notify/resourceUpdated` host-call rather than polled
+/// through a session pool.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOpDiagnosticsReader;
+
+impl DiagnosticsReader for NoOpDiagnosticsReader {
+    fn diagnostics_for(&self, _uri: &str) -> Vec<crate::domain::code_intel::Diagnostic> {
+        Vec::new()
+    }
+}
 
 // ── Push types ────────────────────────────────────────────────────────────────
 

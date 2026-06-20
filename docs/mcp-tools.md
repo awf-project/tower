@@ -81,9 +81,10 @@ version and capability advertisement.
 
 ### 2. tools/list
 
-Enumerate every available tool. The response lists the 9 native `tower_*` tools,
-the 4 always-present code-intelligence tools (`tower_lsp_*`), plus any namespaced
-plugin tools (e.g. `"tower_ast_get_outline"`, `"tower_fmt_format"`) that are loaded.
+Enumerate every available tool. The response lists the 9 native `tower_*` tools
+plus any namespaced tools contributed by discovered extensions (e.g.
+`"tower_ast_get_outline"` from the `ast` extension, `"tower_lsp_diagnostics"` from
+the `lsp` extension).
 
 **Request**
 
@@ -168,7 +169,7 @@ result object.
 | -32600  | InvalidRequest   | `jsonrpc` field is not exactly `"2.0"`                                  |
 | -32601  | MethodNotFound   | The JSON-RPC method name (e.g. `"tools/call"`) is unknown               |
 | -32602  | InvalidParams    | A required tool argument is missing or has the wrong type               |
-| -32603  | InternalError    | Tool execution failed at runtime (I/O error, plugin fault, etc.)        |
+| -32603  | InternalError    | Tool execution failed at runtime (I/O error, extension fault, etc.)     |
 | -32001  | ToolNotFound     | The named tool does not exist in the registry                           |
 | -32002  | ResourceNotFound | The workspace entity targeted by the tool was not found (stable code — clients may branch on this without parsing the message) |
 
@@ -193,7 +194,7 @@ Codes `-32001` and `-32002` are in the JSON-RPC 2.0 server-defined range
 
 ## Native tools
 
-Nine tools are always available, regardless of which plugins are loaded. Their
+Nine tools are always available, regardless of which extensions are loaded. Their
 names are undecorated (no namespace prefix).
 
 ### tower_find_file
@@ -556,7 +557,7 @@ ambiguous `tower_global_replace`. Pairs naturally with `tower_ast_read_symbol`:
 read a symbol's `start_byte`/`end_byte`, then edit exactly that span.
 
 The replacement is applied **byte-exact** — no normalization and no implicit
-formatting (run `tower_fmt_format` separately if you want formatting).
+formatting.
 
 | Field         | Type    | Required | Description                                                        |
 |---------------|---------|----------|--------------------------------------------------------------------|
@@ -615,12 +616,12 @@ formatting (run `tower_fmt_format` separately if you want formatting).
 ## Code-intelligence tools (LSP)
 
 Four `tower_lsp_*` tools surface language-server intelligence over the same
-`tools/call` interface. They are **always present** in `tools/list`, even when no
-language server is configured for the workspace. When there is no backend, or when
-the file's language is not supported by the configured server, each tool returns a
-normal result with `"supported": false` (and an empty payload) rather than an
-error — so an agent can branch on that flag and fall back to the structural
-`tower_ast_*` tools.
+`tools/call` interface. They are contributed by the `lsp` extension (manifest
+`name = "lsp"`) and appear in `tools/list` whenever that extension is discovered.
+When there is no backend, or when the file's language is not supported by the
+configured server, each tool returns a normal result with `"supported": false`
+(and an empty payload) rather than an error — so an agent can branch on that flag
+and fall back to the structural `tower_ast_*` tools.
 
 Positions use **zero-based** `line` and `character`, where `character` is a
 **UTF-16 code-unit** column (LSP convention).
@@ -707,33 +708,34 @@ cursor → `{"supported": true, "hover": null}`. No backend / unsupported →
 
 ---
 
-## Plugin tools and namespacing
+## Extension tools and namespacing
 
-Plugin tools are surfaced through the same `tools/list` / `tools/call` interface
-as native tools, with one invariant: **plugin tool names are always namespaced as
-`"tower_<plugin_name>_<tool_name>"`**.
+Extension tools are surfaced through the same `tools/list` / `tools/call` interface
+as native tools, with one invariant: **extension tool names are always namespaced as
+`"tower_<ext>_<tool_name>"`**.
 
-- A plugin with manifest `name = "ast"` that declares `get_outline` appears
+- An extension with manifest `name = "ast"` that declares `get_outline` appears
   in `tools/list` as `"tower_ast_get_outline"`.
 - Native tools carry the bare `tower_` prefix (`tower_find_file`, etc.). To
-  guarantee plugin tools never collide with native ones, **a plugin name must not
-  begin with `tower`** — that prefix is reserved for host tools, and a plugin
-  whose `manifest.name` starts with `tower` is rejected at registration.
-- The namespacing is unconditional: there is no code path that allows a plugin
+  guarantee extension tools never collide with native ones, **an extension name must
+  not begin with `tower`** — that prefix is reserved for host tools.
+- The namespacing is unconditional: there is no code path that allows an extension
   to claim an un-namespaced name.
 
-Plugin tools are dispatched through `MergedRegistry`, which routes the call to
-the appropriate `IsolatedSandbox`. A plugin fault (trap, fuel exhaustion, epoch
-timeout, or quarantine) maps to `-32603` and does not affect the host process or
-the MCP link.
+Extension tools are dispatched through `ExtensionMergedRegistry`, which routes the
+call to the owning extension via `ExtensionHostPort::invoke`. An extension fault
+(timeout, crash, protocol error, or quarantine) maps to `-32603` and does not affect
+the host process or the MCP link. (Previously these were WASM plugin tools dispatched
+to an in-process sandbox; they are now out-of-process native sidecars — see
+[extensions.md](extensions.md). The tool names and wire shape are unchanged.)
 
 ---
 
-## AST plugin tools
+## AST extension tools
 
-The `ast` crate (manifest `name = "ast"`) provides Tree-sitter-based
-structural analysis for Rust, Go, and PHP. It must be compiled to
-`wasm32-wasip1` and placed in the plugin directory for the tools to appear.
+The `ast` extension (manifest `name = "ast"`) provides Tree-sitter-based
+structural analysis for Rust, Go, and PHP. Its native sidecar binary must be
+discovered from an extension scope for the tools to appear.
 
 Supported languages (detected by file extension or language ID):
 
@@ -930,9 +932,10 @@ the target language returns `{"matches": []}` (not an error), preserving the
 
 Search the **cross-file** in-memory symbol index for symbols matching a name and
 optional kind. Unlike `tower_ast_find_symbols` (which parses one named file), this
-queries the workspace-wide index that the plugin builds incrementally as files are
-read (index-as-you-go) and keeps current via `FileChanged` hooks. Returns matches
-across **all** indexed files, each with its `path`.
+queries the workspace-wide index that the `ast` extension builds incrementally as
+files are indexed (index-as-you-go) and keeps current via `fileIndexed` /
+`fileChanged` events. Returns matches across **all** indexed files, each with its
+`path`.
 
 MCP name: `"tower_ast_search_symbols"`
 
@@ -1018,29 +1021,15 @@ maps to `-32603`. An unrecognised `kind` returns `-32602 InvalidParams`.
 
 ---
 
-## Formatter plugin tools
+## Formatting
 
-The `fmt` crate (manifest `name = "fmt"`) provides change-driven formatting. It
-subscribes to the `FileChanged` hook (auto-format on write) and additionally
-exposes one on-demand MCP tool. The tool appears in `tools/list` only when the
-plugin is loaded and not listed under `[plugins] disabled` in
-`<workspace>/.tower/config.toml`.
-
-### tower_fmt_format
-
-Enqueue a format job. With a `path`, formats that single file; without one,
-enqueues every workspace file ("format all"). The call returns **promptly after
-enqueuing** — formatting is asynchronous and coalesced host-side; the response
-reports the enqueue tally, not the formatting result.
-
-MCP name: `"tower_fmt_format"`
-
-| Field  | Type   | Required | Description                                                      |
-|--------|--------|----------|------------------------------------------------------------------|
-| `path` | string | no       | Path to enqueue. Omit to enqueue all workspace files             |
-
-**Returns** `{"requested": uint, "accepted": uint, "dropped": uint}` — jobs
-requested, accepted into the queue, and dropped (e.g. queue saturation; no retry).
+Formatting is no longer exposed as a standalone MCP tool. In the WASM era a `fmt`
+plugin contributed a `tower_fmt_format` tool; that tool was removed with the WASM
+plugin system. Formatting is now a **host capability** (`workspace/requestFormat`):
+an extension enqueues a format job by calling that capability (backed by the host's
+`FormatQueuePort`), and the host runs the configured external formatters
+asynchronously. See [extensions.md](extensions.md#capability-callbacks) for the
+capability contract.
 
 ---
 
@@ -1104,12 +1093,12 @@ as a JSON string. Always parse it a second time to get the structured object.
 
 ## Behaviour guarantees
 
-- **MCP link survives plugin faults.** A plugin trap, fuel exhaustion, epoch
-  timeout, or quarantine maps to `-32603` and the serve loop continues.
+- **MCP link survives extension faults.** An extension timeout, crash, protocol
+  error, or quarantine maps to `-32603` and the serve loop continues.
 - **`-32002` is stable.** Clients may branch on this code to detect "resource
   not found" without parsing the error message string.
-- **`tools/list` is always fresh.** There is no cache; adding or removing a
-  plugin is reflected in the next `tools/list` call.
+- **`tools/list` is always fresh.** There is no cache; adding or removing an
+  extension is reflected in the next `tools/list` call.
 - **Empty lines are silently skipped.** Lines that are blank after trimming
   produce no response.
 - **Notifications produce no response.** Requests with no `id` field are

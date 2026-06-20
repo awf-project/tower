@@ -12,7 +12,7 @@ use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::mutation::FileMutationService;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::NoOpPluginHost;
+use core_engine::ports::NoOpExtensionHost;
 use core_engine::ports::inbound::FileMutationUseCase;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ fn seed_files(
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         for (p, content) in files {
             svc.create_file(rel(p), content.to_vec()).unwrap();
         }
@@ -64,7 +64,7 @@ fn ac1_global_replace_all_files_rewritten_atomically() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -141,7 +141,7 @@ fn ac2_write_failure_reported_others_committed() {
     let protected_rel = rel("protected_dir/guarded.rs");
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(protected_rel.clone(), b"foo guarded".to_vec())
             .unwrap();
     }
@@ -152,7 +152,7 @@ fn ac2_write_failure_reported_others_committed() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("foo", "bar").unwrap()
     };
 
@@ -254,7 +254,7 @@ fn ac3_blocked_rename_leaves_original_intact_on_disk() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.global_replace("foo", "bar").unwrap()
     };
@@ -310,7 +310,7 @@ fn ac4_dry_run_does_not_modify_any_file() {
 
     let report = {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace_dry_run("foo", "bar").unwrap()
     };
 
@@ -349,7 +349,7 @@ fn ac5_search_text_no_stale_matches_on_real_fs() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.global_replace("oldterm", "newterm").unwrap();
     }
 

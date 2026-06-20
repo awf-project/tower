@@ -58,7 +58,7 @@ use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, RelativePath, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
-use crate::ports::{DocumentSyncPort, NoOpDocumentSync, PluginHostPort, StoragePort};
+use crate::ports::{DocumentSyncPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
 
 // ── WatchEvent ────────────────────────────────────────────────────────────────
 
@@ -92,7 +92,7 @@ pub struct EventProcessor {
     workspace: Arc<RwLock<ProjectWorkspace>>,
     index: Arc<RwLock<InvertedIndex>>,
     storage: Box<dyn StoragePort + Send>,
-    plugin_host: Box<dyn PluginHostPort + Send + Sync>,
+    extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
     /// Compiled matcher for the ROOT `.towerignore` (the canonical location
     /// `tower init` writes). Rebuilt whenever an event touches that file so
     /// subsequent events honor the latest rules. Falls back to
@@ -125,14 +125,14 @@ impl EventProcessor {
     /// - `workspace`    — shared workspace aggregate.
     /// - `index`        — shared inverted index.
     /// - `storage`      — outbound storage port (sled or in-memory fake).
-    /// - `plugin_host`  — lifecycle hook receiver; use `NoOpPluginHost` when
+    /// - `extension_host` — lifecycle hook receiver; use `NoOpExtensionHost` when
     ///   none is registered.
     pub fn new(
         root: PathBuf,
         workspace: Arc<RwLock<ProjectWorkspace>>,
         index: Arc<RwLock<InvertedIndex>>,
         storage: Box<dyn StoragePort + Send>,
-        plugin_host: Box<dyn PluginHostPort + Send + Sync>,
+        extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
     ) -> Self {
         let ignore_matcher = build_ignore_matcher(&root);
         Self {
@@ -140,7 +140,7 @@ impl EventProcessor {
             workspace,
             index,
             storage,
-            plugin_host,
+            extension_host,
             ignore_matcher,
             doc_sync: Arc::new(NoOpDocumentSync),
             echo_set: Arc::new(Mutex::new(HashMap::new())),
@@ -273,7 +273,7 @@ impl EventProcessor {
         }
 
         // OP1: broadcast after VFS update commits.
-        self.plugin_host.on_file_changed(file_id, &rel_path);
+        self.extension_host.on_file_changed(file_id, &rel_path);
 
         Ok(())
     }
@@ -364,7 +364,7 @@ impl EventProcessor {
         }
 
         // OP1: broadcast after VFS update commits.
-        self.plugin_host.on_file_changed(file_id, &rel_path);
+        self.extension_host.on_file_changed(file_id, &rel_path);
 
         Ok(())
     }
@@ -385,7 +385,7 @@ impl EventProcessor {
 
         // ── Write lock ────────────────────────────────────────────────────────
         // `rel_path` is cloned before the lock is taken so it is available for
-        // the post-lock plugin_host call (OP1) without holding the lock during
+        // the post-lock extension_host call (OP1) without holding the lock during
         // the notification (ST1 — short critical sections).
         let file_id = {
             let mut ws = self
@@ -425,7 +425,7 @@ impl EventProcessor {
         }
 
         // OP1: broadcast after VFS update commits (delete side).
-        self.plugin_host.on_file_changed(file_id, &rel_path);
+        self.extension_host.on_file_changed(file_id, &rel_path);
 
         Ok(())
     }
@@ -570,9 +570,10 @@ impl EventProcessor {
 
         // OP1: broadcast after VFS update commits.
         if let Some(fid) = from_file_id {
-            self.plugin_host.on_file_changed(fid, &from_rel_path);
+            self.extension_host.on_file_changed(fid, &from_rel_path);
         }
-        self.plugin_host.on_file_changed(to_file_id, &to_rel_path);
+        self.extension_host
+            .on_file_changed(to_file_id, &to_rel_path);
 
         Ok(())
     }
@@ -689,26 +690,41 @@ mod tests {
     use crate::adapters::in_memory_storage::InMemoryStorage;
     use crate::domain::index::InvertedIndex;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::NoOpPluginHost;
+    use crate::ports::NoOpExtensionHost;
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
-    /// A `PluginHostPort` that records calls to `on_file_changed`.
+    /// An `ExtensionHostPort` that records calls to `on_file_changed`.
     #[derive(Debug, Default)]
-    struct RecordingPluginHost {
+    struct RecordingExtensionHost {
         calls: std::sync::Mutex<Vec<(crate::domain::FileId, RelativePath)>>,
     }
 
-    impl PluginHostPort for RecordingPluginHost {
+    impl ExtensionHostPort for RecordingExtensionHost {
         fn on_file_indexed(&self, _id: crate::domain::FileId, _path: &RelativePath) {}
         fn on_file_changed(&self, id: crate::domain::FileId, path: &RelativePath) {
             self.calls.lock().unwrap().push((id, path.clone()));
         }
+        fn on_file_deleted(&self, _path: &RelativePath) {}
+        fn declared_tools(
+            &self,
+        ) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            tool_name: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::domain::InvokeError> {
+            Err(crate::domain::InvokeError::ToolNotFound(
+                tool_name.to_owned(),
+            ))
+        }
     }
 
-    fn make_processor_with_plugin(
+    fn make_processor_with_extension_host(
         root: PathBuf,
-        plugin: Box<dyn PluginHostPort + Send + Sync>,
+        host: Box<dyn ExtensionHostPort + Send + Sync>,
     ) -> (
         EventProcessor,
         Arc<RwLock<ProjectWorkspace>>,
@@ -722,7 +738,7 @@ mod tests {
             Arc::clone(&workspace),
             Arc::clone(&index),
             storage,
-            plugin,
+            host,
         );
         (processor, workspace, index)
     }
@@ -734,7 +750,7 @@ mod tests {
         Arc<RwLock<ProjectWorkspace>>,
         Arc<RwLock<InvertedIndex>>,
     ) {
-        make_processor_with_plugin(root, Box::new(NoOpPluginHost))
+        make_processor_with_extension_host(root, Box::new(NoOpExtensionHost))
     }
 
     // ── Document-sync wiring (spec 14b) ───────────────────────────────────────
@@ -770,7 +786,7 @@ mod tests {
         let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
         let index = Arc::new(RwLock::new(InvertedIndex::new()));
         let storage = Box::new(InMemoryStorage::new());
-        EventProcessor::new(root, workspace, index, storage, Box::new(NoOpPluginHost))
+        EventProcessor::new(root, workspace, index, storage, Box::new(NoOpExtensionHost))
             .with_document_sync(doc_sync, echo_set)
     }
 
@@ -1181,25 +1197,48 @@ mod tests {
         assert_eq!(ws_guard.snapshot().files.len(), 1);
     }
 
-    // ── TDD step 7/8: PluginHost broadcast ────────────────────────────────────
+    // ── TDD step 7/8: ExtensionHost broadcast ─────────────────────────────────
+
+    /// Helper wrapper to allow Arc<RecordingExtensionHost> to satisfy Box<dyn ExtensionHostPort>.
+    struct ArcExtHost(Arc<RecordingExtensionHost>);
+
+    impl ExtensionHostPort for ArcExtHost {
+        fn on_file_indexed(&self, id: crate::domain::FileId, path: &RelativePath) {
+            self.0.on_file_indexed(id, path);
+        }
+        fn on_file_changed(&self, id: crate::domain::FileId, path: &RelativePath) {
+            self.0.on_file_changed(id, path);
+        }
+        fn on_file_deleted(&self, path: &RelativePath) {
+            self.0.on_file_deleted(path);
+        }
+        fn declared_tools(
+            &self,
+        ) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            tool_name: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::domain::InvokeError> {
+            self.0.invoke(tool_name, params)
+        }
+    }
 
     /// OP1: on_file_changed is broadcast after Create and Modify.
     #[test]
-    fn plugin_host_notified_after_create_and_modify() {
+    fn extension_host_notified_after_create_and_modify() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let file_path = root.join("service.rs");
         std::fs::write(&file_path, b"v1").unwrap();
 
-        let recording = Arc::new(RecordingPluginHost::default());
-        let plugin_clone = Arc::clone(&recording);
-        // Safety: RecordingPluginHost is Send+Sync (Mutex inside).
-        let boxed_plugin: Box<dyn PluginHostPort + Send + Sync> = Box::new(
-            // Wrap arc in a newtype to pass into Box<dyn ...>
-            ArcPlugin(plugin_clone),
-        );
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let boxed_host: Box<dyn ExtensionHostPort + Send + Sync> =
+            Box::new(ArcExtHost(Arc::clone(&recording)));
 
-        let (mut processor, _, _) = make_processor_with_plugin(root, boxed_plugin);
+        let (mut processor, _, _) = make_processor_with_extension_host(root, boxed_host);
 
         processor
             .process_event(WatchEvent::Create(file_path.clone()))
@@ -1219,31 +1258,19 @@ mod tests {
         );
     }
 
-    /// Helper wrapper to allow Arc<RecordingPluginHost> to satisfy Box<dyn PluginHostPort>.
-    struct ArcPlugin(Arc<RecordingPluginHost>);
-
-    impl PluginHostPort for ArcPlugin {
-        fn on_file_indexed(&self, id: crate::domain::FileId, path: &RelativePath) {
-            self.0.on_file_indexed(id, path);
-        }
-        fn on_file_changed(&self, id: crate::domain::FileId, path: &RelativePath) {
-            self.0.on_file_changed(id, path);
-        }
-    }
-
     /// OP1: on_file_changed is broadcast after Delete.
     #[test]
-    fn plugin_host_notified_after_delete() {
+    fn extension_host_notified_after_delete() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let file_path = root.join("soon_deleted.rs");
         std::fs::write(&file_path, b"x").unwrap();
 
-        let recording = Arc::new(RecordingPluginHost::default());
-        let boxed_plugin: Box<dyn PluginHostPort + Send + Sync> =
-            Box::new(ArcPlugin(Arc::clone(&recording)));
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let boxed_host: Box<dyn ExtensionHostPort + Send + Sync> =
+            Box::new(ArcExtHost(Arc::clone(&recording)));
 
-        let (mut processor, _, _) = make_processor_with_plugin(root, boxed_plugin);
+        let (mut processor, _, _) = make_processor_with_extension_host(root, boxed_host);
 
         // Create then delete — we want the delete notification.
         processor
@@ -1289,7 +1316,7 @@ mod tests {
             Arc::clone(&workspace),
             Arc::clone(&index),
             storage,
-            Box::new(NoOpPluginHost),
+            Box::new(NoOpExtensionHost),
         );
 
         // Pre-insert alpha so the rename has a file to delete.
@@ -1749,7 +1776,7 @@ mod tests {
                         ws,
                         idx,
                         storage,
-                        Box::new(NoOpPluginHost),
+                        Box::new(NoOpExtensionHost),
                     );
                     for i in 0..files_per_thread {
                         let path = root_clone.join(format!("thread{t}_file{i}.rs"));

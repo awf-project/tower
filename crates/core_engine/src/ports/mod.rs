@@ -16,10 +16,10 @@
 //! └──────────────────────────────────────────────────────────────┘
 //! OUTBOUND (Driven SPI — domain requires these)
 //! ┌──────────────────────────────────────────────────────────────┐
-//! │ trait StoragePort    { get / put / delete VirtualFile + blobs}│
-//! │ trait FileSystemPort { read / write / rename / scan bytes }  │
-//! │ trait PluginHostPort { on_file_indexed / on_file_changed }   │
-//! │ trait AstIndexPort   { put / get / delete / list blobs }     │
+//! │ trait StoragePort      { get / put / delete VirtualFile + blobs }│
+//! │ trait FileSystemPort   { read / write / rename / scan bytes }    │
+//! │ trait ExtensionHostPort{ on_file_indexed / on_file_changed }     │
+//! │ trait AstIndexPort     { put / get / delete / list blobs }       │
 //! └──────────────────────────────────────────────────────────────┘
 //! TEST DOUBLES (spec 02):
 //!   InMemoryStorage : HashMap-backed StoragePort
@@ -30,15 +30,15 @@
 //!
 //! The domain never imports a concrete adapter. It receives port implementations
 //! through its constructor (or method parameters), ensuring that `domain/` stays
-//! free of `sled`, `std::fs`, `wasmtime`, and `notify` (AC4).
+//! free of `sled`, `std::fs`, and `notify` (AC4).
 
 pub mod ast_index;
 pub mod code_intel;
 pub mod document_sync;
 pub mod error;
+pub mod extension_host;
 pub mod filesystem;
 pub mod navigation;
-pub mod plugin;
 pub mod storage;
 
 // Inbound ports — use-case contracts called by external drivers.
@@ -48,8 +48,8 @@ pub use ast_index::{AstIndexPort, validate_key as validate_ast_index_key};
 pub use code_intel::{CodeIntelError, CodeIntelligencePort};
 pub use document_sync::{DocumentSyncPort, NoOpDocumentSync};
 pub use error::PortError;
+pub use extension_host::{ExtensionHostPort, NoOpExtensionHost};
 pub use filesystem::FileSystemPort;
 pub use inbound::{FileMutationUseCase, FileReplaceError, Match, SearchUseCase, TxReport};
 pub use navigation::NavigationPort;
-pub use plugin::{NoOpPluginHost, PluginHostPort};
 pub use storage::StoragePort;

@@ -1,0 +1,15 @@
+[package]
+name = "fixture_ignore_shutdown"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Regression fixture: completes initialize, then ignores `shutdown` and never exits voluntarily (forces the host's kill escalation)"
+
+[[bin]]
+name = "fixture_ignore_shutdown"
+path = "src/main.rs"
+
+[dependencies]
+extension_protocol = { path = "../../../crates/extension_protocol" }
+serde_json = "1"

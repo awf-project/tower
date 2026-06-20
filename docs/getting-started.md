@@ -15,12 +15,12 @@ The toolchain is pinned in `rust-toolchain.toml`:
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
-targets  = ["wasm32-wasip1"]
 profile  = "minimal"
 ```
 
-`rustup` reads this file automatically on first use and installs the exact channel, components, and
-the `wasm32-wasip1` target. No manual `rustup target add` is needed after a fresh clone.
+`rustup` reads this file automatically on first use and installs the exact channel and components.
+No extra build target is required: the engine and the native extensions all build for the host target.
+(The previous WASM model needed `wasm32-wasip1` and a WASI SDK; neither is required any more.)
 
 If you do not have `rustup`:
 
@@ -36,41 +36,6 @@ Used to enforce license and advisory policy (`deny.toml` at the workspace root).
 cargo install cargo-deny --locked
 ```
 
-### WASI SDK (required only for `ast` and future grammar plugins)
-
-`ast` vendors tree-sitter C grammar sources that must be compiled to `wasm32-wasip1`. The
-Rust wasm target ships no C sysroot, so WASI SDK provides the wasm-targeting clang and the
-`wasi-sysroot`.
-
-Pure-Rust wasm crates (`hello`, all `fixture_*`) compile without it.
-
-**Option A — reuse what the tree-sitter CLI already downloaded (zero extra work)**
-
-```bash
-# After running `tree-sitter build --wasm` at least once the SDK is cached at:
-ls ~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
-
-export CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
-export AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
-```
-
-**Option B — download WASI SDK 25 explicitly**
-
-```bash
-WASI_SDK_DIR="$HOME/.local/wasi-sdk"
-mkdir -p "$WASI_SDK_DIR"
-curl -fsSL \
-  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz \
-  | tar -xz -C "$WASI_SDK_DIR" --strip-components=1
-
-export CC_wasm32_wasip1="$WASI_SDK_DIR/bin/wasm32-wasip1-clang"
-export AR_wasm32_wasip1="$WASI_SDK_DIR/bin/llvm-ar"
-```
-
-The env-var names follow the `cc` crate convention: `CC_<target>` / `AR_<target>` with hyphens
-replaced by underscores. They must be visible in every shell session that builds the wasm target.
-Add the `export` lines to your shell profile or a `.envrc` file to make them persistent.
-
 ---
 
 ## Clone and build
@@ -79,82 +44,46 @@ Add the `export` lines to your shell profile or a `.envrc` file to make them per
 git clone <repository-url> tower
 cd tower
 
-# Build the host binary (tower) and all host-side crates.
-# The wasm32-wasip1 crates are excluded from default-members and are not built here.
-cargo build
+# Build the host binary (tower) and every native extension.
+cargo build            # or: make build
 ```
 
-The binary produced is `target/debug/tower`.
+The host binary produced is `target/debug/tower`; the reference extension binaries
+(`ast_extension`, `hello_extension`, `lsp_extension`) are also under `target/debug/`.
 
 ---
 
 ## Quality gate
 
-Run these commands in order before every merge. The CI pipeline (`ci.yml`) executes them in exactly
-this sequence; a step must pass before the next runs.
+Run these four checks in order before every merge. The CI pipeline (`ci.yml`) executes them in exactly
+this sequence; a step must pass before the next runs. `make gate` runs the whole sequence.
 
 ### 1. Format check
 
 ```bash
-cargo fmt --all --check
+cargo fmt --all --check          # make fmt-check
 ```
 
 ### 2. Clippy (warnings are errors)
 
 ```bash
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings    # make clippy
 ```
 
-### 3. Build wasm fixtures
+### 3. Run the test suite
 
-Integration tests locate fixture `.wasm` files through env vars set by `crates/core_engine/build.rs`.
-Those vars point at `target/wasm32-wasip1/debug/*.wasm`, so the fixtures must be compiled before
-`cargo test` is run. Skipping this step causes integration tests to fail at startup.
+`cargo test --workspace` compiles every native extension binary too, so the host
+integration tests can locate them under `target/debug/`. There is no WASM build
+step and no WASI SDK.
 
 ```bash
-cargo build \
-  -p hello \
-  -p fixture_abi_mismatch \
-  -p fixture_panic_plugin \
-  -p fixture_loop_plugin \
-  -p fixture_loop_hook_plugin \
-  --target wasm32-wasip1
+cargo test --workspace           # make test
 ```
 
-### 4. Build ast for wasm32-wasip1
-
-Requires `CC_wasm32_wasip1` and `AR_wasm32_wasip1` to be set (see [Prerequisites](#prerequisites)).
+### 4. License and advisory policy
 
 ```bash
-cargo build -p ast --target wasm32-wasip1
-```
-
-### 5. Run host-side tests
-
-`default-members` scopes the workspace to the host crates, so a plain `cargo test`
-skips the wasm-only crates — no `--exclude` list needed:
-
-```bash
-cargo test
-```
-
-Expected: 423 tests pass, 6 ignored.
-
-### 6. Run ast host-side tests
-
-`ast` contains a native outline walker that is tested without WASI SDK (tree-sitter compiles
-natively here).
-
-```bash
-cargo test -p ast
-```
-
-Expected: 65 tests pass.
-
-### 7. License and advisory policy
-
-```bash
-cargo deny check
+cargo deny check                 # make deny
 ```
 
 ---
@@ -243,30 +172,31 @@ Expected response:
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 ```
 
-The response lists 7 native `tower_*` tools plus any loaded plugin tools (e.g., `tower_ast_get_outline`,
-`tower_ast_find_symbols` if `ast` is deployed). Plugin tools are always namespaced as
-`tower_<plugin_name>_<tool_name>`.
+The response lists the native `tower_*` tools plus any tools contributed by discovered extensions
+(e.g. `tower_ast_get_outline`, `tower_ast_find_symbols` when the `ast` extension is present).
+Extension tools are always namespaced as `tower_<ext>_<tool_name>`.
 
-To deploy a plugin, install it into one of two scopes and restart `tower` — no recompile:
+Extensions are native sidecar binaries discovered from an extension scope by their `extension.toml`
+manifest. Install one (its binary + manifest) into a scope and restart `tower` — no recompile of the
+host:
 
-- **Global** (`~/.local/share/tower/plugins`, XDG) — usable by every project: `tower plugin install <wasm>`.
-- **Local** (`<workspace>/.tower/plugins`) — this project only, and overrides a global plugin of the
-  same name. An explicit `--plugins-dir <path>` / `$TOWER_PLUGINS_DIR` replaces both scopes with one dir.
+- **Global** (`<xdg-data>/tower/extensions/<name>/`) — usable by every project; scanned first.
+- **Local** (`<workspace>/.tower/extensions/<name>/`) — this project only; wins on a name collision.
+  An explicit `--extensions-dir <path>` / `$TOWER_EXTENSIONS_DIR` replaces both scopes with one dir.
 
 ```bash
-# Global (every project):
-tower plugin install target/wasm32-wasip1/release/ast.wasm
-
-# Or local (this project only):
-mkdir -p .tower/plugins
-cp target/wasm32-wasip1/release/ast.wasm .tower/plugins/
+# Local (this project only): place the binary + manifest in its own directory.
+mkdir -p .tower/extensions/ast
+cp target/debug/ast_extension     .tower/extensions/ast/
+cp extensions/ast/extension.toml  .tower/extensions/ast/
 
 cargo run -p core_engine     # tower_ast_* tools now appear in tools/list
 ```
 
-No plugins in any scope simply serves the 7 native tools; a malformed or ABI-mismatched `.wasm` is
-skipped with a stderr warning and never blocks startup. When the same plugin name is in both scopes,
-the local copy wins. See [`plugins.md`](plugins.md) for the full deployment and fault-isolation details.
+No extensions in any scope simply serves the native tools; an extension that fails to spawn (or one
+listed in the config disable list) is skipped with a stderr warning and never blocks startup. When the
+same extension name appears in both scopes, the local copy wins. See [`extensions.md`](extensions.md)
+for the manifest schema, capabilities, activation, and the supervision/fault model.
 
 ### Find a file
 
@@ -324,6 +254,6 @@ the tool-specific payload.
 ## Next steps
 
 - [architecture.md](architecture.md) — hexagonal boundary, domain model, adapter wiring
-- [mcp-tools.md](mcp-tools.md) — all 7 native tools and the AST plugin tools in full detail
-- [plugins.md](plugins.md) — authoring a Drop-and-Play wasm plugin, ABI, fault isolation
+- [mcp-tools.md](mcp-tools.md) — the native tools and the extension tools in full detail
+- [extensions.md](extensions.md) — authoring a native extension: protocol, capabilities, fault model
 - [development.md](development.md) — contribution guide, TDD workflow, benchmark targets

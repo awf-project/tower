@@ -11,7 +11,7 @@ use crate::domain::virtual_file::{FileMetadata, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::inbound::{FileMutationUseCase, FileReplaceError, TxReport};
-use crate::ports::{FileSystemPort, PluginHostPort, PortError, StoragePort};
+use crate::ports::{ExtensionHostPort, FileSystemPort, PortError, StoragePort};
 
 // ── FileMutationService ───────────────────────────────────────────────────────
 
@@ -35,7 +35,7 @@ use crate::ports::{FileSystemPort, PluginHostPort, PortError, StoragePort};
 /// use core_engine::domain::RelativePath;
 /// use core_engine::adapters::{InMemoryFs, InMemoryStorage};
 /// use core_engine::ports::inbound::FileMutationUseCase;
-/// use core_engine::ports::NoOpPluginHost;
+/// use core_engine::ports::NoOpExtensionHost;
 ///
 /// let mut workspace = ProjectWorkspace::new();
 /// let mut index = InvertedIndex::new();
@@ -47,7 +47,7 @@ use crate::ports::{FileSystemPort, PluginHostPort, PortError, StoragePort};
 ///     &mut workspace,
 ///     &mut index,
 ///     &mut storage,
-///     &NoOpPluginHost,
+///     &NoOpExtensionHost,
 /// );
 ///
 /// let path = RelativePath::new("src/lib.rs");
@@ -61,7 +61,7 @@ pub struct FileMutationService<'ws> {
     workspace: &'ws mut ProjectWorkspace,
     index: &'ws mut InvertedIndex,
     storage: &'ws mut dyn StoragePort,
-    plugin_host: &'ws dyn PluginHostPort,
+    extension_host: &'ws dyn ExtensionHostPort,
 }
 
 impl<'ws> FileMutationService<'ws> {
@@ -69,25 +69,25 @@ impl<'ws> FileMutationService<'ws> {
     ///
     /// # Arguments
     ///
-    /// - `fs`          — file-system port (borrowed mutably so the same
+    /// - `fs`             — file-system port (borrowed mutably so the same
     ///   instance can be reused across multiple calls).
-    /// - `workspace`   — mutable workspace aggregate.
-    /// - `index`       — mutable inverted index.
-    /// - `storage`     — mutable storage port.
-    /// - `plugin_host` — lifecycle hook receiver (`NoOpPluginHost` when none).
+    /// - `workspace`      — mutable workspace aggregate.
+    /// - `index`          — mutable inverted index.
+    /// - `storage`        — mutable storage port.
+    /// - `extension_host` — lifecycle hook receiver (`NoOpExtensionHost` when none).
     pub fn new(
         fs: &'ws mut dyn FileSystemPort,
         workspace: &'ws mut ProjectWorkspace,
         index: &'ws mut InvertedIndex,
         storage: &'ws mut dyn StoragePort,
-        plugin_host: &'ws dyn PluginHostPort,
+        extension_host: &'ws dyn ExtensionHostPort,
     ) -> Self {
         Self {
             fs,
             workspace,
             index,
             storage,
-            plugin_host,
+            extension_host,
         }
     }
 
@@ -153,7 +153,7 @@ impl<'ws> FileMutationService<'ws> {
         self.storage.put(virtual_file).map_err(port_err_to_domain)?;
 
         // Step E: broadcast.
-        self.plugin_host.on_file_changed(file_id, path);
+        self.extension_host.on_file_changed(file_id, path);
 
         Ok(())
     }
@@ -253,7 +253,7 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         self.storage.put(virtual_file).map_err(port_err_to_domain)?;
 
         // ── Step 4: broadcast ─────────────────────────────────────────────────
-        self.plugin_host.on_file_changed(file_id, &path);
+        self.extension_host.on_file_changed(file_id, &path);
 
         Ok(())
     }
@@ -327,7 +327,7 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         }
 
         // Step 5: broadcast.
-        self.plugin_host.on_file_changed(file_id, path);
+        self.extension_host.on_file_changed(file_id, path);
 
         Ok(())
     }

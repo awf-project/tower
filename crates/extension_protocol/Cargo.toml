@@ -1,0 +1,40 @@
+[package]
+name = "extension_protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tower extension protocol — wire contract (JSON-RPC 2.0 types, manifest schema) shared by the host and every sidecar extension author"
+
+[lib]
+name = "extension_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+# Decision: serde + serde_json as the wire format for the JSON-RPC 2.0 protocol.
+# Why: The sidecar extension protocol uses JSON-RPC 2.0 over stdio; JSON is the
+# natural encoding. serde_json is already in the workspace (core_engine). Using
+# JSON (not postcard) matches D2 in spec 20 and the spec 21 wireframe explicitly
+# calls for JSON-RPC envelopes.
+# Trade-off: human-readable (good for debugging / third-party authors) but larger
+# than a binary format. Acceptable: extensions are I/O-bound processes, not hot loops.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+
+# Decision: toml for ExtensionManifest deserialization (extension.toml).
+# Why: spec 21 U3 requires TOML-deserializable manifest. toml is already used
+# in core_engine for .tower/config.toml.
+# Trade-off: same as in core_engine — adds transitive deps. Mitigated by re-using
+# the same version so no duplicate major version lands in the lockfile.
+toml = "0.9"
+
+# Decision: thiserror for typed protocol errors.
+# Why: ExtensionFault and ProtocolError need Display + Error derives without
+# boilerplate. thiserror is already a de-facto workspace companion.
+# Trade-off: proc-macro dep (compile-time only). Standard practice.
+thiserror = "2"
+
+[dev-dependencies]
+# serde_json is already a direct dep but we list it here to make it clear it is
+# used in tests for JSON encoding/decoding roundtrips.
+serde_json = "1"

@@ -1,0 +1,12 @@
+name       = "hello"
+version    = "0.1.0"
+command    = ["hello_extension"]
+activation = "lazy"
+
+# No events: hello is a pure tool-only, lazy extension (U4).
+# No capabilities required beyond the default (no file reads, no index).
+
+[[tools]]
+name        = "greet"
+description = "Return a greeting string. Minimal hello-world example for the extension system."
+schema_json = '{"type":"object","properties":{"name":{"type":"string","description":"Name to greet (optional, defaults to World)"}}}'

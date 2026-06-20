@@ -1,8 +1,8 @@
 # Tower
 
 Tower is a core engine for a high-performance productivity tool: a virtual file system with a persistent
-inverted index, parallel content search, safe mass text refactoring, and a "Drop & Play" WASM
-plugin architecture — all exposed over a JSON-RPC 2.0 stdio interface following the
+inverted index, parallel content search, safe mass text refactoring, and an out-of-process **native
+extension** architecture — all exposed over a JSON-RPC 2.0 stdio interface following the
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io).
 
 Architecture: **Domain-Driven Design + Hexagonal (Ports & Adapters) + Microkernel**.
@@ -18,10 +18,11 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **Parallel content search** | Rayon-backed grep across all indexed files |
 | **Safe file mutations** | Shadow-file pattern (`<path>.tmp_write` → flush → atomic `fs::rename`); crash-safe |
 | **Mass refactoring** | Parallel global find-and-replace with per-file atomic rewrites and a `TxReport` |
-| **MCP server** | JSON-RPC 2.0 over stdin/stdout; 7 native `tower_*` tools plus any plugin tools, served from one surface |
-| **WASM plugin host** | Drop a `.wasm` in the plugins directory — `tower` auto-loads it at startup inside a `wasmtime` sandbox with fuel + epoch compute bounds and automatic fault isolation |
-| **AST analysis** | `ast` — Tree-sitter outline and symbol search for Rust, Go, PHP |
-| **Single static binary** | No JVM, Node, or container required at runtime |
+| **MCP server** | JSON-RPC 2.0 over stdin/stdout; 9 native `tower_*` tools plus any extension tools, served from one surface |
+| **Native extension host** | Out-of-process native sidecar extensions over a JSON-RPC 2.0 protocol on stdio; OS-process isolation, per-call timeouts, restart/backoff, and quarantine |
+| **AST analysis** | `ast` extension — Tree-sitter outline and symbol search for Rust, Go, PHP |
+| **Code intelligence** | `lsp` extension — diagnostics, definition, references, hover via a language-server bridge |
+| **Single static binary** | No WASM, WASI SDK, JVM, Node, or container required at runtime |
 
 ---
 
@@ -87,7 +88,7 @@ cargo run -p core_engine
 # Handshake
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | cargo run -p core_engine -q
 
-# List tools (7 native tower_* tools, plus <plugin>/<tool> for any loaded plugin)
+# List tools (9 native tower_* tools, plus tower_<ext>_<tool> for any loaded extension)
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | cargo run -p core_engine -q
 
 # Find a file
@@ -98,20 +99,22 @@ echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find
 Each request is a single newline-delimited JSON object on stdin; responses arrive on stdout.
 No `Content-Length` header — unlike LSP.
 
-### Drop & Play a plugin
+### Install an extension
 
-`tower` scans a plugins directory at startup (resolved from `--plugins-dir`, then
-`$TOWER_PLUGINS_DIR`, then `<workspace>/.tower/plugins/`). Drop a `.wasm` in, restart, and its
-tools appear in `tools/list` — no host recompile:
+Extensions are out-of-process **native sidecar** binaries described by an `extension.toml` manifest.
+`tower` discovers them at startup (resolved from `--extensions-dir`, then `$TOWER_EXTENSIONS_DIR`,
+then the global XDG dir and `<workspace>/.tower/extensions/`). Drop a binary + manifest into a scope,
+restart, and its tools appear in `tools/list` — no host recompile:
 
 ```bash
-mkdir -p .tower/plugins
-cp target/wasm32-wasip1/release/ast.wasm .tower/plugins/
-cargo run -p core_engine -q     # tools/list now also exposes ast/ast_get_outline + ast/ast_find_symbols
+mkdir -p .tower/extensions/ast
+cp target/debug/ast_extension     .tower/extensions/ast/
+cp extensions/ast/extension.toml  .tower/extensions/ast/
+cargo run -p core_engine -q     # tools/list now also exposes tower_ast_get_outline, tower_ast_find_symbols, …
 ```
 
-A missing/empty directory serves exactly the 7 native tools; a bad plugin is skipped with a stderr
-warning and never aborts startup. See [`docs/plugins.md`](docs/plugins.md) for details.
+No extensions serves exactly the 9 native tools; an extension that fails to spawn is skipped with a
+stderr warning and never aborts startup. See [`docs/extensions.md`](docs/extensions.md) for details.
 
 ---
 
@@ -120,53 +123,36 @@ warning and never aborts startup. See [`docs/plugins.md`](docs/plugins.md) for d
 Run these checks in order before every merge (mirrors CI):
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check                                   # make fmt-check
+cargo clippy --workspace --all-targets -- -D warnings     # make clippy
 
-# Build wasm fixtures BEFORE cargo test (build.rs sets env paths to these .wasm files)
-cargo build \
-  -p hello \
-  -p fixture_abi_mismatch \
-  -p fixture_panic_plugin \
-  -p fixture_loop_plugin \
-  -p fixture_loop_hook_plugin \
-  --target wasm32-wasip1
+# cargo test --workspace also compiles every native extension binary, so the
+# host integration tests locate them under target/debug/. No WASM, no WASI SDK.
+cargo test --workspace                                    # make test
 
-# Build the AST plugin (requires CC_wasm32_wasip1 / AR_wasm32_wasip1 — see getting-started.md)
-cargo build -p ast --target wasm32-wasip1
-
-# Host-side tests — default-members already scopes this to the host crates,
-# so the wasm crates are skipped without any --exclude list.
-cargo test
-
-# ast host-side tests (Tree-sitter compiles natively, no WASI SDK needed)
-cargo test -p ast
-
-cargo deny check
+cargo deny check                                          # make deny
 ```
+
+Or run the whole sequence with `make gate`.
 
 ---
 
 ## Workspace layout
 
 ```
-crates/                   Engine + SDK (host-side, default-members)
+crates/                   Engine + shared protocol (host-side)
 ├── core_engine/          Host binary (tower) + lib; domain / ports / adapters
-├── plugin_sdk/           Distributable SDK: ABI types, Plugin trait, proc-macros
-└── plugin_sdk_macros/    Proc-macro crate: #[plugin_main], #[plugin_export]
+└── extension_protocol/   Shared host ↔ extension wire contract (types + serde only)
 
-plugins/                  wasm32-wasip1 plugins (excluded from default-members)
-├── ast/                  Reference AST plugin → wasm32-wasip1 (~1.2 MB release)
-├── hello/                Minimal example plugin (cdylib + rlib)
-└── fixtures/             Test-only wasm fixtures (not shipped)
-    ├── fixture_abi_mismatch/     wrong ABI version
-    ├── fixture_panic_plugin/     panicking guest
-    ├── fixture_loop_plugin/      infinite-loop guest (fuel test)
-    └── fixture_loop_hook_plugin/ infinite-loop in hook handler
+extensions/               Native sidecar extensions (separate binaries)
+├── ast/                  Reference Tree-sitter AST extension (eager)
+├── hello/                Minimal example extension (lazy)
+├── lsp/                  Language-server bridge extension (lazy)
+└── fixtures/             Test-only fault-isolation fixtures (not shipped)
 ```
 
-`default-members` covers `core_engine`, `plugin_sdk`, and `plugin_sdk_macros` only — the wasm
-crates under `plugins/` are built explicitly with `--target wasm32-wasip1`.
+The reference extensions are ordinary native binaries — `cargo test --workspace` compiles each one
+and the host locates them under `target/debug/`. There is no WASM build step and no WASI SDK.
 
 ---
 
@@ -176,8 +162,8 @@ crates under `plugins/` are built explicitly with `--target wasm32-wasip1`.
 |---|---|
 | [`docs/getting-started.md`](docs/getting-started.md) | Prerequisites, build, quality gate, first MCP session |
 | [`docs/architecture.md`](docs/architecture.md) | Hexagonal boundary, crate layout, ports, data flow, design decisions |
-| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, all 7 native tools, AST plugin tools, error codes |
-| [`docs/plugins.md`](docs/plugins.md) | Plugin authoring guide — SDK, ABI, build, fault isolation |
+| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools, error codes |
+| [`docs/extensions.md`](docs/extensions.md) | Extension authoring guide — native sidecars, the JSON-RPC protocol, capabilities, manifest, fault model |
 | [`docs/development.md`](docs/development.md) | Contributing, TDD workflow, CI pipeline, test conventions |
 | [`docs/ADR/`](docs/ADR/) | Architecture Decision Records |
 | [`project-brief.md`](project-brief.md) | Vision, objectives, functional scope |

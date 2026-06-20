@@ -31,6 +31,59 @@ pub struct TowerConfig {
     /// rather than calling `parse_lsp_config` again.
     #[serde(default)]
     pub lsp: LspConfig,
+    /// `[extensions]` section — sidecar extension runtime settings (spec 24).
+    ///
+    /// Absent → `ExtensionConfig::default()` (30-second timeout).
+    #[serde(default)]
+    pub extensions: ExtensionConfig,
+}
+
+/// `[extensions]` section (spec 24 — supervision & fault model; spec 25 — disable list).
+///
+/// Controls per-request timeout, respawn backoff, and which extensions are
+/// skipped at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionConfig {
+    /// Wall-clock deadline for a single extension tool call or event delivery,
+    /// in seconds (default 30s, matching the old WASM epoch budget — spec 24 U1).
+    ///
+    /// If a call exceeds this deadline the child is killed and
+    /// `ExtensionFault::Timeout` is returned to the caller.
+    #[serde(default = "ExtensionConfig::default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Extension manifest names to skip loading, e.g. `["ast", "lsp"]`.
+    ///
+    /// Matched against `ExtensionManifest::name` (not the filesystem path).
+    /// Disabled extensions are never spawned — the check happens before any
+    /// process is started (spec 25 U3).
+    ///
+    /// Note for spec 28 migration: `[plugins] disabled` (WASM era) will be
+    /// mapped here during the config migration step.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
+impl ExtensionConfig {
+    const fn default_request_timeout_secs() -> u64 {
+        30
+    }
+
+    /// Return the `request_timeout` as a [`std::time::Duration`].
+    #[must_use]
+    pub fn request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.request_timeout_secs)
+    }
+}
+
+impl Default for ExtensionConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: Self::default_request_timeout_secs(),
+            disabled: Vec::new(),
+        }
+    }
 }
 
 /// `[plugins]` section.
@@ -169,6 +222,78 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(TowerConfig::default()),
         Err(source) => Err(ConfigError::Io { path, source }),
+    }
+}
+
+/// Apply backward-compatibility migrations to a loaded [`TowerConfig`] and
+/// return any deprecation warnings to be emitted by the caller (spec 28 O1).
+///
+/// # Migrations
+///
+/// | Legacy key / path                   | New key / path               |
+/// |-------------------------------------|------------------------------|
+/// | `[plugins] disabled`                | `[extensions] disabled`      |
+///
+/// The migration is **additive only** — it copies the legacy value into the new
+/// field when the new field is empty (the user hasn't set it yet). If the user
+/// has explicitly set `[extensions] disabled`, no migration occurs (their intent
+/// wins).
+///
+/// Callers should print each warning string to stderr exactly once at startup
+/// so operators know to update their config file.
+///
+/// # Example
+///
+/// ```rust
+/// use core_engine::adapters::config::{TowerConfig, PluginConfig, apply_backcompat};
+///
+/// let mut cfg = TowerConfig::default();
+/// cfg.plugins.disabled = vec!["ast".to_owned()];
+/// let warnings = apply_backcompat(&mut cfg);
+/// assert_eq!(cfg.extensions.disabled, vec!["ast".to_owned()]);
+/// assert!(!warnings.is_empty());
+/// ```
+pub fn apply_backcompat(cfg: &mut TowerConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // [plugins] disabled → [extensions] disabled
+    if !cfg.plugins.disabled.is_empty() && cfg.extensions.disabled.is_empty() {
+        cfg.extensions.disabled = cfg.plugins.disabled.clone();
+        warnings.push(
+            "tower: deprecated — `[plugins] disabled` in .tower/config.toml is superseded by \
+             `[extensions] disabled`. Please update your config file."
+                .to_owned(),
+        );
+    }
+
+    warnings
+}
+
+/// Resolve the legacy `.tower/plugins/` directory fallback (spec 28 O1).
+///
+/// Returns a deprecation warning string and the fallback path when:
+/// - `extensions_dir` does not exist on disk, **and**
+/// - the legacy `plugins_dir` exists on disk.
+///
+/// The caller should use the returned path as a fallback extension directory
+/// and emit the warning to stderr.
+///
+/// Returns `None` when no fallback is needed (the extensions dir exists or
+/// neither dir exists).
+#[must_use]
+pub fn legacy_plugins_dir_fallback(
+    extensions_dir: &Path,
+    plugins_dir: &Path,
+) -> Option<(PathBuf, String)> {
+    if !extensions_dir.exists() && plugins_dir.exists() {
+        let warning = format!(
+            "tower: deprecated — `.tower/plugins/` is superseded by `.tower/extensions/`. \
+             Move your extensions to {} and update any tooling.",
+            extensions_dir.display()
+        );
+        Some((plugins_dir.to_owned(), warning))
+    } else {
+        None
     }
 }
 
@@ -481,5 +606,196 @@ extensions = ["rs"]
             cfg.lsp.servers.is_empty(),
             "absent [lsp] must yield empty LspConfig"
         );
+    }
+
+    // ── Spec 24: [extensions] section ────────────────────────────────────────
+
+    /// Absent `[extensions]` section yields 30-second default timeout (spec 24 U1).
+    #[test]
+    fn absent_extensions_section_yields_default_timeout() {
+        let tmp = tempdir().unwrap();
+        let cfg = load(tmp.path()).expect("absent config is ok");
+        assert_eq!(
+            cfg.extensions.request_timeout_secs, 30,
+            "default timeout must be 30s"
+        );
+        assert_eq!(
+            cfg.extensions.request_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    /// `[extensions] request_timeout = 5` is parsed correctly.
+    #[test]
+    fn parses_extensions_request_timeout() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[extensions]\nrequest_timeout_secs = 5\n");
+        let cfg = load(tmp.path()).expect("valid extensions config");
+        assert_eq!(cfg.extensions.request_timeout_secs, 5);
+        assert_eq!(
+            cfg.extensions.request_timeout(),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    /// Unknown key in `[extensions]` is rejected.
+    #[test]
+    fn unknown_key_in_extensions_section_is_error() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[extensions]\nunknown_key = true\n");
+        let err = load(tmp.path()).expect_err("unknown field must error");
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    // ── Spec 25: [extensions] disabled list ──────────────────────────────────
+
+    /// `[extensions] disabled = ["ast"]` is parsed correctly (spec 25 U3).
+    #[test]
+    fn parses_extensions_disabled_list() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[extensions]\ndisabled = [\"ast\"]\n");
+        let cfg = load(tmp.path()).expect("valid extensions config with disabled");
+        assert_eq!(cfg.extensions.disabled, vec!["ast".to_string()]);
+    }
+
+    /// Absent `disabled` key yields empty vec (backward-compat).
+    #[test]
+    fn absent_extensions_disabled_yields_empty_vec() {
+        let tmp = tempdir().unwrap();
+        let cfg = load(tmp.path()).expect("absent config ok");
+        assert!(
+            cfg.extensions.disabled.is_empty(),
+            "absent disabled must be empty"
+        );
+    }
+
+    /// `[extensions]` and `[plugins]` and `[lsp]` all coexist.
+    #[test]
+    fn extensions_plugins_lsp_coexist() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+[plugins]
+disabled = ["ast"]
+
+[extensions]
+request_timeout_secs = 60
+disabled = ["lsp"]
+
+[lsp.rust]
+command = "rust-analyzer"
+extensions = ["rs"]
+"#,
+        );
+        let cfg = load(tmp.path()).expect("combined config must load");
+        assert_eq!(cfg.plugins.disabled, vec!["ast"]);
+        assert_eq!(cfg.extensions.request_timeout_secs, 60);
+        assert_eq!(cfg.extensions.disabled, vec!["lsp"]);
+        assert!(cfg.lsp.for_extension("rs").is_some());
+    }
+
+    // ── Spec 28: apply_backcompat + legacy_plugins_dir_fallback ──────────────
+
+    /// AC4 (key migration): `[plugins] disabled` is copied to `[extensions]
+    /// disabled` when the latter is empty, and a warning is returned.
+    #[test]
+    fn apply_backcompat_copies_plugins_disabled_to_extensions_disabled() {
+        let mut cfg = TowerConfig::default();
+        cfg.plugins.disabled = vec!["ast".to_owned(), "hello".to_owned()];
+
+        let warnings = apply_backcompat(&mut cfg);
+
+        assert_eq!(
+            cfg.extensions.disabled,
+            vec!["ast".to_owned(), "hello".to_owned()],
+            "extensions.disabled must be populated from plugins.disabled"
+        );
+        assert!(
+            !warnings.is_empty(),
+            "a deprecation warning must be returned"
+        );
+        assert!(
+            warnings[0].contains("deprecated"),
+            "warning must mention deprecation: {}",
+            warnings[0]
+        );
+    }
+
+    /// AC4: If `[extensions] disabled` is already set, it wins — no migration.
+    #[test]
+    fn apply_backcompat_does_not_overwrite_existing_extensions_disabled() {
+        let mut cfg = TowerConfig::default();
+        cfg.plugins.disabled = vec!["ast".to_owned()];
+        cfg.extensions.disabled = vec!["lsp".to_owned()];
+
+        let warnings = apply_backcompat(&mut cfg);
+
+        assert_eq!(
+            cfg.extensions.disabled,
+            vec!["lsp".to_owned()],
+            "extensions.disabled must be preserved when already set"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no warning when extensions.disabled is already set"
+        );
+    }
+
+    /// AC4: If `[plugins] disabled` is empty, no migration occurs and no warning.
+    #[test]
+    fn apply_backcompat_noop_when_plugins_disabled_is_empty() {
+        let mut cfg = TowerConfig::default();
+        // Both empty — no-op.
+        let warnings = apply_backcompat(&mut cfg);
+        assert!(cfg.extensions.disabled.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    /// AC4 (dir migration): `legacy_plugins_dir_fallback` returns the plugins
+    /// dir + warning when extensions dir is absent but plugins dir exists.
+    #[test]
+    fn legacy_plugins_dir_fallback_returns_fallback_when_plugins_dir_exists() {
+        let tmp = tempdir().unwrap();
+        let extensions_dir = tmp.path().join(".tower/extensions");
+        let plugins_dir = tmp.path().join(".tower/plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+        // extensions dir does NOT exist.
+
+        let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
+        assert!(result.is_some(), "must return Some when plugins dir exists");
+        let (path, warning) = result.unwrap();
+        assert_eq!(path, plugins_dir);
+        assert!(
+            warning.contains("deprecated"),
+            "warning must mention deprecation: {warning}"
+        );
+    }
+
+    /// `legacy_plugins_dir_fallback` returns None when extensions dir exists.
+    #[test]
+    fn legacy_plugins_dir_fallback_returns_none_when_extensions_dir_exists() {
+        let tmp = tempdir().unwrap();
+        let extensions_dir = tmp.path().join(".tower/extensions");
+        let plugins_dir = tmp.path().join(".tower/plugins");
+        fs::create_dir_all(&extensions_dir).unwrap();
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
+        assert!(
+            result.is_none(),
+            "must return None when extensions dir exists"
+        );
+    }
+
+    /// `legacy_plugins_dir_fallback` returns None when neither dir exists.
+    #[test]
+    fn legacy_plugins_dir_fallback_returns_none_when_neither_dir_exists() {
+        let tmp = tempdir().unwrap();
+        let extensions_dir = tmp.path().join(".tower/extensions");
+        let plugins_dir = tmp.path().join(".tower/plugins");
+
+        let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
+        assert!(result.is_none(), "must return None when neither dir exists");
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "fixture_garbage_frames"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spec 24 fault fixture: completes initialize then emits undecodable garbage frames"
+
+[[bin]]
+name = "fixture_garbage_frames"
+path = "src/main.rs"
+
+[dependencies]
+extension_protocol = { path = "../../../crates/extension_protocol" }
+serde_json = "1"

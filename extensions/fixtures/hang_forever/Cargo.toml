@@ -1,0 +1,11 @@
+[package]
+name = "fixture_hang_forever"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spec 24 fault fixture: reads initialize request then hangs forever (never responds)"
+
+[[bin]]
+name = "fixture_hang_forever"
+path = "src/main.rs"

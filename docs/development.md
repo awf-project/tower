@@ -1,14 +1,20 @@
 # Development & Contributing
 
 This document covers: spec-driven workflow, quality gate, testing conventions,
-CI pipeline (including WASI SDK setup), hexagonal boundary rules, and the
-TDD-based build process used to construct tower.
+CI pipeline, hexagonal boundary rules, and the TDD-based build process used to
+construct tower.
+
+> Since the extension-system migration (spec 20) the engine is a **single static
+> binary** with out-of-process **native** sidecar extensions (`extensions/*`).
+> There is **no WASM build step and no WASI SDK** — `cargo test --workspace`
+> compiles every native extension binary and the host locates them under
+> `target/debug/`. The author-facing extension guide is [extensions.md](extensions.md).
 
 ---
 
 ## Spec-driven workflow
 
-All features were built from a backlog of 23 single-responsibility specifications
+All features were built from a backlog of single-responsibility specifications
 in `.agent/todo/` (git-ignored; local working artifacts only). Each spec is
 written in **EARS + Given/When/Then** format and includes an explicit TDD
 sequence. The ordering follows a dependency DAG documented in
@@ -29,51 +35,45 @@ source files.
 
 ## Quality gate
 
-Every commit — and every spec — must pass all five checks in this exact order:
+Every commit — and every spec — must pass these four checks in this exact order.
+The `Makefile` mirrors them; `make gate` runs the whole sequence.
 
 ```sh
 # 1. Formatting
-cargo fmt --all --check
+cargo fmt --all --check            # make fmt-check
 
 # 2. Linting (warnings are hard errors)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings    # make clippy
 
-# 3. Build wasm fixtures (MUST precede cargo test — see fixture ordering below)
-cargo build \
-  -p hello \
-  -p fixture_abi_mismatch \
-  -p fixture_panic_plugin \
-  -p fixture_loop_plugin \
-  -p fixture_loop_hook_plugin \
-  --target wasm32-wasip1
+# 3. Run the full workspace test suite. This compiles every native extension
+#    binary (extensions/*) too, so the host integration tests can locate them
+#    under target/debug/. No WASM build, no WASI SDK.
+cargo test --workspace             # make test
 
-# 4. Build the Tree-sitter AST plugin
-cargo build -p ast --target wasm32-wasip1
-
-# 5. Run host-side tests — default-members already scopes this to the host crates,
-#    so the wasm-only crates are skipped without an --exclude list.
-cargo test
-
-# 6. Run ast host-side tests separately
-cargo test -p ast
-
-# 7. License and advisory policy
-cargo deny check
+# 4. License and advisory policy
+cargo deny check                   # make deny
 ```
 
 `cargo-deny` must be installed once: `cargo install cargo-deny --locked`.
 
-**Why the wasm builds must come before `cargo test`**: `crates/core_engine/build.rs`
-sets `cargo:rustc-env` variables (e.g. `PANIC_PLUGIN_WASM`, `LOOP_PLUGIN_WASM`)
-pointing at the compiled `.wasm` files. Integration tests retrieve these paths via
-`env!("...")` at compile time. If the wasm binaries do not exist when `cargo test`
-runs, the test binary will compile against stale paths or fail to locate fixtures
-at runtime.
+### Makefile targets
 
-**Why you must not spawn `cargo build` from `build.rs`**: doing so would attempt
-to acquire the workspace build lock that the outer `cargo build -p core_engine`
-already holds, causing a deadlock. The CI workflow runs wasm builds as a separate
-step before invoking `cargo test`.
+The `Makefile` is the developer task runner; `make help` lists everything.
+
+| Target           | Command |
+|------------------|---------|
+| `make build`     | `cargo build --workspace` (host + native extensions, debug) |
+| `make release`   | `cargo build --release -p core_engine` |
+| `make run`       | `cargo run -p core_engine` (MCP server over stdio) |
+| `make fmt`       | `cargo fmt --all` |
+| `make fmt-check` | `cargo fmt --all --check` (gate step 1) |
+| `make clippy`    | `cargo clippy --workspace --all-targets -- -D warnings` (gate step 2) |
+| `make test`      | `cargo test --workspace` (gate step 3) |
+| `make deny`      | `cargo deny check` (gate step 4) |
+| `make gate`      | full quality gate: fmt-check + clippy + test + deny |
+| `make dist`      | package a release tarball + sha256 for the host target |
+| `make install`   | build release and install `tower` to `$INSTALL_DIR` (default `~/.local/bin`) |
+| `make clean`     | `cargo clean` + remove `dist/` |
 
 ---
 
@@ -85,45 +85,13 @@ The toolchain is pinned in `rust-toolchain.toml` at the workspace root:
 [toolchain]
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-wasip1"]
 profile = "minimal"
 ```
 
-`rustup` installs this automatically on first use. The `wasm32-wasip1` target is
-included; no manual `rustup target add` is needed on a fresh clone.
-
-### WASI SDK
-
-The WASI SDK is required only to compile `ast` (and any future grammar
-plugin that vendors C sources). Pure-Rust wasm crates (`hello`, all
-fixtures) compile without it.
-
-Two ways to obtain the SDK locally:
-
-**Option A — tree-sitter CLI (auto-installed)**
-
-```sh
-# tree-sitter CLI populates ~/.cache/tree-sitter/wasi-sdk on first `build --wasm`
-export CC_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
-export AR_wasm32_wasip1=~/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
-```
-
-**Option B — manual download**
-
-```sh
-WASI_SDK_DIR=~/.local/wasi-sdk-25
-mkdir -p "$WASI_SDK_DIR"
-curl -fsSL \
-  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz \
-  | tar -xz -C "$WASI_SDK_DIR" --strip-components=1
-
-export CC_wasm32_wasip1="$WASI_SDK_DIR/bin/wasm32-wasip1-clang"
-export AR_wasm32_wasip1="$WASI_SDK_DIR/bin/llvm-ar"
-```
-
-The variable names follow the `cc` crate convention: `CC_<target>` and
-`AR_<target>`, with non-alphanumeric characters replaced by underscores. Minimum
-tested version: wasi-sdk-25.0. wasi-sdk-29.0 also works.
+`rustup` installs this automatically on first use. No extra build target is
+required: the engine and the native extensions all build for the host target.
+(The previous WASM model pinned `wasm32-wasip1` and required a WASI SDK; neither
+is needed any more.)
 
 ---
 
@@ -135,19 +103,13 @@ pull request on `ubuntu-latest`. Steps in order:
 1. `actions/checkout@v4`
 2. `actions-rust-lang/setup-rust-toolchain@v1` — reads `rust-toolchain.toml`
 3. `Swatinem/rust-cache@v2` — Cargo build cache
-4. Cache WASI SDK (key: `wasi-sdk-25.0-x86_64-linux`, path: `$WASI_SDK_DIR`)
-5. Download WASI SDK on cache miss (same `curl | tar` command as Option B above)
-6. Verify WASI clang with `"$CC_wasm32_wasip1" --version`
-7. `cargo fmt --all --check`
-8. `cargo clippy --workspace --all-targets -- -D warnings`
-9. Build wasm fixtures (all five fixture crates + `hello`, `--target wasm32-wasip1`)
-10. Build `ast` for `wasm32-wasip1`
-11. `cargo test --workspace --exclude ...` (all wasm crates excluded)
-12. `cargo test -p ast` (host-side outline walker tests)
-13. `EmbarkStudios/cargo-deny-action@v2`
+4. `cargo fmt --all --check`
+5. `cargo clippy --workspace --all-targets -- -D warnings`
+6. `cargo test --workspace` (also compiles every native extension binary)
+7. `EmbarkStudios/cargo-deny-action@v2`
 
-The CI job env block sets `WASI_SDK_DIR`, `CC_wasm32_wasip1`, and
-`AR_wasm32_wasip1` globally so all build steps inherit them automatically.
+There is no WASI SDK step and no separate WASM build step: native extensions are
+ordinary workspace members compiled by `cargo test --workspace`.
 
 ---
 
@@ -159,31 +121,34 @@ logic to runtime choices.
 
 **The domain imports no infrastructure.** Code under `crates/core_engine/src/domain/`
 carries `#![forbid(unsafe_code)]` and must not import `sled`, `std::fs`,
-`wasmtime`, `notify`, or any transport. The domain depends only on port traits
-defined in `crates/core_engine/src/ports/`.
+`std::process`, `notify`, or any transport. The domain depends only on port traits
+defined in `crates/core_engine/src/ports/` and the pure `extension_protocol` types.
 
 ```
-domain/          # Pure business logic. No I/O. #![forbid(unsafe_code)].
-  workspace.rs   # ProjectWorkspace — the aggregate root
-  file_id.rs     # FileId { index: u32, generation: u32 } — generational
-  plugin_host/   # PluginHostRegistry, PluginInstance trait, PluginFaultKind
-  grep/          # Text search
-  mutation/      # File write operations
-  refactor/      # Global replace
+domain/            # Pure business logic. No I/O. #![forbid(unsafe_code)].
+  workspace.rs     # ProjectWorkspace — the aggregate root
+  file_id.rs       # FileId { index: u32, generation: u32 } — generational
+  extension_host/  # ExtensionRegistry, ExtensionInstance trait, quarantine policy
+  grep/            # Text search
+  mutation/        # File write operations
+  refactor/        # Global replace
   ...
 
-ports/           # Trait definitions only. No concrete types.
-  inbound.rs     # SearchUseCase, FileMutationUseCase (driving ports)
-  storage.rs     # StoragePort (driven)
-  filesystem.rs  # FileSystemPort (driven)
-  plugin.rs      # PluginHostPort (driven), NoOpPluginHost
+ports/             # Trait definitions only. No concrete types.
+  inbound.rs       # SearchUseCase, FileMutationUseCase (driving ports)
+  storage.rs       # StoragePort (driven)
+  filesystem.rs    # FileSystemPort (driven)
+  ast_index.rs     # AstIndexPort (driven)
+  extension_host.rs # ExtensionHostPort (driven)
 
-adapters/        # Concrete implementations. Imports sled, wasmtime, notify, std::fs.
-  storage/       # SledStorageAdapter
-  fs/            # RealFs
-  watcher/       # NotifyWatcherAdapter
-  mcp/           # JSON-RPC 2.0 stdio transport
-  plugin/        # WasmtimeHost, IsolatedSandbox — the only wasmtime-importing code
+adapters/          # Concrete implementations. Imports sled, std::process, notify, std::fs.
+  storage/         # SledStorageAdapter
+  fs/              # RealFs
+  watcher/         # NotifyWatcherAdapter
+  mcp/             # JSON-RPC 2.0 stdio transport, ExtensionMergedRegistry
+  config/          # .tower/config.toml parser
+  extension/       # SidecarHostAdapter, ExtensionSupervisor, discovery,
+                   #   host_deps, path_validation — the only std::process code
   in_memory_fs.rs       # Test double for FileSystemPort
   in_memory_storage.rs  # Test double for StoragePort
 ```
@@ -198,7 +163,7 @@ crossing the boundary.
 ### Domain unit tests
 
 Domain tests live inside their modules under `#[cfg(test)]` and use only
-in-memory test doubles. No real disk, no sled, no wasmtime.
+in-memory test doubles. No real disk, no sled, no subprocess.
 
 ```rust
 // Correct: wire up fakes through trait objects
@@ -234,56 +199,31 @@ adapter-wired scenarios:
 
 | File | Covers |
 |------|--------|
-| `integration_mcp_native_tools.rs` | JSON-RPC over stdio, all 7 native VFS tools |
+| `integration_mcp_native_tools.rs` | JSON-RPC over stdio, the native VFS tools |
 | `integration_global_replace.rs` | Parallel mass find-and-replace, error cases |
 | `integration_mutation.rs` | Shadow-file atomic writes |
-| `plugin_loader.rs` | WasmtimeHost load, ABI guard, capability linker |
-| `ast_e2e.rs` | AST outline + symbol search via MCP |
-| `plugin_fault_isolation.rs` | Trap, fuel exhaustion, epoch timeout, quarantine |
+| `ast_e2e.rs` | AST outline + symbol search via MCP, end-to-end through the `ast` extension |
 
-Fixture `.wasm` paths are injected via `env!("...")` macros, set by
-`crates/core_engine/build.rs`. Always build the wasm fixtures before running
-these tests.
+Native extension binaries are located through `CARGO_BIN_EXE_<name>` env vars that
+Cargo sets for workspace binary crates (e.g. `CARGO_BIN_EXE_ast_extension`), so
+`cargo test --workspace` builds and wires them automatically — no separate build
+step and no `build.rs` artifact-locating dance.
 
-### Plugin logic tested on the host
+### Extension logic tested on the host
 
-`plugins/ast` exposes its outline parsing as a Rust library (`rlib`). Its
-host-side unit tests run with `cargo test -p ast` — no wasm sandbox,
-no WASI SDK needed. This makes the Tree-sitter logic fast to iterate on.
-
-The wasm build (`cargo build -p ast --target wasm32-wasip1`) is a
-separate gate that verifies the same code compiles for the target and produces
-a correctly sized module (~1.2 MB release, ~opt-level=s).
+The `ast` extension's outline/symbol parsing is plain native Rust, so its unit
+tests run as ordinary `cargo test` — no sandbox, no WASI SDK. This keeps the
+Tree-sitter logic fast to iterate on, and the extension binary is exercised
+end-to-end via `ast_e2e.rs`.
 
 ### Fault isolation tests
 
-`tests/plugin_fault_isolation.rs` uses deterministic fuel-based interruption
-rather than wall-clock timers to avoid flakiness:
-
-```rust
-// Prefer a small fuel budget for tests — exhausted in microseconds, no sleep needed
-let config = IsolationConfig {
-    fuel_budget: Some(1_000),
-    epoch_deadline_ticks: None,
-};
-```
-
-Epoch interruption is also tested by calling `engine.increment_epoch()` directly
-rather than relying on the background ticker thread.
-
-### Wasm fixture crates
-
-| Crate | Purpose |
-|-------|---------|
-| `hello` | Minimal example: `greet` tool + `BeforeToolCall` hook |
-| `fixture_abi_mismatch` | Wrong `ABI_VERSION` → `PluginLoadError::AbiMismatch` |
-| `fixture_panic_plugin` | Guest `panic!` → `PluginFaultKind::Trapped` |
-| `fixture_loop_plugin` | Infinite loop in tool handler → `FuelExhausted` |
-| `fixture_loop_hook_plugin` | Infinite loop in hook handler → `FuelExhausted` |
-
-All five are `wasm32-wasip1` only and excluded from `default-members` in the
-workspace `Cargo.toml`. Committed static fixtures (`forbidden_import.wasm`,
-`forbidden_host_import.wat`) live in `crates/core_engine/tests/fixtures/`.
+Extension fault isolation is exercised through the sidecar adapter and supervisor
+(`adapters/extension/`): a child that crashes, hangs past the per-call timeout, or
+violates the protocol yields the corresponding `ExtensionFault`
+(`Crashed` / `Timeout` / `ProtocolError`), and repeated faults drive the
+`ExtensionRegistry` quarantine policy (`MAX_CONSECUTIVE_FAILURES = 3`). The
+test-only fault fixtures live under `extensions/fixtures/`.
 
 ---
 
@@ -292,7 +232,7 @@ workspace `Cargo.toml`. Committed static fixtures (`forbidden_import.wasm`,
 These hold at every commit:
 
 - **Domain purity**: `domain/` is 100% testable with in-memory doubles. No real
-  disk, DB, or runtime in domain unit tests.
+  disk, DB, subprocess, or runtime in domain unit tests.
 - **`FileId` is generational**: `struct FileId { index: u32, generation: u32 }`.
   A reused slot increments `generation` so a stale `FileId` can never silently
   resolve to a different file.
@@ -302,17 +242,19 @@ These hold at every commit:
 - **Zero lock contention**: `EngineState` is behind `Arc<RwLock<EngineState>>`;
   critical sections are short and contain no blocking I/O. The fs watcher
   (writer) must not starve MCP handlers (readers).
-- **Plugin fault isolation**: any plugin trap, panic, fuel exhaustion, or epoch
-  timeout must not crash the host process or sever the MCP link. Enforced by
-  `IsolatedSandbox` catching all wasmtime errors and returning
-  `PluginHostError::PluginFault`.
-- **Capability security**: wasm guests reach the workspace only through
-  `tower_host::host_log` and `tower_host::host_read_file`. Any other
-  `tower_host` import causes a `LinkError` at instantiation.
-- **ABI version guard**: plugins where `manifest.abi != ABI_VERSION` (currently
-  `2`) are rejected at both load time and registration.
-- **Unique plugin names**: duplicate `manifest.name` at registration returns
-  `RegistrationError::DuplicateName`. The second plugin is never stored.
+- **Extension fault isolation**: a child crash, hang (per-call timeout), or
+  protocol violation must not crash the host process or sever the MCP link.
+  Enforced by the OS process boundary plus `SidecarHostAdapter` (timeout/kill)
+  mapping faults to `ExtensionFault`.
+- **Capability security**: extensions reach the workspace only through declared
+  capability callbacks routed to outbound ports; an undeclared `HostCall` is
+  rejected, and path arguments are validated (no `..` traversal, no absolute or
+  empty paths).
+- **Protocol version guard**: the host rejects an extension whose
+  `protocol_version` does not match `extension_protocol::PROTOCOL_VERSION`
+  (currently `1`) at the `initialize` handshake.
+- **Quarantine**: an extension is quarantined after `MAX_CONSECUTIVE_FAILURES`
+  (= 3) consecutive faults; a single success resets the counter.
 - **No panic in `ToolRegistry` implementations**: all runtime failures must be
   returned as `ToolError::ExecutionFailed`. Panics inside tool handlers would
   cross the fault isolation boundary.
@@ -332,13 +274,15 @@ Tower was constructed through an orchestrated TDD workflow applied spec by spec:
    done.
 4. **Gate check**: `fmt + clippy + test` green — only then move to the next spec.
 
-This cycle produced 423 passing host tests and 65 passing `ast` host-side
-tests across 23 specs, with no spec leaving the tree in a broken state.
+No spec left the tree in a broken state: the full quality gate
+(`fmt + clippy + test + deny`) was green at every step.
 
-The dependency order of the 23 specs is preserved in `.agent/todo/README.md`.
+The dependency order of the specs is preserved in `.agent/todo/README.md`.
 The hexagonal architecture ensured that specs could be developed in isolation:
 domain specs never touched adapters, and adapter specs never touched domain logic
-beyond port traits.
+beyond port traits. The most recent slice (specs 20–29) replaced the embedded WASM
+plugin host with the out-of-process native extension model described in
+[extensions.md](extensions.md), without changing the external MCP tool contract.
 
 ---
 

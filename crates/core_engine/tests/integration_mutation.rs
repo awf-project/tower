@@ -14,7 +14,7 @@ use core_engine::domain::RelativePath;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::mutation::FileMutationService;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::NoOpPluginHost;
+use core_engine::ports::NoOpExtensionHost;
 use core_engine::ports::inbound::FileMutationUseCase;
 
 // ── AC1: create_file writes durable content ───────────────────────────────────
@@ -35,7 +35,7 @@ fn create_file_writes_durable_content_to_real_fs() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), content.clone()).unwrap();
     }
 
@@ -67,7 +67,7 @@ fn create_file_leaves_no_stray_tmp_write_on_success() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path, b"fn f() {}".to_vec()).unwrap();
     }
 
@@ -124,7 +124,7 @@ fn delete_file_physically_removes_file_from_real_fs() {
     // Create.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"fn f() {}".to_vec())
             .unwrap();
     }
@@ -135,7 +135,7 @@ fn delete_file_physically_removes_file_from_real_fs() {
     // Delete.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.delete_file(&path).unwrap();
     }
 
@@ -163,7 +163,7 @@ fn create_directory_creates_real_directory_recursively() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_directory(RelativePath::new("a/b/c")).unwrap();
     }
 

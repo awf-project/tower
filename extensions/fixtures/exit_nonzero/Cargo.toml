@@ -1,0 +1,15 @@
+[package]
+name = "fixture_exit_nonzero"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spec 24 fault fixture: completes initialize but exits non-zero when invokeTool is called"
+
+[[bin]]
+name = "fixture_exit_nonzero"
+path = "src/main.rs"
+
+[dependencies]
+extension_protocol = { path = "../../../crates/extension_protocol" }
+serde_json = "1"

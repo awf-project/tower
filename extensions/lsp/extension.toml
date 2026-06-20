@@ -1,0 +1,37 @@
+name    = "lsp"
+version = "0.1.0"
+# The command path is resolved relative to the extension directory at runtime.
+# For tests the binary is located via the CARGO_BIN_EXE_lsp_extension env var.
+command    = ["lsp_extension"]
+# Eager: this extension subscribes to events (below), and the host requires eager
+# activation for event subscribers — events are delivered to a running process and
+# are not buffered/replayed (spec 25 AC3 / U1).
+activation = "eager"
+
+# U1: subscribe to fileChanged and fileDeleted for document sync (spec 27 EV1).
+[events]
+subscribe = ["event/fileChanged", "event/fileDeleted"]
+
+[capabilities]
+required = ["read_file", "notify", "log"]
+
+# Tools contributed to the MCP registry under the tower_lsp_* namespace.
+[[tools]]
+name        = "diagnostics"
+description = "Run the configured language server over a file's current content and return compiler/linter diagnostics (errors and warnings). Use after editing a file to verify the change did not break it."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to analyze"}},"required":["path"]}'
+
+[[tools]]
+name        = "definition"
+description = "Go to the definition of the symbol at the given position in a workspace-relative source file."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}'
+
+[[tools]]
+name        = "references"
+description = "Find all references to the symbol at the given position in a workspace-relative source file."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}'
+
+[[tools]]
+name        = "hover"
+description = "Return hover information for the symbol at the given position in a workspace-relative source file."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}'

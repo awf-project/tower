@@ -19,7 +19,7 @@ use crate::domain::mutation::{FileMutationService, compute_content_version};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::inbound::FileMutationUseCase;
-use crate::ports::{FileSystemPort, NoOpPluginHost};
+use crate::ports::{FileSystemPort, NoOpExtensionHost};
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ fn make_state_with_file(
     let mut storage = InMemoryStorage::new();
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), content.to_vec()).unwrap();
     }
     (fs, ws, idx, storage)
@@ -84,7 +84,7 @@ fn edit_range_cas_matching_version_commits() {
     let v0 = compute_content_version(&fs.read(&path).unwrap());
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let report = svc
         .edit_range_cas(&path, 3, 7, "run", Some(v0))
         .expect("CAS with correct version must commit");
@@ -112,14 +112,14 @@ fn edit_range_cas_stale_version_returns_conflict_and_no_write() {
     // B writes — now the file has new content.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"fn modified_by_b() {}".to_vec())
             .unwrap();
     }
 
     // A tries to mutate with stale v0.
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc
         .edit_range_cas(&path, 0, 0, "// prepend", Some(v0.clone()))
         .unwrap_err();
@@ -146,7 +146,7 @@ fn edit_range_cas_no_expected_version_is_unconditional() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"fn old() {}");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     // No expected_version → must succeed even if content changed.
     let report = svc
         .edit_range_cas(&path, 3, 6, "new", None)
@@ -168,7 +168,7 @@ fn create_file_cas_matching_version_commits() {
     let v1 = compute_content_version(b"v1");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     svc.create_file_cas(path.clone(), b"v2".to_vec(), Some(v1))
         .expect("CAS create_file with correct version must commit");
 
@@ -184,7 +184,7 @@ fn create_file_cas_stale_version_returns_conflict() {
     let stale = compute_content_version(b"some_old_content");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc
         .create_file_cas(path.clone(), b"new".to_vec(), Some(stale))
         .unwrap_err();
@@ -204,7 +204,7 @@ fn create_file_cas_no_version_is_unconditional() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"v1");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     svc.create_file_cas(path.clone(), b"v2".to_vec(), None)
         .expect("unconditional must succeed");
 
@@ -226,7 +226,7 @@ fn create_file_cas_absent_file_with_expected_version_is_conflict() {
     let expected = compute_content_version(b"what the caller thinks is there");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc
         .create_file_cas(path.clone(), b"new".to_vec(), Some(expected.clone()))
         .unwrap_err();
@@ -259,7 +259,7 @@ fn create_file_cas_absent_file_without_version_creates() {
     let mut storage = InMemoryStorage::new();
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     svc.create_file_cas(path.clone(), b"created".to_vec(), None)
         .expect("unconditional create on absent path must succeed");
 
@@ -284,7 +284,7 @@ fn cas_exactly_one_winner_when_two_writers_hold_same_version() {
     // Writer A commits with v0 → succeeds.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file_cas(path.clone(), b"writer_a".to_vec(), Some(v0.clone()))
             .expect("writer A must win");
     }
@@ -292,7 +292,7 @@ fn cas_exactly_one_winner_when_two_writers_hold_same_version() {
     // Writer B tries the same v0 but the file has already changed → conflict.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         let err = svc
             .create_file_cas(path.clone(), b"writer_b".to_vec(), Some(v0))
             .unwrap_err();
@@ -324,7 +324,7 @@ fn global_replace_cas_per_file_conflict_in_tx_report() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path_a.clone(), b"let x = foo;".to_vec())
             .unwrap();
         svc.create_file(path_b.clone(), b"let y = foo;".to_vec())
@@ -337,7 +337,7 @@ fn global_replace_cas_per_file_conflict_in_tx_report() {
     // Simulate b being modified after the read (it now has different content).
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path_b.clone(), b"let y = BAR;".to_vec())
             .unwrap();
     }
@@ -347,7 +347,7 @@ fn global_replace_cas_per_file_conflict_in_tx_report() {
     expected_versions.insert(path_b.clone(), v0_b);
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let report = svc
         .global_replace_cas("foo", "bar", expected_versions)
         .expect("global_replace_cas must return Ok (partial failure, not Err)");
