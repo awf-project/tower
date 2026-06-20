@@ -11,6 +11,10 @@
 #                        vX.Y.Z | dev-... -> a specific tag, used verbatim
 #   TOWER_INSTALL_DIR  Target directory for the binary (default: $HOME/.local/bin)
 #   TOWER_TARGET       Force a target triple instead of auto-detecting
+#   TOWER_EXTENSIONS_DIR  Where to install the bundled reference extensions
+#                         (default: the global XDG scope the host discovers,
+#                          e.g. ~/.local/share/tower/extensions). Matches the
+#                          host's own scope-override env var.
 #
 # Examples:
 #   curl -fsSL .../install.sh | sh                      # latest stable
@@ -121,6 +125,38 @@ tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp/$BIN" "$INSTALL_DIR/$BIN"
 info "installed to $INSTALL_DIR/$BIN"
+
+# --- install bundled reference extensions, if the archive carries them -------
+# Tarball layout: extensions/<name>/{extension.toml,<name>_extension}. They go
+# into the global discovery scope so a fresh install has AST/LSP/fmt without a
+# source checkout. The host discovers this path as the global XDG scope
+# (directories::ProjectDirs "tower" data_dir + /extensions); $TOWER_EXTENSIONS_DIR
+# overrides it, matching the host's own scope-override env var.
+if [ -d "$tmp/extensions" ]; then
+  if [ -n "${TOWER_EXTENSIONS_DIR:-}" ]; then
+    ext_dir="$TOWER_EXTENSIONS_DIR"
+  else
+    case "$(uname -s)" in
+      Darwin) ext_dir="$HOME/Library/Application Support/tower/extensions" ;;
+      *)      ext_dir="${XDG_DATA_HOME:-$HOME/.local/share}/tower/extensions" ;;
+    esac
+  fi
+  for d in "$tmp"/extensions/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    # Replace the whole extension dir so a stale binary never lingers beside a
+    # new manifest after an upgrade.
+    rm -rf "$ext_dir/$name"
+    mkdir -p "$ext_dir/$name"
+    for f in "$d"*; do
+      case "$(basename "$f")" in
+        *.toml) install -m 0644 "$f" "$ext_dir/$name/" ;;
+        *)      install -m 0755 "$f" "$ext_dir/$name/" ;;
+      esac
+    done
+  done
+  info "installed reference extensions to $ext_dir"
+fi
 
 # PATH hint.
 case ":$PATH:" in

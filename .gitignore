@@ -4,6 +4,9 @@
 # The `tower` MCP server creates a sled database under <workspace>/.tower/ at runtime.
 .tower/
 
+# `make dist` build output (release tarballs + checksums).
+/dist/
+
 # Added by awf project-onboard
 /target/
 debug/
