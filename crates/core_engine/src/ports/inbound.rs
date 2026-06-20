@@ -232,7 +232,7 @@ pub trait FileMutationUseCase {
     ///         ├─ workspace.update (stable FileId)      ┐
     ///         ├─ index.remove + index.insert           ├─ VFS + index in sync
     ///         ├─ storage.put                           ┘
-    ///         └─ plugin_host.on_file_changed           ← broadcast after commit
+    ///         └─ extension_host.on_file_changed        ← broadcast after commit
     /// ```
     ///
     /// # Contract

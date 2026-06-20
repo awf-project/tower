@@ -1,0 +1,39 @@
+name    = "ast"
+version = "0.1.0"
+# The command path is resolved relative to the extension directory at runtime.
+# For tests the binary is located via the CARGO_BIN_EXE_ast_extension env var.
+command    = ["ast_extension"]
+activation = "eager"
+
+# U3: eager activation requires event subscriptions to be declared here.
+[events]
+subscribe = ["event/fileIndexed", "event/fileChanged"]
+
+[capabilities]
+required = ["read_file", "list_files", "index_get", "index_put", "log"]
+
+# Tools contributed to the MCP registry under the tower_ast_* namespace.
+[[tools]]
+name        = "get_outline"
+description = "Return a structural outline (functions, structs, methods, traits, enums, impl blocks) for a workspace-relative source file. Supports Rust (.rs), Go (.go), and PHP (.php). Returns an unsupported-language result for other file types."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"}},"required":["path"]}'
+
+[[tools]]
+name        = "find_symbols"
+description = "Find precise definition locations for a named symbol of a given kind in a workspace-relative source file. Uses the error-tolerant syntax tree to exclude false positives in comments and string literals. Supports Rust (.rs), Go (.go), and PHP (.php)."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to search for"},"kind":{"type":"string","description":"Symbol kind: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["path","symbol_name","kind"]}'
+
+[[tools]]
+name        = "search_symbols"
+description = "Search the in-memory cross-file symbol index for symbols matching a given name and optional kind. The index is built incrementally as files are indexed (event-driven) and updated via fileIndexed/fileChanged events."
+schema_json = '{"type":"object","properties":{"name":{"type":"string","description":"Exact symbol name to search for"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["name"]}'
+
+[[tools]]
+name        = "reindex"
+description = "Rebuild the whole-project symbol index by enumerating all workspace files and parsing each. Forces a full reindex; use after large external changes or on a cold cache."
+schema_json = '{"type":"object","properties":{},"additionalProperties":false}'
+
+[[tools]]
+name        = "read_symbol"
+description = "Read only a named symbol source span from a file — not the whole file. Returns the exact byte slice [start_byte, end_byte) plus kind and start/end rows for each match, ordered by start_byte. Supports optional kind filter to disambiguate same-named symbols of different kinds."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to read"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["path","symbol_name"]}'

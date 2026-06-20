@@ -1,0 +1,24 @@
+name    = "fmt"
+version = "0.1.0"
+# The command path is resolved relative to the extension directory at runtime.
+# For tests the binary is located via the target/debug/ path convention.
+command    = ["fmt_extension"]
+# Eager: this extension subscribes to events (below), and the host requires eager
+# activation for event subscribers — events are delivered to a running process and
+# are not buffered/replayed (spec 25 AC3 / U1).
+activation = "eager"
+
+# Subscribe only to fileChanged — mirrors the removed WASM fmt plugin behaviour.
+[events]
+subscribe = ["event/fileChanged"]
+
+[capabilities]
+required = ["request_format", "list_files", "log"]
+
+# The `format` tool enqueues format jobs on-demand.
+# With {"path":"x"} → enqueue one path; with {} → list all files and enqueue each.
+# Returns promptly after enqueuing (does not wait for formatting to complete).
+[[tools]]
+name        = "format"
+description = "Enqueue format jobs for one file or the entire workspace. Pass {\"path\":\"<ws-relative>\"} to format a single file, or {} to format all indexed files. Returns {\"requested\":N,\"accepted\":A,\"dropped\":D} immediately after enqueuing — does not wait for formatting to complete."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to format (omit to format all indexed files)"}},"additionalProperties":false}'

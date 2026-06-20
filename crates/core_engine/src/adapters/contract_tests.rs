@@ -132,11 +132,11 @@ mod dependency_inversion_proof {
     }
 
     #[test]
-    fn no_op_plugin_host_is_callable_through_trait_object() {
+    fn no_op_extension_host_is_callable_through_trait_object() {
         use crate::domain::FileId;
-        use crate::ports::{NoOpPluginHost, PluginHostPort};
+        use crate::ports::{ExtensionHostPort, NoOpExtensionHost};
 
-        let host: &dyn PluginHostPort = &NoOpPluginHost;
+        let host: &dyn ExtensionHostPort = &NoOpExtensionHost;
         let id = FileId::new_for_testing(0, 0);
         let path = RelativePath::new("src/main.rs");
         // Calling through dyn — must compile and not panic (AC3 / OP1).

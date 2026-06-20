@@ -2,35 +2,46 @@
 resolver = "2"
 members = [
     "crates/core_engine",
-    "crates/plugin_sdk",
-    "crates/plugin_sdk_macros",
-    # Plugins (wasm32-wasip1) live under plugins/, separate from the engine + SDK.
-    "plugins/ast",
-    "plugins/hello",
-    "plugins/fmt",
-    # Test-only fixtures (specs 11c/11d), grouped under plugins/fixtures/ and
-    # excluded from default-members so host builds/tests ignore them.
-    "plugins/fixtures/fixture_abi_mismatch",
-    "plugins/fixtures/fixture_panic_plugin",
-    "plugins/fixtures/fixture_loop_plugin",
-    "plugins/fixtures/fixture_loop_hook_plugin",
+    "crates/extension_protocol",
+    # Test-only sidecar extension binary for spec 23 integration tests.
+    "extensions/test_helper",
+    # Spec 24 fault-isolation fixtures (native binaries, not WASM).
+    "extensions/fixtures/hang_forever",
+    "extensions/fixtures/crash_on_init",
+    "extensions/fixtures/exit_nonzero",
+    "extensions/fixtures/garbage_frames",
+    # Regression fixture: completes init then ignores `shutdown` (forces host kill escalation).
+    "extensions/fixtures/ignore_shutdown",
+    # Spec 26 native extensions (native binaries, no WASM).
+    "extensions/ast",
+    "extensions/hello",
+    # Spec 27 LSP sidecar extension (native binary, no WASM).
+    "extensions/lsp",
+    # Fmt sidecar extension — subscribes to fileChanged and triggers the format queue.
+    "extensions/fmt",
 ]
 
-# Decision: ast, hello, and 11c/11d fixtures target wasm32-wasip1 and
-# are excluded from default-members so host `cargo test` / `cargo build` ignores them.
-# Why: mirrors the ast precedent (spec OP1). The wasm build is verified
-# explicitly via `cargo build --target wasm32-wasip1 -p hello` etc.
-# Trade-off: `cargo test --workspace` fails (wasm target unavailable on the host
-# default build). Run plain `cargo test` instead — default-members already scopes
-# it to the host crates below, so no `--exclude` list is needed.
-#
-# Exception: ast (spec 12c) can also be tested host-side because its
-# outline module uses native tree-sitter. Host tests run via
-# `cargo test -p ast` explicitly; the wasm build is gated separately.
 default-members = [
     "crates/core_engine",
-    "crates/plugin_sdk",
-    "crates/plugin_sdk_macros",
+    "crates/extension_protocol",
+    # test_helper extension binary — compiled natively, part of default build
+    # so that `cargo test --workspace` can locate the binary for spec 23 tests.
+    "extensions/test_helper",
+    # Spec 24 fault-isolation fixtures — compiled natively so that spec 24
+    # integration tests can locate them via the same target/debug/ path convention.
+    "extensions/fixtures/hang_forever",
+    "extensions/fixtures/crash_on_init",
+    "extensions/fixtures/exit_nonzero",
+    "extensions/fixtures/garbage_frames",
+    # Regression fixture: completes init then ignores `shutdown` (bug #1, shutdown deadlock).
+    "extensions/fixtures/ignore_shutdown",
+    # Spec 26 native extensions — compiled natively (no WASM, no WASI SDK).
+    "extensions/ast",
+    "extensions/hello",
+    # Spec 27 LSP sidecar extension — compiled natively.
+    "extensions/lsp",
+    # Fmt sidecar extension — compiled natively so e2e tests can locate the binary.
+    "extensions/fmt",
 ]
 
 [workspace.package]
@@ -38,10 +49,5 @@ edition = "2024"
 rust-version = "1.96"
 license = "EUPL-1.2"
 
-# Decision: opt-level="s" for release builds to control wasm module size.
-# Primarily relevant for wasm crates (ast, hello, fixtures).
-# Per 12a recipe: the ast release target is ~1.2 MB with this setting.
-# Trade-off: marginally slower host binaries in release mode (acceptable;
-# no user-visible difference at this project scale).
 [profile.release]
 opt-level = "s"

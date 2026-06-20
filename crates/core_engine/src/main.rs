@@ -11,20 +11,15 @@
 //!    (`StoragePort::is_scan_complete`).
 //! 4. Wrap all state in an `Arc<RwLock<EngineState>>` for deadlock-free sharing
 //!    with any future background watcher thread (spec 06 lock discipline).
-//! 5. Discover and load WASM plugins (drop & play) across two scopes: resolve the
-//!    ordered plugin dirs (`--plugins-dir` / `$TOWER_PLUGINS_DIR` replace the path;
-//!    otherwise the XDG global `~/.local/share/tower/plugins` then the project-local
-//!    `<root>/.tower/plugins`, local winning on a name collision), load each
-//!    `*.wasm` through the isolated-sandbox path (11c/11d) injecting the workspace
-//!    `FileSystemPort`, and register the survivors. A missing or empty scope simply
-//!    yields no plugins; a single bad plugin is skipped with a stderr warning and
-//!    never aborts startup.
-//!
-//! The binary also exposes a `tower plugin <install|list|remove>` subcommand to
-//! manage installed plugins in the local or global scope (`--local` / `--global`,
-//! default local); when `argv[1] == "plugin"` it runs that instead of the server.
-//! 6. Serve the 7 native `tower_*` tools PLUS any plugin tools (namespaced
-//!    `<plugin>/<tool>`) over real `stdin` / `stdout` via a `MergedRegistry`.
+//! 5. Discover and load sidecar extensions (spec 25/28): resolve the ordered
+//!    extension dirs (`--extensions-dir` / `$TOWER_EXTENSIONS_DIR` override or
+//!    XDG global then workspace-local, local wins on name collision), spawn each
+//!    extension binary via `SidecarHostAdapter`, register survivors. A missing or
+//!    empty scope yields no extensions; a single bad extension is skipped with a
+//!    stderr warning and never aborts startup.
+//! 6. Serve the 9 native `tower_*` tools PLUS any extension tools (namespaced
+//!    `tower_<ext>_<tool>`) over real `stdin` / `stdout` via an
+//!    `ExtensionMergedRegistry`.
 //!
 //! # Wiring decision: `Arc<RwLock<EngineState>>`
 //!
@@ -44,7 +39,6 @@
 
 use std::env;
 use std::io::{BufReader, BufWriter};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use core_engine::adapters::SledStorageAdapter;
@@ -52,79 +46,84 @@ use core_engine::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
 use core_engine::adapters::config;
+use core_engine::adapters::extension::{
+    HostDeps as ExtensionHostDeps, global_extensions_dir, load_extensions_into_registry,
+    resolve_extension_dirs,
+};
 use core_engine::adapters::fs::scan::{
     init_towerignore, reconcile_pruned, warn_if_towerignore_absent,
 };
 use core_engine::adapters::fs::{RealFs, workspace_scan};
-use core_engine::adapters::lsp::pool::SessionPool;
-use core_engine::adapters::mcp::chain_registry::ChainRegistry;
-use core_engine::adapters::mcp::lsp_tools::{LspToolRegistry, SubscriptionRegistry};
+use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use core_engine::adapters::mcp::native_tools::EngineState;
-use core_engine::adapters::mcp::nav_tools::NavToolRegistry;
-use core_engine::adapters::mcp::{MergedRegistry, PushEvent, serve_with_push};
-use core_engine::adapters::plugin::{
-    DEFAULT_PLUGINS_SUBDIR, HostDeps, IsolationEngine, Scope, global_plugins_dir, install,
-    load_plugins_into_registry, production_isolation_config, resolve_plugin_dirs,
-};
+use core_engine::adapters::mcp::{ExtensionMergedRegistry, PushEvent, serve_with_push};
 use core_engine::adapters::watcher::NotifyWatcherAdapter;
+use core_engine::domain::extension_host::ExtensionRegistry;
 use core_engine::domain::index::InvertedIndex;
-use core_engine::domain::plugin_host::PluginHostRegistry;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::domain::{FileId, RelativePath};
 use core_engine::ports::AstIndexPort;
-use core_engine::ports::CodeIntelligencePort;
-use core_engine::ports::{FileSystemPort, PluginHostPort, StoragePort};
+use core_engine::ports::{ExtensionHostPort, StoragePort};
 
-// ── SharedPluginHost ──────────────────────────────────────────────────────────
+// ── SharedExtensionHost ───────────────────────────────────────────────────────
 
-/// Adapter that delegates [`PluginHostPort`] calls to the shared
-/// [`PluginHostRegistry`] through an `Arc<RwLock<_>>`.
+/// Adapter that bridges the watcher's [`ExtensionHostPort`] interface to the
+/// [`ExtensionRegistry`] through an `Arc<RwLock<_>>`.
 ///
-/// # Decision
+/// # Safety
 ///
-/// The watcher needs `Box<dyn PluginHostPort + Send + Sync>`, while the MCP
-/// serve loop holds `Arc<RwLock<PluginHostRegistry>>`. Rather than cloning the
-/// registry (which would break the shared-identity requirement — watcher would
-/// fire hooks into a dead copy), we wrap the `Arc` in a thin newtype that
-/// delegates through the lock.
-///
-/// # Trade-off
-///
-/// Each `on_file_changed` / `on_file_indexed` call takes the registry `RwLock`
-/// **read** guard and enqueues onto every subscribed plugin's bounded mailbox;
-/// the actual work runs on each plugin's own worker thread. The mailbox send is
-/// a blocking, backpressuring send, but since every hot-path consumer also takes
-/// a read guard, concurrent readers never contend — MCP reads are never starved.
-/// The only thing a full mailbox could block is a future `register()` writer,
-/// which is startup-only. Safe to call from the watcher thread.
-struct SharedPluginHost(Arc<RwLock<PluginHostRegistry>>);
+/// The `RwLock` read guard is acquired and released within each call — no lock
+/// is held across the extension delivery, so concurrent MCP reads are never
+/// starved.
+struct SharedExtensionHost(Arc<RwLock<ExtensionRegistry>>);
 
-impl PluginHostPort for SharedPluginHost {
-    fn on_file_indexed(&self, id: FileId, path: &RelativePath) {
-        // Recover a poisoned lock (wasm trap inside a hook could poison it).
+impl ExtensionHostPort for SharedExtensionHost {
+    fn on_file_indexed(
+        &self,
+        id: core_engine::domain::FileId,
+        path: &core_engine::domain::RelativePath,
+    ) {
         let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
         guard.on_file_indexed(id, path);
     }
 
-    fn on_file_changed(&self, id: FileId, path: &RelativePath) {
+    fn on_file_changed(
+        &self,
+        id: core_engine::domain::FileId,
+        path: &core_engine::domain::RelativePath,
+    ) {
         let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
         guard.on_file_changed(id, path);
+    }
+
+    fn on_file_deleted(&self, path: &core_engine::domain::RelativePath) {
+        let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
+        guard.on_file_deleted(path);
+    }
+
+    fn declared_tools(
+        &self,
+    ) -> Vec<(
+        core_engine::domain::ExtensionId,
+        extension_protocol::ToolDecl,
+    )> {
+        let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
+        guard.declared_tools()
+    }
+
+    fn invoke(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, core_engine::domain::InvokeError> {
+        let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
+        guard.invoke(tool_name, params)
     }
 }
 
 fn main() {
-    // Subcommand dispatch: `tower plugin <install|list|remove> ...` manages
-    // installed plugins instead of starting the MCP server.
-    let args: Vec<String> = env::args().collect();
-    if args.get(1).map(String::as_str) == Some("plugin") {
-        if let Err(e) = run_plugin_cli(&args[2..]) {
-            eprintln!("tower: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
     // `init` may appear after global flags (e.g. `tower --workspace-dir <p> init`),
     // mirroring how resolve_workspace_root scans all args, so detect it anywhere.
+    let args: Vec<String> = env::args().collect();
     if args.iter().skip(1).any(|a| a == "init") {
         if let Err(e) = run_init() {
             eprintln!("tower: {e}");
@@ -136,59 +135,6 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("tower: {e}");
         std::process::exit(1);
-    }
-}
-
-/// Handle `tower plugin <install <path> | list | remove <name>> [--local|--global]`.
-///
-/// `install`/`remove` act on the scope chosen by `--local` / `--global`,
-/// defaulting to **local** (`<workspace>/.tower/plugins`); `list` always shows
-/// both scopes. These manage plugin **files** by name — see
-/// [`core_engine::adapters::plugin::install`].
-fn run_plugin_cli(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("install") => {
-            let src = first_positional(&args[1..])
-                .ok_or("usage: tower plugin install <path-to.wasm> [--local|--global]")?;
-            let scope = install::scope_from_flags(args, Scope::Local)?;
-            let dir = scope_dir(scope)?;
-            let dest = install::install(&dir, Path::new(src))
-                .map_err(|e| format!("install failed: {e}"))?;
-            println!("installed {src} -> {} ({scope})", dest.display());
-            Ok(())
-        }
-        Some("list") => {
-            let global = global_plugins_dir();
-            let local = resolve_workspace_root().join(DEFAULT_PLUGINS_SUBDIR);
-            let listed = install::list(global.as_deref(), Some(&local));
-            if listed.is_empty() {
-                println!("no plugins installed");
-            } else {
-                for p in listed {
-                    println!("{:<6} {}", p.scope.to_string(), p.file_name);
-                }
-            }
-            Ok(())
-        }
-        Some("remove") => {
-            let name = first_positional(&args[1..])
-                .ok_or("usage: tower plugin remove <name> [--local|--global]")?;
-            let scope = install::scope_from_flags(args, Scope::Local)?;
-            let dir = scope_dir(scope)?;
-            if install::remove(&dir, name).map_err(|e| format!("remove failed: {e}"))? {
-                println!("removed '{name}' from {} ({scope})", dir.display());
-            } else {
-                println!("no such {scope} plugin: '{name}'");
-            }
-            Ok(())
-        }
-        Some(other) => Err(format!(
-            "unknown plugin subcommand '{other}' (expected: install | list | remove)"
-        )),
-        None => Err(
-            "usage: tower plugin <install <path> | list | remove <name>> [--local|--global]"
-                .to_string(),
-        ),
     }
 }
 
@@ -221,32 +167,19 @@ fn run_init() -> Result<(), String> {
     Ok(())
 }
 
-/// The directory backing a [`Scope`]: local is `<workspace>/.tower/plugins`,
-/// global is the XDG data dir (absent only without HOME/XDG base dirs).
-fn scope_dir(scope: Scope) -> Result<PathBuf, String> {
-    match scope {
-        Scope::Local => Ok(resolve_workspace_root().join(DEFAULT_PLUGINS_SUBDIR)),
-        Scope::Global => global_plugins_dir().ok_or_else(|| {
-            "cannot determine the global plugins directory (no HOME/XDG base dir)".to_string()
-        }),
-    }
-}
-
-/// First non-flag argument (an argument not starting with `--`), so the path /
-/// name can appear before or after the scope flag.
-fn first_positional(args: &[String]) -> Option<&str> {
-    args.iter()
-        .find(|a| !a.starts_with("--"))
-        .map(String::as_str)
-}
-
 fn run() -> Result<(), String> {
     // ── Step 1: resolve workspace root ────────────────────────────────────────
     let workspace_root = resolve_workspace_root();
 
     // Load the local project config (.tower/config.toml) early so a malformed
     // file fails fast before any DB or watcher work. Absent file → defaults.
-    let tower_config = config::load(&workspace_root).map_err(|e| e.to_string())?;
+    let mut tower_config = config::load(&workspace_root).map_err(|e| e.to_string())?;
+
+    // Apply backward-compatibility migrations from the legacy [plugins] section
+    // → [extensions] section (spec 28 O1), emitting deprecation warnings.
+    for warning in config::apply_backcompat(&mut tower_config) {
+        eprintln!("{warning}");
+    }
 
     // Warn on EVERY boot when the sole ignore source is absent — not only on a
     // fresh scan. The scan's restart guard short-circuits subsequent boots, so a
@@ -316,26 +249,6 @@ fn run() -> Result<(), String> {
         Box::new(fs),
     )));
 
-    // ── Step 5: discover and load WASM plugins (global + local, drop & play) ──
-    // Explicit --plugins-dir / $TOWER_PLUGINS_DIR replace the search path; otherwise
-    // the XDG global scope is scanned first and the project-local scope last, so a
-    // local plugin shadows a global one of the same name.
-    let plugin_dirs = resolve_plugin_dirs(
-        plugins_dir_arg().as_deref(),
-        env::var("TOWER_PLUGINS_DIR").ok().as_deref(),
-        global_plugins_dir(),
-        &workspace_root,
-    );
-
-    // The IsolationEngine owns the background epoch ticker; it must outlive the
-    // serve loop so per-call epoch deadlines keep firing. Held in `run`'s scope.
-    let isolation_engine = IsolationEngine::new()
-        .map_err(|e| format!("failed to initialise plugin isolation engine: {e}"))?;
-
-    // Plugins read the real workspace through their own FileSystemPort (the same
-    // capability the native tools use), satisfying host_read_file.
-    let plugin_fs: Arc<dyn FileSystemPort + Send + Sync> = Arc::new(RealFs::new(&workspace_root));
-
     // ── AST index: resolve the per-workspace XDG data directory ──────────────
     //
     // Decision: fall back to `<workspace_root>/.tower/ast` when
@@ -344,8 +257,8 @@ fn run() -> Result<(), String> {
     //
     // Why: silently falling back to a workspace-local directory keeps the
     // binary usable in constrained environments. The data is a pure cache
-    // (re-derivable by the plugin); losing XDG isolation in those environments
-    // is acceptable.
+    // (re-derivable by the extension); losing XDG isolation in those
+    // environments is acceptable.
     //
     // Trade-off: the local `.tower/ast` directory is committed-adjacent and
     // could appear in version control if the user forgets to gitignore it.
@@ -361,15 +274,8 @@ fn run() -> Result<(), String> {
             workspace_root.join(".tower").join("ast")
         }
     };
-    let plugin_ast_index: Arc<dyn AstIndexPort + Send + Sync> =
+    let ext_ast_index: Arc<dyn AstIndexPort + Send + Sync> =
         Arc::new(XdgAstIndexAdapter::new(ast_base_dir));
-
-    // Extract the workspace Arc from EngineState so plugins see the same live
-    // workspace as the MCP handlers and the watcher (same Arc, same RwLock).
-    let plugin_workspace = state
-        .read()
-        .map_err(|_| "engine state lock poisoned".to_string())?
-        .workspace_arc();
 
     // Real format queue: workers run the external formatters declared in
     // .tower/config.toml and share their echo-suppression set with the registry
@@ -381,107 +287,115 @@ fn run() -> Result<(), String> {
         ));
 
     // Capture the formatter echo set before `format_queue` is moved into the
-    // plugin deps. Shared with the watcher so formatter-induced writes do not
+    // extension deps. Shared with the watcher so formatter-induced writes do not
     // trigger a spurious `didChange` to the language server (spec 14b UN1).
     let echo_set = format_queue
         .shared_echo_set()
         .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
 
-    let plugin_deps = HostDeps {
-        fs: plugin_fs,
-        ast_index: plugin_ast_index,
-        workspace: plugin_workspace,
-        format_queue,
+    // ── Step 5a: push bridge (for extension notify/resourceUpdated) ───────────
+    //
+    // The push channel carries `PushEvent`s from extensions (via their
+    // `notify/resourceUpdated` host-call) to the MCP serve loop. The
+    // `serve_with_push` function bridges these into MCP push notifications.
+    let (push_tx, push_rx) = std::sync::mpsc::channel::<PushEvent>();
+    let sub_reg = Arc::new(std::sync::Mutex::new(SubscriptionRegistry::new()));
+
+    // ── Step 5b: discover and load sidecar extensions (spec 28 EV1) ──────────
+    //
+    // Resolution order:
+    //   1. --extensions-dir <path> / $TOWER_EXTENSIONS_DIR (explicit override).
+    //   2. Default: XDG global → <workspace>/.tower/extensions (local wins).
+    //   3. Back-compat fallback: if .tower/extensions/ absent but .tower/plugins/
+    //      exists, use the plugins dir and warn (spec 28 O1).
+    let extensions_dir_local = workspace_root.join(".tower/extensions");
+    let plugins_dir_legacy = workspace_root.join(".tower/plugins");
+
+    let mut extension_dirs = resolve_extension_dirs(
+        extensions_dir_arg().as_deref(),
+        env::var("TOWER_EXTENSIONS_DIR").ok().as_deref(),
+        global_extensions_dir(),
+        &workspace_root,
+    );
+
+    // Spec 28 O1: legacy .tower/plugins/ fallback — warn and substitute.
+    if let Some((fallback_dir, warning)) =
+        config::legacy_plugins_dir_fallback(&extensions_dir_local, &plugins_dir_legacy)
+    {
+        eprintln!("{warning}");
+        // Replace the local scope entry with the legacy plugins dir.
+        // `resolve_extension_dirs` with no override produces [global?, local].
+        // If the extensions_dir_arg / env override was set, extension_dirs has
+        // a single explicit entry and no local-scope fallback is needed.
+        if extensions_dir_arg().is_none()
+            && env::var("TOWER_EXTENSIONS_DIR")
+                .unwrap_or_default()
+                .is_empty()
+        {
+            // Replace any occurrence of extensions_dir_local with the fallback.
+            for dir in &mut extension_dirs {
+                if dir == &extensions_dir_local {
+                    *dir = fallback_dir.clone();
+                }
+            }
+        }
+    }
+
+    // Extensions read the real workspace through their FileSystemPort capability.
+    let ext_fs: Arc<dyn core_engine::adapters::extension::host_deps::FsAdapter + Send + Sync> =
+        Arc::new(std::sync::Mutex::new(RealFs::new(&workspace_root)));
+
+    let ext_deps = ExtensionHostDeps {
+        fs: ext_fs,
+        // Cast Arc<dyn AstIndexPort + Send + Sync> → Arc<dyn AstIndexPort>:
+        // HostDeps fields do not carry the Send + Sync bounds so we upcast here.
+        ast_index: Arc::clone(&ext_ast_index) as Arc<dyn AstIndexPort>,
+        format_queue: Arc::clone(&format_queue)
+            as Arc<dyn core_engine::adapters::formatter::FormatQueuePort>,
+        push_tx: Some(push_tx),
     };
 
-    let plugin_host = load_plugins_into_registry(
-        &plugin_dirs,
-        &isolation_engine,
-        plugin_deps,
-        production_isolation_config(),
-        &tower_config.plugins.disabled,
+    let ext_registry = load_extensions_into_registry(
+        &extension_dirs,
+        ext_deps,
+        tower_config.extensions.request_timeout(),
+        &tower_config.extensions.disabled,
     );
-    let plugin_count = plugin_host.declared_tools().len();
-    if plugin_count > 0 {
-        let scopes: Vec<String> = plugin_dirs
+    let ext_tool_count = ext_registry.declared_tools().len();
+    if ext_tool_count > 0 {
+        let scopes: Vec<String> = extension_dirs
             .iter()
             .map(|d| d.display().to_string())
             .collect();
         eprintln!(
-            "tower: loaded {plugin_count} plugin tool(s) from [{}]",
+            "tower: loaded {ext_tool_count} extension tool(s) from [{}]",
             scopes.join(", ")
         );
     }
-    let plugin_host = Arc::new(RwLock::new(plugin_host));
+    let ext_registry = Arc::new(RwLock::new(ext_registry));
 
-    // Inject the real plugin host into the shared EngineState so MCP-driven
+    // Inject the extension host into the shared EngineState so MCP-driven
     // mutations (create/delete/global_replace) broadcast `on_file_changed` to
-    // plugins. Without this the handlers would keep their no-op default and the
-    // AST plugin's cross-file index would go stale after MCP deletes/edits.
+    // extensions. Without this the handlers would keep their no-op default and
+    // the AST extension's cross-file index would go stale after MCP deletes/edits.
     {
-        let host: Arc<dyn PluginHostPort + Send + Sync> =
-            Arc::new(SharedPluginHost(Arc::clone(&plugin_host)));
+        let host: Arc<dyn ExtensionHostPort + Send + Sync> =
+            Arc::new(SharedExtensionHost(Arc::clone(&ext_registry)));
         state
             .write()
             .map_err(|_| "engine state lock poisoned".to_string())?
             .set_plugin_host(host);
     }
 
-    // ── Step 5a-bis: push bridge + session pool ────────────────────────────────
-    //
-    // Decision 3: unified blocking ServeInput channel. Architecture:
-    //
-    //   LspClientAdapter dispatcher
-    //     --DiagnosticsEvent(mpsc::Sender)--> diag_rx
-    //       --PushEvent--> serve_with_push unified channel (internal)
-    //
-    // The forwarder thread (diag_rx → push_tx) is spawned here. serve_with_push
-    // receives push_rx and internally bridges Push events into the unified channel.
-    use core_engine::adapters::lsp::DiagnosticsEvent;
-    use core_engine::adapters::lsp::pool::RealSpawner;
-
-    let (diag_tx, diag_rx) = std::sync::mpsc::channel::<DiagnosticsEvent>();
-    let (push_tx, push_rx) = std::sync::mpsc::channel::<PushEvent>();
-    let sub_reg = Arc::new(std::sync::Mutex::new(SubscriptionRegistry::new()));
-
-    // Forwarder: DiagnosticsEvent → PushEvent.
-    // Exits cleanly when diag_rx disconnects (SessionPool dropped or all sessions evicted).
-    std::thread::spawn(move || {
-        while let Ok(event) = diag_rx.recv() {
-            // Ignore send error: MCP serve loop may have already exited.
-            let _ = push_tx.send(PushEvent {
-                uri: event.uri,
-                generation: event.generation,
-            });
-        }
-    });
-
-    // Build the pool with push_tx so each spawned session gets a clone of the
-    // diagnostics sender wired at spawn time (RealSpawner → LspClientAdapter::spawn).
-    let lsp_pool = Arc::new(SessionPool::with_spawner(
-        tower_config.lsp.clone(),
-        workspace_root.clone(),
-        Arc::new(RealSpawner),
-        Some(diag_tx),
-    ));
-
-    // ── Step 5b: spawn the filesystem watcher for live VFS sync ───────────────
+    // ── Step 5c: spawn the filesystem watcher for live VFS sync ──────────────
     //
     // Decision: always-on, fail-fast at startup.
-    // Why: live VFS sync is now a core feature (spec 06), not optional. A watcher
-    // that fails to initialise means FS events will never reach the index —
-    // silently serving stale data is worse than a clear startup error.
-    //
-    // Trade-off: if the host OS notify backend is unavailable (e.g. certain
-    // container environments with no inotify), the server will refuse to start.
-    // An operator that truly wants a read-only / scan-only mode can be added
-    // later with a `--no-watch` flag; for now the binary makes the correct
-    // default: always live.
+    // Why: live VFS sync is now a core feature (spec 06), not optional.
     //
     // Watcher state sharing:
     //   workspace + index — Arc clones from EngineState (same instances as MCP)
     //   storage          — try_clone() of the sled adapter (same Db, no re-open)
-    //   plugin_host      — SharedPluginHost wrapping Arc<RwLock<PluginHostRegistry>>
+    //   extension_host   — SharedExtensionHost wrapping Arc<RwLock<ExtensionRegistry>>
     let watcher_workspace = state
         .read()
         .map_err(|_| "engine state lock poisoned".to_string())?
@@ -490,14 +404,16 @@ fn run() -> Result<(), String> {
         .read()
         .map_err(|_| "engine state lock poisoned".to_string())?
         .index_arc();
-    let watcher_plugin_host = Box::new(SharedPluginHost(Arc::clone(&plugin_host)));
+    let watcher_ext_host: Box<dyn ExtensionHostPort + Send + Sync> =
+        Box::new(SharedExtensionHost(Arc::clone(&ext_registry)));
 
-    // 14b: the watcher mirrors live file edits into the language server. The
-    // pool's DocumentSyncPort impl routes events to the appropriate per-language
-    // session, and the formatter echo set prevents formatter writes from
-    // churning diagnostics.
+    // LSP doc-sync is now provided by the LSP extension (spec 27).
+    // The hard-wired SessionPool / doc_sync adapter is no longer wired into the
+    // watcher; use the NoOp stub so the watcher no longer drives language-server
+    // document events directly.
+    use core_engine::ports::NoOpDocumentSync;
     let doc_sync: Arc<dyn core_engine::ports::DocumentSyncPort + Send + Sync> =
-        Arc::clone(&lsp_pool) as _;
+        Arc::new(NoOpDocumentSync);
 
     // `_watcher` is intentionally bound (not `_`) so the Drop impl runs at the
     // end of `run()` — dropping it earlier would stop live sync.
@@ -506,7 +422,7 @@ fn run() -> Result<(), String> {
         watcher_workspace,
         watcher_index,
         Box::new(storage_for_watcher),
-        watcher_plugin_host,
+        watcher_ext_host,
         doc_sync,
         Arc::clone(&echo_set),
     )
@@ -517,38 +433,64 @@ fn run() -> Result<(), String> {
         workspace_root.display()
     );
 
-    // ── Step 6: serve native + plugin tools over real stdin/stdout ────────────
-    // MergedRegistry exposes the 9 native tower_* tools plus namespaced plugin
-    // tools. A missing/empty plugins dir leaves it serving exactly the natives.
-    // (The 4 tower_lsp_* code-intelligence tools are chained in at step 6b below.)
-    // Lock stdin/stdout for the duration of the serve loop.
-    // BufReader/BufWriter ensure line-oriented I/O matches the framing spec.
-    let merged_registry = MergedRegistry::new(Arc::clone(&state), plugin_host);
-
-    // ── Step 6b: code-intelligence + navigation tools from the session pool ───
+    // ── Step 5d: replay the initial scan to extensions ───────────────────────
     //
-    // The pool implements all three port traits. When no language is configured,
-    // or when an extension is not handled, it returns Unsupported — identical
-    // behaviour to the old None/InMemoryCodeIntel path.
-    let code_intel: Arc<dyn CodeIntelligencePort> = Arc::clone(&lsp_pool) as _;
-    let nav: Option<Arc<dyn core_engine::ports::NavigationPort>> = Some(Arc::clone(&lsp_pool) as _);
+    // The workspace scan (step 3) ran before extensions were loaded (step 5b),
+    // so event subscribers — notably the AST extension's cross-file symbol
+    // index — never saw those files, leaving `search_symbols` empty until a
+    // manual `reindex`. Deliver the already-indexed files as `fileIndexed` now,
+    // in a background thread so startup is not blocked (delivery is one
+    // round-trip per file per subscriber). The watcher (step 5c) covers
+    // everything that changes from here on; re-delivering a file the watcher
+    // also reports is harmless (the AST index is idempotent per path).
+    {
+        let replay: Vec<(
+            core_engine::domain::FileId,
+            core_engine::domain::RelativePath,
+        )> = {
+            let ws_arc = state
+                .read()
+                .map_err(|_| "engine state lock poisoned".to_string())?
+                .workspace_arc();
+            let ws = ws_arc.read().unwrap_or_else(|p| p.into_inner());
+            ws.all_file_ids()
+                .into_iter()
+                .filter_map(|id| ws.get(id).ok().map(|vf| (id, vf.path.clone())))
+                .collect()
+        };
+        if !replay.is_empty() {
+            eprintln!(
+                "tower: delivering {} indexed file(s) to extensions (background)",
+                replay.len()
+            );
+            let host = SharedExtensionHost(Arc::clone(&ext_registry));
+            std::thread::Builder::new()
+                .name("ext-initial-index".to_owned())
+                .spawn(move || {
+                    for (id, path) in replay {
+                        host.on_file_indexed(id, &path);
+                    }
+                })
+                .map_err(|e| format!("failed to spawn initial-index thread: {e}"))?;
+        }
+    }
 
-    let lsp_registry = LspToolRegistry::new(Arc::clone(&state), code_intel);
-    let nav_registry = NavToolRegistry::new(Arc::clone(&state), nav);
+    // ── Step 6: serve native + extension tools over real stdin/stdout ─────────
+    //
+    // ExtensionMergedRegistry combines the 9 native tower_* tools with any
+    // extension tools namespaced tower_<ext>_<tool>.
+    let mut served_registry = ExtensionMergedRegistry::new(Arc::clone(&state), ext_registry);
 
-    // Compose: ChainRegistry tries merged → tower_lsp_diagnostics → navigation.
-    // `list` concatenates all surfaces; `call` routes by first-non-NotFound.
-    let mut served_registry = ChainRegistry::new(vec![
-        Box::new(merged_registry),
-        Box::new(lsp_registry),
-        Box::new(nav_registry),
-    ]);
+    // resource_uris: empty in the extension model — resources/subscribe is driven
+    // by extensions through their notify/resourceUpdated host-call. The sub_reg
+    // and push_rx are still needed for the serve_with_push machinery.
+    let resource_uris: Vec<String> = Vec::new();
 
-    // resource_uris: static list from config (one entry per language).
-    // diag_reader: pulls last-published diagnostics for resources/read (AC6).
-    let resource_uris: Vec<String> = lsp_pool.resource_uris();
-    let diag_reader: Arc<dyn core_engine::adapters::lsp::pool::DiagnosticsReader> =
-        Arc::clone(&lsp_pool) as _;
+    // DiagnosticsReader: no-op in the extension model (diagnostics are pushed
+    // via the extension's notify/resourceUpdated, not polled through the pool).
+    use core_engine::adapters::mcp::transport::NoOpDiagnosticsReader;
+    let diag_reader: Arc<dyn core_engine::adapters::mcp::transport::DiagnosticsReader> =
+        Arc::new(NoOpDiagnosticsReader);
 
     // serve_with_push requires R: Send + 'static (the reader moves into a thread).
     // BufReader<Stdin> satisfies both; StdinLock<'_> does not (lifetime).
@@ -571,12 +513,12 @@ fn run() -> Result<(), String> {
 /// 1. `--workspace-dir <path>` command-line argument.
 /// 2. `TOWER_WORKSPACE` environment variable.
 /// 3. Current working directory.
-fn resolve_workspace_root() -> PathBuf {
+fn resolve_workspace_root() -> std::path::PathBuf {
     // Check for --workspace-dir <path> flag.
     let args: Vec<String> = env::args().collect();
     for pair in args.windows(2) {
         if pair[0] == "--workspace-dir" {
-            return PathBuf::from(&pair[1]);
+            return std::path::PathBuf::from(&pair[1]);
         }
     }
 
@@ -584,22 +526,22 @@ fn resolve_workspace_root() -> PathBuf {
     if let Ok(val) = env::var("TOWER_WORKSPACE")
         && !val.is_empty()
     {
-        return PathBuf::from(val);
+        return std::path::PathBuf::from(val);
     }
 
     // Default: current working directory.
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// Extract the value of the `--plugins-dir <path>` command-line flag, if present.
+/// Extract the value of the `--extensions-dir <path>` command-line flag, if present.
 ///
 /// Returns `None` when the flag is absent; resolution then falls back to
-/// `$TOWER_PLUGINS_DIR` and finally the workspace default (see
-/// [`resolve_plugins_dir`]).
-fn plugins_dir_arg() -> Option<String> {
+/// `$TOWER_EXTENSIONS_DIR` and finally the workspace default
+/// (`<ws>/.tower/extensions`).
+fn extensions_dir_arg() -> Option<String> {
     let args: Vec<String> = env::args().collect();
     for pair in args.windows(2) {
-        if pair[0] == "--plugins-dir" {
+        if pair[0] == "--extensions-dir" {
             return Some(pair[1].clone());
         }
     }

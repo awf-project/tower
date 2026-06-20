@@ -56,7 +56,7 @@ use super::error::WatcherError;
 use super::event_processor::{EventProcessor, WatchEvent};
 use crate::domain::index::InvertedIndex;
 use crate::domain::workspace::ProjectWorkspace;
-use crate::ports::{DocumentSyncPort, NoOpDocumentSync, PluginHostPort, StoragePort};
+use crate::ports::{DocumentSyncPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
 
 /// Capacity of the internal event channel.
 ///
@@ -84,7 +84,7 @@ const CHANNEL_CAPACITY: usize = 256;
 /// use core_engine::adapters::in_memory_storage::InMemoryStorage;
 /// use core_engine::domain::index::InvertedIndex;
 /// use core_engine::domain::workspace::ProjectWorkspace;
-/// use core_engine::ports::NoOpPluginHost;
+/// use core_engine::ports::NoOpExtensionHost;
 ///
 /// let root = std::env::temp_dir().join("my-workspace");
 /// std::fs::create_dir_all(&root).unwrap();
@@ -98,7 +98,7 @@ const CHANNEL_CAPACITY: usize = 256;
 ///     Arc::clone(&workspace),
 ///     Arc::clone(&index),
 ///     storage,
-///     Box::new(NoOpPluginHost),
+///     Box::new(NoOpExtensionHost),
 /// )
 /// .expect("watcher must start");
 /// // Watcher is now running; drop it to shut down cleanly.
@@ -134,14 +134,14 @@ impl NotifyWatcherAdapter {
         workspace: Arc<RwLock<ProjectWorkspace>>,
         index: Arc<RwLock<InvertedIndex>>,
         storage: Box<dyn StoragePort + Send>,
-        plugin_host: Box<dyn PluginHostPort + Send + Sync>,
+        extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
     ) -> Result<Self, WatcherError> {
         Self::with_document_sync(
             root,
             workspace,
             index,
             storage,
-            plugin_host,
+            extension_host,
             Arc::new(NoOpDocumentSync),
             Arc::new(Mutex::new(HashMap::new())),
         )
@@ -159,7 +159,7 @@ impl NotifyWatcherAdapter {
         workspace: Arc<RwLock<ProjectWorkspace>>,
         index: Arc<RwLock<InvertedIndex>>,
         storage: Box<dyn StoragePort + Send>,
-        plugin_host: Box<dyn PluginHostPort + Send + Sync>,
+        extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
         doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
         echo_set: Arc<Mutex<HashMap<String, ()>>>,
     ) -> Result<Self, WatcherError> {
@@ -208,13 +208,13 @@ impl NotifyWatcherAdapter {
             .map_err(WatcherError::NotifyWatch)?;
 
         // Spawn the worker thread that drains the channel.
-        let mut processor = EventProcessor::new(root, workspace, index, storage, plugin_host)
+        let mut processor = EventProcessor::new(root, workspace, index, storage, extension_host)
             .with_document_sync(doc_sync, echo_set);
 
         // Decision: wrap each per-event invocation in `catch_unwind` so that a
-        // panicking `PluginHostPort` or `StoragePort` implementation does not
+        // panicking `ExtensionHostPort` or `StoragePort` implementation does not
         // kill the worker thread permanently. Without this, a panic inside
-        // `process_event` (e.g. from a user-supplied plugin host) terminates
+        // `process_event` (e.g. from a misbehaving extension host) terminates
         // the worker thread; subsequent OS events fill the bounded channel (256
         // slots) and are then silently dropped, causing the workspace to diverge
         // from disk indefinitely.
@@ -223,7 +223,7 @@ impl NotifyWatcherAdapter {
         // holds `Box<dyn ...>` trait objects whose unwind safety we cannot
         // statically verify. We accept this because:
         //   a) the domain state (workspace + index) is guarded by `RwLock`s that
-        //      are not held across the `plugin_host` call, so a panic there does
+        //      are not held across the `extension_host` call, so a panic there does
         //      not leave the domain in an inconsistent state;
         //   b) a poisoned lock (from a panic *inside* a lock guard) is treated as
         //      unrecoverable by the `.expect()` calls in `process_event`, which
@@ -345,7 +345,7 @@ mod tests {
     use crate::adapters::in_memory_storage::InMemoryStorage;
     use crate::domain::index::FileSearch;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::NoOpPluginHost;
+    use crate::ports::NoOpExtensionHost;
     use crate::ports::inbound::SearchUseCase as _;
 
     /// Smoke test: the real OS watcher picks up a file creation under a tempdir.
@@ -372,7 +372,7 @@ mod tests {
             Arc::clone(&workspace),
             Arc::clone(&index),
             storage,
-            Box::new(NoOpPluginHost),
+            Box::new(NoOpExtensionHost),
         )
         .expect("watcher must start");
 
@@ -451,7 +451,7 @@ mod tests {
         let storage = Box::new(InMemoryStorage::new());
 
         let watcher =
-            NotifyWatcherAdapter::new(root, workspace, index, storage, Box::new(NoOpPluginHost))
+            NotifyWatcherAdapter::new(root, workspace, index, storage, Box::new(NoOpExtensionHost))
                 .expect("watcher must start");
 
         drop(watcher); // Must not hang or panic.

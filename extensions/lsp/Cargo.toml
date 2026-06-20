@@ -1,0 +1,28 @@
+[package]
+name = "lsp_extension"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LSP sidecar extension (spec 27) — absorbs adapters/lsp/* over the extension protocol"
+
+[[bin]]
+name = "lsp_extension"
+path = "src/main.rs"
+
+[features]
+testing = []
+
+[dependencies]
+extension_protocol = { path = "../../crates/extension_protocol" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+# Re-use the existing LSP adapter logic from core_engine.
+# The extension process is a standalone binary; depending on core_engine here
+# does NOT create a circular dependency (extensions/* are not in crates/*).
+core_engine = { path = "../../crates/core_engine" }
+toml = "0.9"
+ignore = "0.4.26"
+
+[dev-dependencies]
+tempfile = "3"

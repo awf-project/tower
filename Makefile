@@ -1,27 +1,27 @@
 # tower — developer task runner.
 # Mirrors the quality gate in docs/development.md (run in the same order as CI).
+#
+# Since the extension-system migration (spec 20) the engine is a single static
+# binary with out-of-process *native* sidecar extensions (extensions/*). There is
+# no WASM build step, no WASI SDK, and no wasm fixtures — `cargo test --workspace`
+# compiles every native extension binary and the host can locate them under
+# target/debug/.
 
 BIN          := tower
 PKG          := core_engine
 VERSION      := v$(shell sed -n 's/^version = "\(.*\)"/\1/p' crates/$(PKG)/Cargo.toml | head -1)
 HOST_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
-WASM_TARGET  := wasm32-wasip1
 INSTALL_DIR  ?= $(HOME)/.local/bin
 
-# WASI toolchain for the tree-sitter C sources in ast (see AGENTS.md).
-# Defaults to the tree-sitter cache; an exported CC_wasm32_wasip1 / AR_wasm32_wasip1
-# (e.g. in CI) overrides these at recipe time.
-WASI_CC      ?= $(HOME)/.cache/tree-sitter/wasi-sdk/bin/wasm32-wasip1-clang
-WASI_AR      ?= $(HOME)/.cache/tree-sitter/wasi-sdk/bin/llvm-ar
-
-# wasm fixtures that must be built before `cargo test` (see development.md).
-WASM_FIXTURES := hello fixture_abi_mismatch fixture_panic_plugin \
-                 fixture_loop_plugin fixture_loop_hook_plugin
-FIXTURE_FLAGS := $(addprefix -p ,$(WASM_FIXTURES))
-
-# fmt (pure-Rust guest) — local install artifacts.
-FMT_WASM_RELEASE  := target/$(WASM_TARGET)/release/fmt.wasm
-PLUGINS_DIR_LOCAL := .tower/plugins
+# `install-extensions` knobs.
+#   EXTENSIONS  — reference extensions to install (space-separated; manifest dir names).
+#   EXT_DEST    — discovery scope to install into. Default: local project scope.
+#                 For the global XDG scope, pass
+#                   EXT_DEST=$(HOME)/.local/share/tower/extensions
+#   EXT_PROFILE — release (default, deployable) or debug (fast, reuses dev build).
+EXTENSIONS   ?= ast lsp fmt
+EXT_DEST     ?= .tower/extensions
+EXT_PROFILE  ?= release
 
 .DEFAULT_GOAL := help
 
@@ -37,8 +37,8 @@ help: ## Show this help
 ## Build & run
 ## ---------------------------------------------------------------------------
 .PHONY: build
-build: ## Build host crates (debug)
-	cargo build
+build: ## Build the workspace (debug) — host + native extensions
+	cargo build --workspace
 
 .PHONY: release
 release: ## Build the tower binary (release)
@@ -47,33 +47,6 @@ release: ## Build the tower binary (release)
 .PHONY: run
 run: ## Run the MCP server over stdio (cargo run)
 	cargo run -p $(PKG)
-
-## ---------------------------------------------------------------------------
-## WASM artifacts
-## ---------------------------------------------------------------------------
-.PHONY: wasm-fixtures
-wasm-fixtures: ## Build the 5 wasm test fixtures + hello
-	cargo build $(FIXTURE_FLAGS) --target $(WASM_TARGET)
-
-.PHONY: wasm-ast
-wasm-ast: ## Build ast for wasm (debug; uses cached WASI SDK; override via CC_wasm32_wasip1 / AR_wasm32_wasip1)
-	CC_wasm32_wasip1="$${CC_wasm32_wasip1:-$(WASI_CC)}" \
-	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
-	cargo build -p ast --target $(WASM_TARGET)
-
-.PHONY: wasm-ast-release
-wasm-ast-release: ## Build ast for wasm (release; smaller/faster — use for deployed plugins)
-	CC_wasm32_wasip1="$${CC_wasm32_wasip1:-$(WASI_CC)}" \
-	AR_wasm32_wasip1="$${AR_wasm32_wasip1:-$(WASI_AR)}" \
-	cargo build -p ast --target $(WASM_TARGET) --release
-
-.PHONY: wasm-fmt
-wasm-fmt: ## Build fmt for wasm (debug; pure Rust — no WASI SDK needed)
-	cargo build -p fmt --target $(WASM_TARGET)
-
-.PHONY: wasm-fmt-release
-wasm-fmt-release: ## Build fmt for wasm (release; for deployment)
-	cargo build -p fmt --target $(WASM_TARGET) --release
 
 ## ---------------------------------------------------------------------------
 ## Quality gate (same order as CI — see docs/development.md)
@@ -91,26 +64,16 @@ clippy: ## Lint, warnings as errors (CI step 2)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: test
-test: wasm-fixtures wasm-ast wasm-fmt ## Run host-side tests (builds wasm first)
-	cargo test
-
-.PHONY: test-ast
-test-ast: ## Run ast host-side tests
-	cargo test -p ast
-
-.PHONY: test-fmt
-test-fmt: ## Run fmt host-side tests
-	cargo test -p fmt
+test: ## Run the workspace test suite (compiles native extensions first)
+	cargo test --workspace
 
 .PHONY: deny
 deny: ## License & advisory policy
 	cargo deny check
 
 .PHONY: gate
-gate: fmt-check clippy wasm-fixtures wasm-ast wasm-fmt ## Full quality gate (fmt+clippy+wasm+tests+deny)
-	cargo test
-	cargo test -p ast
-	cargo test -p fmt
+gate: fmt-check clippy ## Full quality gate (fmt + clippy + tests + deny)
+	cargo test --workspace
 	cargo deny check
 
 ## ---------------------------------------------------------------------------
@@ -133,11 +96,22 @@ install: release ## Build release and install tower to $(INSTALL_DIR)
 	install -m 0755 target/release/$(BIN) "$(INSTALL_DIR)/$(BIN)"
 	@echo "installed $(BIN) -> $(INSTALL_DIR)/$(BIN)"
 
-.PHONY: install-fmt
-install-fmt: wasm-fmt-release ## Install fmt (release) into the local scope (<ws>/.tower/plugins) — restart tower to load
-	@mkdir -p "$(PLUGINS_DIR_LOCAL)"
-	install -m 0644 "$(FMT_WASM_RELEASE)" "$(PLUGINS_DIR_LOCAL)/fmt.wasm"
-	@echo "installed fmt -> $(PLUGINS_DIR_LOCAL)/fmt.wasm (restart tower to load)"
+# Reference extensions are discovered, not bundled: each must live in a scope as
+# <scope>/<name>/extension.toml alongside its native binary (the manifest's
+# `command` is resolved relative to the extension directory). This builds them
+# and lays out that structure. Restart tower (or reconnect the MCP server) after.
+.PHONY: install-extensions
+install-extensions: ## Build + install reference extensions ($(EXTENSIONS), $(EXT_PROFILE)) into $(EXT_DEST)
+	cargo build $(if $(filter release,$(EXT_PROFILE)),--release,) \
+	  $(addprefix -p ,$(addsuffix _extension,$(EXTENSIONS)))
+	@for ext in $(EXTENSIONS); do \
+	  dest="$(EXT_DEST)/$$ext"; \
+	  mkdir -p "$$dest"; \
+	  install -m 0644 "extensions/$$ext/extension.toml" "$$dest/extension.toml"; \
+	  install -m 0755 "target/$(EXT_PROFILE)/$${ext}_extension" "$$dest/$${ext}_extension"; \
+	  echo "installed extension '$$ext' ($(EXT_PROFILE)) -> $$dest"; \
+	done
+	@echo "restart tower / reconnect the MCP server to load the new extensions"
 
 ## ---------------------------------------------------------------------------
 ## Housekeeping

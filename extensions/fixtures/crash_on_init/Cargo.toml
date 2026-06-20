@@ -1,0 +1,11 @@
+[package]
+name = "fixture_crash_on_init"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spec 24 fault fixture: reads initialize request then crashes with exit code 1"
+
+[[bin]]
+name = "fixture_crash_on_init"
+path = "src/main.rs"

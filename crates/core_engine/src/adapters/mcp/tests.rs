@@ -489,9 +489,8 @@ fn non_utf8_frame_returns_parse_error_and_loop_continues() {
 
 use std::sync::{Arc, Mutex};
 
-use crate::adapters::lsp::pool::DiagnosticsReader;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
-use crate::adapters::mcp::transport::{PushEvent, serve_with_push};
+use crate::adapters::mcp::transport::{DiagnosticsReader, PushEvent, serve_with_push};
 use crate::domain::code_intel::Diagnostic;
 
 struct NullDiagReader;

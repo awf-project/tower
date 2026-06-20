@@ -34,7 +34,7 @@ use core_engine::adapters::SledStorageAdapter;
 use core_engine::adapters::watcher::NotifyWatcherAdapter;
 use core_engine::domain::index::{FileSearch, InvertedIndex};
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::NoOpPluginHost;
+use core_engine::ports::NoOpExtensionHost;
 use core_engine::ports::inbound::SearchUseCase;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ fn start_watcher(
         workspace,
         index,
         Box::new(storage),
-        Box::new(NoOpPluginHost),
+        Box::new(NoOpExtensionHost),
     )
     .expect("watcher must start in integration test environment")
 }

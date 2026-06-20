@@ -1,0 +1,16 @@
+[package]
+name = "test_helper_extension"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal test-only sidecar extension binary for spec 23 integration tests"
+
+# This binary is NOT a wasm32 target; it runs natively as a child process.
+[[bin]]
+name = "test_helper_extension"
+path = "src/main.rs"
+
+[dependencies]
+extension_protocol = { path = "../../crates/extension_protocol" }
+serde_json = "1"

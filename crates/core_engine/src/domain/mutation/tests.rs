@@ -21,7 +21,7 @@ use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::{FileMutationService, is_tmp_artifact};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::ports::inbound::FileMutationUseCase;
-use crate::ports::{FileSystemPort, NoOpPluginHost, PortError, StoragePort};
+use crate::ports::{FileSystemPort, NoOpExtensionHost, PortError, StoragePort};
 
 // ── TDD step 1 & 2: create_file → content + searchable ───────────────────────
 
@@ -38,7 +38,7 @@ fn create_file_content_present_and_searchable() {
     let mut fs = InMemoryFs::new();
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
 
     let path = RelativePath::new("src/http_client.rs");
     svc.create_file(path.clone(), b"fn get() {}".to_vec())
@@ -79,12 +79,12 @@ fn create_file_overwrite_updates_without_duplication() {
 
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"v1".to_vec()).unwrap();
     }
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"v2".to_vec()).unwrap();
     }
 
@@ -149,7 +149,7 @@ fn crash_before_rename_returns_error_and_leaves_domain_state_clean() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.create_file(
             RelativePath::new("src/important.rs"),
@@ -199,7 +199,7 @@ fn delete_file_removes_from_vfs_index_and_storage() {
     // Create first.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"fn go() {}".to_vec())
             .unwrap();
     }
@@ -209,7 +209,7 @@ fn delete_file_removes_from_vfs_index_and_storage() {
     // Delete.
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.delete_file(&path).unwrap();
     }
 
@@ -286,7 +286,7 @@ fn delete_file_fs_fails_storage_record_retained() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.create_file(path.clone(), b"fn f() {}".to_vec())
             .unwrap();
@@ -302,7 +302,7 @@ fn delete_file_fs_fails_storage_record_retained() {
             &mut ws,
             &mut idx,
             &mut storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.delete_file(&path)
     };
@@ -375,7 +375,7 @@ fn delete_file_storage_fails_physical_file_already_gone() {
             &mut ws,
             &mut idx,
             &mut real_storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.create_file(path.clone(), b"fn f() {}".to_vec())
             .unwrap();
@@ -392,7 +392,7 @@ fn delete_file_storage_fails_physical_file_already_gone() {
             &mut ws,
             &mut idx,
             &mut fail_storage,
-            &NoOpPluginHost,
+            &NoOpExtensionHost,
         );
         svc.delete_file(&path)
     };
@@ -418,7 +418,7 @@ fn delete_file_on_unknown_path_returns_not_found() {
     let mut fs = InMemoryFs::new();
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
 
     let result = svc.delete_file(&RelativePath::new("ghost.rs"));
     assert!(
@@ -438,7 +438,7 @@ fn create_directory_recursive_succeeds() {
     let mut fs = InMemoryFs::new();
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
 
     // InMemoryFs mkdir is a no-op but must not error.
     svc.create_directory(RelativePath::new("a/b/c")).unwrap();
@@ -475,7 +475,7 @@ fn watcher_ignores_tmp_write_create_event() {
         Arc::clone(&workspace),
         Arc::clone(&index),
         Box::new(InMemoryStorage::new()),
-        Box::new(NoOpPluginHost),
+        Box::new(NoOpExtensionHost),
     );
 
     // is_tmp_artifact fires before read_metadata — no file needs to exist.
@@ -508,7 +508,7 @@ fn watcher_ignores_real_fs_tmp_modify_event() {
         Arc::clone(&workspace),
         Arc::clone(&index),
         Box::new(InMemoryStorage::new()),
-        Box::new(NoOpPluginHost),
+        Box::new(NoOpExtensionHost),
     );
 
     // is_tmp_artifact fires before read_metadata — no file needs to exist.
@@ -550,7 +550,7 @@ fn watcher_create_after_mutation_is_idempotent() {
         let mut storage = InMemoryStorage::new();
         let mut fs = InMemoryFs::new();
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"pub fn run() {}".to_vec())
             .unwrap();
         ws.get_by_path(&path).unwrap()
@@ -567,7 +567,7 @@ fn watcher_create_after_mutation_is_idempotent() {
         Arc::clone(&workspace),
         Arc::clone(&index),
         Box::new(InMemoryStorage::new()),
-        Box::new(NoOpPluginHost),
+        Box::new(NoOpExtensionHost),
     );
     processor
         .process_event(WatchEvent::Create(abs_path))
@@ -604,7 +604,7 @@ fn watcher_modify_after_mutation_preserves_file_id() {
         let mut storage = InMemoryStorage::new();
         let mut fs = InMemoryFs::new();
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), b"fn handle() {}".to_vec())
             .unwrap();
         ws.get_by_path(&path).unwrap()
@@ -619,7 +619,7 @@ fn watcher_modify_after_mutation_preserves_file_id() {
         Arc::clone(&workspace),
         Arc::clone(&index),
         Box::new(InMemoryStorage::new()),
-        Box::new(NoOpPluginHost),
+        Box::new(NoOpExtensionHost),
     );
     processor
         .process_event(WatchEvent::Modify(abs_path))
@@ -649,7 +649,7 @@ fn make_state_with_file(
     let mut storage = InMemoryStorage::new();
     {
         let mut svc =
-            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+            FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
         svc.create_file(path.clone(), content.to_vec()).unwrap();
     }
     (fs, ws, idx, storage)
@@ -668,7 +668,7 @@ fn edit_range_splice_mid_file_bytes_identical() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"fn main() {}");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let report = svc.edit_range(&path, 3, 7, "run").unwrap();
 
     // Report shape.
@@ -694,7 +694,7 @@ fn edit_range_zero_length_span_inserts() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"fn lib() {}");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     svc.edit_range(&path, 0, 0, "pub ").unwrap();
 
     let bytes = fs.read(&path).unwrap();
@@ -709,7 +709,7 @@ fn edit_range_empty_replacement_deletes_span() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"hello world");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     svc.edit_range(&path, 5, 11, "").unwrap();
 
     let bytes = fs.read(&path).unwrap();
@@ -725,7 +725,7 @@ fn edit_range_end_beyond_len_rejected() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abc");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc.edit_range(&path, 0, 10, "x").unwrap_err();
 
     assert!(
@@ -743,7 +743,7 @@ fn edit_range_start_greater_than_end_rejected() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abcdef");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc.edit_range(&path, 4, 2, "x").unwrap_err();
 
     assert!(
@@ -767,7 +767,7 @@ fn edit_range_non_utf8_boundary_rejected() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, &content);
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc.edit_range(&path, 2, 3, "e").unwrap_err();
 
     assert!(
@@ -787,7 +787,7 @@ fn edit_range_end_non_utf8_boundary_rejected() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, &content);
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc.edit_range(&path, 1, 2, "e").unwrap_err();
 
     assert!(
@@ -813,7 +813,7 @@ fn edit_range_binary_content_returns_invalid_range_and_file_unchanged() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, content);
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let err = svc.edit_range(&path, 0, 2, "x").unwrap_err();
 
     assert!(
@@ -840,7 +840,7 @@ fn edit_range_append_at_eof_succeeds_and_content_correct() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abc");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     let report = svc.edit_range(&path, 3, 3, "DEF").unwrap();
 
     assert_eq!(report.files_changed, 1);
@@ -868,7 +868,7 @@ fn edit_range_mid_file_insertion_surrounding_bytes_identical() {
     let (mut fs, mut ws, mut idx, mut storage) = make_state_with_file(&path, b"abc");
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
     svc.edit_range(&path, 1, 1, "X").unwrap();
 
     let bytes = fs.read(&path).unwrap();
@@ -905,7 +905,7 @@ fn edit_range_missing_file_returns_not_found() {
     let mut storage = InMemoryStorage::new();
 
     let mut svc =
-        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpPluginHost);
+        FileMutationService::new(&mut fs, &mut ws, &mut idx, &mut storage, &NoOpExtensionHost);
 
     let err = svc
         .edit_range(&RelativePath::new("ghost.rs"), 0, 0, "x")
@@ -936,17 +936,32 @@ fn edit_range_missing_file_returns_not_found() {
 #[test]
 fn edit_range_broadcasts_on_file_changed_and_refreshes_vfs() {
     use crate::domain::FileId;
-    use crate::ports::PluginHostPort;
+    use crate::ports::ExtensionHostPort;
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct RecordingHost {
         changed: Mutex<Vec<String>>,
     }
-    impl PluginHostPort for RecordingHost {
+    impl ExtensionHostPort for RecordingHost {
         fn on_file_indexed(&self, _id: FileId, _path: &RelativePath) {}
         fn on_file_changed(&self, _id: FileId, path: &RelativePath) {
             self.changed.lock().unwrap().push(path.as_str().to_owned());
+        }
+        fn on_file_deleted(&self, _path: &RelativePath) {}
+        fn declared_tools(
+            &self,
+        ) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            tool_name: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, crate::domain::InvokeError> {
+            Err(crate::domain::InvokeError::ToolNotFound(
+                tool_name.to_owned(),
+            ))
         }
     }
 

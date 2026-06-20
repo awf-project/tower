@@ -11,14 +11,14 @@
 //!         ├─ workspace.insert / update    ┐
 //!         ├─ index.insert / delta-reindex ├─ VFS + index in sync
 //!         ├─ storage.put                  ┘
-//!         └─ plugin_host.on_file_changed  ← broadcast after commit
+//!         └─ extension_host.on_file_changed  ← broadcast after commit
 //!
 //!  delete_file(path):
 //!    resolve FileId from workspace
 //!    workspace.remove + index.remove  ← clear in-memory state
 //!    FileSystemPort.delete(path)      ← physical remove first (crash-safe)
 //!    storage.delete                   ← persist removal after physical delete
-//!    plugin_host.on_file_changed
+//!    extension_host.on_file_changed
 //!
 //!  create_directory(path):
 //!    FileSystemPort.mkdir(path)    ← recursive
