@@ -1,0 +1,42 @@
+# Local tower project configuration.
+# Schema is strict: unknown keys abort startup (exit 1).
+
+# Language servers, keyed by language. Each file routes to its server by
+# extension. idle_timeout_secs is optional (absent = sessions stay resident).
+[lsp]
+# idle_timeout_secs = 300
+
+[lsp.rust]
+command = "rust-analyzer"
+extensions = ["rs"]
+
+[plugins]
+# Plugin file stems (without `.wasm`) to skip loading, e.g. ["ast"].
+# A disabled plugin gets no sandbox, no fuel, no tools, no watcher hooks.
+disabled = []
+
+# [plugins.formatter.tools.<id>] — external formatters run by plugin_fmt when a
+# file changes. mode = "filter" (default, stdin->stdout) or "inplace".
+# `{path}` is substituted with the file path (filter) or temp copy (inplace).
+# Uninstalled tools are skipped, so unused entries are harmless.
+
+[plugins.formatter.tools.rustfmt]
+argv = ["rustfmt", "--edition", "2024"]
+extensions = ["rs"]
+
+[plugins.formatter.tools.gofmt]
+argv = ["gofmt"]
+extensions = ["go"]
+
+[plugins.formatter.tools.zigfmt]
+argv = ["zig", "fmt", "--stdin"]
+extensions = ["zig"]
+
+[plugins.formatter.tools.prettier]
+argv = ["prettier", "--stdin-filepath", "{path}"]
+extensions = ["ts", "tsx", "js", "jsx"]
+
+[plugins.formatter.tools.php-cs-fixer]
+mode = "inplace"
+argv = ["php-cs-fixer", "fix", "{path}"]
+extensions = ["php"]

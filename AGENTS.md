@@ -51,6 +51,58 @@ cargo run -p core_engine                     # MCP server over stdio
 **Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy -- -D warnings`
 + `cargo test --workspace` all green. State it with evidence, never assume.
 
+## MCP tool surface (JSON-RPC over stdio)
+
+The `core_engine` binary exposes these tools to MCP clients. All `path` arguments are
+**workspace-relative**. Mutating tools accept an optional `expected_version` (hex SHA-256 from a
+prior `tower_read_file` with `with_version: true`) for **optimistic compare-and-swap** (spec 18): the
+write is rejected with `PreconditionFailed` if the file changed since it was read.
+
+### VFS — files & search (host-side)
+
+| Tool | Purpose |
+|------|---------|
+| `tower_read_file` | Read raw UTF-8; `with_version: true` returns a `version` CAS token. |
+| `tower_create_file` | Create/overwrite with `content`; CAS via `expected_version`. |
+| `tower_edit_range` | Splice `replacement` into byte range `[start_byte, end_byte)` (UTF-8 boundaries; empty = delete; equal bytes = insert); atomic commit; CAS. |
+| `tower_global_replace` | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
+| `tower_create_directory` | Recursive `mkdir`. |
+| `tower_delete_file` | Delete a file. |
+| `tower_find_file` | Match a substring/fuzzy `query` against file paths. |
+| `tower_search_text` | Grep `pattern` across all indexed file contents. |
+| `tower_reindex` | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete). |
+
+### AST — structural navigation (`ast` extension, spec 26)
+
+Tree-sitter backed; error-tolerant so comments/strings yield no false positives. Supports `.rs`, `.go`, `.php`.
+Symbol kinds: `function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class`.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_ast_get_outline` | Structural outline (functions, structs, methods, traits, enums, impl blocks) of one file. |
+| `tower_ast_find_symbols` | Precise definition locations of a named symbol of a given `kind` within one file. |
+| `tower_ast_read_symbol` | Read only a named symbol's source span (byte slice + kind + start/end rows), not the whole file. |
+| `tower_ast_search_symbols` | Cross-file lookup against the in-memory symbol index (kept fresh by `fileIndexed`/`fileChanged` events). |
+| `tower_ast_reindex` | Force a full whole-project symbol reindex (cold cache / large external change). |
+
+### LSP — semantic queries (`lsp` extension, spec 27)
+
+Require a configured language server for the file extension (`[lsp.<lang>]` in `.tower/config.toml`).
+Positions are **0-based** `line` + **UTF-16** `character` offset.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_lsp_definition` | Go to definition of the symbol at a position. |
+| `tower_lsp_references` | Find all references to the symbol at a position. |
+| `tower_lsp_hover` | Hover info for the symbol at a position. |
+| `tower_lsp_diagnostics` | Errors/warnings for a file. |
+
+### Formatting
+
+| Tool | Purpose |
+|------|---------|
+| `tower_fmt_format` | Enqueue format jobs; `{path}` formats one file, `{}` formats all indexed files. Returns `{requested, accepted, dropped}` immediately — does **not** wait for completion. |
+
 ## Non-negotiable invariants
 
 - **Domain purity**: 100% of the domain testable with in-memory test doubles — no real disk/DB in
@@ -66,7 +118,9 @@ cargo run -p core_engine                     # MCP server over stdio
   boundary (spec 24). A child that ignores shutdown is killed (SIGTERM → SIGKILL).
 - **Capability security**: sidecar extensions reach the workspace only through explicit HostCall
   dispatch in `SidecarHostAdapter`; no direct net, raw fs, or storage-cache access.
-- **Single static binary**: no JVM, no Node, no container required at runtime.
+- **No runtime VM**: ships as a self-contained native build — no JVM, no Node, no container required
+  at runtime. (Third-party Rust crates, including the official MCP SDK `rmcp`, are linked in normally;
+  the constraint is about not requiring an external runtime, not about avoiding dependencies.)
 
 ## Working conventions specific to this repo
 

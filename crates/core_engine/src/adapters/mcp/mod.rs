@@ -1,25 +1,26 @@
-//! MCP transport adapter (spec 10a).
+//! MCP inbound adapter (spec 10a — rmcp 1.7).
 //!
-//! JSON-RPC 2.0 over stdio, newline-delimited framing. This module contains
-//! only the **protocol plumbing** — it is deliberately tool-agnostic.
+//! JSON-RPC 2.0 over stdio, served via the [`rmcp`] SDK. This module contains
+//! the protocol plumbing and the tool-registry abstraction — it is
+//! deliberately tool-agnostic.
 //!
 //! # Wireframe
 //!
 //! ```text
-//!  stdin ─► frame parser ─► JsonRpcRequest ─► Dispatcher
-//!                                              │ registry.lookup(tool_name)
-//!                                              ▼
-//!                            ToolRegistry (trait) ─► result ─► JsonRpcResponse ─► stdout
-//!  trait ToolRegistry { list() -> Vec<ToolDesc>; call(name, args) -> Result<Value, ToolError> }
-//!    (native tools register here in 10b; extension tools appended in 28 — same surface)
+//!  stdin ─► rmcp transport ─► TowerMcpHandler
+//!                                │ registry.list()  → tools/list response
+//!                                │ registry.call()  → tools/call response
+//!                                ▼
+//!                 ToolRegistry (trait) ─► ExtensionMergedRegistry
+//!                   (native tools in 10b; extension tools appended in 28)
 //! ```
 //!
 //! # What is NOT here
 //!
-//! - The 9 native tool handlers — those are spec 10b.
+//! - The 9 native tool handlers — those are spec 10b (`native_tools`).
 //! - Extension tool merging — spec 28 (`ExtensionMergedRegistry`).
-//! - `std::io::stdin()` / `std::io::stdout()` — the binary entry wires those
-//!   in spec 10b. The `serve` function is generic over `R: BufRead, W: Write`.
+//! - `tokio::io::stdin()` / `tokio::io::stdout()` — the binary entry wires
+//!   those in `main.rs`. The rmcp transport is generic over async I/O.
 //!
 //! # Registry seam
 //!
@@ -29,24 +30,23 @@
 //! |------|-------------|--------------|
 //! | 10b  | `NativeToolRegistry` | 9 workspace tools |
 //! | 28   | `ExtensionMergedRegistry` | wraps 10b + extension tools |
-//!
-//! The transport only calls `registry.list()` and `registry.call()` — it never
-//! needs to be changed when new tools arrive.
 
 pub mod chain_registry;
+pub mod diagnostics;
 pub mod extension_merged_registry;
 pub mod lsp_support;
 pub mod lsp_tools;
 pub mod native_tools;
 pub mod nav_tools;
 pub mod registry;
-pub mod transport;
+pub mod rmcp_server;
 pub mod types;
 
+pub use diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader, PushEvent};
 pub use extension_merged_registry::ExtensionMergedRegistry;
 pub use native_tools::{EngineState, NativeToolRegistry};
 pub use registry::ToolRegistry;
-pub use transport::{PushEvent, serve, serve_with_push};
+pub use rmcp_server::{TowerMcpHandler, spawn_push_task};
 pub use types::{ToolDesc, ToolError};
 
 #[cfg(test)]

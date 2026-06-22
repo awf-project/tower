@@ -28,6 +28,8 @@ tempfile = "3.27.0"
 # Self-dependency with `testing` feature so integration tests in tests/ can use
 # test-only helpers like `FileId::new_for_testing` (gated on that feature).
 core_engine = { path = ".", features = ["testing"] }
+# rmcp client feature used in mcp handler unit tests (in-process duplex transport).
+rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
 
 [dependencies]
 # Decision: extension_protocol provides the ExtensionManifest, ExtensionFault,
@@ -83,3 +85,5 @@ serde_json = "1"
 # XDG_DATA_HOME" rule) cross-platform, used only at the binary/adapter edge to
 # locate the global extensions dir. Domain stays untouched.
 directories = "6"
+rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "sync"] }

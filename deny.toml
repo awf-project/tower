@@ -43,6 +43,11 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal path dependencies (e.g. the `core_engine` self dev-dep and the
+# extensions' `extension_protocol`/`test_helper` path deps) carry no version req and
+# would otherwise be flagged as wildcards. Path deps are resolved from the local tree,
+# not a registry, so they pose no supply-chain wildcard risk — exempt them.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

@@ -121,8 +121,9 @@ impl SessionSpawner for RealSpawner {
     }
 }
 
-// (DiagnosticsReader / NoOpDiagnosticsReader have been moved to
-//  core_engine::adapters::mcp::transport as part of spec 29 cleanup.)
+// (DiagnosticsReader / NoOpDiagnosticsReader now live in
+//  core_engine::adapters::mcp::diagnostics — the hand-rolled `transport` module
+//  was removed in the rmcp migration.)
 
 // ── PoolEntry ─────────────────────────────────────────────────────────────────
 

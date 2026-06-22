@@ -38,7 +38,6 @@
 //! and the loop continues.
 
 use std::env;
-use std::io::{BufReader, BufWriter};
 use std::sync::{Arc, RwLock};
 
 use core_engine::adapters::SledStorageAdapter;
@@ -56,7 +55,9 @@ use core_engine::adapters::fs::scan::{
 use core_engine::adapters::fs::{RealFs, workspace_scan};
 use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use core_engine::adapters::mcp::native_tools::EngineState;
-use core_engine::adapters::mcp::{ExtensionMergedRegistry, PushEvent, serve_with_push};
+use core_engine::adapters::mcp::{
+    ExtensionMergedRegistry, PushEvent, TowerMcpHandler, spawn_push_task,
+};
 use core_engine::adapters::watcher::NotifyWatcherAdapter;
 use core_engine::domain::extension_host::ExtensionRegistry;
 use core_engine::domain::index::InvertedIndex;
@@ -297,7 +298,7 @@ fn run() -> Result<(), String> {
     //
     // The push channel carries `PushEvent`s from extensions (via their
     // `notify/resourceUpdated` host-call) to the MCP serve loop. The
-    // `serve_with_push` function bridges these into MCP push notifications.
+    // `spawn_push_task` function bridges these into MCP push notifications.
     let (push_tx, push_rx) = std::sync::mpsc::channel::<PushEvent>();
     let sub_reg = Arc::new(std::sync::Mutex::new(SubscriptionRegistry::new()));
 
@@ -479,32 +480,51 @@ fn run() -> Result<(), String> {
     //
     // ExtensionMergedRegistry combines the 9 native tower_* tools with any
     // extension tools namespaced tower_<ext>_<tool>.
-    let mut served_registry = ExtensionMergedRegistry::new(Arc::clone(&state), ext_registry);
+    let served_registry = ExtensionMergedRegistry::new(Arc::clone(&state), ext_registry);
 
     // resource_uris: empty in the extension model — resources/subscribe is driven
-    // by extensions through their notify/resourceUpdated host-call. The sub_reg
-    // and push_rx are still needed for the serve_with_push machinery.
+    // by extensions through their notify/resourceUpdated host-call.
     let resource_uris: Vec<String> = Vec::new();
 
     // DiagnosticsReader: no-op in the extension model (diagnostics are pushed
     // via the extension's notify/resourceUpdated, not polled through the pool).
-    use core_engine::adapters::mcp::transport::NoOpDiagnosticsReader;
-    let diag_reader: Arc<dyn core_engine::adapters::mcp::transport::DiagnosticsReader> =
+    use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
+    let diag_reader: Arc<dyn core_engine::adapters::mcp::diagnostics::DiagnosticsReader> =
         Arc::new(NoOpDiagnosticsReader);
 
-    // serve_with_push requires R: Send + 'static (the reader moves into a thread).
-    // BufReader<Stdin> satisfies both; StdinLock<'_> does not (lifetime).
-    let stdout = std::io::stdout();
-    serve_with_push(
-        BufReader::new(std::io::stdin()),
-        BufWriter::new(stdout.lock()),
-        &mut served_registry,
-        sub_reg,
+    // Build the rmcp handler and serve over stdio.
+    let handler = TowerMcpHandler::new(
+        served_registry,
         diag_reader,
+        Arc::clone(&sub_reg),
         resource_uris,
-        Some(push_rx),
-    )
-    .map_err(|e| format!("serve loop I/O error: {e}"))
+    );
+
+    // Build a tokio runtime for the rmcp async serve loop.
+    // `run()` is synchronous (spawns the watcher and other sync threads before
+    // reaching here) so we create a dedicated runtime rather than making `run`
+    // async — this avoids restructuring the entire startup path.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("mcp-runtime")
+        .build()
+        .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+
+    rt.block_on(async {
+        let running = rmcp::serve_server(handler, rmcp::transport::io::stdio())
+            .await
+            .map_err(|e| format!("MCP server initialization error: {e}"))?;
+
+        // Spawn the push-forwarding thread now that we have the peer handle.
+        spawn_push_task(running.peer().clone(), sub_reg, push_rx);
+
+        // Wait for the client to disconnect (EOF on stdin) or an error.
+        running
+            .waiting()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("serve loop I/O error: {e}"))
+    })
 }
 
 /// Resolve the workspace root directory.

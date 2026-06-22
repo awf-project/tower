@@ -23,10 +23,10 @@ use crate::ports::{CodeIntelError, CodeIntelligencePort};
 
 /// Thread-safe set of MCP resource URIs the client has subscribed to.
 ///
-/// Shared between `serve_with_push` (reads `is_subscribed` on each push event)
-/// and the `resources/subscribe`/`resources/unsubscribe` dispatch arms (writes,
-/// from the main serve thread). Held only for `HashSet` operations (microseconds);
-/// never held while doing any session I/O.
+/// Shared between the push-forwarding task (reads `is_subscribed` on each push
+/// event) and the `resources/subscribe`/`resources/unsubscribe` handler methods
+/// (writes). Held only for `HashSet` operations (microseconds); never held
+/// while doing any session I/O.
 pub struct SubscriptionRegistry {
     subscribed: std::collections::HashSet<String>,
 }
