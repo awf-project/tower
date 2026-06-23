@@ -10,6 +10,12 @@ unmaintained = "workspace"
 
 [licenses]
 version = 2
+# The allow list below is a deliberate policy whitelist: it pre-approves
+# permissive licenses we accept even if no current dependency uses them yet
+# (e.g. BSD-2-Clause, Zlib), so a future transitive dep cannot silently break
+# the build. `unused-allowed-license = "allow"` suppresses the resulting
+# "license was not encountered" noise without weakening the policy.
+unused-allowed-license = "allow"
 # Permissive licenses + the project's own EUPL-1.2. Anything copyleft-incompatible
 # (GPL-only, AGPL, etc.) is absent from the list and therefore rejected.
 allow = [

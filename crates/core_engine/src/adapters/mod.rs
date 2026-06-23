@@ -10,10 +10,16 @@
 /// Real adapter: [`ast_index::XdgAstIndexAdapter`].
 /// In-memory fake: [`InMemoryAstIndex`].
 pub mod ast_index;
+/// Binary CLI surface (clap, derive).
+pub mod cli;
 /// Local project configuration (`.tower/config.toml`).
 ///
 /// Infra: reads `std::fs` and parses `toml`. The domain never sees it.
 pub mod config;
+/// Shared-daemon hub: one daemon per workspace owns the engine; `tower mcp`
+/// clients relay stdio over a Unix socket. Pure infrastructure (sockets,
+/// processes, framing) — the `domain/` crate is never imported here.
+pub mod daemon;
 /// Sidecar extension adapter — `SidecarHostAdapter` implementing
 /// `ExtensionInstance` over a child process with JSON-RPC 2.0 over stdio (spec 23).
 ///

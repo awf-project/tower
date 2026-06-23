@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 # The extension process is a standalone binary; depending on core_engine here
 # does NOT create a circular dependency (extensions/* are not in crates/*).
 core_engine = { path = "../../crates/core_engine" }
-toml = "0.9"
+toml = "1.1.2"
 ignore = "0.4.26"
 
 [dev-dependencies]

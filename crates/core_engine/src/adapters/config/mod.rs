@@ -36,6 +36,10 @@ pub struct TowerConfig {
     /// Absent → `ExtensionConfig::default()` (30-second timeout).
     #[serde(default)]
     pub extensions: ExtensionConfig,
+    /// `[daemon]` section — shared-daemon runtime settings.
+    /// Absent → `DaemonConfig::default()` (30-second idle timeout).
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 /// `[extensions]` section (spec 24 — supervision & fault model; spec 25 — disable list).
@@ -82,6 +86,36 @@ impl Default for ExtensionConfig {
         Self {
             request_timeout_secs: Self::default_request_timeout_secs(),
             disabled: Vec::new(),
+        }
+    }
+}
+
+/// `[daemon]` section — shared-daemon hub settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Seconds with zero keep-alive clients before the daemon self-terminates.
+    /// Only `mcp`/`observer` connections count; `control` connections do not.
+    #[serde(default = "DaemonConfig::default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl DaemonConfig {
+    const fn default_idle_timeout_secs() -> u64 {
+        30
+    }
+
+    /// Idle timeout as a [`std::time::Duration`].
+    #[must_use]
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_timeout_secs)
+    }
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: Self::default_idle_timeout_secs(),
         }
     }
 }
@@ -797,5 +831,30 @@ extensions = ["rs"]
 
         let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
         assert!(result.is_none(), "must return None when neither dir exists");
+    }
+
+    // ── Task 2: [daemon] config section ──────────────────────────────────────
+
+    #[test]
+    fn daemon_config_defaults_to_30s() {
+        let cfg = TowerConfig::default();
+        assert_eq!(cfg.daemon.idle_timeout_secs, 30);
+        assert_eq!(
+            cfg.daemon.idle_timeout(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn daemon_idle_timeout_parses_from_toml() {
+        let src = "[daemon]\nidle_timeout_secs = 5\n";
+        let cfg: TowerConfig = toml::from_str(src).expect("parse");
+        assert_eq!(cfg.daemon.idle_timeout(), std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn daemon_unknown_key_is_rejected() {
+        let src = "[daemon]\nidle_timeoutt_secs = 5\n";
+        assert!(toml::from_str::<TowerConfig>(src).is_err());
     }
 }
