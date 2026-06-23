@@ -14,8 +14,9 @@ use crate::adapters::ast_index::{
 };
 use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_workspace_root};
 use crate::adapters::config::{TowerConfig, legacy_plugins_dir_fallback};
+use crate::adapters::extension::host_deps::ApplyEditsHostPort;
 use crate::adapters::extension::{
-    HostDeps as ExtensionHostDeps, global_extensions_dir, load_extensions_into_registry,
+    HostDeps as ExtensionHostDeps, global_extensions_dir, load_extensions_into_shared_registry,
     resolve_extension_dirs,
 };
 use crate::adapters::fs::scan::reconcile_pruned;
@@ -24,13 +25,127 @@ use crate::adapters::mcp::PushEvent;
 use crate::adapters::mcp::diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader};
 use crate::adapters::mcp::native_tools::EngineState;
 use crate::adapters::watcher::NotifyWatcherAdapter;
+use crate::domain::DomainError;
 use crate::domain::extension_host::ExtensionRegistry;
 use crate::domain::index::InvertedIndex;
+use crate::domain::mutation::FileMutationService;
 use crate::domain::workspace::ProjectWorkspace;
+use crate::domain::{FileId, RelativePath};
+use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest, FileMutationUseCase};
 use crate::ports::{AstIndexPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
 
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
 type FormatterEchoSet = Arc<Mutex<HashMap<String, ()>>>;
+
+struct EngineApplyEditsHost {
+    state: Arc<RwLock<EngineState>>,
+}
+
+#[derive(Default)]
+struct DeferredExtensionHost {
+    changed: Mutex<Vec<(FileId, RelativePath)>>,
+}
+
+impl DeferredExtensionHost {
+    fn drain_changed(&self) -> Vec<(FileId, RelativePath)> {
+        self.changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+}
+
+impl ExtensionHostPort for DeferredExtensionHost {
+    fn on_file_indexed(&self, _id: FileId, _path: &RelativePath) {}
+
+    fn on_file_changed(&self, id: FileId, path: &RelativePath) {
+        self.changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((id, path.clone()));
+    }
+
+    fn on_file_deleted(&self, _path: &RelativePath) {}
+
+    fn declared_tools(
+        &self,
+    ) -> Vec<(
+        crate::domain::extension_host::ExtensionId,
+        extension_protocol::ToolDecl,
+    )> {
+        Vec::new()
+    }
+
+    fn invoke(
+        &self,
+        tool_name: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::domain::extension_host::InvokeError> {
+        Err(crate::domain::extension_host::InvokeError::ToolNotFound(
+            tool_name.to_owned(),
+        ))
+    }
+}
+
+impl EngineApplyEditsHost {
+    fn new(state: Arc<RwLock<EngineState>>) -> Self {
+        Self { state }
+    }
+
+    fn with_mutation_service<T>(
+        &self,
+        f: impl FnOnce(&mut FileMutationService<'_>) -> Result<T, DomainError>,
+    ) -> Result<T, DomainError> {
+        let deferred_host = DeferredExtensionHost::default();
+        let (result, extension_host) = {
+            let mut guard = self
+                .state
+                .write()
+                .map_err(|_| DomainError::IoError("engine state lock poisoned".to_owned()))?;
+            let ws_arc = Arc::clone(&guard.workspace);
+            let idx_arc = Arc::clone(&guard.index);
+            let mut ws = ws_arc
+                .write()
+                .map_err(|_| DomainError::IoError("workspace lock poisoned".to_owned()))?;
+            let mut idx = idx_arc
+                .write()
+                .map_err(|_| DomainError::IoError("index lock poisoned".to_owned()))?;
+            let extension_host = guard.extension_host();
+            let engine = &mut *guard;
+            let mut svc = FileMutationService::new(
+                engine.fs.as_mut(),
+                &mut ws,
+                &mut idx,
+                engine.storage.as_mut(),
+                &deferred_host,
+            );
+            (f(&mut svc), extension_host)
+        };
+
+        for (file_id, path) in deferred_host.drain_changed() {
+            extension_host.on_file_changed(file_id, &path);
+        }
+
+        result
+    }
+}
+
+impl ApplyEditsHostPort for EngineApplyEditsHost {
+    fn apply_edits_cas(
+        &self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError> {
+        self.with_mutation_service(|svc| svc.apply_edits_cas(request))
+    }
+
+    fn apply_edits_dry_run(
+        &self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError> {
+        self.with_mutation_service(|svc| svc.apply_edits_dry_run(request))
+    }
+}
 
 // ── SharedExtensionHost ───────────────────────────────────────────────────────
 
@@ -167,9 +282,11 @@ fn load_extension_registry(
     opts: &GlobalOpts,
     workspace_root: &Path,
     tower_config: &TowerConfig,
+    state: &Arc<RwLock<EngineState>>,
+    ext_registry: &Arc<RwLock<ExtensionRegistry>>,
     ext_ast_index: Arc<dyn AstIndexPort + Send + Sync>,
     format_queue: Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>,
-) -> (Arc<RwLock<ExtensionRegistry>>, mpsc::Receiver<PushEvent>) {
+) -> mpsc::Receiver<PushEvent> {
     let (push_tx, push_rx) = mpsc::channel::<PushEvent>();
     let extensions_dir_local = workspace_root.join(".tower/extensions");
     let plugins_dir_legacy = workspace_root.join(".tower/plugins");
@@ -206,16 +323,22 @@ fn load_extension_registry(
         fs: ext_fs,
         ast_index: ext_ast_index as Arc<dyn AstIndexPort>,
         format_queue: format_queue as Arc<dyn crate::adapters::formatter::FormatQueuePort>,
+        apply_edits: Arc::new(EngineApplyEditsHost::new(Arc::clone(state))),
         push_tx: Some(push_tx),
     };
 
-    let ext_registry = load_extensions_into_registry(
+    load_extensions_into_shared_registry(
+        ext_registry,
         &extension_dirs,
         ext_deps,
         tower_config.extensions.request_timeout(),
         &tower_config.extensions.disabled,
     );
-    let ext_tool_count = ext_registry.declared_tools().len();
+    let ext_tool_count = ext_registry
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .declared_tools()
+        .len();
     if ext_tool_count > 0 {
         let scopes: Vec<String> = extension_dirs
             .iter()
@@ -226,7 +349,7 @@ fn load_extension_registry(
             scopes.join(", ")
         );
     }
-    (Arc::new(RwLock::new(ext_registry)), push_rx)
+    push_rx
 }
 
 fn inject_extension_host(
@@ -340,14 +463,17 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
 
     let ext_ast_index = ast_index_for_workspace(&workspace_root);
     let (format_queue, echo_set) = format_queue_for_workspace(&workspace_root, &tower_config);
-    let (ext_registry, push_rx) = load_extension_registry(
+    let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
+    inject_extension_host(&state, &ext_registry)?;
+    let push_rx = load_extension_registry(
         opts,
         &workspace_root,
         &tower_config,
+        &state,
+        &ext_registry,
         ext_ast_index,
         format_queue,
     );
-    inject_extension_host(&state, &ext_registry)?;
     let _watcher = start_watcher(
         &workspace_root,
         &state,

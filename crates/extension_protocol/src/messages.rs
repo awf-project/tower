@@ -195,6 +195,13 @@ pub enum Event {
 
 // ── HostCall ──────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplyEditsHostCallTextEdit {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub replacement: String,
+}
+
 /// Requests an extension may make back to the host (capability callbacks).
 ///
 /// The sidecar adapter (spec 23) routes each variant to the appropriate
@@ -244,6 +251,12 @@ pub enum HostCall {
         /// Workspace-relative path of the file to format.
         path: String,
     },
+    RequestApplyEdits {
+        path: String,
+        expected_version: String,
+        edits: Vec<ApplyEditsHostCallTextEdit>,
+        dry_run: bool,
+    },
     /// Emit a log message through the host's logging subsystem (`log`).
     Log {
         /// Severity level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
@@ -261,4 +274,187 @@ pub enum HostCall {
         /// The resource URI that was updated (e.g. a `file://…` diagnostics URI).
         uri: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ApplyEditsHostCallTextEdit, HostCall};
+
+    #[test]
+    fn request_apply_edits_hostcall_exists() {
+        let call = HostCall::RequestApplyEdits {
+            path: "src/lib.rs".to_owned(),
+            expected_version: "abc123".to_owned(),
+            edits: Vec::new(),
+            dry_run: false,
+        };
+
+        assert!(matches!(call, HostCall::RequestApplyEdits { .. }));
+    }
+
+    #[test]
+    fn request_apply_edits_hostcall_is_struct_variant_with_required_fields() {
+        let call = HostCall::RequestApplyEdits {
+            path: "src/lib.rs".to_owned(),
+            expected_version: "abc123".to_owned(),
+            edits: vec![ApplyEditsHostCallTextEdit {
+                start_byte: 1,
+                end_byte: 4,
+                replacement: "let".to_owned(),
+            }],
+            dry_run: true,
+        };
+
+        assert!(matches!(call, HostCall::RequestApplyEdits { .. }));
+        match call {
+            HostCall::RequestApplyEdits {
+                path,
+                expected_version,
+                edits,
+                dry_run,
+            } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(expected_version, "abc123");
+                assert_eq!(
+                    edits,
+                    vec![ApplyEditsHostCallTextEdit {
+                        start_byte: 1,
+                        end_byte: 4,
+                        replacement: "let".to_owned(),
+                    }]
+                );
+                assert!(dry_run);
+            }
+            other => {
+                let value = serde_json::to_value(other).expect("serialize HostCall variant");
+                assert_eq!(value["type"], "RequestApplyEdits");
+            }
+        }
+    }
+
+    #[test]
+    fn request_apply_edits_hostcall_preserves_existing_hostcall_serde_tagging_convention() {
+        let call = HostCall::RequestApplyEdits {
+            path: "src/lib.rs".to_owned(),
+            expected_version: "abc123".to_owned(),
+            edits: vec![ApplyEditsHostCallTextEdit {
+                start_byte: 0,
+                end_byte: 0,
+                replacement: "use crate::x;\n".to_owned(),
+            }],
+            dry_run: false,
+        };
+
+        let value = serde_json::to_value(call).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "RequestApplyEdits",
+                "path": "src/lib.rs",
+                "expected_version": "abc123",
+                "edits": [
+                    {
+                        "start_byte": 0,
+                        "end_byte": 0,
+                        "replacement": "use crate::x;\n"
+                    }
+                ],
+                "dry_run": false
+            })
+        );
+        assert!(value.get("method").is_none());
+    }
+
+    #[test]
+    fn apply_edits_hostcall_text_edit_exists_with_public_fields() {
+        let edit = ApplyEditsHostCallTextEdit {
+            start_byte: 3,
+            end_byte: 8,
+            replacement: "replacement".to_owned(),
+        };
+
+        assert_eq!(edit.start_byte, 3);
+        assert_eq!(edit.end_byte, 8);
+        assert_eq!(edit.replacement, "replacement");
+    }
+
+    #[test]
+    fn public_wire_dto_names_are_exact_for_request_apply_edits() {
+        fn accept_edit(_edit: ApplyEditsHostCallTextEdit) {}
+        fn accept_host_call(_call: HostCall) {}
+
+        accept_edit(ApplyEditsHostCallTextEdit {
+            start_byte: 0,
+            end_byte: 1,
+            replacement: "x".to_owned(),
+        });
+        accept_host_call(HostCall::RequestApplyEdits {
+            path: "src/lib.rs".to_owned(),
+            expected_version: "abc123".to_owned(),
+            edits: Vec::new(),
+            dry_run: true,
+        });
+    }
+
+    #[test]
+    fn malformed_request_apply_edits_hostcall_payloads_fail_to_deserialize() {
+        let missing_expected_version = json!({
+            "type": "RequestApplyEdits",
+            "path": "src/lib.rs",
+            "edits": [],
+            "dry_run": false
+        });
+        let missing_edits = json!({
+            "type": "RequestApplyEdits",
+            "path": "src/lib.rs",
+            "expected_version": "abc123",
+            "dry_run": false
+        });
+        let invalid_edit_range_field = json!({
+            "type": "RequestApplyEdits",
+            "path": "src/lib.rs",
+            "expected_version": "abc123",
+            "edits": [
+                {
+                    "start_byte": "not-a-usize",
+                    "end_byte": 4,
+                    "replacement": "let"
+                }
+            ],
+            "dry_run": false
+        });
+
+        assert!(serde_json::from_value::<HostCall>(missing_expected_version).is_err());
+        assert!(serde_json::from_value::<HostCall>(missing_edits).is_err());
+        assert!(serde_json::from_value::<HostCall>(invalid_edit_range_field).is_err());
+    }
+
+    #[test]
+    fn request_apply_edits_hostcall_round_trips() {
+        let call = HostCall::RequestApplyEdits {
+            path: "src/lib.rs".to_owned(),
+            expected_version: "abc123".to_owned(),
+            edits: vec![
+                ApplyEditsHostCallTextEdit {
+                    start_byte: 0,
+                    end_byte: 0,
+                    replacement: "use crate::x;\n".to_owned(),
+                },
+                ApplyEditsHostCallTextEdit {
+                    start_byte: 12,
+                    end_byte: 17,
+                    replacement: "value".to_owned(),
+                },
+            ],
+            dry_run: true,
+        };
+
+        let json = serde_json::to_string(&call).unwrap();
+        let round_tripped: HostCall = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(round_tripped, call);
+    }
 }

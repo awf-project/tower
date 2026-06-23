@@ -105,7 +105,9 @@ extensions/                Native sidecar extensions (separate binaries)
 ├── lsp/                   Language-server bridge extension (lazy)
 │                          Tools: diagnostics, definition, references, hover
 ├── lint/                  Standalone linter extension (lazy)
-│                          Tool: check; runs configured external linters read-only
+│                          Tools: check, fix; runs configured external linters
+│                                 read-only and applies structured fixes through
+│                                 manifest-gated host apply-edits
 └── fixtures/              Test-only fault-isolation fixtures
 ```
 

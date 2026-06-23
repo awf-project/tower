@@ -40,6 +40,9 @@ pub enum DomainError {
     /// No write, VFS update, index update, storage mutation, or broadcast is
     /// performed when this error is returned (UN1/AC3/AC4).
     InvalidRange(String),
+    /// The requested operation is part of the public domain contract but is not
+    /// available in this build or implementation phase.
+    UnsupportedOperation(String),
     /// Optimistic concurrency check failed: the file's current content hash does
     /// not match the caller's expected version.
     ///
@@ -70,6 +73,7 @@ impl core::fmt::Display for DomainError {
             Self::NotADirectory(path) => write!(f, "not a directory: {}", path.as_str()),
             Self::IoError(reason) => write!(f, "I/O error: {reason}"),
             Self::InvalidRange(reason) => write!(f, "invalid byte range: {reason}"),
+            Self::UnsupportedOperation(reason) => write!(f, "unsupported operation: {reason}"),
             Self::VersionConflict { expected, actual } => {
                 write!(f, "version conflict: expected {expected}, actual {actual}")
             }

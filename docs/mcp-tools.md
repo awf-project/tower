@@ -762,8 +762,10 @@ cursor → `{"supported": true, "hover": null}`. No backend / unsupported →
 ## Standalone lint tools
 
 The `lint` extension (manifest `name = "lint"`) runs configured external linters on demand and
-returns diagnostics using the same response vocabulary as `tower_lsp_diagnostics`. The extension
-declares only read/list/log capabilities and does not mutate workspace files.
+returns diagnostics using the same response vocabulary as `tower_lsp_diagnostics`. It can also
+apply structured fixes through the manifest-gated `workspace/applyEdits` HostCall. Linter binaries
+are not allowed to mutate workspace files directly; Tower owns CAS validation, overlap handling,
+atomic writes, and index refresh.
 
 Configure linters in `<workspace>/.tower/config.toml`:
 
@@ -880,6 +882,116 @@ clients can branch without treating expected lint-runner failures as transport f
 
 Stable lint error codes are `lint_missing_binary`, `lint_unparseable_output`, `lint_nonzero_exit`,
 `lint_timeout`, and `lint_invalid_config`.
+
+### tower_lint_fix
+
+Apply or preview structured fixes emitted by configured linters. `rustc-json` fixes are extracted
+from suggestion spans; `MachineApplicable` suggestions are applied by default, while
+`MaybeIncorrect` or unknown applicability is skipped unless `unsafe` is true. `eslint-json` fixes
+are extracted from `messages[].fix.range` and `messages[].fix.text`. `generic-regex` and fix-less
+diagnostics are reported as skipped unsupported fixes, not tool failures.
+
+| Field     | Type    | Required | Description                                                     |
+|-----------|---------|----------|-----------------------------------------------------------------|
+| `path`    | string  | no       | Workspace-relative file path; omit to inspect supported files   |
+| `unsafe`  | boolean | no       | Apply fixes with unsafe or unknown applicability                |
+| `dry_run` | boolean | no       | Return previews without writing files                           |
+
+**Dry-run request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 32,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lint_fix",
+    "arguments": { "path": "src/main.rs", "dry_run": true }
+  }
+}
+```
+
+**Apply request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 33,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lint_fix",
+    "arguments": { "path": "src/main.rs" }
+  }
+}
+```
+
+**Returns**
+
+```json
+{
+  "files_changed": 1,
+  "fixes_applied": 1,
+  "fixes_skipped": [
+    {
+      "path": "src/main.rs",
+      "reason": "unsafe",
+      "diagnostic": {
+        "path": "src/main.rs",
+        "line": 9,
+        "character": 14,
+        "endLine": 9,
+        "endCharacter": 17,
+        "severity": "warning",
+        "message": "suggestion is not machine-applicable",
+        "source": "rustc"
+      },
+      "supported_fix": true
+    }
+  ],
+  "remaining_diagnostics": [],
+  "previews": []
+}
+```
+
+`files_changed` counts distinct files for which Tower committed a non-dry-run edit. `fixes_applied`
+counts accepted fix records. `fixes_skipped` uses stable reasons: `conflict`, `unsafe`,
+`unsupported`, `cas_conflict`, and `invalid_range`. `remaining_diagnostics` is produced by one
+follow-up lint check after successful writes; `tower_lint_fix` does not run an iterative fix loop.
+
+Dry-run responses keep `files_changed` at `0` and include preview entries:
+
+```json
+{
+  "files_changed": 0,
+  "fixes_applied": 1,
+  "fixes_skipped": [],
+  "remaining_diagnostics": [],
+  "previews": [
+    {
+      "path": "src/main.rs",
+      "edits": [
+        { "start_byte": 6, "end_byte": 10, "replacement": "fixed" }
+      ],
+      "preview_content": "let fixed = true;\n"
+    }
+  ]
+}
+```
+
+Fix-tool failures return a stable error object in the tool payload rather than a JSON-RPC transport
+error when the request reached the extension:
+
+```json
+{
+  "error": {
+    "code": "lint_fix_apply_failed",
+    "message": "failed to apply lint fixes"
+  }
+}
+```
+
+Stable fix error codes are `lint_fix_unavailable`, `lint_fix_apply_failed`, and
+`lint_fix_invalid_request`.
 
 ---
 

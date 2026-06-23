@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use super::host_deps::HostDeps;
+use super::host_deps::{HostDeps, UnsupportedApplyEditsHost};
 use super::sidecar::SidecarHostAdapter;
 use crate::adapters::formatter::NoOpFormatQueue;
 use crate::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -35,7 +35,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Assumes `cargo build` (or `cargo test`) has already compiled it.
 fn test_helper_bin() -> String {
-    // CARGO_MANIFEST_DIR is core_engine's directory: .../tower/crates/core_engine
+    // CARGO_MANIFEST_DIR points at tower/crates/core_engine.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
         .parent() // crates/
@@ -57,6 +57,7 @@ fn make_deps(fs: InMemoryFs) -> HostDeps {
         fs: Arc::new(Mutex::new(fs)),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -66,6 +67,7 @@ fn make_deps_with_index(fs: InMemoryFs, index: InMemoryAstIndex) -> HostDeps {
         fs: Arc::new(Mutex::new(fs)),
         ast_index: Arc::new(index),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }

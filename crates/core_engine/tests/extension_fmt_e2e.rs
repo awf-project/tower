@@ -4,7 +4,7 @@
 //!
 //! - **EV1**: `event/fileChanged` delivers → `requestFormat` called with that path.
 //! - **EV2**: A `.tmp_write` path is NOT forwarded to `requestFormat`.
-//! - **T1**: `format` tool with `{"path":"x"}` → `{requested:1,...}`.
+//! - **T1**: `format` tool with `{"path":"x"}` → a one-file request count.
 //! - **T2**: `format` tool with `{}` → lists files and enqueues each, returns
 //!   aggregated counts.
 //! - **Stress**: Concurrent-spawn stress (≥ 20 iterations) to prove no
@@ -26,6 +26,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
 use core_engine::adapters::extension::{HostDeps, SidecarHostAdapter};
 use core_engine::adapters::formatter::{EnqueueResult, FormatQueuePort, NoOpFormatQueue};
 use core_engine::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -108,6 +109,7 @@ fn make_deps_with_recording(fq: RecordingFormatQueue) -> HostDeps {
         fs: Arc::new(Mutex::new(InMemoryFs::new())),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(fq),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -117,6 +119,7 @@ fn make_deps_with_fs_and_recording(fs: InMemoryFs, fq: RecordingFormatQueue) -> 
         fs: Arc::new(Mutex::new(fs)),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(fq),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -126,6 +129,7 @@ fn make_deps() -> HostDeps {
         fs: Arc::new(Mutex::new(InMemoryFs::new())),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -243,7 +247,7 @@ fn fmt_process_tmp_write_path_not_forwarded() {
 
 // ── T1: format tool with single path ─────────────────────────────────────────
 
-/// T1: `format` tool with `{"path":"src/lib.rs"}` → `{requested:1,...}` and
+/// T1: `format` tool with `{"path":"src/lib.rs"}` reports one request and
 /// enqueues exactly that path.
 #[test]
 fn fmt_tool_with_path_enqueues_one_file() {

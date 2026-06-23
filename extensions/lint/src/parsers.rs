@@ -8,6 +8,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::diagnostics::LintDiagnostic;
+use crate::fixes::{FixApplicability, LintByteEdit, LintFix, UnsupportedFix, UnsupportedFixReason};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParserError {
@@ -35,6 +36,176 @@ pub fn parse_linter_output(
             source_override,
         ),
     }
+}
+
+pub fn extract_linter_fixes(
+    format: ParserFormat,
+    input: &str,
+    workspace_root: &Path,
+    regex: Option<&str>,
+    source_override: Option<&str>,
+) -> Result<Vec<LintFix>, ParserError> {
+    match format {
+        ParserFormat::RustcJson => extract_rustc_fixes(input, workspace_root, source_override),
+        ParserFormat::EslintJson => extract_eslint_fixes(input, workspace_root, source_override),
+        ParserFormat::GenericRegex => extract_generic_regex_fixes(
+            input,
+            workspace_root,
+            regex.ok_or(ParserError::MissingCaptureGroup("regex"))?,
+            source_override,
+        ),
+    }
+}
+
+pub fn extract_rustc_fixes(
+    input: &str,
+    workspace_root: &Path,
+    source_override: Option<&str>,
+) -> Result<Vec<LintFix>, ParserError> {
+    let mut fixes = Vec::new();
+
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let value: Value = serde_json::from_str(line).map_err(|_| ParserError::InvalidJson)?;
+        if value.get("reason").and_then(Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let Some(diagnostic) =
+            rustc_diagnostic_from_message(message, workspace_root, source_override)?
+        else {
+            continue;
+        };
+        let Some(spans) = message.get("spans").and_then(Value::as_array) else {
+            fixes.push(unsupported_fix(
+                diagnostic,
+                UnsupportedFixReason::NoStructuredFix,
+            ));
+            continue;
+        };
+
+        let mut edits = Vec::new();
+        let mut applicability = FixApplicability::Safe;
+        for span in spans {
+            let Some(replacement) = span.get("suggested_replacement").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(start_byte) = span
+                .get("byte_start")
+                .and_then(Value::as_u64)
+                .and_then(to_usize)
+            else {
+                continue;
+            };
+            let Some(end_byte) = span
+                .get("byte_end")
+                .and_then(Value::as_u64)
+                .and_then(to_usize)
+            else {
+                continue;
+            };
+            let Some(file_name) = span.get("file_name").and_then(Value::as_str) else {
+                continue;
+            };
+            if normalize_workspace_path(file_name, workspace_root)? != diagnostic.path {
+                continue;
+            }
+
+            if span.get("applicability").and_then(Value::as_str) != Some("MachineApplicable") {
+                applicability = FixApplicability::Unsafe;
+            }
+            edits.push(LintByteEdit {
+                start_byte,
+                end_byte,
+                replacement: replacement.to_owned(),
+            });
+        }
+
+        if edits.is_empty() {
+            fixes.push(unsupported_fix(
+                diagnostic,
+                UnsupportedFixReason::NoStructuredFix,
+            ));
+        } else {
+            fixes.push(LintFix {
+                path: diagnostic.path.clone(),
+                edits,
+                applicability,
+                unsupported: None,
+                diagnostic,
+            });
+        }
+    }
+
+    finish_fixes(fixes)
+}
+
+pub fn extract_eslint_fixes(
+    input: &str,
+    workspace_root: &Path,
+    source_override: Option<&str>,
+) -> Result<Vec<LintFix>, ParserError> {
+    let value: Value = serde_json::from_str(input).map_err(|_| ParserError::InvalidJson)?;
+    let file_results: Vec<&Value> = match &value {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => vec![&value],
+        _ => return Err(ParserError::NoDiagnostics),
+    };
+    let mut fixes = Vec::new();
+
+    for file_result in file_results {
+        let Some(file_path) = file_result.get("filePath").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(messages) = file_result.get("messages").and_then(Value::as_array) else {
+            continue;
+        };
+        let path = normalize_workspace_path(file_path, workspace_root)?;
+
+        for message in messages {
+            let Some(diagnostic) = eslint_diagnostic_from_message(message, &path, source_override)
+            else {
+                continue;
+            };
+            let Some(edit) = eslint_edit_from_message(message) else {
+                if message.get("fix").is_none() {
+                    fixes.push(unsupported_fix(
+                        diagnostic,
+                        UnsupportedFixReason::NoStructuredFix,
+                    ));
+                }
+                continue;
+            };
+
+            fixes.push(LintFix {
+                path: diagnostic.path.clone(),
+                edits: vec![edit],
+                applicability: FixApplicability::Safe,
+                unsupported: None,
+                diagnostic,
+            });
+        }
+    }
+
+    finish_fixes(fixes)
+}
+
+pub fn extract_generic_regex_fixes(
+    input: &str,
+    workspace_root: &Path,
+    regex: &str,
+    source_override: Option<&str>,
+) -> Result<Vec<LintFix>, ParserError> {
+    let diagnostics = parse_generic_regex(input, workspace_root, regex, source_override)?;
+    finish_fixes(
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| unsupported_fix(diagnostic, UnsupportedFixReason::UnsupportedParser))
+            .collect(),
+    )
 }
 
 pub fn parse_rustc_json(
@@ -213,6 +384,112 @@ pub fn parse_generic_regex(
     finish(diagnostics)
 }
 
+fn rustc_diagnostic_from_message(
+    message: &Value,
+    workspace_root: &Path,
+    source_override: Option<&str>,
+) -> Result<Option<LintDiagnostic>, ParserError> {
+    let Some(span) = select_rustc_span(message.get("spans")) else {
+        return Ok(None);
+    };
+    let Some(file_name) = span.get("file_name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(message_text) = message.get("message").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(start_line) = one_based_u32(span.get("line_start")) else {
+        return Ok(None);
+    };
+    let Some(start_col) = one_based_u32(span.get("column_start")) else {
+        return Ok(None);
+    };
+    let end_line = one_based_u32(span.get("line_end")).unwrap_or(start_line);
+    let end_col = one_based_u32(span.get("column_end")).unwrap_or(start_col);
+    let code = message
+        .get("code")
+        .and_then(|code| code.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let source = source_override
+        .unwrap_or_else(|| rustc_default_source(code.as_deref()))
+        .to_owned();
+
+    Ok(Some(LintDiagnostic {
+        path: normalize_workspace_path(file_name, workspace_root)?,
+        diagnostic: Diagnostic {
+            range: range(start_line, start_col, end_line, end_col),
+            severity: rustc_severity(message.get("level").and_then(Value::as_str)),
+            message: message_text.to_owned(),
+            source: Some(source),
+            code,
+        },
+    }))
+}
+
+fn eslint_diagnostic_from_message(
+    message: &Value,
+    path: &str,
+    source_override: Option<&str>,
+) -> Option<LintDiagnostic> {
+    let message_text = message.get("message").and_then(Value::as_str)?;
+    let start_line = one_based_u32(message.get("line"))?;
+    let start_col = one_based_u32(message.get("column"))?;
+    let end_line = one_based_u32(message.get("endLine")).unwrap_or(start_line);
+    let end_col = one_based_u32(message.get("endColumn")).unwrap_or(start_col);
+
+    Some(LintDiagnostic {
+        path: path.to_owned(),
+        diagnostic: Diagnostic {
+            range: range(start_line, start_col, end_line, end_col),
+            severity: eslint_severity(message.get("severity").and_then(Value::as_i64)),
+            message: message_text.to_owned(),
+            source: Some(source_override.unwrap_or("eslint").to_owned()),
+            code: message
+                .get("ruleId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        },
+    })
+}
+
+fn eslint_edit_from_message(message: &Value) -> Option<LintByteEdit> {
+    let fix = message.get("fix")?;
+    let range = fix.get("range")?.as_array()?;
+    if range.len() != 2 {
+        return None;
+    }
+    let start_byte = range[0].as_u64().and_then(to_usize)?;
+    let end_byte = range[1].as_u64().and_then(to_usize)?;
+    if start_byte > end_byte {
+        return None;
+    }
+    let replacement = fix.get("text")?.as_str()?.to_owned();
+
+    Some(LintByteEdit {
+        start_byte,
+        end_byte,
+        replacement,
+    })
+}
+
+fn unsupported_fix(diagnostic: LintDiagnostic, reason: UnsupportedFixReason) -> LintFix {
+    LintFix {
+        path: diagnostic.path.clone(),
+        edits: Vec::new(),
+        applicability: FixApplicability::Unsupported,
+        unsupported: Some(UnsupportedFix {
+            supported_fix: false,
+            reason,
+        }),
+        diagnostic,
+    }
+}
+
+fn to_usize(value: u64) -> Option<usize> {
+    usize::try_from(value).ok()
+}
+
 fn select_rustc_span(spans: Option<&Value>) -> Option<&Value> {
     let spans = spans?.as_array()?;
     spans
@@ -386,6 +663,28 @@ fn finish(mut diagnostics: Vec<LintDiagnostic>) -> Result<Vec<LintDiagnostic>, P
             ))
     });
     Ok(diagnostics)
+}
+
+fn finish_fixes(mut fixes: Vec<LintFix>) -> Result<Vec<LintFix>, ParserError> {
+    if fixes.is_empty() {
+        return Err(ParserError::NoDiagnostics);
+    }
+
+    fixes.sort_by(|left, right| {
+        (
+            left.path.as_str(),
+            left.diagnostic.diagnostic.range.start.line,
+            left.diagnostic.diagnostic.range.start.character,
+            left.diagnostic.diagnostic.message.as_str(),
+        )
+            .cmp(&(
+                right.path.as_str(),
+                right.diagnostic.diagnostic.range.start.line,
+                right.diagnostic.diagnostic.range.start.character,
+                right.diagnostic.diagnostic.message.as_str(),
+            ))
+    });
+    Ok(fixes)
 }
 
 #[cfg(test)]
@@ -765,6 +1064,254 @@ mod tests {
                 ("src/b.rs", 0, 0, "later path"),
             ]
         );
+    }
+
+    #[test]
+    fn fixes_rs_exists_and_defines_public_lint_fix_byte_edit_applicability_and_unsupported_types() {
+        use crate::fixes::{
+            FixApplicability, LintByteEdit, LintFix, UnsupportedFix, UnsupportedFixReason,
+        };
+
+        let diagnostic = LintDiagnostic {
+            path: "src/lib.rs".to_owned(),
+            diagnostic: core_engine::domain::code_intel::Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 4,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 7,
+                    },
+                },
+                severity: Severity::Warning,
+                message: "replace it".to_owned(),
+                source: Some("rustc".to_owned()),
+                code: Some("unused".to_owned()),
+            },
+        };
+        let lint_fix = LintFix {
+            path: "src/lib.rs".to_owned(),
+            edits: vec![LintByteEdit {
+                start_byte: 12,
+                end_byte: 15,
+                replacement: "new".to_owned(),
+            }],
+            applicability: FixApplicability::Unsupported,
+            unsupported: Some(UnsupportedFix {
+                supported_fix: false,
+                reason: UnsupportedFixReason::NoStructuredFix,
+            }),
+            diagnostic,
+        };
+
+        assert_eq!(lint_fix.path, "src/lib.rs");
+        assert_eq!(lint_fix.edits[0].start_byte, 12);
+        assert_eq!(lint_fix.edits[0].end_byte, 15);
+        assert_eq!(lint_fix.edits[0].replacement, "new");
+        assert_eq!(lint_fix.applicability, FixApplicability::Unsupported);
+        assert_eq!(
+            lint_fix
+                .unsupported
+                .as_ref()
+                .map(|unsupported| { (unsupported.supported_fix, unsupported.reason.clone(),) }),
+            Some((false, UnsupportedFixReason::NoStructuredFix))
+        );
+        assert_eq!(FixApplicability::Safe, FixApplicability::Safe);
+        assert_eq!(FixApplicability::Unsafe, FixApplicability::Unsafe);
+        assert_eq!(
+            UnsupportedFixReason::UnsupportedParser,
+            UnsupportedFixReason::UnsupportedParser
+        );
+    }
+
+    #[test]
+    fn extract_rustc_fixes_extracts_suggested_replacement_spans_with_machine_applicable_as_safe_fixes()
+     {
+        use crate::fixes::FixApplicability;
+
+        let input = r#"{"reason":"compiler-message","message":{"message":"use `is_empty`","level":"warning","code":{"code":"clippy::len_zero"},"spans":[{"file_name":"/workspace/src/lib.rs","is_primary":true,"line_start":4,"column_start":8,"line_end":4,"column_end":17,"byte_start":42,"byte_end":51,"suggested_replacement":"items.is_empty()","applicability":"MachineApplicable"}]}}"#;
+
+        let fixes = extract_rustc_fixes(input, workspace_root(), None).assert_ok();
+
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].path, "src/lib.rs");
+        assert_eq!(fixes[0].applicability, FixApplicability::Safe);
+        assert_eq!(fixes[0].unsupported, None);
+        assert_eq!(fixes[0].edits.len(), 1);
+        assert_eq!(fixes[0].edits[0].start_byte, 42);
+        assert_eq!(fixes[0].edits[0].end_byte, 51);
+        assert_eq!(fixes[0].edits[0].replacement, "items.is_empty()");
+        assert_eq!(fixes[0].diagnostic.diagnostic.message, "use `is_empty`");
+    }
+
+    #[test]
+    fn extract_rustc_fixes_marks_maybe_incorrect_and_unknown_rustc_applicability_as_unsafe_fixes() {
+        use crate::fixes::FixApplicability;
+
+        let input = r#"{"reason":"compiler-message","message":{"message":"maybe replace","level":"warning","spans":[{"file_name":"/workspace/src/a.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":2,"byte_start":0,"byte_end":1,"suggested_replacement":"x","applicability":"MaybeIncorrect"}]}}
+{"reason":"compiler-message","message":{"message":"unknown applicability","level":"warning","spans":[{"file_name":"/workspace/src/b.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":2,"byte_start":2,"byte_end":3,"suggested_replacement":"y","applicability":"HasPlaceholders"}]}}"#;
+
+        let fixes = extract_rustc_fixes(input, workspace_root(), None).assert_ok();
+
+        assert_eq!(fixes.len(), 2);
+        assert_eq!(fixes[0].applicability, FixApplicability::Unsafe);
+        assert_eq!(fixes[1].applicability, FixApplicability::Unsafe);
+        assert_eq!(fixes[0].unsupported, None);
+        assert_eq!(fixes[1].unsupported, None);
+    }
+
+    #[test]
+    fn extract_rustc_fixes_preserves_diagnostics_without_suggestions_as_unsupported_no_structured_fix()
+     {
+        use crate::fixes::{FixApplicability, UnsupportedFix, UnsupportedFixReason};
+
+        let input = r#"{"reason":"compiler-message","message":{"message":"unused import","level":"warning","code":{"code":"unused_imports"},"spans":[{"file_name":"/workspace/src/lib.rs","is_primary":true,"line_start":2,"column_start":5,"line_end":2,"column_end":14}]}}"#;
+
+        let fixes = extract_rustc_fixes(input, workspace_root(), None).assert_ok();
+
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].path, "src/lib.rs");
+        assert_eq!(fixes[0].edits, Vec::new());
+        assert_eq!(fixes[0].applicability, FixApplicability::Unsupported);
+        assert_eq!(
+            fixes[0].unsupported,
+            Some(UnsupportedFix {
+                supported_fix: false,
+                reason: UnsupportedFixReason::NoStructuredFix,
+            })
+        );
+        assert_eq!(fixes[0].diagnostic.diagnostic.message, "unused import");
+    }
+
+    #[test]
+    fn extract_eslint_fixes_extracts_messages_fix_range_and_text_into_byte_edits_and_skips_malformed_ranges()
+     {
+        use crate::fixes::FixApplicability;
+
+        let input = r#"[{"filePath":"/workspace/web/app.js","messages":[{"ruleId":"semi","severity":2,"message":"Missing semicolon.","line":3,"column":12,"fix":{"range":[31,31],"text":";"}},{"ruleId":"quotes","severity":1,"message":"Expected single quotes.","line":4,"column":5,"fix":{"range":[44],"text":"'value'"}}]}]"#;
+
+        let fixes = extract_eslint_fixes(input, workspace_root(), None).assert_ok();
+
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].path, "web/app.js");
+        assert_eq!(fixes[0].applicability, FixApplicability::Safe);
+        assert_eq!(fixes[0].unsupported, None);
+        assert_eq!(fixes[0].edits.len(), 1);
+        assert_eq!(fixes[0].edits[0].start_byte, 31);
+        assert_eq!(fixes[0].edits[0].end_byte, 31);
+        assert_eq!(fixes[0].edits[0].replacement, ";");
+        assert_eq!(fixes[0].diagnostic.diagnostic.code.as_deref(), Some("semi"));
+    }
+
+    #[test]
+    fn extract_eslint_fixes_preserves_fixless_diagnostics_as_unsupported_no_structured_fix() {
+        use crate::fixes::{FixApplicability, UnsupportedFix, UnsupportedFixReason};
+
+        let input = r#"[{"filePath":"/workspace/web/app.js","messages":[{"ruleId":"no-console","severity":1,"message":"Unexpected console statement.","line":6,"column":9}]}]"#;
+
+        let fixes = extract_eslint_fixes(input, workspace_root(), None).assert_ok();
+
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].path, "web/app.js");
+        assert_eq!(fixes[0].edits, Vec::new());
+        assert_eq!(fixes[0].applicability, FixApplicability::Unsupported);
+        assert_eq!(
+            fixes[0].unsupported,
+            Some(UnsupportedFix {
+                supported_fix: false,
+                reason: UnsupportedFixReason::NoStructuredFix,
+            })
+        );
+        assert_eq!(
+            fixes[0].diagnostic.diagnostic.message,
+            "Unexpected console statement."
+        );
+        assert_eq!(
+            fixes[0].diagnostic.diagnostic.code.as_deref(),
+            Some("no-console")
+        );
+    }
+
+    #[test]
+    fn extract_generic_regex_fixes_reports_diagnostics_as_unsupported_parser_and_applies_no_edit_data()
+     {
+        use crate::fixes::{FixApplicability, UnsupportedFix, UnsupportedFixReason};
+
+        let input = "src/main.rs:7:13: warning W001: suspicious call";
+        let regex = r"(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<severity>\w+) (?P<code>\w+): (?P<message>.+)";
+
+        let fixes =
+            extract_generic_regex_fixes(input, workspace_root(), regex, Some("custom-lint"))
+                .assert_ok();
+
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].path, "src/main.rs");
+        assert_eq!(fixes[0].edits, Vec::new());
+        assert_eq!(fixes[0].applicability, FixApplicability::Unsupported);
+        assert_eq!(
+            fixes[0].unsupported,
+            Some(UnsupportedFix {
+                supported_fix: false,
+                reason: UnsupportedFixReason::UnsupportedParser,
+            })
+        );
+        assert_eq!(
+            fixes[0].diagnostic.diagnostic.source.as_deref(),
+            Some("custom-lint")
+        );
+    }
+
+    #[test]
+    fn fix_parser_output_remains_deterministically_sorted_by_existing_diagnostic_ordering_rules() {
+        let input = r#"[{"filePath":"/workspace/src/b.js","messages":[{"ruleId":"b","severity":1,"message":"later path","line":1,"column":1,"fix":{"range":[8,9],"text":"b"}}]},{"filePath":"/workspace/src/a.js","messages":[{"ruleId":"z","severity":1,"message":"z message","line":1,"column":1,"fix":{"range":[6,7],"text":"z"}},{"ruleId":"a","severity":1,"message":"a message","line":1,"column":1,"fix":{"range":[4,5],"text":"a"}},{"ruleId":"line","severity":1,"message":"later line","line":2,"column":1,"fix":{"range":[2,3],"text":"l"}},{"ruleId":"char","severity":1,"message":"later character","line":1,"column":2,"fix":{"range":[0,1],"text":"c"}}]}]"#;
+
+        let fixes = extract_eslint_fixes(input, workspace_root(), None).assert_ok();
+
+        let order: Vec<_> = fixes
+            .iter()
+            .map(|fix| {
+                (
+                    fix.path.as_str(),
+                    fix.diagnostic.diagnostic.range.start.line,
+                    fix.diagnostic.diagnostic.range.start.character,
+                    fix.diagnostic.diagnostic.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("src/a.js", 0, 0, "a message"),
+                ("src/a.js", 0, 0, "z message"),
+                ("src/a.js", 0, 1, "later character"),
+                ("src/a.js", 1, 0, "later line"),
+                ("src/b.js", 0, 0, "later path"),
+            ]
+        );
+    }
+
+    #[test]
+    fn fix_extraction_rejects_relative_diagnostic_paths_that_escape_the_workspace_root() {
+        let input = r#"{"reason":"compiler-message","message":{"message":"escaped","level":"warning","spans":[{"file_name":"../outside.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":2,"byte_start":0,"byte_end":1,"suggested_replacement":"x","applicability":"MachineApplicable"}]}}"#;
+
+        let error = extract_rustc_fixes(input, Path::new("."), None).assert_err();
+
+        assert_eq!(error, ParserError::UnsafePath("../outside.rs".to_owned()));
+    }
+
+    #[test]
+    fn public_parser_apis_preserve_existing_diagnostic_only_check_behavior_with_fix_payloads() {
+        let input = r#"{"reason":"compiler-message","message":{"message":"use `is_empty`","level":"warning","spans":[{"file_name":"/workspace/src/lib.rs","is_primary":true,"line_start":4,"column_start":8,"line_end":4,"column_end":17,"byte_start":42,"byte_end":51,"suggested_replacement":"items.is_empty()","applicability":"MachineApplicable"}]}}"#;
+
+        let diagnostics =
+            parse_linter_output(ParserFormat::RustcJson, input, workspace_root(), None, None)
+                .assert_ok();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path, "src/lib.rs");
+        assert_eq!(diagnostics[0].diagnostic.message, "use `is_empty`");
     }
 
     trait ParserResultExt<T> {

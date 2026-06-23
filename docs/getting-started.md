@@ -253,22 +253,31 @@ that has a matching lint configuration.
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{"path":"src/main.rs"}}}
 ```
 
+Call `tower_lint_fix` to apply structured fixes emitted by `rustc-json` or `eslint-json` linters.
+The lint extension does not run linter in-place mutation modes; fixes are sent through Tower's
+CAS-guarded atomic write path. Use `dry_run:true` to return previews without changing files, and
+`unsafe:true` only when you want to apply fixes marked unsafe or unknown by the linter.
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tower_lint_fix","arguments":{"path":"src/main.rs","dry_run":true}}}
+```
+
 ### Create a file
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
 ```
 
 ### Mass find-and-replace
 
 ```json
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
 ```
 
 Response shape (success):
 
 ```json
-{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"}]},"id":8}
+{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"}]},"id":10}
 ```
 
 All tool responses follow the same envelope: `result.content[0].text` is a JSON string containing

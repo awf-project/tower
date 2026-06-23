@@ -11,7 +11,8 @@ use core_engine::adapters::config::lint::{ParserFormat, TargetMode};
 
 use crate::config::RunnerLintConfig;
 use crate::diagnostics::LintDiagnostic;
-use crate::parsers::{ParserError, parse_linter_output};
+use crate::fixes::LintFix;
+use crate::parsers::{ParserError, extract_linter_fixes, parse_linter_output};
 
 const OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -29,6 +30,12 @@ pub struct RunRequest<'a> {
 pub struct RunOutcome {
     pub supported: bool,
     pub diagnostics: Vec<LintDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunFixOutcome {
+    pub supported: bool,
+    pub fixes: Vec<LintFix>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +61,64 @@ impl LintToolError {
 }
 
 pub fn run_linter(request: RunRequest<'_>) -> Result<RunOutcome, LintToolError> {
+    let (output, status_code, status_success) = run_linter_output(request)?;
+    if status_success && output.trim().is_empty() {
+        return Ok(RunOutcome {
+            supported: true,
+            diagnostics: Vec::new(),
+        });
+    }
+
+    match parse_linter_output(
+        request.config.format,
+        &output,
+        request.workspace_root,
+        request.config.regex.as_deref(),
+        request.config.source.as_deref(),
+    ) {
+        Ok(diagnostics) => Ok(RunOutcome {
+            supported: true,
+            diagnostics,
+        }),
+        Err(ParserError::NoDiagnostics) if status_success => Ok(RunOutcome {
+            supported: true,
+            diagnostics: Vec::new(),
+        }),
+        Err(error) => Err(map_parser_error(error, status_code)),
+    }
+}
+
+pub fn run_linter_fixes(request: RunRequest<'_>) -> Result<RunFixOutcome, LintToolError> {
+    let (output, status_code, status_success) = run_linter_output(request)?;
+    if status_success && output.trim().is_empty() {
+        return Ok(RunFixOutcome {
+            supported: true,
+            fixes: Vec::new(),
+        });
+    }
+
+    match extract_linter_fixes(
+        request.config.format,
+        &output,
+        request.workspace_root,
+        request.config.regex.as_deref(),
+        request.config.source.as_deref(),
+    ) {
+        Ok(fixes) => Ok(RunFixOutcome {
+            supported: true,
+            fixes,
+        }),
+        Err(ParserError::NoDiagnostics) if status_success => Ok(RunFixOutcome {
+            supported: true,
+            fixes: Vec::new(),
+        }),
+        Err(error) => Err(map_parser_error(error, status_code)),
+    }
+}
+
+fn run_linter_output(
+    request: RunRequest<'_>,
+) -> Result<(String, Option<i32>, bool), LintToolError> {
     validate_config(request.config)?;
 
     let args = command_args(request)?;
@@ -98,30 +163,7 @@ pub fn run_linter(request: RunRequest<'_>) -> Result<RunOutcome, LintToolError> 
     append_reader_output(&mut output, stdout)?;
     append_reader_output(&mut output, stderr)?;
     let output = String::from_utf8_lossy(&output);
-    if status.success() && output.trim().is_empty() {
-        return Ok(RunOutcome {
-            supported: true,
-            diagnostics: Vec::new(),
-        });
-    }
-
-    match parse_linter_output(
-        request.config.format,
-        &output,
-        request.workspace_root,
-        request.config.regex.as_deref(),
-        request.config.source.as_deref(),
-    ) {
-        Ok(diagnostics) => Ok(RunOutcome {
-            supported: true,
-            diagnostics,
-        }),
-        Err(ParserError::NoDiagnostics) if status.success() => Ok(RunOutcome {
-            supported: true,
-            diagnostics: Vec::new(),
-        }),
-        Err(error) => Err(map_parser_error(error, status.code())),
-    }
+    Ok((output.into_owned(), status.code(), status.success()))
 }
 
 fn validate_config(config: &RunnerLintConfig) -> Result<(), LintToolError> {
@@ -658,6 +700,29 @@ mod tests {
         assert_eq!(outcome.diagnostics.len(), 1);
         assert_eq!(outcome.diagnostics[0].path, "src/main.rs");
         assert_eq!(outcome.diagnostics[0].diagnostic.severity, Severity::Error);
+    }
+
+    #[test]
+    fn run_linter_keeps_structured_fix_payloads_diagnostic_only_until_fix_orchestration() {
+        let workspace = TestWorkspace::new();
+        let command = workspace.command(
+            "rustc_fix_payload.sh",
+            "#!/bin/sh\nprintf '%s\\n' '{\"reason\":\"compiler-message\",\"message\":{\"message\":\"use `is_empty`\",\"level\":\"warning\",\"code\":{\"code\":\"clippy::len_zero\"},\"spans\":[{\"file_name\":\"src/lib.rs\",\"is_primary\":true,\"line_start\":4,\"column_start\":8,\"line_end\":4,\"column_end\":17,\"byte_start\":42,\"byte_end\":51,\"suggested_replacement\":\"items.is_empty()\",\"applicability\":\"MachineApplicable\"}]}}'\n",
+        );
+        let mut config = regex_config(command, TargetMode::None);
+        config.format = ParserFormat::RustcJson;
+        config.regex = None;
+
+        let outcome = run_linter(request(&config, &workspace, None, None)).assert_ok();
+
+        assert!(outcome.supported);
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(outcome.diagnostics[0].path, "src/lib.rs");
+        assert_eq!(outcome.diagnostics[0].diagnostic.message, "use `is_empty`");
+        assert_eq!(
+            outcome.diagnostics[0].diagnostic.code.as_deref(),
+            Some("clippy::len_zero")
+        );
     }
 
     #[test]

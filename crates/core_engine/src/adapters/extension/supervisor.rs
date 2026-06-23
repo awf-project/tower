@@ -116,6 +116,7 @@ enum RespawnState {
 ///     fs: Arc::new(Mutex::new(InMemoryFs::new())),
 ///     ast_index: Arc::new(InMemoryAstIndex::new()),
 ///     format_queue: Arc::new(NoOpFormatQueue),
+///     apply_edits: Arc::new(core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost),
 ///     push_tx: None,
 /// };
 /// let _supervisor = ExtensionSupervisor::new(manifest, deps, Duration::from_secs(30));
@@ -223,6 +224,7 @@ impl ExtensionSupervisor {
             fs: std::sync::Arc::clone(&self.deps.fs),
             ast_index: std::sync::Arc::clone(&self.deps.ast_index),
             format_queue: std::sync::Arc::clone(&self.deps.format_queue),
+            apply_edits: std::sync::Arc::clone(&self.deps.apply_edits),
             push_tx: self.deps.push_tx.clone(),
         }
     }

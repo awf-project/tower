@@ -163,6 +163,10 @@ impl EngineState {
         self.extension_host = host;
     }
 
+    pub(crate) fn extension_host(&self) -> Arc<dyn ExtensionHostPort + Send + Sync> {
+        Arc::clone(&self.extension_host)
+    }
+
     /// Return a clone of the workspace `Arc` for sharing with the watcher.
     ///
     /// The watcher and MCP handlers operate on the **same** `ProjectWorkspace`

@@ -28,6 +28,7 @@ use std::time::Duration;
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
 use extension_protocol::{Event, ExtensionManifest};
 
+use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
 use core_engine::adapters::extension::{HostDeps, SidecarHostAdapter};
 use core_engine::adapters::formatter::NoOpFormatQueue;
 use core_engine::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -40,7 +41,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 // ── Binary path helpers ───────────────────────────────────────────────────────
 
 fn workspace_root() -> std::path::PathBuf {
-    // CARGO_MANIFEST_DIR = .../tower/crates/core_engine
+    // CARGO_MANIFEST_DIR points at tower/crates/core_engine.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     std::path::Path::new(manifest_dir)
         .parent() // crates/
@@ -77,6 +78,7 @@ fn make_deps(fs: InMemoryFs) -> HostDeps {
         fs: Arc::new(Mutex::new(fs)),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -87,6 +89,7 @@ fn make_deps_with_index(fs: InMemoryFs, index: InMemoryAstIndex) -> HostDeps {
         fs: Arc::new(Mutex::new(fs)),
         ast_index: Arc::new(index),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }

@@ -10,7 +10,10 @@ use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
-use crate::ports::inbound::{FileMutationUseCase, FileReplaceError, TxReport};
+use crate::ports::inbound::{
+    ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, FileMutationUseCase,
+    FileReplaceError, SkippedEdit, SkippedEditReason, TextEdit, TxReport,
+};
 use crate::ports::{ExtensionHostPort, FileSystemPort, PortError, StoragePort};
 
 // ── FileMutationService ───────────────────────────────────────────────────────
@@ -292,7 +295,7 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
     /// Trade-off: a crash after fs.delete but before storage.delete leaves a
     /// dangling storage entry (minor leak). The watcher heals it. A crash after
     /// storage.delete but before fs.delete would leave the file permanently
-    /// unreachable — we explicitly avoid that failure mode.
+    /// hidden from the domain API until a full rescan.
     ///
     /// # Errors
     ///
@@ -529,6 +532,74 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         self.edit_range(path, start_byte, end_byte, replacement)
     }
 
+    fn apply_edits_cas(
+        &mut self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError> {
+        let file_id = self
+            .workspace
+            .get_by_path(&request.path)
+            .ok_or(DomainError::NotFound)?;
+        let bytes = self.fs.read(&request.path).map_err(port_err_to_domain)?;
+        let actual = compute_content_version(&bytes);
+        if actual != request.expected_version {
+            return Err(DomainError::VersionConflict {
+                expected: request.expected_version,
+                actual,
+            });
+        }
+
+        let plan = plan_apply_edits(&request.path, &bytes, request.edits)?;
+        let new_version = if plan.applied.is_empty() {
+            None
+        } else {
+            let version = compute_content_version(plan.content.as_bytes());
+            self.commit_indexed_write(&request.path, file_id, plan.content.into_bytes())?;
+            Some(version)
+        };
+
+        Ok(ApplyEditsFileResult {
+            path: request.path,
+            applied: plan.applied,
+            skipped: plan.skipped,
+            new_version,
+            preview: None,
+        })
+    }
+
+    fn apply_edits_dry_run(
+        &self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError> {
+        if self.workspace.get_by_path(&request.path).is_none() {
+            return Err(DomainError::NotFound);
+        }
+        let bytes = self.fs.read(&request.path).map_err(port_err_to_domain)?;
+        let actual = compute_content_version(&bytes);
+        if actual != request.expected_version {
+            return Err(DomainError::VersionConflict {
+                expected: request.expected_version,
+                actual,
+            });
+        }
+
+        let plan = plan_apply_edits(&request.path, &bytes, request.edits)?;
+        let preview = ApplyEditsPreview {
+            path: request.path.clone(),
+            edits: plan.applied.clone(),
+            skipped: plan.skipped.clone(),
+            preview_content: plan.content,
+        };
+
+        Ok(ApplyEditsFileResult {
+            path: request.path,
+            applied: preview.edits.clone(),
+            skipped: preview.skipped.clone(),
+            new_version: None,
+            preview: Some(preview),
+        })
+    }
+
     fn global_replace_cas(
         &mut self,
         target: &str,
@@ -597,4 +668,238 @@ fn port_err_to_domain(err: PortError) -> DomainError {
         | PortError::ReadFailed(reason)
         | PortError::InvalidArgs(reason) => DomainError::IoError(reason),
     }
+}
+
+struct ApplyEditsPlan {
+    applied: Vec<TextEdit>,
+    skipped: Vec<SkippedEdit>,
+    content: String,
+}
+
+#[derive(Clone)]
+struct PlannedTextEdit {
+    edit: TextEdit,
+}
+
+fn plan_apply_edits(
+    path: &RelativePath,
+    bytes: &[u8],
+    edits: Vec<TextEdit>,
+) -> Result<ApplyEditsPlan, DomainError> {
+    let text = validate_apply_edits(path, bytes, &edits)?;
+    let (planned, skipped) = filter_conflicting_edits(edits);
+    let content = splice_text_edits(text, &planned);
+    let applied = planned.into_iter().map(|planned| planned.edit).collect();
+
+    Ok(ApplyEditsPlan {
+        applied,
+        skipped,
+        content,
+    })
+}
+
+fn validate_apply_edits<'a>(
+    path: &RelativePath,
+    bytes: &'a [u8],
+    edits: &[TextEdit],
+) -> Result<&'a str, DomainError> {
+    let len = bytes.len();
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        DomainError::InvalidRange(format!(
+            "{} is not UTF-8 text; apply_edits only edits text files ({e})",
+            path.as_str()
+        ))
+    })?;
+
+    for edit in edits {
+        if edit.start_byte > edit.end_byte {
+            return Err(DomainError::InvalidRange(format!(
+                "{}: start ({}) must be ≤ end ({})",
+                path.as_str(),
+                edit.start_byte,
+                edit.end_byte
+            )));
+        }
+        if edit.end_byte > len {
+            return Err(DomainError::InvalidRange(format!(
+                "{}: end ({}) exceeds file length ({len})",
+                path.as_str(),
+                edit.end_byte
+            )));
+        }
+        if !text.is_char_boundary(edit.start_byte) {
+            return Err(DomainError::InvalidRange(format!(
+                "{}: start byte {} is not on a UTF-8 character boundary",
+                path.as_str(),
+                edit.start_byte
+            )));
+        }
+        if !text.is_char_boundary(edit.end_byte) {
+            return Err(DomainError::InvalidRange(format!(
+                "{}: end byte {} is not on a UTF-8 character boundary",
+                path.as_str(),
+                edit.end_byte
+            )));
+        }
+    }
+
+    Ok(text)
+}
+
+fn filter_conflicting_edits(edits: Vec<TextEdit>) -> (Vec<PlannedTextEdit>, Vec<SkippedEdit>) {
+    let mut indexed: Vec<(usize, TextEdit)> = edits.into_iter().enumerate().collect();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        left.start_byte
+            .cmp(&right.start_byte)
+            .then_with(|| left.end_byte.cmp(&right.end_byte))
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    let mut applied_indexed: Vec<(usize, PlannedTextEdit)> = Vec::new();
+    let mut skipped_indexed: Vec<(usize, SkippedEdit)> = Vec::new();
+    let mut component: Vec<(usize, TextEdit)> = Vec::new();
+    let mut component_end: Option<usize> = None;
+
+    for (index, edit) in indexed {
+        match component_end {
+            None => {
+                component_end = Some(edit.end_byte);
+                component.push((index, edit));
+            }
+            Some(end) if edit.start_byte <= end => {
+                component_end = Some(end.max(edit.end_byte));
+                component.push((index, edit));
+            }
+            Some(_) => {
+                flush_conflict_component(
+                    &mut component,
+                    &mut applied_indexed,
+                    &mut skipped_indexed,
+                );
+                component_end = Some(edit.end_byte);
+                component.push((index, edit));
+            }
+        }
+    }
+    flush_conflict_component(&mut component, &mut applied_indexed, &mut skipped_indexed);
+
+    applied_indexed.sort_by(|(left_index, left), (right_index, right)| {
+        left.edit
+            .start_byte
+            .cmp(&right.edit.start_byte)
+            .then_with(|| left.edit.end_byte.cmp(&right.edit.end_byte))
+            .then_with(|| left_index.cmp(right_index))
+    });
+    skipped_indexed.sort_by(|(left_index, left), (right_index, right)| {
+        left.edit
+            .start_byte
+            .cmp(&right.edit.start_byte)
+            .then_with(|| left.edit.end_byte.cmp(&right.edit.end_byte))
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    (
+        applied_indexed.into_iter().map(|(_, edit)| edit).collect(),
+        skipped_indexed
+            .into_iter()
+            .map(|(_, skipped)| skipped)
+            .collect(),
+    )
+}
+
+fn flush_conflict_component(
+    component: &mut Vec<(usize, TextEdit)>,
+    applied: &mut Vec<(usize, PlannedTextEdit)>,
+    skipped: &mut Vec<(usize, SkippedEdit)>,
+) {
+    if component.is_empty() {
+        return;
+    }
+
+    let mut accepted: Vec<(usize, TextEdit)> = Vec::new();
+    let mut rejected: Vec<(usize, SkippedEdit)> = Vec::new();
+    for (index, edit) in component.drain(..) {
+        if accepted
+            .iter()
+            .all(|(_, accepted_edit)| !text_edits_conflict(accepted_edit, &edit))
+        {
+            accepted.push((index, edit));
+        } else {
+            rejected.push((
+                index,
+                SkippedEdit {
+                    edit,
+                    reason: SkippedEditReason::Conflict,
+                },
+            ));
+        }
+    }
+
+    if !rejected.is_empty()
+        && accepted.len() < 2
+        && !same_position_empty_insertions(&accepted, &rejected)
+    {
+        skipped.extend(accepted.into_iter().map(|(index, edit)| {
+            (
+                index,
+                SkippedEdit {
+                    edit,
+                    reason: SkippedEditReason::Conflict,
+                },
+            )
+        }));
+        skipped.extend(rejected);
+    } else {
+        applied.extend(
+            accepted
+                .into_iter()
+                .map(|(index, edit)| (index, PlannedTextEdit { edit })),
+        );
+        skipped.extend(rejected);
+    }
+}
+
+fn text_edits_conflict(left: &TextEdit, right: &TextEdit) -> bool {
+    if left.start_byte == left.end_byte && right.start_byte == right.end_byte {
+        return left.start_byte == right.start_byte;
+    }
+
+    left.start_byte < right.end_byte && right.start_byte < left.end_byte
+}
+
+fn same_position_empty_insertions(
+    accepted: &[(usize, TextEdit)],
+    rejected: &[(usize, SkippedEdit)],
+) -> bool {
+    let Some((_, accepted_edit)) = accepted.first() else {
+        return false;
+    };
+    let is_empty_at = |edit: &TextEdit, byte| edit.start_byte == byte && edit.end_byte == byte;
+    let byte = accepted_edit.start_byte;
+
+    is_empty_at(accepted_edit, byte)
+        && rejected
+            .iter()
+            .all(|(_, skipped)| is_empty_at(&skipped.edit, byte))
+}
+
+fn splice_text_edits(text: &str, applied: &[PlannedTextEdit]) -> String {
+    let mut spliced = text.to_owned();
+    let mut descending = applied.to_vec();
+    descending.sort_by(|left, right| {
+        right
+            .edit
+            .start_byte
+            .cmp(&left.edit.start_byte)
+            .then_with(|| right.edit.end_byte.cmp(&left.edit.end_byte))
+    });
+
+    for planned in descending {
+        spliced.replace_range(
+            planned.edit.start_byte..planned.edit.end_byte,
+            &planned.edit.replacement,
+        );
+    }
+
+    spliced
 }

@@ -116,6 +116,7 @@ rejected with a protocol error.
 | `list_files`           | `workspace/listFiles`      | `FileSystemPort`    | Enumerate indexed workspace files. |
 | `index_get`            | `index/get`                | `AstIndexPort`      | Read a value from the AST index cache (e.g. key `ast/<path>`). |
 | `index_put`            | `index/put`                | `AstIndexPort`      | Write bytes to the AST index cache. |
+| `request_apply_edits`  | `workspace/applyEdits`     | `ApplyEditsHostPort`| Apply one file's byte edits through the host's CAS-guarded atomic mutation path, or preview them when `dry_run:true` is set. |
 | `request_format`       | `workspace/requestFormat`  | `FormatQueuePort`   | Enqueue a workspace file for formatting. |
 | `notify`               | `notify/resourceUpdated`   | MCP push channel    | Push a `notifications/resources/updated` event to subscribed MCP clients (best-effort, no round trip). |
 | `log`                  | `log`                      | host logging        | Emit a log line (`trace`/`debug`/`info`/`warn`/`error`) through the host. |
@@ -266,7 +267,7 @@ The reference extensions live in `extensions/`:
 | `extensions/hello` | lazy       | Minimal example — a single `greet` tool, no events, no capabilities. The smallest possible extension. |
 | `extensions/ast`   | eager      | Tree-sitter AST analysis. Subscribes to `fileIndexed`/`fileChanged`, uses `read_file`/`list_files`/`index_get`/`index_put`/`log`. Tools: `get_outline`, `find_symbols`, `search_symbols`, `reindex`, `read_symbol`. |
 | `extensions/lsp`   | lazy       | Language-server bridge. Subscribes to `fileChanged`/`fileDeleted`, uses `read_file`/`notify`/`log`. Tools: `diagnostics`, `definition`, `references`, `hover`. |
-| `extensions/lint`  | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`log`, runs configured external linters read-only, and returns LSP-shaped diagnostics. Tool: `check`. |
+| `extensions/lint`  | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`request_apply_edits`/`log`, runs configured external linters read-only, returns LSP-shaped diagnostics, and applies structured fixes through the host. Tools: `check`, `fix`. |
 
 The `lint` extension is configured from `<workspace>/.tower/config.toml` under `[lint.<language>]`.
 Each entry declares a command, file extensions, parser format, and target mode:
@@ -280,8 +281,8 @@ format = "rustc-json"
 target = "none"
 ```
 
-See [mcp-tools.md](mcp-tools.md#standalone-lint-tools) for the `tower_lint_check` wire contract and
-the full lint configuration reference.
+See [mcp-tools.md](mcp-tools.md#standalone-lint-tools) for the `tower_lint_check` and
+`tower_lint_fix` wire contracts and the full lint configuration reference.
 
 ### Minimal walkthrough (`hello`)
 

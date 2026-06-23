@@ -23,15 +23,16 @@ use std::time::Duration;
 
 use extension_protocol::envelope::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use extension_protocol::{
-    Capability, ExtensionFault, ExtensionManifest, InitParams, InitResult, PROTOCOL_VERSION,
-    Response,
+    Capability, ExtensionFault, ExtensionManifest, HostCall, InitParams, InitResult,
+    PROTOCOL_VERSION, Response,
 };
 use serde_json::Value;
 
 use super::host_deps::HostDeps;
 use super::path_validation::validate_capability_path;
 use crate::adapters::mcp::PushEvent;
-use crate::domain::ExtensionInstance;
+use crate::domain::{DomainError, ExtensionInstance, RelativePath};
+use crate::ports::inbound::{ApplyEditsRequest, TextEdit};
 
 // ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -441,7 +442,7 @@ impl ExtensionInstance for SidecarHostAdapter {
     }
 
     fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionFault> {
-        // Build the flat wire params: {"name": ..., "params": ...}
+        // Build the flat wire params with the tool name and original params.
         let flat_params = serde_json::json!({"name": name, "params": params});
 
         let raw = self.send_request("invokeTool", flat_params)?;
@@ -795,6 +796,68 @@ fn dispatch_host_call(
                 }
             }
         }
+        "workspace/applyEdits" => {
+            if !allowed_caps.contains(&Capability::RequestApplyEdits) {
+                return encode_response_err(
+                    call_id,
+                    -32603,
+                    "capability 'request_apply_edits' not declared".to_owned(),
+                );
+            }
+            let call = match decode_apply_edits_host_call(params) {
+                Ok(call) => call,
+                Err(e) => return encode_response_err(call_id, -32602, e),
+            };
+            let HostCall::RequestApplyEdits {
+                path,
+                expected_version,
+                edits,
+                dry_run,
+            } = call
+            else {
+                return encode_response_err(
+                    call_id,
+                    -32602,
+                    "invalid_params: workspace/applyEdits decoded to a different HostCall"
+                        .to_owned(),
+                );
+            };
+
+            if let Err(e) = validate_apply_edits_request_params(&path, &expected_version, &edits) {
+                return encode_response_err(call_id, -32602, e);
+            }
+            let domain_edits: Vec<TextEdit> = edits
+                .into_iter()
+                .map(|edit| TextEdit {
+                    start_byte: edit.start_byte,
+                    end_byte: edit.end_byte,
+                    replacement: edit.replacement,
+                })
+                .collect();
+            let range_context = apply_edits_range_context(&domain_edits);
+            let request = ApplyEditsRequest {
+                path: RelativePath::new(path.clone()),
+                expected_version,
+                edits: domain_edits,
+            };
+
+            let result = if dry_run {
+                deps.apply_edits.apply_edits_dry_run(request)
+            } else {
+                deps.apply_edits.apply_edits_cas(request)
+            };
+            match result {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(value) => encode_response_ok(call_id, value),
+                    Err(e) => encode_response_err(
+                        call_id,
+                        -32603,
+                        format!("apply_edits serialization failed: {e}"),
+                    ),
+                },
+                Err(e) => encode_apply_edits_error(call_id, e, &path, &range_context),
+            }
+        }
         "log" => {
             // Log capability: emit to stderr (host-side, structured).
             // No capability check — log is always allowed.
@@ -829,6 +892,72 @@ fn dispatch_host_call(
     }
 }
 
+fn decode_apply_edits_host_call(params: Value) -> Result<HostCall, String> {
+    let mut object = match params {
+        Value::Object(object) => object,
+        _ => {
+            return Err("invalid_params: workspace/applyEdits params must be an object".to_owned());
+        }
+    };
+    object.insert(
+        "type".to_owned(),
+        Value::String("RequestApplyEdits".to_owned()),
+    );
+    serde_json::from_value(Value::Object(object))
+        .map_err(|e| format!("invalid_params: workspace/applyEdits params are malformed: {e}"))
+}
+
+fn validate_apply_edits_request_params(
+    path: &str,
+    expected_version: &str,
+    edits: &[extension_protocol::messages::ApplyEditsHostCallTextEdit],
+) -> Result<(), String> {
+    validate_capability_path(path).map_err(|e| format!("invalid_params: {e}"))?;
+    if expected_version.len() != 64 || !expected_version.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "invalid_params: expected_version must be a 64-character SHA-256 hex string".to_owned(),
+        );
+    }
+    for edit in edits {
+        if edit.start_byte > edit.end_byte {
+            return Err(format!(
+                "invalid_range: path={path}, start_byte={} exceeds end_byte={}",
+                edit.start_byte, edit.end_byte
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_edits_range_context(edits: &[TextEdit]) -> String {
+    edits
+        .iter()
+        .map(|edit| format!("start_byte={}, end_byte={}", edit.start_byte, edit.end_byte))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn encode_apply_edits_error(
+    call_id: Value,
+    error: DomainError,
+    path: &str,
+    range_context: &str,
+) -> String {
+    match error {
+        DomainError::VersionConflict { expected, actual } => encode_response_err(
+            call_id,
+            -32009,
+            format!("precondition_failed: path={path}, expected={expected}, actual={actual}"),
+        ),
+        DomainError::InvalidRange(reason) => encode_response_err(
+            call_id,
+            -32602,
+            format!("invalid_range: path={path}, ranges=[{range_context}]: {reason}"),
+        ),
+        other => encode_response_err(call_id, -32603, format!("apply_edits: {other}")),
+    }
+}
+
 // ── Capability string helpers ─────────────────────────────────────────────────
 
 fn capability_to_str(cap: &Capability) -> &'static str {
@@ -838,6 +967,7 @@ fn capability_to_str(cap: &Capability) -> &'static str {
         Capability::IndexGet => "index_get",
         Capability::IndexPut => "index_put",
         Capability::RequestFormat => "request_format",
+        Capability::RequestApplyEdits => "request_apply_edits",
         Capability::Log => "log",
         Capability::Notify => "notify",
     }
@@ -850,6 +980,7 @@ fn str_to_capability(s: &str) -> Option<Capability> {
         "index_get" => Some(Capability::IndexGet),
         "index_put" => Some(Capability::IndexPut),
         "request_format" => Some(Capability::RequestFormat),
+        "request_apply_edits" => Some(Capability::RequestApplyEdits),
         "log" => Some(Capability::Log),
         "notify" => Some(Capability::Notify),
         _ => None,
@@ -861,32 +992,438 @@ fn str_to_capability(s: &str) -> Option<Capability> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::mpsc;
 
+    use serde_json::Value;
     use serde_json::json;
 
     use super::{HostDeps, dispatch_host_call};
+    use crate::adapters::extension::host_deps::ApplyEditsHostPort;
     use crate::adapters::formatter::NoOpFormatQueue;
     use crate::adapters::mcp::PushEvent;
     use crate::adapters::{InMemoryAstIndex, InMemoryFs};
+    use crate::domain::{DomainError, RelativePath};
+    use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest, TextEdit};
     use extension_protocol::Capability;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedApplyEditsCall {
+        Apply(ApplyEditsRequest),
+        DryRun(ApplyEditsRequest),
+    }
+
+    struct RecordingApplyEditsHost {
+        calls: Mutex<Vec<RecordedApplyEditsCall>>,
+        result: ApplyEditsFileResult,
+    }
+
+    impl RecordingApplyEditsHost {
+        fn new(result: ApplyEditsFileResult) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                result,
+            }
+        }
+
+        fn calls(&self) -> Vec<RecordedApplyEditsCall> {
+            self.calls.lock().expect("call recorder lock").clone()
+        }
+    }
+
+    impl Default for RecordingApplyEditsHost {
+        fn default() -> Self {
+            Self::new(successful_apply_edits_result("src/main.rs"))
+        }
+    }
+
+    impl ApplyEditsHostPort for RecordingApplyEditsHost {
+        fn apply_edits_cas(
+            &self,
+            request: ApplyEditsRequest,
+        ) -> Result<ApplyEditsFileResult, DomainError> {
+            self.calls
+                .lock()
+                .expect("call recorder lock")
+                .push(RecordedApplyEditsCall::Apply(request));
+            Ok(self.result.clone())
+        }
+
+        fn apply_edits_dry_run(
+            &self,
+            request: ApplyEditsRequest,
+        ) -> Result<ApplyEditsFileResult, DomainError> {
+            self.calls
+                .lock()
+                .expect("call recorder lock")
+                .push(RecordedApplyEditsCall::DryRun(request));
+            Ok(self.result.clone())
+        }
+    }
+
+    struct VersionConflictApplyEditsHost;
+
+    impl ApplyEditsHostPort for VersionConflictApplyEditsHost {
+        fn apply_edits_cas(
+            &self,
+            _request: ApplyEditsRequest,
+        ) -> Result<ApplyEditsFileResult, DomainError> {
+            Err(DomainError::VersionConflict {
+                expected: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                actual: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+            })
+        }
+
+        fn apply_edits_dry_run(
+            &self,
+            _request: ApplyEditsRequest,
+        ) -> Result<ApplyEditsFileResult, DomainError> {
+            panic!("stale CAS regression test must route through apply_edits_cas")
+        }
+    }
+
+    fn successful_apply_edits_result(path: &str) -> ApplyEditsFileResult {
+        ApplyEditsFileResult {
+            path: RelativePath::new(path),
+            applied: vec![TextEdit {
+                start_byte: 0,
+                end_byte: 0,
+                replacement: "use std::fmt;\n".to_owned(),
+            }],
+            skipped: Vec::new(),
+            new_version: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+            preview: None,
+        }
+    }
 
     fn make_deps_with_push(push_tx: mpsc::Sender<PushEvent>) -> HostDeps {
         HostDeps {
             fs: Arc::new(std::sync::Mutex::new(InMemoryFs::new())),
             ast_index: Arc::new(InMemoryAstIndex::new()),
             format_queue: Arc::new(NoOpFormatQueue),
+            apply_edits: Arc::new(RecordingApplyEditsHost::default()),
             push_tx: Some(push_tx),
         }
     }
 
     fn make_deps_no_push() -> HostDeps {
+        make_deps_no_push_with_apply_edits(Arc::new(RecordingApplyEditsHost::default()))
+    }
+
+    fn make_deps_no_push_with_apply_edits(apply_edits: Arc<dyn ApplyEditsHostPort>) -> HostDeps {
         HostDeps {
             fs: Arc::new(std::sync::Mutex::new(InMemoryFs::new())),
             ast_index: Arc::new(InMemoryAstIndex::new()),
             format_queue: Arc::new(NoOpFormatQueue),
+            apply_edits,
             push_tx: None,
         }
+    }
+
+    fn parse_response(frame: &str) -> Value {
+        serde_json::from_str(frame.trim()).expect("parse response frame")
+    }
+
+    fn response_error(response: &Value) -> (i64, String) {
+        let error = response
+            .get("error")
+            .expect("response must contain JSON-RPC error");
+        let code = error
+            .get("code")
+            .and_then(Value::as_i64)
+            .expect("error code must be numeric");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("error message must be a string")
+            .to_owned();
+        (code, message)
+    }
+
+    fn production_sidecar_source() -> &'static str {
+        include_str!("sidecar.rs")
+            .split("// ── Unit tests")
+            .next()
+            .expect("sidecar production source prefix")
+    }
+
+    #[test]
+    fn request_apply_edits_host_deps_contract_surface_is_declared() {
+        let source = include_str!("host_deps.rs");
+
+        assert!(
+            source.contains("pub trait ApplyEditsHostPort: Send + Sync"),
+            "host_deps.rs must define public object-safe ApplyEditsHostPort"
+        );
+        assert!(
+            source.contains(
+                "apply_edits_cas(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>"
+            ),
+            "ApplyEditsHostPort must expose apply_edits_cas with the domain DTOs"
+        );
+        assert!(
+            source.contains(
+                "apply_edits_dry_run(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>"
+            ),
+            "ApplyEditsHostPort must expose apply_edits_dry_run with the domain DTOs"
+        );
+        assert!(
+            source.contains("pub apply_edits: Arc<dyn ApplyEditsHostPort>"),
+            "HostDeps must expose the apply-edits dependency as an Arc trait object"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_undeclared_capability_is_rejected_before_mutation() {
+        let deps = make_deps_no_push();
+        let response_frame = dispatch_host_call(
+            "workspace/applyEdits",
+            json!(41),
+            json!({
+                "path": "src/main.rs",
+                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": [
+                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                ],
+                "dry_run": false
+            }),
+            &deps,
+            &[],
+        );
+
+        let response = parse_response(&response_frame);
+        let (code, message) = response_error(&response);
+        assert_eq!(code, -32603);
+        assert!(
+            message.contains("capability 'request_apply_edits' not declared"),
+            "undeclared RequestApplyEdits must fail with the capability error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_invalid_path_and_malformed_expected_version_are_invalid_params() {
+        let deps = make_deps_no_push();
+        let allowed_caps = vec![Capability::RequestApplyEdits];
+
+        for path in ["/tmp/escape.rs", "../escape.rs"] {
+            let response_frame = dispatch_host_call(
+                "workspace/applyEdits",
+                json!(42),
+                json!({
+                    "path": path,
+                    "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "edits": [
+                        {"start_byte": 0, "end_byte": 0, "replacement": "x"}
+                    ],
+                    "dry_run": false
+                }),
+                &deps,
+                &allowed_caps,
+            );
+
+            let response = parse_response(&response_frame);
+            let (code, message) = response_error(&response);
+            assert_eq!(code, -32602, "invalid path {path:?} must be invalid params");
+            assert!(
+                message.starts_with("invalid_params:") || message.contains("path"),
+                "invalid path response must include validation context, got: {message}"
+            );
+        }
+
+        let malformed_version_response = dispatch_host_call(
+            "workspace/applyEdits",
+            json!(43),
+            json!({
+                "path": "src/main.rs",
+                "expected_version": null,
+                "edits": [
+                    {"start_byte": 0, "end_byte": 0, "replacement": "x"}
+                ],
+                "dry_run": false
+            }),
+            &deps,
+            &allowed_caps,
+        );
+
+        let response = parse_response(&malformed_version_response);
+        let (code, message) = response_error(&response);
+        assert_eq!(code, -32602);
+        assert!(
+            message.starts_with("invalid_params:"),
+            "malformed expected_version must fail closed as invalid_params, got: {message}"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_malformed_params_decode_to_invalid_params() {
+        let deps = make_deps_no_push();
+        let allowed_caps = vec![Capability::RequestApplyEdits];
+
+        let response_frame = dispatch_host_call(
+            "workspace/applyEdits",
+            json!(44),
+            json!({
+                "path": "src/main.rs",
+                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": "not-an-edit-list",
+                "dry_run": false
+            }),
+            &deps,
+            &allowed_caps,
+        );
+
+        let response = parse_response(&response_frame);
+        let (code, message) = response_error(&response);
+        assert_eq!(
+            code, -32602,
+            "malformed RequestApplyEdits params must be JSON-RPC invalid params"
+        );
+        assert!(
+            message.starts_with("invalid_params:"),
+            "malformed RequestApplyEdits params must include invalid_params context, got: {message}"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_stale_cas_maps_to_precondition_failed() {
+        let deps = make_deps_no_push_with_apply_edits(Arc::new(VersionConflictApplyEditsHost));
+        let allowed_caps = vec![Capability::RequestApplyEdits];
+
+        let response_frame = dispatch_host_call(
+            "workspace/applyEdits",
+            json!(44),
+            json!({
+                "path": "src/main.rs",
+                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": [
+                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                ],
+                "dry_run": false
+            }),
+            &deps,
+            &allowed_caps,
+        );
+
+        let response = parse_response(&response_frame);
+        let (code, message) = response_error(&response);
+        assert_eq!(
+            code, -32009,
+            "stale CAS must map to the JSON-RPC precondition failed code"
+        );
+        assert!(
+            message.starts_with("precondition_failed:"),
+            "stale CAS must use the precondition_failed message prefix, got: {message}"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_range_validation_errors_include_invalid_range_context() {
+        let source = production_sidecar_source();
+
+        assert!(
+            source.contains("DomainError::InvalidRange"),
+            "dispatch_host_call must explicitly map range and UTF-8 validation failures"
+        );
+        assert!(
+            source.contains("invalid_range:"),
+            "InvalidRange must serialize with invalid_range prefix"
+        );
+        assert!(
+            source.contains("start_byte") && source.contains("end_byte"),
+            "invalid range responses must preserve range context"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_dry_run_success_routes_once_and_serializes_domain_result() {
+        let result = successful_apply_edits_result("src/main.rs");
+        let apply_edits = Arc::new(RecordingApplyEditsHost::new(result.clone()));
+        let deps = make_deps_no_push_with_apply_edits(apply_edits.clone());
+        let allowed_caps = vec![Capability::RequestApplyEdits];
+
+        let response_frame = dispatch_host_call(
+            "workspace/applyEdits",
+            json!(45),
+            json!({
+                "path": "src/main.rs",
+                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": [
+                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                ],
+                "dry_run": true
+            }),
+            &deps,
+            &allowed_caps,
+        );
+
+        let response = parse_response(&response_frame);
+        assert_eq!(
+            response.get("result"),
+            Some(&serde_json::to_value(&result).expect("serialize domain apply-edits result")),
+            "successful dispatch must serialize the domain ApplyEditsFileResult directly"
+        );
+        assert_eq!(
+            apply_edits.calls(),
+            vec![RecordedApplyEditsCall::DryRun(ApplyEditsRequest {
+                path: RelativePath::new("src/main.rs"),
+                expected_version:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                edits: vec![TextEdit {
+                    start_byte: 0,
+                    end_byte: 0,
+                    replacement: "use std::fmt;\n".to_owned(),
+                }],
+            })],
+            "dry_run:true must route exactly once to the dry-run dependency path"
+        );
+    }
+
+    #[test]
+    fn request_apply_edits_apply_success_routes_once_and_serializes_domain_result() {
+        let result = successful_apply_edits_result("src/main.rs");
+        let apply_edits = Arc::new(RecordingApplyEditsHost::new(result.clone()));
+        let deps = make_deps_no_push_with_apply_edits(apply_edits.clone());
+        let allowed_caps = vec![Capability::RequestApplyEdits];
+
+        let response_frame = dispatch_host_call(
+            "workspace/applyEdits",
+            json!(46),
+            json!({
+                "path": "src/main.rs",
+                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": [
+                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                ],
+                "dry_run": false
+            }),
+            &deps,
+            &allowed_caps,
+        );
+
+        let response = parse_response(&response_frame);
+        assert_eq!(
+            response.get("result"),
+            Some(&serde_json::to_value(&result).expect("serialize domain apply-edits result")),
+            "successful dispatch must serialize the domain ApplyEditsFileResult directly"
+        );
+        assert_eq!(
+            apply_edits.calls(),
+            vec![RecordedApplyEditsCall::Apply(ApplyEditsRequest {
+                path: RelativePath::new("src/main.rs"),
+                expected_version:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                edits: vec![TextEdit {
+                    start_byte: 0,
+                    end_byte: 0,
+                    replacement: "use std::fmt;\n".to_owned(),
+                }],
+            })],
+            "dry_run:false must route exactly once to the mutating apply dependency path"
+        );
     }
 
     /// Spec 27 O1: `notify/resourceUpdated` HostCall dispatches to the push channel.

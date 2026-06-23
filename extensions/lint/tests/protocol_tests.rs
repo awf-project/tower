@@ -27,6 +27,39 @@ fn protocol_rs_defines_the_lint_tool_dtos_and_skips_absent_error() {
     );
 
     let result = CheckResult {
+        supported: true,
+        diagnostics: vec![LintDiagnosticDto {
+            path: "src/lib.rs".to_owned(),
+            line: 3,
+            character: 7,
+            end_line: 3,
+            end_character: 16,
+            severity: "warning".to_owned(),
+            code: Some("clippy::len_zero".to_owned()),
+            message: "use `is_empty`".to_owned(),
+            source: Some("rustc".to_owned()),
+        }],
+        error: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize diagnostic-only result"),
+        json!({
+            "supported": true,
+            "diagnostics": [{
+                "path": "src/lib.rs",
+                "line": 3,
+                "character": 7,
+                "endLine": 3,
+                "endCharacter": 16,
+                "severity": "warning",
+                "code": "clippy::len_zero",
+                "message": "use `is_empty`",
+                "source": "rustc"
+            }]
+        })
+    );
+
+    let result = CheckResult {
         supported: false,
         diagnostics: Vec::new(),
         error: Some(LintToolErrorResponse {

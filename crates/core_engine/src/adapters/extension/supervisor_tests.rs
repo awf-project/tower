@@ -17,7 +17,7 @@ use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSectio
 use extension_protocol::{ExtensionFault, ExtensionManifest};
 use serde_json::json;
 
-use super::host_deps::HostDeps;
+use super::host_deps::{HostDeps, UnsupportedApplyEditsHost};
 use super::sidecar::SidecarHostAdapter;
 use super::supervisor::ExtensionSupervisor;
 use crate::adapters::formatter::NoOpFormatQueue;
@@ -53,6 +53,7 @@ fn make_deps() -> HostDeps {
         fs: Arc::new(Mutex::new(InMemoryFs::new())),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -85,7 +86,7 @@ fn ac1_initialize_timeout_returns_fault_host_survives() {
     let result = SidecarHostAdapter::spawn(manifest, make_deps(), short);
 
     // spawn returns Result<Box<dyn ExtensionInstance>, ExtensionFault>.
-    // Box<dyn ExtensionInstance> does not implement Debug, so extract with .err().
+    // Box<dyn ExtensionInstance> lacks Debug, so extract the error.
     assert!(result.is_err(), "hang-forever must return a fault");
     let fault = result.err().expect("just checked is_err()");
     assert!(
