@@ -10,6 +10,13 @@
 command = "rust-analyzer"
 extensions = ["rs"]
 
+[lint.rust]
+command = "cargo"
+args = ["clippy", "--message-format=json", "--quiet"]
+extensions = ["rs"]
+format = "rustc-json"
+target = "none"
+
 [extensions]
 # Plugin file stems to skip loading, e.g. ["ast"].
 # A disabled extension gets no sandbox, no fuel, no tools, no watcher hooks.

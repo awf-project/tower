@@ -8,7 +8,9 @@
 //! Absent file → `TowerConfig::default()` (silent). Present but unreadable or
 //! invalid (bad TOML / unknown key) → `Err` → the binary fails fast (exit 1).
 
+pub mod lint;
 pub mod lsp;
+pub use lint::{LintCommandConfig, LintConfig, ParserFormat, TargetMode};
 pub use lsp::{LspConfig, LspServerConfig, parse_lsp_config};
 
 use std::collections::BTreeMap;
@@ -31,6 +33,8 @@ pub struct TowerConfig {
     /// rather than calling `parse_lsp_config` again.
     #[serde(default)]
     pub lsp: LspConfig,
+    #[serde(default)]
+    pub lint: LintConfig,
     /// `[extensions]` section — sidecar extension runtime settings (spec 24).
     ///
     /// Absent → `ExtensionConfig::default()` (30-second timeout).

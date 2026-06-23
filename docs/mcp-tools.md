@@ -84,7 +84,7 @@ version and capability advertisement.
 Enumerate every available tool. The response lists the native `tower_*` tools
 plus any namespaced tools contributed by discovered extensions (e.g.
 `"tower_ast_get_outline"` from the `ast` extension, `"tower_lsp_diagnostics"` from
-the `lsp` extension).
+the `lsp` extension, or `"tower_lint_check"` from the `lint` extension).
 
 **Request**
 
@@ -703,7 +703,7 @@ compiler/linter diagnostics. Use after editing a file to verify the change.
 }
 ```
 
-`severity` is one of `error`, `warning`, `information`, `hint`. No backend or
+`severity` is one of `error`, `warning`, `info`, `hint`. No backend or
 unsupported language → `{"supported": false, "diagnostics": []}`.
 
 ### tower_lsp_definition
@@ -756,6 +756,130 @@ Get hover information (type/doc) for the symbol at a position. Same arguments as
 The range fields are present only when the server reports one. No symbol under the
 cursor → `{"supported": true, "hover": null}`. No backend / unsupported →
 `{"supported": false, "hover": null}`.
+
+---
+
+## Standalone lint tools
+
+The `lint` extension (manifest `name = "lint"`) runs configured external linters on demand and
+returns diagnostics using the same response vocabulary as `tower_lsp_diagnostics`. The extension
+declares only read/list/log capabilities and does not mutate workspace files.
+
+Configure linters in `<workspace>/.tower/config.toml`:
+
+```toml
+[lint.rust]
+command = "cargo"
+args = ["clippy", "--message-format=json"]
+extensions = ["rs"]
+format = "rustc-json"
+target = "none"
+
+[lint.javascript]
+command = "eslint"
+args = ["--format", "json"]
+extensions = ["js", "jsx", "ts", "tsx"]
+format = "eslint-json"
+target = "append"
+```
+
+Supported `format` values are `rustc-json`, `eslint-json`, and `generic-regex`. Supported `target`
+values are:
+
+| Value | Behavior |
+|-------|----------|
+| `append` | Append the target path to the configured command arguments |
+| `stdin` | Read the target file through Tower and pass its content to command stdin |
+| `none` | Run the command without a per-file path; the linter output must identify files |
+
+For `generic-regex`, set `regex` to a pattern with named capture groups. Required groups are
+`file`, `line`, `col`, and `message`; optional groups include `endLine`, `endCol`, `severity`, and
+`code`. `source` may be set to override the diagnostic source string.
+
+### tower_lint_check
+
+Run configured standalone linters for one file or for every indexed file with a matching
+configuration.
+
+| Field  | Type   | Required | Description                                                |
+|--------|--------|----------|------------------------------------------------------------|
+| `path` | string | no       | Workspace-relative file path; omit to lint supported files |
+
+**Single-file request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lint_check",
+    "arguments": { "path": "src/main.rs" }
+  }
+}
+```
+
+**Workspace request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 31,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lint_check",
+    "arguments": {}
+  }
+}
+```
+
+**Returns**
+
+```json
+{
+  "supported": true,
+  "diagnostics": [
+    {
+      "path": "src/main.rs",
+      "line": 9,
+      "character": 14,
+      "endLine": 9,
+      "endCharacter": 17,
+      "severity": "error",
+      "message": "cannot find value `foo`",
+      "source": "rustc",
+      "code": "E0425"
+    }
+  ]
+}
+```
+
+`line`, `character`, `endLine`, and `endCharacter` are zero-based. `severity` is one of `error`,
+`warning`, `info`, or `hint`. Workspace lint results are sorted deterministically by path and then
+position.
+
+A file with no matching `[lint.<language>]` configuration returns a successful unsupported result:
+
+```json
+{ "supported": false, "diagnostics": [] }
+```
+
+Runner failures are also returned as successful tool results with a stable lint error object, so MCP
+clients can branch without treating expected lint-runner failures as transport failures:
+
+```json
+{
+  "supported": false,
+  "diagnostics": [],
+  "error": {
+    "code": "lint_missing_binary",
+    "message": "lint command is unavailable"
+  }
+}
+```
+
+Stable lint error codes are `lint_missing_binary`, `lint_unparseable_output`, `lint_nonzero_exit`,
+`lint_timeout`, and `lint_invalid_config`.
 
 ---
 

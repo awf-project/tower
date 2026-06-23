@@ -104,6 +104,8 @@ extensions/                Native sidecar extensions (separate binaries)
 ├── hello/                 Minimal example extension (lazy; greet tool)
 ├── lsp/                   Language-server bridge extension (lazy)
 │                          Tools: diagnostics, definition, references, hover
+├── lint/                  Standalone linter extension (lazy)
+│                          Tool: check; runs configured external linters read-only
 └── fixtures/              Test-only fault-isolation fixtures
 ```
 

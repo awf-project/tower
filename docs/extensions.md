@@ -266,6 +266,22 @@ The reference extensions live in `extensions/`:
 | `extensions/hello` | lazy       | Minimal example — a single `greet` tool, no events, no capabilities. The smallest possible extension. |
 | `extensions/ast`   | eager      | Tree-sitter AST analysis. Subscribes to `fileIndexed`/`fileChanged`, uses `read_file`/`list_files`/`index_get`/`index_put`/`log`. Tools: `get_outline`, `find_symbols`, `search_symbols`, `reindex`, `read_symbol`. |
 | `extensions/lsp`   | lazy       | Language-server bridge. Subscribes to `fileChanged`/`fileDeleted`, uses `read_file`/`notify`/`log`. Tools: `diagnostics`, `definition`, `references`, `hover`. |
+| `extensions/lint`  | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`log`, runs configured external linters read-only, and returns LSP-shaped diagnostics. Tool: `check`. |
+
+The `lint` extension is configured from `<workspace>/.tower/config.toml` under `[lint.<language>]`.
+Each entry declares a command, file extensions, parser format, and target mode:
+
+```toml
+[lint.rust]
+command = "cargo"
+args = ["clippy", "--message-format=json"]
+extensions = ["rs"]
+format = "rustc-json"
+target = "none"
+```
+
+See [mcp-tools.md](mcp-tools.md#standalone-lint-tools) for the `tower_lint_check` wire contract and
+the full lint configuration reference.
 
 ### Minimal walkthrough (`hello`)
 

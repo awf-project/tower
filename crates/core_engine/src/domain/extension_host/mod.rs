@@ -425,6 +425,37 @@ impl ExtensionRegistry {
             .find(|h| h.manifest.tools.iter().any(|t| t.name == tool_name))
             .ok_or_else(|| InvokeError::ToolNotFound(tool_name.to_owned()))?;
 
+        Self::invoke_handle(handle, tool_name, params)
+    }
+
+    /// Invoke a tool declared by a specific extension.
+    ///
+    /// The MCP merge layer has already matched the fully namespaced public tool
+    /// name, so it must preserve that extension identity when local tool names
+    /// collide across extensions.
+    pub fn invoke_extension(
+        &self,
+        extension_id: &ExtensionId,
+        tool_name: &str,
+        params: Value,
+    ) -> Result<Value, InvokeError> {
+        let handle = self
+            .handles
+            .iter()
+            .find(|h| {
+                h.manifest.name == extension_id.as_str()
+                    && h.manifest.tools.iter().any(|t| t.name == tool_name)
+            })
+            .ok_or_else(|| InvokeError::ToolNotFound(tool_name.to_owned()))?;
+
+        Self::invoke_handle(handle, tool_name, params)
+    }
+
+    fn invoke_handle(
+        handle: &ExtensionHandle,
+        tool_name: &str,
+        params: Value,
+    ) -> Result<Value, InvokeError> {
         if handle.is_quarantined() {
             return Err(InvokeError::Fault(ExtensionFault::Quarantined));
         }
@@ -918,6 +949,22 @@ mod tests {
             .invoke("diagnostics", Value::Null)
             .expect("lsp/diagnostics");
         assert_eq!(r_b, Value::String("lsp".to_owned()), "must route to lsp");
+    }
+
+    #[test]
+    fn invoke_extension_routes_duplicate_local_tool_name_by_extension_id() {
+        let ext_a = IdentifyingExtension::new("fmt", vec![make_tool("check")]);
+        let ext_b = IdentifyingExtension::new("lint", vec![make_tool("check")]);
+
+        let mut registry = ExtensionRegistry::new();
+        registry.register(Box::new(ext_a)).expect("register fmt");
+        registry.register(Box::new(ext_b)).expect("register lint");
+
+        let result = registry
+            .invoke_extension(&ExtensionId::new("lint"), "check", Value::Null)
+            .expect("lint/check");
+
+        assert_eq!(result, Value::String("lint".to_owned()));
     }
 
     /// Invoking a non-existent tool returns ToolNotFound.

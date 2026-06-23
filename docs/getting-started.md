@@ -49,7 +49,8 @@ cargo build            # or: make build
 ```
 
 The host binary produced is `target/debug/tower`; the reference extension binaries
-(`ast_extension`, `hello_extension`, `lsp_extension`) are also under `target/debug/`.
+(`ast_extension`, `hello_extension`, `lsp_extension`, `lint_extension`) are also under
+`target/debug/`.
 
 ---
 
@@ -174,8 +175,9 @@ Expected response:
 ```
 
 The response lists the native `tower_*` tools plus any tools contributed by discovered extensions
-(e.g. `tower_ast_get_outline`, `tower_ast_find_symbols` when the `ast` extension is present).
-Extension tools are always namespaced as `tower_<ext>_<tool_name>`.
+(e.g. `tower_ast_get_outline` when the `ast` extension is present, or `tower_lint_check`
+when the `lint` extension is present). Extension tools are always namespaced as
+`tower_<ext>_<tool_name>`.
 
 Extensions are native sidecar binaries discovered from an extension scope by their `extension.toml`
 manifest. Install one (its binary + manifest) into a scope and restart `tower` — no recompile of the
@@ -223,16 +225,44 @@ for the manifest schema, capabilities, activation, and the supervision/fault mod
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"src/main.rs"}}}
 ```
 
+### Run standalone linters
+
+Configure linters in `<workspace>/.tower/config.toml` under `[lint.<language>]`. The extension
+matches files by extension and runs the configured command read-only.
+
+```toml
+[lint.rust]
+command = "cargo"
+args = ["clippy", "--message-format=json"]
+extensions = ["rs"]
+format = "rustc-json"
+target = "none"
+
+[lint.javascript]
+command = "eslint"
+args = ["--format", "json"]
+extensions = ["js", "jsx", "ts", "tsx"]
+format = "eslint-json"
+target = "append"
+```
+
+Call `tower_lint_check` with a path to lint one file, or with `{}` to lint every indexed file
+that has a matching lint configuration.
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{"path":"src/main.rs"}}}
+```
+
 ### Create a file
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
 ```
 
 ### Mass find-and-replace
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
 ```
 
 Response shape (success):
