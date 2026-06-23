@@ -48,7 +48,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::debounce::debounce_events;
@@ -57,12 +58,6 @@ use super::event_processor::{EventProcessor, WatchEvent};
 use crate::domain::index::InvertedIndex;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::ports::{DocumentSyncPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
-
-/// Capacity of the internal event channel.
-///
-/// A small buffer is sufficient because the worker thread drains it
-/// continuously. A larger buffer would increase memory usage without benefit.
-const CHANNEL_CAPACITY: usize = 256;
 
 /// OS-backed filesystem watcher adapter (spec 06).
 ///
@@ -163,7 +158,7 @@ impl NotifyWatcherAdapter {
         doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
         echo_set: Arc<Mutex<HashMap<String, ()>>>,
     ) -> Result<Self, WatcherError> {
-        let (tx, rx): (Sender<WatchEvent>, Receiver<WatchEvent>) = bounded(CHANNEL_CAPACITY);
+        let (tx, rx): (Sender<WatchEvent>, Receiver<WatchEvent>) = unbounded();
 
         // Clone root for the notify callback closure.
         let root_for_callback = root.clone();
@@ -184,13 +179,14 @@ impl NotifyWatcherAdapter {
                         raw_to_watch_events(event, &root_for_callback);
                     let coalesced = debounce_events(raw_events);
                     for watch_event in coalesced {
-                        // If the channel is full, drop the event rather than
-                        // blocking the notify callback thread (which could
-                        // deadlock the OS event queue).
-                        if tx_for_callback.try_send(watch_event).is_err() {
-                            // Channel full or closed — log and continue.
+                        // This is an unbounded channel: sending does not wait for
+                        // the worker to finish extension callbacks. Deletion
+                        // events are index-correctness signals, so dropping them
+                        // under backpressure would create permanent ghosts.
+                        if tx_for_callback.send(watch_event).is_err() {
+                            // Channel closed during shutdown — log and continue.
                             eprintln!(
-                                "[tower/watcher] event channel full or closed; dropping event"
+                                "[tower/watcher] event channel closed during shutdown; dropping event"
                             );
                         }
                     }
@@ -215,9 +211,8 @@ impl NotifyWatcherAdapter {
         // panicking `ExtensionHostPort` or `StoragePort` implementation does not
         // kill the worker thread permanently. Without this, a panic inside
         // `process_event` (e.g. from a misbehaving extension host) terminates
-        // the worker thread; subsequent OS events fill the bounded channel (256
-        // slots) and are then silently dropped, causing the workspace to diverge
-        // from disk indefinitely.
+        // the worker thread; subsequent OS events are no longer applied, causing
+        // the workspace to diverge from disk indefinitely.
         //
         // Trade-off: `AssertUnwindSafe` is required because `EventProcessor`
         // holds `Box<dyn ...>` trait objects whose unwind safety we cannot
@@ -316,6 +311,21 @@ fn raw_to_watch_events(event: Event, _root: &PathBuf) -> Vec<WatchEvent> {
 
     match event.kind {
         EventKind::Create(_) => paths.into_iter().map(WatchEvent::Create).collect(),
+
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            paths.into_iter().map(WatchEvent::Delete).collect()
+        }
+
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            paths.into_iter().map(WatchEvent::Create).collect()
+        }
+
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if paths.len() == 2 => {
+            let mut paths = paths.into_iter();
+            let from = paths.next().expect("len checked");
+            let to = paths.next().expect("len checked");
+            vec![WatchEvent::Rename { from, to }]
+        }
 
         EventKind::Modify(_) => paths.into_iter().map(WatchEvent::Modify).collect(),
 
@@ -424,6 +434,57 @@ mod tests {
         assert_eq!(
             result,
             vec![WatchEvent::Delete(PathBuf::from("/root/b.rs"))]
+        );
+    }
+
+    /// Rename-from modify events are deletion signals for the old path.
+    #[test]
+    fn raw_to_watch_events_rename_from_is_delete() {
+        use notify::event::EventAttributes;
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            paths: vec![PathBuf::from("/root/old.rs")],
+            attrs: EventAttributes::default(),
+        };
+        let result = raw_to_watch_events(event, &PathBuf::from("/root"));
+        assert_eq!(
+            result,
+            vec![WatchEvent::Delete(PathBuf::from("/root/old.rs"))]
+        );
+    }
+
+    /// Rename-to modify events are creation signals for the new path.
+    #[test]
+    fn raw_to_watch_events_rename_to_is_create() {
+        use notify::event::EventAttributes;
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            paths: vec![PathBuf::from("/root/new.rs")],
+            attrs: EventAttributes::default(),
+        };
+        let result = raw_to_watch_events(event, &PathBuf::from("/root"));
+        assert_eq!(
+            result,
+            vec![WatchEvent::Create(PathBuf::from("/root/new.rs"))]
+        );
+    }
+
+    /// A paired rename event preserves source and destination in one WatchEvent.
+    #[test]
+    fn raw_to_watch_events_rename_both_is_rename() {
+        use notify::event::EventAttributes;
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            paths: vec![PathBuf::from("/root/old.rs"), PathBuf::from("/root/new.rs")],
+            attrs: EventAttributes::default(),
+        };
+        let result = raw_to_watch_events(event, &PathBuf::from("/root"));
+        assert_eq!(
+            result,
+            vec![WatchEvent::Rename {
+                from: PathBuf::from("/root/old.rs"),
+                to: PathBuf::from("/root/new.rs"),
+            }]
         );
     }
 

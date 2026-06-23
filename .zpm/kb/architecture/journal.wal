@@ -1,0 +1,40 @@
+{"ts":1782212310,"op":"retractall","clause":"arch_component(_,_,_,'feature_f001_directory_listing')"}
+{"ts":1782212310,"op":"retractall","clause":"arch_port(_,_,'feature_f001_directory_listing')"}
+{"ts":1782212310,"op":"retractall","clause":"arch_decision(_,_,_,_,'feature_f001_directory_listing')"}
+{"ts":1782212310,"op":"retractall","clause":"arch_convention(_,_,_,'feature_f001_directory_listing')"}
+{"ts":1782212310,"op":"retractall","clause":"arch_adr(_,_,'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_feature('feature_f001_directory_listing',_,_)"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('adapters', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('adapters', infrastructure, '', 'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('config', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('config', infrastructure, '', 'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('daemon', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('daemon', infrastructure, '', 'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('mcp', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('mcp', infrastructure, '', 'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('watcher', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('watcher', infrastructure, '', 'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('domain', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('domain', domain, '', 'feature_f001_directory_listing')"}
+{"ts":1782212311,"op":"retractall","clause":"arch_component('index', _, _, _)"}
+{"ts":1782212311,"op":"assert","clause":"arch_component('index', domain, '', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_decision('dec_list_dir_search_usecase', _, _, _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_decision('dec_list_dir_search_usecase', 'directory listing', 'implement list_dir as SearchUseCase/FileSearch behavior over ProjectWorkspace tracked paths', 'preserves domain purity, keeps MCP as an adapter, and avoids adding a filesystem walk or FileSystemPort method', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_decision('dec_list_dir_prefix_synthesis', _, _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_decision('dec_list_dir_prefix_synthesis', 'directory listing model', 'derive directory entries from tracked file path prefixes', 'Tower tracks files rather than directories, so prefix synthesis provides deterministic navigation while inheriting ignore and temporary-file exclusion semantics', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_decision('dec_not_a_directory_error', _, _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_decision('dec_not_a_directory_error', 'list_dir error semantics', 'represent tracked-file listing attempts with DomainError::NotADirectory mapped to MCP InvalidParams', 'the path exists but is semantically invalid as a directory, so NotFound would misclassify the failure', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_decision('dec_shared_workspace_daemon', _, _, _, _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_decision('dec_shared_workspace_daemon', 'MCP process model', 'route tower mcp through a per-workspace connect-or-spawn daemon over a Unix socket', 'multiple clients share one Sled index, watcher, extension registry, and MCP session state instead of spawning isolated engines per client', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_decision('dec_watcher_lossless_deletes', _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_decision('dec_watcher_lossless_deletes', 'watcher index correctness', 'treat deletion-related events as non-droppable index-correctness signals', 'dropping Delete or rename-derived deletion events under backpressure leaves stale indexed entries until reindex or startup reconciliation', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_convention('conv_list_dir_response_shape', _, _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_convention('conv_list_dir_response_shape', 'MCP native tools', 'tower_list_dir returns machine-readable JSON entries with path, name, and kind; client-specific tree rendering stays out of the tool', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_convention('conv_list_dir_missing_prefix', _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_convention('conv_list_dir_missing_prefix', 'directory listing', 'missing or untracked list_dir prefixes return an empty entries array rather than an error', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_convention('conv_native_tool_surface_tests', _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_convention('conv_native_tool_surface_tests', 'MCP native tool tests', 'native tool names and counts should be derived from EXPECTED_NATIVE_TOOL_NAMES instead of duplicated numeric literals', 'feature_f001_directory_listing')"}
+{"ts":1782212312,"op":"retractall","clause":"arch_convention('conv_daemon_wire', _, _, _, _)"}
+{"ts":1782212312,"op":"assert","clause":"arch_convention('conv_daemon_wire', 'daemon socket protocol', 'daemon socket clients send one newline-delimited JSON handshake first, and protocol version changes require bumping PROTOCOL_VERSION', 'feature_f001_directory_listing')"}
+{"ts":1782212313,"op":"retractall","clause":"arch_convention('conv_daemon_idle_config', _, _, _)"}
+{"ts":1782212313,"op":"assert","clause":"arch_convention('conv_daemon_idle_config', 'daemon config', '[daemon].idle_timeout_secs defaults to 30 seconds and unknown daemon config keys are rejected', 'feature_f001_directory_listing')"}

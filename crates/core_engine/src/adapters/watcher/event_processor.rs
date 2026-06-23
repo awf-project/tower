@@ -312,6 +312,12 @@ impl EventProcessor {
             return self.handle_delete(abs_path);
         }
 
+        if let Err(e) = std::fs::metadata(&abs_path)
+            && e.kind() == std::io::ErrorKind::NotFound
+        {
+            return self.handle_delete(abs_path);
+        }
+
         let metadata = read_metadata(&abs_path);
         let new_tokens = tokenize(rel_path.as_str());
 
@@ -425,7 +431,7 @@ impl EventProcessor {
         }
 
         // OP1: broadcast after VFS update commits (delete side).
-        self.extension_host.on_file_changed(file_id, &rel_path);
+        self.extension_host.on_file_deleted(&rel_path);
 
         Ok(())
     }
@@ -688,24 +694,28 @@ mod tests {
 
     use super::*;
     use crate::adapters::in_memory_storage::InMemoryStorage;
-    use crate::domain::index::InvertedIndex;
+    use crate::domain::index::{FileSearch, InvertedIndex};
     use crate::domain::workspace::ProjectWorkspace;
     use crate::ports::NoOpExtensionHost;
+    use crate::ports::inbound::SearchUseCase as _;
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
-    /// An `ExtensionHostPort` that records calls to `on_file_changed`.
+    /// An `ExtensionHostPort` that records file lifecycle notifications.
     #[derive(Debug, Default)]
     struct RecordingExtensionHost {
-        calls: std::sync::Mutex<Vec<(crate::domain::FileId, RelativePath)>>,
+        changed: std::sync::Mutex<Vec<(crate::domain::FileId, RelativePath)>>,
+        deleted: std::sync::Mutex<Vec<RelativePath>>,
     }
 
     impl ExtensionHostPort for RecordingExtensionHost {
         fn on_file_indexed(&self, _id: crate::domain::FileId, _path: &RelativePath) {}
         fn on_file_changed(&self, id: crate::domain::FileId, path: &RelativePath) {
-            self.calls.lock().unwrap().push((id, path.clone()));
+            self.changed.lock().unwrap().push((id, path.clone()));
         }
-        fn on_file_deleted(&self, _path: &RelativePath) {}
+        fn on_file_deleted(&self, path: &RelativePath) {
+            self.deleted.lock().unwrap().push(path.clone());
+        }
         fn declared_tools(
             &self,
         ) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
@@ -997,6 +1007,36 @@ mod tests {
         );
     }
 
+    /// Some OS/editor combinations report deletion of a tracked path as Modify.
+    /// If the path no longer exists, Modify must clean up the tracked entry.
+    #[test]
+    fn modify_on_deleted_tracked_path_removes_file_from_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let file_path = root.join("deleted_by_modify.rs");
+        std::fs::write(&file_path, b"fn gone() {}").unwrap();
+
+        let (mut processor, workspace, index) = make_processor(root);
+        processor
+            .process_event(WatchEvent::Create(file_path.clone()))
+            .unwrap();
+
+        std::fs::remove_file(&file_path).unwrap();
+        processor
+            .process_event(WatchEvent::Modify(file_path))
+            .unwrap();
+
+        let ws_guard = workspace.read().unwrap();
+        let idx_guard = index.read().unwrap();
+        let results = FileSearch::new(&idx_guard, &ws_guard)
+            .find_file("deleted_by_modify")
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "Modify on a deleted tracked path must remove it from search; got {results:?}"
+        );
+    }
+
     /// Delete on an unknown path is a silent no-op (not an error).
     #[test]
     fn delete_unknown_path_is_noop() {
@@ -1249,7 +1289,7 @@ mod tests {
             .process_event(WatchEvent::Modify(file_path))
             .unwrap();
 
-        let calls = recording.calls.lock().unwrap();
+        let calls = recording.changed.lock().unwrap();
         assert_eq!(
             calls.len(),
             2,
@@ -1258,9 +1298,9 @@ mod tests {
         );
     }
 
-    /// OP1: on_file_changed is broadcast after Delete.
+    /// OP1: on_file_deleted is broadcast after Delete.
     #[test]
-    fn extension_host_notified_after_delete() {
+    fn extension_host_deleted_after_delete() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let file_path = root.join("soon_deleted.rs");
@@ -1281,12 +1321,18 @@ mod tests {
             .process_event(WatchEvent::Delete(file_path))
             .unwrap();
 
-        let calls = recording.calls.lock().unwrap();
+        let changed = recording.changed.lock().unwrap();
+        let deleted = recording.deleted.lock().unwrap();
         assert_eq!(
-            calls.len(),
-            2,
-            "on_file_changed must be called for both Create and Delete; got {} call(s)",
-            calls.len()
+            changed.len(),
+            1,
+            "on_file_changed must only be called for Create; got {} call(s)",
+            changed.len()
+        );
+        assert_eq!(
+            deleted.as_slice(),
+            &[RelativePath::new("soon_deleted.rs")],
+            "on_file_deleted must be called for Delete"
         );
     }
 

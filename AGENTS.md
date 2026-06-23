@@ -39,10 +39,10 @@ extensions/                 # Out-of-process sidecar extensions (all are workspa
 ## Commands (available after spec 00)
 
 ```bash
+cargo build --workspace --bins               # builds native sidecar binaries into target/debug/
 cargo test --workspace                       # domain unit tests use in-memory doubles (zero disk I/O);
-                                             # also compiles every native extension binary into target/debug/
-                                             # so host e2e/integration tests can spawn the real sidecars
-cargo clippy --workspace -- -D warnings      # warnings are errors
+                                             # host e2e/integration tests spawn the prebuilt sidecars
+cargo clippy --workspace --all-targets -- -D warnings  # warnings are errors
 cargo fmt --check
 cargo deny check                             # license/advisory policy
 cargo run -p core_engine                     # MCP server over stdio
@@ -52,8 +52,8 @@ tower status                                 # snapshot of the running daemon
 tower shutdown                               # stop the running daemon
 ```
 
-**Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy -- -D warnings`
-+ `cargo test --workspace` all green. State it with evidence, never assume.
+**Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings`
++ `cargo build --workspace --bins` + `cargo test --workspace` all green. State it with evidence, never assume.
 
 ## MCP tool surface (JSON-RPC over stdio)
 

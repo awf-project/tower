@@ -17,7 +17,7 @@
 //!    extension binary via `SidecarHostAdapter`, register survivors. A missing or
 //!    empty scope yields no extensions; a single bad extension is skipped with a
 //!    stderr warning and never aborts startup.
-//! 6. Serve the 9 native `tower_*` tools PLUS any extension tools (namespaced
+//! 6. Serve the native `tower_*` tools PLUS any extension tools (namespaced
 //!    `tower_<ext>_<tool>`) over real `stdin` / `stdout` via an
 //!    `ExtensionMergedRegistry`.
 //!

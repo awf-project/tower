@@ -88,11 +88,17 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
     match hs.role {
         ClientRole::Mcp => {
             let (handler, sub) = build_handler(&ctx);
+            ctx.registry.register_initializing();
             let running = match serve_server(handler, (read_half, write_half)).await {
                 Ok(r) => r,
-                Err(_) => return,
+                Err(_) => {
+                    ctx.registry.unregister_initializing();
+                    return;
+                }
             };
-            let id = ctx.registry.register(running.peer().clone(), sub);
+            let id = ctx
+                .registry
+                .register_initialized(running.peer().clone(), sub);
             let _ = running.waiting().await;
             ctx.registry.unregister(id);
         }

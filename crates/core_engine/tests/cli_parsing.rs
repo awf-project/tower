@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use core_engine::adapters::cli::{Cli, Command, GlobalOpts, resolve_workspace_root};
+use core_engine::adapters::cli::{Cli, Command, resolve_workspace_root};
 
 fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(args).expect("args parse")
@@ -69,14 +69,4 @@ fn version_flag_is_recognized() {
 #[test]
 fn unknown_subcommand_is_rejected() {
     assert!(Cli::try_parse_from(["tower", "bogus"]).is_err());
-}
-
-// Local helper so the test file does not need to construct GlobalOpts by hand
-// when it only cares about defaults.
-#[allow(dead_code)]
-fn default_opts() -> GlobalOpts {
-    GlobalOpts {
-        workspace_dir: None,
-        extensions_dir: None,
-    }
 }

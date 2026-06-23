@@ -113,9 +113,15 @@ async fn relay_mcp(stream: UnixStream) -> std::io::Result<()> {
         tokio::io::copy(&mut sr, &mut stdout).await?;
         stdout.flush().await
     };
+
+    tokio::pin!(up);
+    tokio::pin!(down);
     tokio::select! {
-        r = up => r,
-        r = down => r,
+        r = &mut up => {
+            r?;
+            down.await
+        }
+        r = &mut down => r,
     }
 }
 

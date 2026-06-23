@@ -107,8 +107,9 @@ extensions/                Native sidecar extensions (separate binaries)
 └── fixtures/              Test-only fault-isolation fixtures
 ```
 
-The reference extensions are ordinary native binaries — `cargo test --workspace` compiles each one and
-the host locates them under `target/debug/`. There is no WASM build step and no WASI SDK.
+The reference extensions are ordinary native binaries. `cargo build --workspace --bins`
+builds them under `target/debug/` before tests that spawn them. There is no WASM build
+step and no WASI SDK.
 
 ## Ports in detail
 

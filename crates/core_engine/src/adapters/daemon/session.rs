@@ -21,6 +21,7 @@ struct SessionEntry {
 struct Inner {
     sessions: Vec<SessionEntry>,
     next_id: u64,
+    initializing: usize,
 }
 
 /// Registry of live keep-alive sessions, shared across the accept loop, the
@@ -38,15 +39,39 @@ impl SessionRegistry {
             inner: Mutex::new(Inner {
                 sessions: Vec::new(),
                 next_id: 1,
+                initializing: 0,
             }),
             count_changed: Notify::new(),
         })
     }
 
-    /// Register a session; returns its id. Increments the keep-alive count.
-    pub fn register(&self, peer: Peer<RoleServer>, sub: Arc<Mutex<SubscriptionRegistry>>) -> u64 {
+    /// Count an accepted MCP connection while rmcp performs initialization.
+    pub fn register_initializing(&self) {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.initializing += 1;
+        }
+        self.count_changed.notify_waiters();
+    }
+
+    /// Drop an initializing connection that closed or failed before serving.
+    pub fn unregister_initializing(&self) {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.initializing = g.initializing.saturating_sub(1);
+        }
+        self.count_changed.notify_waiters();
+    }
+
+    /// Register a fully initialized session; returns its id.
+    pub fn register_initialized(
+        &self,
+        peer: Peer<RoleServer>,
+        sub: Arc<Mutex<SubscriptionRegistry>>,
+    ) -> u64 {
         let id = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.initializing = g.initializing.saturating_sub(1);
             let id = g.next_id;
             g.next_id += 1;
             g.sessions.push(SessionEntry { id, peer, sub });
@@ -68,11 +93,8 @@ impl SessionRegistry {
     /// Number of live keep-alive sessions (mcp/observer).
     #[must_use]
     pub fn keep_alive_count(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .sessions
-            .len()
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.sessions.len() + g.initializing
     }
 
     /// Notify every session subscribed to `uri`. Runs on the push thread's
@@ -116,7 +138,7 @@ pub fn select_subscribed(subs: &[(u64, Arc<Mutex<SubscriptionRegistry>>)], uri: 
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::adapters::daemon::session::select_subscribed;
+    use crate::adapters::daemon::session::{SessionRegistry, select_subscribed};
     use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
 
     fn sub_for(uri: &str) -> Arc<Mutex<SubscriptionRegistry>> {
@@ -136,5 +158,17 @@ mod tests {
         assert_eq!(hit, vec![2]);
         let none = select_subscribed(&subs, "file:///z.rs");
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn initializing_mcp_connection_counts_as_keep_alive_until_registered_or_closed() {
+        let registry = SessionRegistry::new();
+        assert_eq!(registry.keep_alive_count(), 0);
+
+        registry.register_initializing();
+        assert_eq!(registry.keep_alive_count(), 1);
+
+        registry.unregister_initializing();
+        assert_eq!(registry.keep_alive_count(), 0);
     }
 }

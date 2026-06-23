@@ -18,7 +18,7 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **Parallel content search** | Rayon-backed grep across all indexed files |
 | **Safe file mutations** | Shadow-file pattern (`<path>.tmp_write` → flush → atomic `fs::rename`); crash-safe |
 | **Mass refactoring** | Parallel global find-and-replace with per-file atomic rewrites and a `TxReport` |
-| **MCP server** | JSON-RPC 2.0 over stdin/stdout; 9 native `tower_*` tools plus any extension tools, served from one surface |
+| **MCP server** | JSON-RPC 2.0 over stdin/stdout; native `tower_*` tools plus any extension tools, served from one surface |
 | **Native extension host** | Out-of-process native sidecar extensions over a JSON-RPC 2.0 protocol on stdio; OS-process isolation, per-call timeouts, restart/backoff, and quarantine |
 | **AST analysis** | `ast` extension — Tree-sitter outline and symbol search for Rust, Go, PHP |
 | **Code intelligence** | `lsp` extension — diagnostics, definition, references, hover via a language-server bridge |
@@ -88,11 +88,15 @@ cargo run -p core_engine
 # Handshake
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | cargo run -p core_engine -q
 
-# List tools (9 native tower_* tools, plus tower_<ext>_<tool> for any loaded extension)
+# List tools (native tower_* tools, plus tower_<ext>_<tool> for any loaded extension)
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | cargo run -p core_engine -q
 
 # Find a file
 echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find_file","arguments":{"query":"main.rs"}}}' \
+  | cargo run -p core_engine -q
+
+# List indexed directory entries
+echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_list_dir","arguments":{"path":"src","recursive":true,"max_depth":1}}}' \
   | cargo run -p core_engine -q
 ```
 
@@ -113,7 +117,7 @@ cp extensions/ast/extension.toml  .tower/extensions/ast/
 cargo run -p core_engine -q     # tools/list now also exposes tower_ast_get_outline, tower_ast_find_symbols, …
 ```
 
-No extensions serves exactly the 9 native tools; an extension that fails to spawn is skipped with a
+No extensions serves the native tools; an extension that fails to spawn is skipped with a
 stderr warning and never aborts startup. See [`docs/extensions.md`](docs/extensions.md) for details.
 
 ---
@@ -126,8 +130,9 @@ Run these checks in order before every merge (mirrors CI):
 cargo fmt --all --check                                   # make fmt-check
 cargo clippy --workspace --all-targets -- -D warnings     # make clippy
 
-# cargo test --workspace also compiles every native extension binary, so the
-# host integration tests locate them under target/debug/. No WASM, no WASI SDK.
+# Build native extension binaries first so host integration tests can locate
+# them under target/debug/. No WASM, no WASI SDK.
+cargo build --workspace --bins
 cargo test --workspace                                    # make test
 
 cargo deny check                                          # make deny
@@ -151,8 +156,9 @@ extensions/               Native sidecar extensions (separate binaries)
 └── fixtures/             Test-only fault-isolation fixtures (not shipped)
 ```
 
-The reference extensions are ordinary native binaries — `cargo test --workspace` compiles each one
-and the host locates them under `target/debug/`. There is no WASM build step and no WASI SDK.
+The reference extensions are ordinary native binaries. Build them with
+`cargo build --workspace --bins` before `cargo test --workspace` so host integration
+tests can locate sidecars under `target/debug/`. There is no WASM build step and no WASI SDK.
 
 ---
 

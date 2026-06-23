@@ -65,7 +65,7 @@ fn make_handler_from_merged(
 }
 
 /// Build an `ExtensionMergedRegistry` backed by a real (empty) engine state and
-/// no extensions. This gives us the 9 native `tower_*` tools.
+/// no extensions. This gives us the native `tower_*` tools.
 fn make_native_registry() -> ExtensionMergedRegistry {
     let ext_reg = Arc::new(std::sync::RwLock::new(
         crate::domain::extension_host::ExtensionRegistry::new(),
@@ -152,7 +152,6 @@ fn ac2_list_tools_native_registry_returns_expected_tools() {
             .list_tools(Default::default())
             .await
             .expect("list_tools failed");
-        // The native registry has 9 tools.
         assert!(
             !result.tools.is_empty(),
             "native registry must yield at least one tool"

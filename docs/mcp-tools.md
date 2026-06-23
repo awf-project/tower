@@ -81,7 +81,7 @@ version and capability advertisement.
 
 ### 2. tools/list
 
-Enumerate every available tool. The response lists the 9 native `tower_*` tools
+Enumerate every available tool. The response lists the native `tower_*` tools
 plus any namespaced tools contributed by discovered extensions (e.g.
 `"tower_ast_get_outline"` from the `ast` extension, `"tower_lsp_diagnostics"` from
 the `lsp` extension).
@@ -194,7 +194,7 @@ Codes `-32001` and `-32002` are in the JSON-RPC 2.0 server-defined range
 
 ## Native tools
 
-Nine tools are always available, regardless of which extensions are loaded. Their
+The native tools are always available, regardless of which extensions are loaded. Their
 names are undecorated (no namespace prefix).
 
 ### tower_find_file
@@ -237,6 +237,57 @@ Empty result when nothing matches: `{"paths": []}`.
 
 ---
 
+### tower_list_dir
+
+List indexed files and synthesized directories under a workspace-relative path.
+The listing is derived from the tracked path set, not from a live filesystem
+walk, so it inherits the current index and ignore rules. Empty directories are
+not tracked.
+
+| Field       | Type    | Required | Description                                                        |
+|-------------|---------|----------|--------------------------------------------------------------------|
+| `path`      | string  | yes      | Workspace-relative directory path to list; `""` and `"."` mean root |
+| `recursive` | boolean | no       | Include descendants instead of only direct children                 |
+| `max_depth` | integer | no       | Positive recursion depth limit; valid only when `recursive` is true |
+
+**Returns** `{"entries": [{"path": string, "name": string, "kind": "file"|"dir"}]}`
+
+Entries are sorted by workspace-relative path. Directory entries are synthesized
+from tracked file prefixes and de-duplicated.
+
+**Request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_list_dir",
+    "arguments": { "path": "src", "recursive": true, "max_depth": 1 }
+  }
+}
+```
+
+**Success response**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [{ "type": "text", "text": "{\"entries\":[{\"path\":\"src/lib.rs\",\"name\":\"lib.rs\",\"kind\":\"file\"},{\"path\":\"src/net\",\"name\":\"net\",\"kind\":\"dir\"}]}" }]
+  },
+  "id": 11
+}
+```
+
+Missing or untracked prefixes return an empty success payload:
+`{"entries": []}`. A `path` that names a tracked file returns `-32602
+InvalidParams` with a not-a-directory message. Supplying `max_depth` without
+`recursive: true`, or supplying `max_depth: 0`, also returns `-32602`.
+
+---
+
 ### tower_search_text
 
 Parallel grep across all indexed file contents.
@@ -252,7 +303,7 @@ Parallel grep across all indexed file contents.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 11,
+  "id": 12,
   "method": "tools/call",
   "params": {
     "name": "tower_search_text",
@@ -269,7 +320,7 @@ Parallel grep across all indexed file contents.
   "result": {
     "content": [{ "type": "text", "text": "{\"matches\":[{\"path\":\"src/client.rs\",\"line_number\":1,\"line_content\":\"fn client() {}\"}]}" }]
   },
-  "id": 11
+  "id": 12
 }
 ```
 
@@ -291,7 +342,7 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 12,
+  "id": 13,
   "method": "tools/call",
   "params": {
     "name": "tower_read_file",
@@ -308,7 +359,7 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
   "result": {
     "content": [{ "type": "text", "text": "{\"content\":\"fn main() {}\\n\"}" }]
   },
-  "id": 12
+  "id": 13
 }
 ```
 
@@ -318,7 +369,7 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
 {
   "jsonrpc": "2.0",
   "error": { "code": -32002, "message": "Resource not found: path or entity not found in workspace" },
-  "id": 12
+  "id": 13
 }
 ```
 
@@ -341,7 +392,7 @@ Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 13,
+  "id": 14,
   "method": "tools/call",
   "params": {
     "name": "tower_create_file",
@@ -358,7 +409,7 @@ Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
   "result": {
     "content": [{ "type": "text", "text": "{\"created\":true}" }]
   },
-  "id": 13
+  "id": 14
 }
 ```
 
@@ -380,7 +431,7 @@ become visible to subsequent file operations.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 14,
+  "id": 15,
   "method": "tools/call",
   "params": {
     "name": "tower_create_directory",
@@ -397,7 +448,7 @@ become visible to subsequent file operations.
   "result": {
     "content": [{ "type": "text", "text": "{\"created\":true}" }]
   },
-  "id": 14
+  "id": 15
 }
 ```
 
@@ -419,7 +470,7 @@ path is not found.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 15,
+  "id": 16,
   "method": "tools/call",
   "params": {
     "name": "tower_delete_file",
@@ -436,7 +487,7 @@ path is not found.
   "result": {
     "content": [{ "type": "text", "text": "{\"deleted\":true}" }]
   },
-  "id": 15
+  "id": 16
 }
 ```
 
@@ -487,7 +538,7 @@ a `CHANGELOG.txt` entry — all rewritten unconditionally.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 16,
+  "id": 17,
   "method": "tools/call",
   "params": {
     "name": "tower_global_replace",
@@ -504,7 +555,7 @@ a `CHANGELOG.txt` entry — all rewritten unconditionally.
   "result": {
     "content": [{ "type": "text", "text": "{\"files_changed\":3,\"replacements\":7,\"errors\":[]}" }]
   },
-  "id": 16
+  "id": 17
 }
 ```
 
@@ -527,7 +578,7 @@ no arguments.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 17,
+  "id": 18,
   "method": "tools/call",
   "params": { "name": "tower_reindex", "arguments": {} }
 }
@@ -541,7 +592,7 @@ no arguments.
   "result": {
     "content": [{ "type": "text", "text": "{\"files_indexed\":128}" }]
   },
-  "id": 17
+  "id": 18
 }
 ```
 
@@ -585,7 +636,7 @@ formatting.
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 18,
+  "id": 19,
   "method": "tools/call",
   "params": {
     "name": "tower_edit_range",
@@ -607,7 +658,7 @@ formatting.
   "result": {
     "content": [{ "type": "text", "text": "{\"files_changed\":1,\"replacements\":1,\"errors\":[]}" }]
   },
-  "id": 18
+  "id": 19
 }
 ```
 

@@ -5,7 +5,7 @@
 //!
 //! ```text
 //!  ExtensionMergedRegistry
-//!    native:    NativeToolRegistry           (9 tower_* tools, spec 10b)
+//!    native:    NativeToolRegistry              (spec 10b)
 //!    extension: Arc<RwLock<ExtensionRegistry>>  (declared_tools(), spec 22)
 //!
 //!  list()  → native.list() ++ extension tools (namespaced tower_<ext>_<tool>)
@@ -72,7 +72,7 @@ use crate::domain::extension_host::{ExtensionRegistry, InvokeError};
 /// let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
 /// let merged = ExtensionMergedRegistry::new(engine_state, ext_registry);
 /// let tools = merged.list();
-/// // tools contains 9 native tower_* tools plus any extension tools.
+/// // tools contains native tower_* tools plus any extension tools.
 /// ```
 pub struct ExtensionMergedRegistry {
     native: NativeToolRegistry,
@@ -193,7 +193,7 @@ mod tests {
     use serde_json::{Value as JsonValue, json};
 
     use super::ExtensionMergedRegistry;
-    use crate::adapters::mcp::native_tools::EngineState;
+    use crate::adapters::mcp::native_tools::{EXPECTED_NATIVE_TOOL_NAMES, EngineState};
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::{InMemoryFs, InMemoryStorage};
     use crate::domain::extension_host::ExtensionRegistry;
@@ -345,17 +345,17 @@ mod tests {
         let reg = merged_with_echo_extension("ast", "get_outline");
         let tools = reg.list();
 
-        // At least 9 native tools + 1 extension.
         assert!(
-            tools.len() >= 10,
-            "expected ≥10 tools (9 native + 1 extension), got {}",
+            tools.len() > EXPECTED_NATIVE_TOOL_NAMES.len(),
+            "expected native tools plus one extension, got {}",
             tools.len()
         );
-        // Native tool is present.
-        assert!(
-            tools.iter().any(|t| t.name == "tower_find_file"),
-            "native tower_find_file must be present"
-        );
+        for expected_name in EXPECTED_NATIVE_TOOL_NAMES {
+            assert!(
+                tools.iter().any(|t| t.name == expected_name),
+                "native {expected_name} must be present"
+            );
+        }
         // Extension tool is present.
         assert!(
             tools.iter().any(|t| t.name == "tower_ast_get_outline"),
