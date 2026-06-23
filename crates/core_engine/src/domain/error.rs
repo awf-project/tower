@@ -1,5 +1,7 @@
 //! Domain errors — explicit enum variants, no I/O.
 
+use super::RelativePath;
+
 /// Errors the domain layer can return. Every failure mode is an explicit
 /// variant (spec DoD / UN1).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -15,6 +17,9 @@ pub enum DomainError {
     /// Used by mutation use-cases (spec 02 inbound port declarations) when an
     /// operation targets a path that has not been indexed.
     NotFound,
+    /// The requested path is tracked as a file, so it cannot be listed as a
+    /// directory.
+    NotADirectory(RelativePath),
     /// A port-level I/O failure crossed the domain boundary.
     ///
     /// The inner string carries the human-readable reason from the port
@@ -62,6 +67,7 @@ impl core::fmt::Display for DomainError {
             Self::StaleHandle => write!(f, "stale file handle: slot freed or reused"),
             Self::DuplicatePath => write!(f, "path already maps to a live file"),
             Self::NotFound => write!(f, "path or entity not found in workspace"),
+            Self::NotADirectory(path) => write!(f, "not a directory: {}", path.as_str()),
             Self::IoError(reason) => write!(f, "I/O error: {reason}"),
             Self::InvalidRange(reason) => write!(f, "invalid byte range: {reason}"),
             Self::VersionConflict { expected, actual } => {

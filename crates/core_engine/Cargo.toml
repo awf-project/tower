@@ -52,26 +52,25 @@ rayon = "1"
 # logic that the ignore crate has battle-tested across large real-world codebases.
 # Trade-off: transitive deps (crossbeam-channel, same_file, walkdir, globset, etc.)
 # vs. a single well-audited crate. All transitive licenses are MIT/Apache-2.0/BSD.
-# Decision: crossbeam-channel is a direct dep (not just transitive via notify)
-# because NotifyWatcherAdapter explicitly uses Sender/Receiver types.
-# Pinned to 0.5 to match notify 6.1's transitive requirement.
+# Decision: crossbeam-channel is a direct dep because NotifyWatcherAdapter
+# explicitly owns the event channel between the notify callback and worker.
 crossbeam-channel = "0.5"
 ignore = "0.4.26"
-# Decision: notify 6.1 for OS FS event subscription (spec 06).
+# Decision: notify 8.x for OS FS event subscription (spec 06).
 # License: CC0-1.0 (public domain) — added to deny.toml allow list.
-notify = "6.1"
+notify = "8.2.0"
 postcard = { version = "1.1.3", features = ["alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # Decision: toml for the local project config file (.tower/config.toml).
 # Why: idiomatic Rust config format; deserialized via the existing serde derive.
 # License: MIT/Apache-2.0 (transitive deps winnow/toml_edit/etc.), already
 # covered by deny.toml's allow list.
-toml = "0.9"
+toml = "1.1.2"
 # Decision: sha2 for SHA-256 content hashes on indexed files (FileMetadata.content_hash).
 # Why: a 32-byte content fingerprint for change detection, computed in the fs adapter
 # (infra layer) — the domain only holds the opaque bytes. MIT/Apache-2.0 (RustCrypto),
 # covered by the deny.toml allow list.
-sha2 = "0.10"
+sha2 = "0.11.0"
 sled = "0.34"
 # Decision: serde_json for MCP JSON-RPC 2.0 transport (spec 10a).
 # Why: JSON-RPC is text/JSON; postcard (used by storage) is a binary format unsuitable
@@ -86,4 +85,10 @@ serde_json = "1"
 # locate the global extensions dir. Domain stays untouched.
 directories = "6"
 rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync"] }
+# clap (derive) for the binary CLI surface: subcommands + --version/--help.
+# MIT/Apache-2.0; covered by deny.toml allow-list.
+clap = { version = "4", features = ["derive"] }
+# rustix: safe wrappers for setsid() (detach the auto-spawned daemon) and
+# flock() (serialize the spawn race). Apache-2.0/MIT/BSD; deny allow-list.
+rustix = { version = "1", features = ["process", "fs"] }

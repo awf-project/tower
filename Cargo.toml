@@ -24,11 +24,11 @@ members = [
 default-members = [
     "crates/core_engine",
     "crates/extension_protocol",
-    # test_helper extension binary — compiled natively, part of default build
-    # so that `cargo test --workspace` can locate the binary for spec 23 tests.
+    # test_helper extension binary — compiled natively by the pre-test
+    # `cargo build --workspace --bins` step so spec 23 tests can spawn it.
     "extensions/test_helper",
-    # Spec 24 fault-isolation fixtures — compiled natively so that spec 24
-    # integration tests can locate them via the same target/debug/ path convention.
+    # Spec 24 fault-isolation fixtures — compiled natively by the pre-test
+    # build step so integration tests can locate them via target/debug/.
     "extensions/fixtures/hang_forever",
     "extensions/fixtures/crash_on_init",
     "extensions/fixtures/exit_nonzero",

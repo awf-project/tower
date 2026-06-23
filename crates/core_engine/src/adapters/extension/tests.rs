@@ -7,9 +7,9 @@
 //! # Test binary location
 //!
 //! The `test_helper_extension` binary must be built before these tests run.
-//! `cargo test --workspace` compiles it because `extensions/test_helper` is in
-//! `default-members`. The binary is located via `CARGO_MANIFEST_DIR` navigation
-//! to the workspace root, then `target/debug/test_helper_extension`.
+//! The CI and `make test` run `cargo build --workspace --bins` first. The binary
+//! is located via `CARGO_MANIFEST_DIR` navigation to the workspace root, then
+//! `target/debug/test_helper_extension`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

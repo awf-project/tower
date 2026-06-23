@@ -17,7 +17,7 @@
 //!
 //! # What is NOT here
 //!
-//! - The 9 native tool handlers — those are spec 10b (`native_tools`).
+//! - The native tool handlers — those are spec 10b (`native_tools`).
 //! - Extension tool merging — spec 28 (`ExtensionMergedRegistry`).
 //! - `tokio::io::stdin()` / `tokio::io::stdout()` — the binary entry wires
 //!   those in `main.rs`. The rmcp transport is generic over async I/O.

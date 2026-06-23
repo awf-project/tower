@@ -28,9 +28,9 @@ jobs:
       #
       # Since the extension-system migration (spec 20) the engine is a single
       # static binary with out-of-process *native* sidecar extensions. There is
-      # no WASM build step and no WASI SDK: `cargo test --workspace` compiles
-      # every native extension binary, and the host integration tests locate them
-      # under target/debug/.
+      # no WASM build step and no WASI SDK. Build workspace binaries explicitly
+      # before tests so host integration tests can spawn sidecars from
+      # target/debug/.
       - name: Format check
         run: cargo fmt --all --check
 
@@ -38,7 +38,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: |
+          cargo build --workspace --bins
+          cargo test --workspace
 
       - name: License & advisory policy
         uses: EmbarkStudios/cargo-deny-action@v2

@@ -11,6 +11,10 @@
 //! The placeholder types ([`Match`], [`TxReport`]) are deliberately minimal.
 //! They will gain fields in the specs cited above.
 
+use std::num::NonZeroUsize;
+
+use serde::{Deserialize, Serialize};
+
 use crate::domain::{DomainError, FileId, RelativePath};
 
 // ── Supporting value types ───────────────────────────────────────────────────
@@ -41,6 +45,32 @@ pub struct Match {
     /// Listed last in the struct so it does not participate in the primary sort
     /// key — path + line_number already uniquely identify a hit.
     pub file_id: FileId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectoryEntryKind {
+    File,
+    Dir,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub path: RelativePath,
+    pub name: String,
+    pub kind: DirectoryEntryKind,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ListDirRequest {
+    pub path: RelativePath,
+    pub recursive: bool,
+    pub max_depth: Option<NonZeroUsize>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct ListDirResult {
+    pub entries: Vec<DirectoryEntry>,
 }
 
 /// A per-file error recorded by a [`global_replace`] transaction.
@@ -104,6 +134,8 @@ pub trait SearchUseCase {
     ///
     /// Returns [`DomainError`] on workspace inconsistency.
     fn search_text(&self, pattern: &str) -> Result<Vec<Match>, DomainError>;
+
+    fn list_dir(&self, request: ListDirRequest) -> Result<ListDirResult, DomainError>;
 
     /// Return up to `cap` text matches of `pattern` across indexed file content.
     ///

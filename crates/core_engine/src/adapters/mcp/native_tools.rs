@@ -1,6 +1,6 @@
 //! Native `tower_*` tool handlers — spec 10b.
 //!
-//! Implements all 9 workspace tools and registers them into the 10a
+//! Registers the native workspace tools into the 10a
 //! [`ToolRegistry`]. Each handler follows the same thin pattern:
 //!
 //! ```text
@@ -12,6 +12,7 @@
 //! ```text
 //! register_native_tools(registry, state):
 //!   tower_find_file       {query}              → SearchUseCase.find_file
+//!   tower_list_dir        {path,recursive}     → SearchUseCase.list_dir
 //!   tower_search_text     {pattern}            → SearchUseCase.search_text
 //!   tower_read_file       {path}               → FileSystemPort.read
 //!   tower_create_file     {path, content}      → FileMutationUseCase.create_file
@@ -69,6 +70,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
@@ -81,8 +83,24 @@ use crate::domain::token::tokenize;
 use crate::domain::virtual_file::FileMetadata;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
-use crate::ports::inbound::{FileMutationUseCase, SearchUseCase};
+use crate::ports::inbound::{
+    DirectoryEntryKind, FileMutationUseCase, ListDirRequest, SearchUseCase,
+};
 use crate::ports::{ExtensionHostPort, FileSystemPort, NoOpExtensionHost, StoragePort};
+
+/// Canonical ordered native MCP tool surface.
+pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 10] = [
+    "tower_find_file",
+    "tower_list_dir",
+    "tower_search_text",
+    "tower_read_file",
+    "tower_create_file",
+    "tower_create_directory",
+    "tower_delete_file",
+    "tower_global_replace",
+    "tower_edit_range",
+    "tower_reindex",
+];
 
 // ── EngineState ───────────────────────────────────────────────────────────────
 
@@ -166,7 +184,7 @@ impl EngineState {
 
 // ── NativeToolRegistry ────────────────────────────────────────────────────────
 
-/// [`ToolRegistry`] implementation for the 9 native `tower_*` tools (spec 10b).
+/// [`ToolRegistry`] implementation for the native `tower_*` tools (spec 10b).
 ///
 /// Holds a reference-counted, lock-protected [`EngineState`] so that both this
 /// registry and the filesystem watcher can share the workspace/index/storage/fs
@@ -192,7 +210,7 @@ impl EngineState {
 /// let mut registry = NativeToolRegistry::new(shared);
 ///
 /// let tools = registry.list();
-/// assert_eq!(tools.len(), 9);
+/// assert!(tools.iter().any(|tool| tool.name == "tower_read_file"));
 /// ```
 pub struct NativeToolRegistry {
     state: Arc<RwLock<EngineState>>,
@@ -208,8 +226,9 @@ impl NativeToolRegistry {
 
 impl ToolRegistry for NativeToolRegistry {
     fn list(&self) -> Vec<ToolDesc> {
-        vec![
+        let tools = vec![
             tool_find_file_desc(),
+            tool_list_dir_desc(),
             tool_search_text_desc(),
             tool_read_file_desc(),
             tool_create_file_desc(),
@@ -218,12 +237,21 @@ impl ToolRegistry for NativeToolRegistry {
             tool_global_replace_desc(),
             tool_edit_range_desc(),
             tool_reindex_desc(),
-        ]
+        ];
+        debug_assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            EXPECTED_NATIVE_TOOL_NAMES
+        );
+        tools
     }
 
     fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
         match name {
             "tower_find_file" => call_find_file(&self.state, args),
+            "tower_list_dir" => call_list_dir(&self.state, args),
             "tower_search_text" => call_search_text(&self.state, args),
             "tower_read_file" => call_read_file(&self.state, args),
             "tower_create_file" => call_create_file(&self.state, args),
@@ -252,6 +280,34 @@ fn tool_find_file_desc() -> ToolDesc {
                 }
             },
             "required": ["query"]
+        }),
+    }
+}
+
+fn tool_list_dir_desc() -> ToolDesc {
+    ToolDesc {
+        name: "tower_list_dir".to_owned(),
+        description:
+            "List indexed files and synthesized directories under a workspace-relative path."
+                .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative directory path to list."
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "When true, include descendants rather than only direct children."
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional positive recursion depth limit; valid only when recursive is true."
+                }
+            },
+            "required": ["path"]
         }),
     }
 }
@@ -473,6 +529,53 @@ fn call_find_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value
     Ok(json!({ "paths": paths_json }))
 }
 
+fn call_list_dir(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
+    let path = RelativePath::new(require_str(&args, "path")?);
+    let recursive = optional_bool(&args, "recursive")?.unwrap_or(false);
+    let max_depth = optional_non_zero_usize(&args, "max_depth")?;
+
+    if max_depth.is_some() && !recursive {
+        return Err(ToolError::InvalidArgs(
+            "field 'max_depth' is valid only when 'recursive' is true".to_owned(),
+        ));
+    }
+
+    let result = {
+        let guard = state.read().map_err(lock_poisoned)?;
+        let ws_arc = Arc::clone(&guard.workspace);
+        let idx_arc = Arc::clone(&guard.index);
+        drop(guard);
+        let ws = ws_arc.read().map_err(lock_poisoned)?;
+        let idx = idx_arc.read().map_err(lock_poisoned)?;
+        let search = FileSearch::new(&idx, &ws);
+        search
+            .list_dir(ListDirRequest {
+                path,
+                recursive,
+                max_depth,
+            })
+            .map_err(domain_err_to_tool_error)?
+    };
+
+    let entries: Vec<Value> = result
+        .entries
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                DirectoryEntryKind::File => "file",
+                DirectoryEntryKind::Dir => "dir",
+            };
+            json!({
+                "path": entry.path.as_str(),
+                "name": entry.name,
+                "kind": kind
+            })
+        })
+        .collect();
+
+    Ok(json!({ "entries": entries }))
+}
+
 fn call_search_text(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let pattern = require_str(&args, "pattern")?;
 
@@ -593,25 +696,15 @@ fn port_err_to_tool_error(err: crate::ports::PortError) -> ToolError {
     }
 }
 
-fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
-    let path = require_str(&args, "path")?;
-    let content = require_str(&args, "content")?;
-    // Optional CAS guard: absent → unconditional write (U2); malformed → reject.
-    let expected_version = optional_version(&args, "expected_version")?;
-
-    let rel = RelativePath::new(path);
-    let bytes = content.as_bytes().to_vec();
-
-    // Outer write-lock gives exclusive access to storage + fs.
-    // Destructure to split the mutable borrow across fields — the borrow
-    // checker cannot split it through a DerefMut guard, but it CAN through a
-    // raw &mut reference to the struct.
+fn with_mutation_service<T>(
+    state: &Arc<RwLock<EngineState>>,
+    f: impl FnOnce(&mut FileMutationService<'_>) -> Result<T, DomainError>,
+) -> Result<T, ToolError> {
     let mut guard = state.write().map_err(lock_poisoned)?;
     let ws_arc = Arc::clone(&guard.workspace);
     let idx_arc = Arc::clone(&guard.index);
     let mut ws = ws_arc.write().map_err(lock_poisoned)?;
     let mut idx = idx_arc.write().map_err(lock_poisoned)?;
-    // Split the &mut EngineState into independent field borrows.
     let engine = &mut *guard;
     let extension_host = Arc::clone(&engine.extension_host);
     let mut svc = FileMutationService::new(
@@ -621,8 +714,21 @@ fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
         engine.storage.as_mut(),
         extension_host.as_ref(),
     );
-    svc.create_file_cas(rel, bytes, expected_version)
-        .map_err(domain_err_to_tool_error)?;
+    f(&mut svc).map_err(domain_err_to_tool_error)
+}
+
+fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
+    let path = require_str(&args, "path")?;
+    let content = require_str(&args, "content")?;
+    // Optional CAS guard: absent → unconditional write (U2); malformed → reject.
+    let expected_version = optional_version(&args, "expected_version")?;
+
+    let rel = RelativePath::new(path);
+    let bytes = content.as_bytes().to_vec();
+
+    with_mutation_service(state, |svc| {
+        svc.create_file_cas(rel, bytes, expected_version)
+    })?;
 
     Ok(json!({ "created": true }))
 }
@@ -634,22 +740,7 @@ fn call_create_directory(
     let path = require_str(&args, "path")?;
     let rel = RelativePath::new(path);
 
-    let mut guard = state.write().map_err(lock_poisoned)?;
-    let ws_arc = Arc::clone(&guard.workspace);
-    let idx_arc = Arc::clone(&guard.index);
-    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
-    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
-    let engine = &mut *guard;
-    let extension_host = Arc::clone(&engine.extension_host);
-    let mut svc = FileMutationService::new(
-        engine.fs.as_mut(),
-        &mut ws,
-        &mut idx,
-        engine.storage.as_mut(),
-        extension_host.as_ref(),
-    );
-    svc.create_directory(rel)
-        .map_err(domain_err_to_tool_error)?;
+    with_mutation_service(state, |svc| svc.create_directory(rel))?;
 
     Ok(json!({ "created": true }))
 }
@@ -658,21 +749,7 @@ fn call_delete_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
     let path = require_str(&args, "path")?;
     let rel = RelativePath::new(path);
 
-    let mut guard = state.write().map_err(lock_poisoned)?;
-    let ws_arc = Arc::clone(&guard.workspace);
-    let idx_arc = Arc::clone(&guard.index);
-    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
-    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
-    let engine = &mut *guard;
-    let extension_host = Arc::clone(&engine.extension_host);
-    let mut svc = FileMutationService::new(
-        engine.fs.as_mut(),
-        &mut ws,
-        &mut idx,
-        engine.storage.as_mut(),
-        extension_host.as_ref(),
-    );
-    svc.delete_file(&rel).map_err(domain_err_to_tool_error)?;
+    with_mutation_service(state, |svc| svc.delete_file(&rel))?;
 
     Ok(json!({ "deleted": true }))
 }
@@ -684,23 +761,9 @@ fn call_global_replace(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<
     // malformed map (non-object, or non-string value) is rejected, not ignored.
     let expected_versions = optional_version_map(&args, "expected_versions")?;
 
-    let mut guard = state.write().map_err(lock_poisoned)?;
-    let ws_arc = Arc::clone(&guard.workspace);
-    let idx_arc = Arc::clone(&guard.index);
-    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
-    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
-    let engine = &mut *guard;
-    let extension_host = Arc::clone(&engine.extension_host);
-    let mut svc = FileMutationService::new(
-        engine.fs.as_mut(),
-        &mut ws,
-        &mut idx,
-        engine.storage.as_mut(),
-        extension_host.as_ref(),
-    );
-    let report = svc
-        .global_replace_cas(target, replacement, expected_versions)
-        .map_err(domain_err_to_tool_error)?;
+    let report = with_mutation_service(state, |svc| {
+        svc.global_replace_cas(target, replacement, expected_versions)
+    })?;
 
     let errors_json: Vec<Value> = report
         .errors
@@ -725,23 +788,9 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
 
     let rel = RelativePath::new(path);
 
-    let mut guard = state.write().map_err(lock_poisoned)?;
-    let ws_arc = Arc::clone(&guard.workspace);
-    let idx_arc = Arc::clone(&guard.index);
-    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
-    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
-    let engine = &mut *guard;
-    let extension_host = Arc::clone(&engine.extension_host);
-    let mut svc = FileMutationService::new(
-        engine.fs.as_mut(),
-        &mut ws,
-        &mut idx,
-        engine.storage.as_mut(),
-        extension_host.as_ref(),
-    );
-    let report = svc
-        .edit_range_cas(&rel, start_byte, end_byte, replacement, expected_version)
-        .map_err(domain_err_to_tool_error)?;
+    let report = with_mutation_service(state, |svc| {
+        svc.edit_range_cas(&rel, start_byte, end_byte, replacement, expected_version)
+    })?;
 
     let errors_json: Vec<Value> = report
         .errors
@@ -763,8 +812,8 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
 /// 1. Walk the filesystem via `FileSystemPort::scan()` (no locks held during the walk).
 /// 2. Build a fresh `ProjectWorkspace` and `InvertedIndex` from the scan results.
 /// 3. Persist the rebuilt state: write fresh records via `StoragePort::put_batch`,
-///    delete records whose paths are absent from the scan, then call
-///    `StoragePort::mark_scan_complete()`.
+///    call `StoragePort::mark_scan_complete()`, then prune records absent from
+///    the scan.
 /// 4. Acquire workspace→index write locks in that order and swap in the rebuilt
 ///    structures.
 ///
@@ -852,12 +901,9 @@ fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
     // We do NOT hold the workspace/index locks during storage I/O — storage
     // writes can be slow and the watcher must not be starved.
     //
-    // Deletion reconciliation: the previous storage records that are no longer
-    // in the fresh scan must be removed.  We enumerate what is currently stored
-    // via the live workspace snapshot (held under the outer write-lock, which
-    // prevents concurrent mutations), then delete any `FileId` not present in the
-    // fresh workspace.  The fresh records are written via `put_batch`, and the
-    // scan-complete marker is re-set so the restart guard sees a consistent index.
+    // The fresh records and scan-complete marker are written before pruning old
+    // records. If either fresh-write step fails, the previously persisted index
+    // remains recoverable instead of being partially erased.
     {
         let mut guard = state.write().map_err(lock_poisoned)?;
 
@@ -866,11 +912,6 @@ fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
             let ws = guard.workspace.read().map_err(lock_poisoned)?;
             ws.snapshot().files.into_iter().map(|f| f.id).collect()
         };
-
-        // Delete every stale record.  Errors (e.g. already absent) are benign.
-        for id in stale_ids {
-            let _ = guard.storage.delete(id);
-        }
 
         // Write all fresh records in a single atomic batch.
         guard
@@ -883,6 +924,13 @@ fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
             .storage
             .mark_scan_complete()
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        // Delete old records only after the replacement index is durably present.
+        // If a delete fails, the worst outcome is a stale persisted entry that the
+        // next startup reconciliation can prune; fresh records are not lost.
+        for id in stale_ids {
+            let _ = guard.storage.delete(id);
+        }
     }
 
     // Phase 4: swap the rebuilt in-memory structures into the live state.
@@ -936,6 +984,35 @@ fn require_usize(args: &Value, field: &str) -> Result<usize, ToolError> {
     })
 }
 
+fn optional_bool(args: &Value, field: &str) -> Result<Option<bool>, ToolError> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| ToolError::InvalidArgs(format!("field '{field}' must be a boolean"))),
+    }
+}
+
+fn optional_non_zero_usize(args: &Value, field: &str) -> Result<Option<NonZeroUsize>, ToolError> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(value) => {
+            let n = value.as_u64().ok_or_else(|| {
+                ToolError::InvalidArgs(format!("field '{field}' must be a positive integer"))
+            })?;
+            let n = usize::try_from(n).map_err(|_| {
+                ToolError::InvalidArgs(format!(
+                    "field '{field}' value {n} exceeds platform usize::MAX"
+                ))
+            })?;
+            NonZeroUsize::new(n).map(Some).ok_or_else(|| {
+                ToolError::InvalidArgs(format!("field '{field}' must be greater than zero"))
+            })
+        }
+    }
+}
+
 /// Map a [`DomainError`] to a [`ToolError`] with a stable, inspectable code.
 ///
 /// # Stable code assignment
@@ -956,6 +1033,9 @@ fn require_usize(args: &Value, field: &str) -> Result<usize, ToolError> {
 fn domain_err_to_tool_error(err: DomainError) -> ToolError {
     match err {
         DomainError::NotFound => ToolError::ResourceNotFound(err.to_string()),
+        DomainError::NotADirectory(path) => {
+            ToolError::InvalidArgs(format!("not a directory: {}", path.as_str()))
+        }
         DomainError::InvalidRange(_) => ToolError::InvalidArgs(err.to_string()),
         DomainError::VersionConflict { .. } => ToolError::PreconditionFailed(err.to_string()),
         other => ToolError::ExecutionFailed(other.to_string()),
@@ -979,7 +1059,7 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::{EngineState, NativeToolRegistry};
+    use super::{EXPECTED_NATIVE_TOOL_NAMES, EngineState, NativeToolRegistry};
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::mcp::types::ToolError;
     use crate::adapters::{InMemoryFs, InMemoryStorage};
@@ -1023,8 +1103,385 @@ mod tests {
         )))
     }
 
+    fn state_with_client_file_and_storage(
+        storage: Box<dyn StoragePort + Send + Sync>,
+    ) -> Arc<RwLock<EngineState>> {
+        let mut workspace = ProjectWorkspace::new();
+        let mut index = InvertedIndex::new();
+        let mut fs = InMemoryFs::new();
+
+        let path = RelativePath::new("src/client.rs");
+        let id = workspace
+            .insert(path.clone(), FileMetadata::default())
+            .unwrap();
+        let file = workspace.get(id).unwrap().clone();
+        index.insert(id, &tokenize("src/client.rs"));
+        fs.write(path, b"fn client() {}".to_vec()).unwrap();
+
+        let state = Arc::new(RwLock::new(EngineState::new(
+            workspace,
+            index,
+            storage,
+            Box::new(fs),
+        )));
+        state.write().unwrap().storage.put(file).unwrap();
+        state
+    }
+
     fn make_registry(state: Arc<RwLock<EngineState>>) -> NativeToolRegistry {
         NativeToolRegistry::new(state)
+    }
+
+    fn state_with_list_dir_files() -> Arc<RwLock<EngineState>> {
+        let state = empty_state();
+        let mut reg = make_registry(Arc::clone(&state));
+        for (path, content) in [
+            ("README.md", "# Project"),
+            ("src/a.rs", "fn a() {}"),
+            ("src/nested/b.rs", "fn b() {}"),
+        ] {
+            reg.call(
+                "tower_create_file",
+                json!({ "path": path, "content": content }),
+            )
+            .expect("setup create_file must succeed");
+        }
+        state
+    }
+
+    fn list_dir_entries(value: &Value) -> Vec<(String, String, String)> {
+        value["entries"]
+            .as_array()
+            .expect("list_dir response must contain entries array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["path"].as_str().unwrap().to_owned(),
+                    entry["name"].as_str().unwrap().to_owned(),
+                    entry["kind"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_invalid_args(err: ToolError) {
+        assert!(
+            matches!(err, ToolError::InvalidArgs(_)),
+            "expected ToolError::InvalidArgs; got {err:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct FailBatchStorage {
+        inner: InMemoryStorage,
+    }
+
+    impl StoragePort for FailBatchStorage {
+        fn get(
+            &self,
+            id: crate::domain::FileId,
+        ) -> Result<crate::domain::VirtualFile, crate::ports::PortError> {
+            self.inner.get(id)
+        }
+
+        fn put(&mut self, file: crate::domain::VirtualFile) -> Result<(), crate::ports::PortError> {
+            self.inner.put(file)
+        }
+
+        fn put_batch(
+            &mut self,
+            _files: &[crate::domain::VirtualFile],
+        ) -> Result<(), crate::ports::PortError> {
+            Err(crate::ports::PortError::WriteFailed(
+                "injected put_batch failure".to_owned(),
+            ))
+        }
+
+        fn delete(&mut self, id: crate::domain::FileId) -> Result<(), crate::ports::PortError> {
+            self.inner.delete(id)
+        }
+
+        fn put_blob(
+            &mut self,
+            hash: crate::domain::ContentHash,
+            bytes: Vec<u8>,
+        ) -> Result<(), crate::ports::PortError> {
+            self.inner.put_blob(hash, bytes)
+        }
+
+        fn get_blob(
+            &self,
+            hash: &crate::domain::ContentHash,
+        ) -> Result<Vec<u8>, crate::ports::PortError> {
+            self.inner.get_blob(hash)
+        }
+
+        fn mark_scan_complete(&mut self) -> Result<(), crate::ports::PortError> {
+            self.inner.mark_scan_complete()
+        }
+
+        fn is_scan_complete(&self) -> Result<bool, crate::ports::PortError> {
+            self.inner.is_scan_complete()
+        }
+    }
+
+    #[test]
+    fn t009_registry_names_match_expected_native_tool_names() {
+        let reg = make_registry(empty_state());
+        let tools = reg.list();
+        let actual: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        assert_eq!(
+            actual, EXPECTED_NATIVE_TOOL_NAMES,
+            "NativeToolRegistry::list must stay aligned with the shared expected-name helper"
+        );
+    }
+
+    #[test]
+    fn t009_expected_native_tool_names_include_list_dir() {
+        let expected = EXPECTED_NATIVE_TOOL_NAMES;
+
+        assert_eq!(expected.len(), 10);
+        assert!(
+            expected.contains(&"tower_list_dir"),
+            "expected native tool names must include tower_list_dir; got {expected:?}"
+        );
+    }
+
+    #[test]
+    fn t009_expected_native_tool_names_cover_registry_names() {
+        let reg = make_registry(empty_state());
+        let tools = reg.list();
+        let actual: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        for expected_name in EXPECTED_NATIVE_TOOL_NAMES {
+            assert!(
+                actual.contains(&expected_name),
+                "native registry unit assertions must include {expected_name}; got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn t009_native_tools_has_no_stale_nine_tool_expectations() {
+        let source = include_str!("native_tools.rs");
+        let stale_numeric = concat!("9", " native tools");
+        let stale_word = concat!("nine", " native tools");
+        let stale_doc = concat!("9", " `tower_*` tools");
+
+        assert!(
+            !source.contains(stale_numeric)
+                && !source.contains(stale_word)
+                && !source.contains(stale_doc),
+            "native tool tests/comments must not retain stale 9-tool expectations"
+        );
+    }
+
+    #[test]
+    fn t009_native_tools_has_no_fragile_tool_count_comments() {
+        let source = include_str!("native_tools.rs");
+        let stale_implements = concat!("Implements all ", "9", " workspace tools");
+        let fragile_count = concat!("10", " native `tower_*` tools");
+        let fragile_doc_assert = concat!("assert_eq!(tools.len(), ", "10", ");");
+
+        assert!(
+            !source.contains(stale_implements)
+                && !source.contains(fragile_count)
+                && !source.contains(fragile_doc_assert),
+            "native_tools.rs comments should avoid duplicating a native tool count that can drift"
+        );
+    }
+
+    // ── T007: tower_list_dir native tool wiring ───────────────────────────────
+
+    #[test]
+    fn list_dir_native_tool_registry_list_includes_tower_list_dir_tool_descriptor() {
+        let reg = make_registry(empty_state());
+        let tools = reg.list();
+
+        assert!(
+            tools.iter().any(|tool| tool.name == "tower_list_dir"),
+            "NativeToolRegistry::list must include tower_list_dir; got {:?}",
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn list_dir_native_tool_registry_call_dispatches_tower_list_dir_to_new_handler() {
+        let mut reg = make_registry(state_with_list_dir_files());
+
+        let value = reg
+            .call("tower_list_dir", json!({ "path": "src" }))
+            .expect("tower_list_dir call must dispatch to the handler and succeed");
+
+        assert_eq!(
+            list_dir_entries(&value),
+            vec![
+                ("src/a.rs".to_owned(), "a.rs".to_owned(), "file".to_owned()),
+                (
+                    "src/nested".to_owned(),
+                    "nested".to_owned(),
+                    "dir".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_dir_schema_describes_object_with_path_recursive_and_max_depth_properties() {
+        let reg = make_registry(empty_state());
+        let tool = reg
+            .list()
+            .into_iter()
+            .find(|tool| tool.name == "tower_list_dir")
+            .expect("tower_list_dir descriptor must be registered");
+
+        assert_eq!(tool.input_schema["type"], "object");
+        let properties = tool.input_schema["properties"]
+            .as_object()
+            .expect("tower_list_dir schema must declare object properties");
+        assert!(properties.contains_key("path"));
+        assert!(properties.contains_key("recursive"));
+        assert!(properties.contains_key("max_depth"));
+    }
+
+    #[test]
+    fn list_dir_handler_defaults_omitted_recursive_to_false() {
+        let mut reg = make_registry(state_with_list_dir_files());
+
+        let value = reg
+            .call("tower_list_dir", json!({ "path": "src" }))
+            .expect("omitted recursive must default to false");
+
+        assert_eq!(
+            list_dir_entries(&value),
+            vec![
+                ("src/a.rs".to_owned(), "a.rs".to_owned(), "file".to_owned()),
+                (
+                    "src/nested".to_owned(),
+                    "nested".to_owned(),
+                    "dir".to_owned()
+                ),
+            ],
+            "default non-recursive listing must not include src/nested/b.rs"
+        );
+    }
+
+    #[test]
+    fn list_dir_handler_rejects_max_depth_when_recursive_is_omitted_or_false_with_tool_error_invalid_args()
+     {
+        let mut reg = make_registry(state_with_list_dir_files());
+
+        let omitted = reg
+            .call("tower_list_dir", json!({ "path": "src", "max_depth": 1 }))
+            .unwrap_err();
+        assert_invalid_args(omitted);
+
+        let false_recursive = reg
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src", "recursive": false, "max_depth": 1 }),
+            )
+            .unwrap_err();
+        assert_invalid_args(false_recursive);
+    }
+
+    #[test]
+    fn list_dir_handler_rejects_max_depth_zero_with_tool_error_invalid_args() {
+        let mut reg = make_registry(state_with_list_dir_files());
+
+        let err = reg
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src", "recursive": true, "max_depth": 0 }),
+            )
+            .unwrap_err();
+
+        assert_invalid_args(err);
+    }
+
+    #[test]
+    fn list_dir_handler_rejects_non_string_path_non_boolean_recursive_and_non_integer_max_depth_with_tool_error_invalid_args()
+     {
+        let mut reg = make_registry(state_with_list_dir_files());
+
+        for args in [
+            json!({ "path": 42 }),
+            json!({ "path": "src", "recursive": "yes" }),
+            json!({ "path": "src", "recursive": true, "max_depth": "1" }),
+        ] {
+            let err = reg.call("tower_list_dir", args).unwrap_err();
+            assert_invalid_args(err);
+        }
+    }
+
+    #[test]
+    fn list_dir_call_with_file_path_maps_not_a_directory_to_tool_error_invalid_args_preserving_path()
+     {
+        let mut reg = make_registry(state_with_list_dir_files());
+        let err = reg
+            .call("tower_list_dir", json!({ "path": "src/a.rs" }))
+            .unwrap_err();
+
+        match err {
+            ToolError::InvalidArgs(message) => assert!(
+                message.contains("src/a.rs"),
+                "NotADirectory mapping must preserve requested path; got {message:?}"
+            ),
+            other => panic!("expected ToolError::InvalidArgs; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_dir_successful_response_is_json_object_containing_entries_with_path_name_and_kind_file_or_dir()
+     {
+        let mut reg = make_registry(state_with_list_dir_files());
+
+        let value = reg
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src", "recursive": true }),
+            )
+            .expect("recursive tower_list_dir must succeed");
+
+        assert!(
+            value.as_object().is_some(),
+            "response must be a JSON object"
+        );
+        assert_eq!(
+            list_dir_entries(&value),
+            vec![
+                ("src/a.rs".to_owned(), "a.rs".to_owned(), "file".to_owned()),
+                (
+                    "src/nested".to_owned(),
+                    "nested".to_owned(),
+                    "dir".to_owned()
+                ),
+                (
+                    "src/nested/b.rs".to_owned(),
+                    "b.rs".to_owned(),
+                    "file".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_dir_native_registry_changes_remain_source_compatible_with_main_registry_usage() {
+        fn accepts_registry_trait(registry: &mut dyn ToolRegistry) -> Result<Value, ToolError> {
+            let tools = registry.list();
+            assert!(tools.iter().any(|tool| tool.name == "tower_list_dir"));
+            registry.call("tower_list_dir", json!({ "path": "src" }))
+        }
+
+        let mut reg = make_registry(state_with_list_dir_files());
+        let value = accepts_registry_trait(&mut reg)
+            .expect("NativeToolRegistry must remain usable through ToolRegistry");
+
+        assert!(value.get("entries").is_some());
     }
 
     // ── Extension-host notification on MCP mutations ──────────────────────────
@@ -1032,7 +1489,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::domain::FileId;
-    use crate::ports::ExtensionHostPort;
+    use crate::ports::{ExtensionHostPort, StoragePort};
 
     /// Records every `on_file_changed` / `on_file_indexed` call so tests can
     /// assert the domain broadcast actually reached the host.
@@ -1100,38 +1557,30 @@ mod tests {
         );
     }
 
-    // ── AC1: tools/list shows 9 tools with schemas ────────────────────────────
+    // ── AC1: tools/list shows native tools with schemas ───────────────────────
 
     #[test]
-    fn ac1_tools_list_returns_nine_tower_tools() {
+    fn ac1_tools_list_returns_ten_tower_tools() {
         let reg = make_registry(empty_state());
         let tools = reg.list();
         assert_eq!(
             tools.len(),
-            9,
-            "expected 9 native tools; got {}",
+            EXPECTED_NATIVE_TOOL_NAMES.len(),
+            "unexpected native tool count; got {}",
             tools.len()
         );
     }
 
     #[test]
-    fn ac1_all_nine_tool_names_present() {
+    fn ac1_all_ten_tool_names_present() {
         let reg = make_registry(empty_state());
         let tool_list = reg.list();
         let names: Vec<&str> = tool_list.iter().map(|t| t.name.as_str()).collect();
-        let expected = [
-            "tower_find_file",
-            "tower_search_text",
-            "tower_read_file",
-            "tower_create_file",
-            "tower_create_directory",
-            "tower_delete_file",
-            "tower_global_replace",
-            "tower_edit_range",
-            "tower_reindex",
-        ];
-        for name in &expected {
-            assert!(names.contains(name), "missing tool '{name}'; got {names:?}");
+        for name in EXPECTED_NATIVE_TOOL_NAMES {
+            assert!(
+                names.contains(&name),
+                "missing tool '{name}'; got {names:?}"
+            );
         }
     }
 
@@ -1461,6 +1910,39 @@ mod tests {
         assert!(
             paths.is_empty(),
             "file removed from fs must not be findable after reindex"
+        );
+    }
+
+    #[test]
+    fn reindex_put_batch_failure_leaves_existing_persisted_record_recoverable() {
+        let state = state_with_client_file_and_storage(Box::new(FailBatchStorage::default()));
+        let client_id = {
+            let guard = state.read().unwrap();
+            let ws = guard.workspace.read().unwrap();
+            ws.get_by_path(&RelativePath::new("src/client.rs"))
+                .expect("setup file must be tracked")
+        };
+
+        {
+            let mut guard = state.write().unwrap();
+            guard
+                .fs
+                .delete(&RelativePath::new("src/client.rs"))
+                .unwrap();
+        }
+
+        let mut reg = make_registry(Arc::clone(&state));
+        let err = reg.call("tower_reindex", json!({})).unwrap_err();
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(_)),
+            "reindex must surface storage failure; got {err:?}"
+        );
+
+        let guard = state.read().unwrap();
+        let persisted = guard.storage.get(client_id);
+        assert!(
+            persisted.is_ok(),
+            "failed reindex must not delete old persisted record before fresh batch succeeds"
         );
     }
 

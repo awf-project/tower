@@ -39,19 +39,32 @@ extensions/                 # Out-of-process sidecar extensions (all are workspa
 ## Commands (available after spec 00)
 
 ```bash
+cargo build --workspace --bins               # builds native sidecar binaries into target/debug/
 cargo test --workspace                       # domain unit tests use in-memory doubles (zero disk I/O);
-                                             # also compiles every native extension binary into target/debug/
-                                             # so host e2e/integration tests can spawn the real sidecars
-cargo clippy --workspace -- -D warnings      # warnings are errors
+                                             # host e2e/integration tests spawn the prebuilt sidecars
+cargo clippy --workspace --all-targets -- -D warnings  # warnings are errors
 cargo fmt --check
 cargo deny check                             # license/advisory policy
 cargo run -p core_engine                     # MCP server over stdio
+tower mcp                                    # MCP stdio client: connect-or-spawn the daemon, relay
+tower daemon                                 # run the shared daemon in the foreground
+tower status                                 # snapshot of the running daemon
+tower shutdown                               # stop the running daemon
 ```
 
-**Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy -- -D warnings`
-+ `cargo test --workspace` all green. State it with evidence, never assume.
+**Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings`
++ `cargo build --workspace --bins` + `cargo test --workspace` all green. State it with evidence, never assume.
 
 ## MCP tool surface (JSON-RPC over stdio)
+
+**Multi-agent model.** Each agent launches `tower mcp`, a thin stdio client that
+connects to (or spawns) a single per-workspace **daemon** holding the Sled index,
+watcher, and extensions. The daemon listens on `<workspace>/.tower/daemon.sock` and
+serves one MCP session per client over shared state, so several agents can drive the
+same workspace concurrently (writes stay safe via the existing `expected_version`
+CAS). The daemon self-terminates after `[daemon] idle_timeout_secs` (default 30s)
+with no connected clients. **Migration:** point MCP client configs at `tower mcp`
+(was `tower`).
 
 The `core_engine` binary exposes these tools to MCP clients. All `path` arguments are
 **workspace-relative**. Mutating tools accept an optional `expected_version` (hex SHA-256 from a
@@ -131,6 +144,7 @@ Positions are **0-based** `line` + **UTF-16** `character` offset.
 - **Local config**: `<workspace>/.tower/config.toml` (TOML) holds per-project settings.
   `[extensions] disabled = ["<name>"]` skips loading the named extension by manifest name.
   `[lsp.<lang>]` configures a language-server binding for the `lsp_extension` sidecar.
+  `[daemon] idle_timeout_secs` — seconds with no connected clients before the daemon exits (default 30).
   Absent file → defaults; malformed file → startup fails (exit 1). Parser: `adapters/config`.
 
 ## KNOWN PROTOCOL HAZARDS (sidecar extension multiplexing)
@@ -215,3 +229,60 @@ Query: `zpm query-logic --goal "rule(Id, pitfall, Desc, Prio, Src)" --memory fee
 ### Review Standards
 
 Query: `zpm query-logic --goal "rule(Id, review, Desc, Prio, Src)" --memory feedback`
+
+
+## Tower MCP Server (code intelligence)
+
+This project is indexed by the [tower](https://github.com/awf-project/tower) MCP server, which
+continuously watches the workspace. **Prefer tower tools over raw file scans**: `tower_search_text`
+instead of grepping the tree, `tower_ast_*` instead of reading whole files to find a symbol, and the
+CAS-guarded mutators for safe edits. All `path` arguments are **workspace-relative**.
+
+Mutating tools accept an optional `expected_version` (hex SHA-256 from a prior `tower_read_file` with
+`with_version: true`) for **optimistic compare-and-swap**: the write is rejected with
+`PreconditionFailed` if the file changed since it was read.
+
+### VFS — files & search (host-side)
+
+| Tool | Purpose |
+|------|---------|
+| `tower_read_file` | Read raw UTF-8; `with_version: true` returns a `version` CAS token. |
+| `tower_create_file` | Create/overwrite with `content`; CAS via `expected_version`. |
+| `tower_edit_range` | Splice `replacement` into byte range `[start_byte, end_byte)` (UTF-8 boundaries; empty = delete; equal bytes = insert); atomic commit; CAS. |
+| `tower_global_replace` | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
+| `tower_create_directory` | Recursive `mkdir`. |
+| `tower_delete_file` | Delete a file. |
+| `tower_find_file` | Match a substring/fuzzy `query` against file paths. |
+| `tower_search_text` | Grep `pattern` across all indexed file contents. |
+| `tower_reindex` | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete). |
+
+### AST — structural navigation (`ast` extension)
+
+Tree-sitter backed; error-tolerant so comments/strings yield no false positives. Supports `.rs`, `.go`, `.php`.
+Symbol kinds: `function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class`.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_ast_get_outline` | Structural outline (functions, structs, methods, traits, enums, impl blocks) of one file. |
+| `tower_ast_find_symbols` | Precise definition locations of a named symbol of a given `kind` within one file. |
+| `tower_ast_read_symbol` | Read only a named symbol's source span (byte slice + kind + start/end rows), not the whole file. |
+| `tower_ast_search_symbols` | Cross-file lookup against the in-memory symbol index (kept fresh by `fileIndexed`/`fileChanged` events). |
+| `tower_ast_reindex` | Force a full whole-project symbol reindex (cold cache / large external change). |
+
+### LSP — semantic queries (`lsp` extension)
+
+Require a configured language server for the file extension (`[lsp.<lang>]` in `.tower/config.toml`).
+Positions are **0-based** `line` + **UTF-16** `character` offset.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_lsp_definition` | Go to definition of the symbol at a position. |
+| `tower_lsp_references` | Find all references to the symbol at a position. |
+| `tower_lsp_hover` | Hover info for the symbol at a position. |
+| `tower_lsp_diagnostics` | Errors/warnings for a file. |
+
+### Formatting
+
+| Tool | Purpose |
+|------|---------|
+| `tower_fmt_format` | Enqueue format jobs; `{path}` formats one file, `{}` formats all indexed files. Returns `{requested, accepted, dropped}` immediately — does **not** wait for completion. |

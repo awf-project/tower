@@ -72,11 +72,12 @@ cargo clippy --workspace --all-targets -- -D warnings    # make clippy
 
 ### 3. Run the test suite
 
-`cargo test --workspace` compiles every native extension binary too, so the host
-integration tests can locate them under `target/debug/`. There is no WASM build
-step and no WASI SDK.
+Build native extension binaries before running tests so the host integration
+tests can locate sidecars under `target/debug/`. There is no WASM build step and
+no WASI SDK.
 
 ```bash
+cargo build --workspace --bins
 cargo test --workspace           # make test
 ```
 
@@ -204,34 +205,40 @@ for the manifest schema, capabilities, activation, and the supervision/fault mod
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find_file","arguments":{"query":"main.rs"}}}
 ```
 
+### List a directory
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_list_dir","arguments":{"path":"src","recursive":true,"max_depth":1}}}
+```
+
 ### Search for text
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_search_text","arguments":{"pattern":"fn main"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_search_text","arguments":{"pattern":"fn main"}}}
 ```
 
 ### Read a file
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"src/main.rs"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"src/main.rs"}}}
 ```
 
 ### Create a file
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
 ```
 
 ### Mass find-and-replace
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
 ```
 
 Response shape (success):
 
 ```json
-{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"}]},"id":7}
+{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"}]},"id":8}
 ```
 
 All tool responses follow the same envelope: `result.content[0].text` is a JSON string containing

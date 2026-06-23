@@ -3,9 +3,8 @@
 #
 # Since the extension-system migration (spec 20) the engine is a single static
 # binary with out-of-process *native* sidecar extensions (extensions/*). There is
-# no WASM build step, no WASI SDK, and no wasm fixtures — `cargo test --workspace`
-# compiles every native extension binary and the host can locate them under
-# target/debug/.
+# no WASM build step, no WASI SDK, and no wasm fixtures. Build workspace binaries
+# before tests so the host can locate sidecars under target/debug/.
 
 BIN          := tower
 PKG          := core_engine
@@ -65,6 +64,7 @@ clippy: ## Lint, warnings as errors (CI step 2)
 
 .PHONY: test
 test: ## Run the workspace test suite (compiles native extensions first)
+	cargo build --workspace --bins
 	cargo test --workspace
 
 .PHONY: deny
@@ -72,9 +72,7 @@ deny: ## License & advisory policy
 	cargo deny check
 
 .PHONY: gate
-gate: fmt-check clippy ## Full quality gate (fmt + clippy + tests + deny)
-	cargo test --workspace
-	cargo deny check
+gate: fmt-check clippy test deny ## Full quality gate, same sequence as CI
 
 ## ---------------------------------------------------------------------------
 ## Distribution

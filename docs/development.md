@@ -6,9 +6,10 @@ construct tower.
 
 > Since the extension-system migration (spec 20) the engine is a **single static
 > binary** with out-of-process **native** sidecar extensions (`extensions/*`).
-> There is **no WASM build step and no WASI SDK** — `cargo test --workspace`
-> compiles every native extension binary and the host locates them under
-> `target/debug/`. The author-facing extension guide is [extensions.md](extensions.md).
+> There is **no WASM build step and no WASI SDK**. Run
+> `cargo build --workspace --bins` before `cargo test --workspace` so the host
+> can locate native extension binaries under `target/debug/`. The author-facing
+> extension guide is [extensions.md](extensions.md).
 
 ---
 
@@ -45,9 +46,9 @@ cargo fmt --all --check            # make fmt-check
 # 2. Linting (warnings are hard errors)
 cargo clippy --workspace --all-targets -- -D warnings    # make clippy
 
-# 3. Run the full workspace test suite. This compiles every native extension
-#    binary (extensions/*) too, so the host integration tests can locate them
-#    under target/debug/. No WASM build, no WASI SDK.
+# 3. Build native extension binaries, then run the full workspace test suite.
+#    Host integration tests locate sidecars under target/debug/.
+cargo build --workspace --bins
 cargo test --workspace             # make test
 
 # 4. License and advisory policy
@@ -68,7 +69,7 @@ The `Makefile` is the developer task runner; `make help` lists everything.
 | `make fmt`       | `cargo fmt --all` |
 | `make fmt-check` | `cargo fmt --all --check` (gate step 1) |
 | `make clippy`    | `cargo clippy --workspace --all-targets -- -D warnings` (gate step 2) |
-| `make test`      | `cargo test --workspace` (gate step 3) |
+| `make test`      | `cargo build --workspace --bins` then `cargo test --workspace` (gate step 3) |
 | `make deny`      | `cargo deny check` (gate step 4) |
 | `make gate`      | full quality gate: fmt-check + clippy + test + deny |
 | `make dist`      | package a release tarball + sha256 for the host target |
@@ -105,11 +106,12 @@ pull request on `ubuntu-latest`. Steps in order:
 3. `Swatinem/rust-cache@v2` — Cargo build cache
 4. `cargo fmt --all --check`
 5. `cargo clippy --workspace --all-targets -- -D warnings`
-6. `cargo test --workspace` (also compiles every native extension binary)
-7. `EmbarkStudios/cargo-deny-action@v2`
+6. `cargo build --workspace --bins`
+7. `cargo test --workspace`
+8. `EmbarkStudios/cargo-deny-action@v2`
 
 There is no WASI SDK step and no separate WASM build step: native extensions are
-ordinary workspace members compiled by `cargo test --workspace`.
+ordinary workspace members compiled by `cargo build --workspace --bins` before tests.
 
 ---
 
@@ -204,10 +206,11 @@ adapter-wired scenarios:
 | `integration_mutation.rs` | Shadow-file atomic writes |
 | `ast_e2e.rs` | AST outline + symbol search via MCP, end-to-end through the `ast` extension |
 
-Native extension binaries are located through `CARGO_BIN_EXE_<name>` env vars that
-Cargo sets for workspace binary crates (e.g. `CARGO_BIN_EXE_ast_extension`), so
-`cargo test --workspace` builds and wires them automatically — no separate build
-step and no `build.rs` artifact-locating dance.
+Native extension binaries are located either through `CARGO_BIN_EXE_<name>` env vars
+for package integration tests or through the workspace `target/debug/` convention
+for host-side tests that spawn sibling sidecars. `make test` builds workspace bins
+first, then runs `cargo test --workspace`; no non-Cargo build step or `build.rs`
+artifact-locating dance is needed.
 
 ### Extension logic tested on the host
 

@@ -32,14 +32,16 @@
 //! as a separate token).
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::domain::grep::TextSearch;
 use crate::domain::token::tokenize;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::FileSystemPort;
-use crate::ports::inbound::{Match, SearchUseCase};
+use crate::ports::inbound::{
+    DirectoryEntry, DirectoryEntryKind, ListDirRequest, ListDirResult, Match, SearchUseCase,
+};
 
 use super::InvertedIndex;
 
@@ -221,6 +223,51 @@ impl SearchUseCase for FileSearch<'_> {
         }
     }
 
+    fn list_dir(&self, request: ListDirRequest) -> Result<ListDirResult, DomainError> {
+        let request_path = normalize_list_dir_path(&request.path);
+        let requested = RelativePath::new(request_path);
+
+        if !request_path.is_empty() && self.workspace.get_by_path(&requested).is_some() {
+            return Err(DomainError::NotADirectory(requested));
+        }
+
+        let mut entries: BTreeMap<RelativePath, DirectoryEntryKind> = BTreeMap::new();
+
+        for id in self.workspace.all_file_ids() {
+            let Ok(file) = self.workspace.get(id) else {
+                continue;
+            };
+            let Some(descendant) = descendant_path(request_path, file.path.as_str()) else {
+                continue;
+            };
+            if descendant.is_empty() {
+                continue;
+            }
+
+            if request.recursive {
+                add_recursive_entries(
+                    &mut entries,
+                    request_path,
+                    descendant,
+                    request.max_depth.map(core::num::NonZeroUsize::get),
+                );
+            } else {
+                add_direct_entry(&mut entries, request_path, descendant);
+            }
+        }
+
+        Ok(ListDirResult {
+            entries: entries
+                .into_iter()
+                .map(|(path, kind)| DirectoryEntry {
+                    name: last_component(path.as_str()).to_string(),
+                    path,
+                    kind,
+                })
+                .collect(),
+        })
+    }
+
     /// Search with an early-stop cap (spec 07 OP1).
     ///
     /// Overrides the default trait implementation to pass the cap directly to
@@ -243,6 +290,73 @@ fn last_component(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+fn normalize_list_dir_path(path: &RelativePath) -> &str {
+    match path.as_str() {
+        "" | "." => "",
+        path => path.trim_end_matches('/'),
+    }
+}
+
+fn descendant_path<'a>(request_path: &str, tracked_path: &'a str) -> Option<&'a str> {
+    if request_path.is_empty() {
+        return Some(tracked_path);
+    }
+
+    tracked_path
+        .strip_prefix(request_path)
+        .and_then(|rest| rest.strip_prefix('/'))
+}
+
+fn add_direct_entry(
+    entries: &mut BTreeMap<RelativePath, DirectoryEntryKind>,
+    request_path: &str,
+    descendant: &str,
+) {
+    let (name, kind) = match descendant.split_once('/') {
+        Some((directory, _)) => (directory, DirectoryEntryKind::Dir),
+        None => (descendant, DirectoryEntryKind::File),
+    };
+
+    entries.insert(join_path(request_path, name), kind);
+}
+
+fn add_recursive_entries(
+    entries: &mut BTreeMap<RelativePath, DirectoryEntryKind>,
+    request_path: &str,
+    descendant: &str,
+    max_depth: Option<usize>,
+) {
+    let components: Vec<&str> = descendant.split('/').collect();
+    let file_depth = components.len();
+    let entry_depth = max_depth.map_or(file_depth, |depth| depth.min(file_depth));
+
+    for depth in 1..entry_depth {
+        entries.insert(
+            join_path(request_path, &components[..depth].join("/")),
+            DirectoryEntryKind::Dir,
+        );
+    }
+
+    let kind = if entry_depth == file_depth {
+        DirectoryEntryKind::File
+    } else {
+        DirectoryEntryKind::Dir
+    };
+
+    entries.insert(
+        join_path(request_path, &components[..entry_depth].join("/")),
+        kind,
+    );
+}
+
+fn join_path(base: &str, child: &str) -> RelativePath {
+    if base.is_empty() {
+        RelativePath::new(child)
+    } else {
+        RelativePath::new(format!("{base}/{child}"))
+    }
+}
+
 // ── PartialOrd / Ord for RelativePath (needed for sort) ───────────────────────
 //
 // RelativePath derives PartialEq + Eq + Hash but not Ord. We implement it here
@@ -257,6 +371,7 @@ mod tests {
     use crate::domain::token::tokenize;
     use crate::domain::virtual_file::FileMetadata;
     use crate::domain::workspace::ProjectWorkspace;
+    use crate::ports::inbound::{DirectoryEntry, DirectoryEntryKind};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -274,6 +389,334 @@ mod tests {
 
     fn make_search<'a>(idx: &'a InvertedIndex, ws: &'a ProjectWorkspace) -> FileSearch<'a> {
         FileSearch::new(idx, ws)
+    }
+
+    mod list_dir {
+        use super::*;
+        use std::num::NonZeroUsize;
+
+        #[test]
+        fn directory_entry_kind_exists_and_represents_exactly_file_and_dir_entry_kinds() {
+            assert_eq!(
+                serde_json::to_value(DirectoryEntryKind::File).unwrap(),
+                serde_json::json!("file")
+            );
+            assert_eq!(
+                serde_json::to_value(DirectoryEntryKind::Dir).unwrap(),
+                serde_json::json!("dir")
+            );
+        }
+
+        #[test]
+        fn directory_entry_exists_with_public_path_name_and_kind_fields_using_relative_path() {
+            let entry = DirectoryEntry {
+                path: path("src/lib.rs"),
+                name: "lib.rs".to_string(),
+                kind: DirectoryEntryKind::File,
+            };
+
+            assert_eq!(entry.path.as_str(), "src/lib.rs");
+            assert_eq!(entry.name, "lib.rs");
+            assert_eq!(entry.kind, DirectoryEntryKind::File);
+        }
+
+        #[test]
+        fn list_dir_request_exists_with_public_path_recursive_and_max_depth_fields() {
+            let request = ListDirRequest {
+                path: path("src"),
+                recursive: true,
+                max_depth: Some(NonZeroUsize::new(2).unwrap()),
+            };
+
+            assert_eq!(request.path.as_str(), "src");
+            assert!(request.recursive);
+            assert_eq!(request.max_depth.map(NonZeroUsize::get), Some(2));
+        }
+
+        #[test]
+        fn list_dir_result_exists_with_public_entries_field_containing_directory_entry_values() {
+            let result = ListDirResult {
+                entries: vec![DirectoryEntry {
+                    path: path("src"),
+                    name: "src".to_string(),
+                    kind: DirectoryEntryKind::Dir,
+                }],
+            };
+
+            assert_eq!(result.entries.len(), 1);
+            assert_eq!(result.entries[0].path.as_str(), "src");
+            assert_eq!(result.entries[0].kind, DirectoryEntryKind::Dir);
+        }
+
+        #[test]
+        fn search_use_case_declares_list_dir_returning_list_dir_result_or_domain_error() {
+            fn assert_signature<T: SearchUseCase>(
+                use_case: &T,
+                request: ListDirRequest,
+            ) -> Result<ListDirResult, DomainError> {
+                use_case.list_dir(request)
+            }
+
+            let mut ws = ProjectWorkspace::new();
+            let mut idx = InvertedIndex::new();
+            add_file(&mut ws, &mut idx, "src/lib.rs");
+            add_file(&mut ws, &mut idx, "src/main.rs");
+
+            let result = assert_signature(
+                &make_search(&idx, &ws),
+                ListDirRequest {
+                    path: path("src"),
+                    recursive: false,
+                    max_depth: None,
+                },
+            )
+            .unwrap();
+
+            let entries: Vec<(&str, DirectoryEntryKind)> = result
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.kind))
+                .collect();
+
+            assert_eq!(
+                entries,
+                vec![
+                    ("src/lib.rs", DirectoryEntryKind::File),
+                    ("src/main.rs", DirectoryEntryKind::File),
+                ]
+            );
+        }
+
+        fn entry(path: &str, kind: DirectoryEntryKind) -> DirectoryEntry {
+            DirectoryEntry {
+                path: super::path(path),
+                name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                kind,
+            }
+        }
+
+        fn list_paths(
+            tracked_paths: &[&str],
+            request_path: &str,
+            recursive: bool,
+            max_depth: Option<usize>,
+        ) -> Result<ListDirResult, DomainError> {
+            let mut ws = ProjectWorkspace::new();
+            let mut idx = InvertedIndex::new();
+            for tracked_path in tracked_paths {
+                add_file(&mut ws, &mut idx, tracked_path);
+            }
+
+            make_search(&idx, &ws).list_dir(ListDirRequest {
+                path: super::path(request_path),
+                recursive,
+                max_depth: max_depth.map(|depth| NonZeroUsize::new(depth).unwrap()),
+            })
+        }
+
+        #[test]
+        fn list_dir_returns_src_a_rs_and_src_b_rs_as_files_and_src_net_as_dir_for_src_direct_listing()
+         {
+            let result = list_paths(
+                &["src/a.rs", "src/b.rs", "src/net/c.rs"],
+                "src",
+                false,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.entries,
+                vec![
+                    entry("src/a.rs", DirectoryEntryKind::File),
+                    entry("src/b.rs", DirectoryEntryKind::File),
+                    entry("src/net", DirectoryEntryKind::Dir),
+                ]
+            );
+        }
+
+        #[test]
+        fn list_dir_treats_empty_path_as_workspace_root_and_returns_direct_root_entries() {
+            let result = list_paths(
+                &["README.md", "src/lib.rs", "tests/search.rs"],
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.entries,
+                vec![
+                    entry("README.md", DirectoryEntryKind::File),
+                    entry("src", DirectoryEntryKind::Dir),
+                    entry("tests", DirectoryEntryKind::Dir),
+                ]
+            );
+        }
+
+        #[test]
+        fn list_dir_treats_dot_path_as_workspace_root_with_same_entries_and_order_as_empty_path() {
+            let tracked_paths = ["README.md", "src/lib.rs", "tests/search.rs"];
+
+            let empty_path = list_paths(&tracked_paths, "", false, None).unwrap();
+            let dot_path = list_paths(&tracked_paths, ".", false, None).unwrap();
+
+            assert_eq!(dot_path.entries, empty_path.entries);
+        }
+
+        #[test]
+        fn list_dir_treats_trailing_slash_path_as_same_directory_for_direct_listing() {
+            let tracked_paths = ["src/a.rs", "src/b.rs", "src/net/c.rs"];
+
+            let without_slash = list_paths(&tracked_paths, "src", false, None).unwrap();
+            let with_slash = list_paths(&tracked_paths, "src/", false, None).unwrap();
+
+            assert_eq!(with_slash.entries, without_slash.entries);
+        }
+
+        #[test]
+        fn list_dir_recursive_includes_synthesized_directories_and_descendant_files() {
+            let result = list_paths(&["src/net/c.rs"], "src", true, None).unwrap();
+
+            assert_eq!(
+                result.entries,
+                vec![
+                    entry("src/net", DirectoryEntryKind::Dir),
+                    entry("src/net/c.rs", DirectoryEntryKind::File),
+                ]
+            );
+        }
+
+        #[test]
+        fn list_dir_treats_trailing_slash_path_as_same_directory_for_recursive_listing() {
+            let tracked_paths = ["src/net/c.rs"];
+
+            let without_slash = list_paths(&tracked_paths, "src", true, None).unwrap();
+            let with_slash = list_paths(&tracked_paths, "src/", true, None).unwrap();
+
+            assert_eq!(with_slash.entries, without_slash.entries);
+        }
+
+        #[test]
+        fn list_dir_recursive_with_max_depth_one_includes_src_net_dir_and_excludes_src_net_c_rs() {
+            let result = list_paths(&["src/net/c.rs"], "src", true, Some(1)).unwrap();
+
+            assert_eq!(
+                result.entries,
+                vec![entry("src/net", DirectoryEntryKind::Dir)]
+            );
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .all(|entry| entry.path.as_str() != "src/net/c.rs"),
+                "max_depth:1 must exclude src/net/c.rs; got {:?}",
+                result.entries
+            );
+        }
+
+        #[test]
+        fn list_dir_de_duplicates_synthesized_directories_for_shared_directory_prefixes() {
+            let result = list_paths(
+                &["src/net/client.rs", "src/net/server.rs", "src/ui/view.rs"],
+                "src",
+                false,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.entries,
+                vec![
+                    entry("src/net", DirectoryEntryKind::Dir),
+                    entry("src/ui", DirectoryEntryKind::Dir),
+                ]
+            );
+        }
+
+        #[test]
+        fn list_dir_sorts_all_returned_entries_deterministically_by_workspace_relative_path() {
+            let result = list_paths(
+                &["src/z.rs", "src/a.rs", "src/net/c.rs", "src/m.rs"],
+                "src",
+                false,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.entries,
+                vec![
+                    entry("src/a.rs", DirectoryEntryKind::File),
+                    entry("src/m.rs", DirectoryEntryKind::File),
+                    entry("src/net", DirectoryEntryKind::Dir),
+                    entry("src/z.rs", DirectoryEntryKind::File),
+                ]
+            );
+        }
+
+        #[test]
+        fn list_dir_returns_empty_entries_for_path_with_no_tracked_descendants() {
+            let result = list_paths(&["src/lib.rs"], "missing", false, None).unwrap();
+
+            assert_eq!(result, ListDirResult { entries: vec![] });
+        }
+
+        #[test]
+        fn list_dir_returns_not_a_directory_error_when_request_path_exactly_matches_tracked_file() {
+            let err = list_paths(&["src/lib.rs"], "src/lib.rs", false, None).unwrap_err();
+
+            assert_eq!(err, DomainError::NotADirectory(super::path("src/lib.rs")));
+        }
+
+        #[test]
+        fn list_dir_returns_not_a_directory_error_when_trailing_slash_path_matches_tracked_file() {
+            let err = list_paths(&["src/lib.rs"], "src/lib.rs/", false, None).unwrap_err();
+
+            assert_eq!(err, DomainError::NotADirectory(super::path("src/lib.rs")));
+        }
+
+        #[test]
+        fn domain_error_has_exactly_not_a_directory_variant_carrying_requested_relative_path() {
+            let requested = path("src/lib.rs");
+            let err = DomainError::NotADirectory(requested.clone());
+
+            assert_eq!(err, DomainError::NotADirectory(requested));
+        }
+
+        #[test]
+        fn domain_error_not_a_directory_display_includes_path_as_str() {
+            let path = path("src/lib.rs");
+            let rendered = DomainError::NotADirectory(path.clone()).to_string();
+
+            assert!(
+                rendered.contains(path.as_str()),
+                "NotADirectory display must include requested path; got {rendered:?}"
+            );
+        }
+
+        #[test]
+        fn existing_search_use_case_methods_and_dtos_remain_source_compatible_except_implementors_needing_list_dir()
+         {
+            let mut ws = ProjectWorkspace::new();
+            let mut idx = InvertedIndex::new();
+            let file_id = add_file(&mut ws, &mut idx, "src/lib.rs");
+            let search = make_search(&idx, &ws);
+
+            let file_results = search.find_file("lib").unwrap();
+            let text_results = search.search_text("lib").unwrap();
+            let search_match = Match {
+                path: path("src/lib.rs"),
+                line_number: 1,
+                line_content: "fn lib() {}".to_string(),
+                file_id,
+            };
+
+            assert_eq!(file_results, vec![path("src/lib.rs")]);
+            assert!(text_results.is_empty());
+            assert_eq!(search_match.path.as_str(), "src/lib.rs");
+        }
     }
 
     // ── TDD step 5/6: find_file basics ────────────────────────────────────────
