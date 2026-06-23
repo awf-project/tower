@@ -255,6 +255,76 @@ fn host_call_log_round_trips_json() {
     }
 }
 
+#[test]
+fn existing_host_call_and_manifest_serialization_contracts_stay_unchanged() {
+    let read_file = serde_json::to_value(HostCall::ReadFile {
+        path: "/src/lib.rs".to_owned(),
+    })
+    .expect("serialize readFile host call");
+    assert_eq!(
+        read_file,
+        serde_json::json!({
+            "type": "ReadFile",
+            "path": "/src/lib.rs"
+        })
+    );
+
+    let request_format = serde_json::to_value(HostCall::RequestFormat {
+        path: "/src/main.rs".to_owned(),
+    })
+    .expect("serialize requestFormat host call");
+    assert_eq!(
+        request_format,
+        serde_json::json!({
+            "type": "RequestFormat",
+            "path": "/src/main.rs"
+        })
+    );
+
+    let log = serde_json::to_value(HostCall::Log {
+        level: "info".to_owned(),
+        msg: "hello from extension".to_owned(),
+    })
+    .expect("serialize log host call");
+    assert_eq!(
+        log,
+        serde_json::json!({
+            "type": "Log",
+            "level": "info",
+            "msg": "hello from extension"
+        })
+    );
+
+    let toml = r#"
+        name = "fmt"
+        version = "0.1.0"
+        command = ["fmt_extension"]
+        activation = "lazy"
+
+        [capabilities]
+        required = ["read_file", "list_files", "request_format", "log"]
+    "#;
+    let manifest: ExtensionManifest = toml::from_str(toml).expect("parse existing capabilities");
+    assert_eq!(
+        manifest.capabilities.required,
+        vec!["read_file", "list_files", "request_format", "log"]
+    );
+
+    let capabilities = [
+        (Capability::ReadFile, "\"read_file\""),
+        (Capability::ListFiles, "\"list_files\""),
+        (Capability::RequestFormat, "\"request_format\""),
+        (Capability::Log, "\"log\""),
+    ];
+    for (capability, expected_json) in capabilities {
+        let json = serde_json::to_string(&capability).expect("serialize existing capability");
+        assert_eq!(json, expected_json);
+        let decoded: Capability =
+            serde_json::from_str(expected_json).expect("deserialize existing capability");
+        assert_eq!(decoded, capability);
+    }
+}
+
 // ── AC2: ExtensionManifest TOML parse ────────────────────────────────────────
 
 #[test]
@@ -333,28 +403,28 @@ fn extension_manifest_empty_tools_is_valid() {
 // ── AC3: Malformed input → ProtocolError, no panic ───────────────────────────
 
 #[test]
-fn malformed_request_returns_error_not_panic() {
+fn malformed_request_returns_error_without_unwind() {
     let bad = r#"{"type":"UnknownMethod","data":{}}"#;
     let result: Result<Request, _> = serde_json::from_str(bad);
     assert!(result.is_err(), "malformed message must fail, not panic");
 }
 
 #[test]
-fn malformed_response_returns_error_not_panic() {
+fn malformed_response_returns_error_without_unwind() {
     let bad = r#"{"not": "a valid response"}"#;
     let result: Result<Response, _> = serde_json::from_str(bad);
     assert!(result.is_err(), "malformed response must fail, not panic");
 }
 
 #[test]
-fn malformed_event_returns_error_not_panic() {
+fn malformed_event_returns_error_without_unwind() {
     let bad = r#"{"type":"SomethingElse"}"#;
     let result: Result<Event, _> = serde_json::from_str(bad);
     assert!(result.is_err(), "malformed event must fail, not panic");
 }
 
 #[test]
-fn incomplete_json_returns_error_not_panic() {
+fn incomplete_json_returns_error_without_unwind() {
     let bad = r#"{"type":"Initialize","#;
     let result: Result<Request, _> = serde_json::from_str(bad);
     assert!(result.is_err(), "incomplete JSON must fail, not panic");

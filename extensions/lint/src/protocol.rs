@@ -15,6 +15,15 @@ pub struct CheckRequest {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FixRequest {
+    pub path: Option<String>,
+    #[serde(default, rename = "unsafe")]
+    pub unsafe_fixes: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CheckResult {
     pub supported: bool,
     pub diagnostics: Vec<LintDiagnosticDto>,
@@ -24,6 +33,53 @@ pub struct CheckResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LintToolErrorResponse {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FixResult {
+    pub files_changed: usize,
+    pub fixes_applied: usize,
+    pub fixes_skipped: Vec<SkippedFixDto>,
+    pub remaining_diagnostics: Vec<LintDiagnosticDto>,
+    pub previews: Vec<FixPreviewDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SkippedFixDto {
+    pub path: String,
+    pub reason: SkippedFixReason,
+    pub diagnostic: Option<LintDiagnosticDto>,
+    pub supported_fix: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkippedFixReason {
+    Conflict,
+    Unsafe,
+    Unsupported,
+    CasConflict,
+    InvalidRange,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FixPreviewDto {
+    pub path: String,
+    pub edits: Vec<FixPreviewEditDto>,
+    pub preview_content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FixPreviewEditDto {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub replacement: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FixToolErrorResponse {
     pub code: String,
     pub message: String,
 }

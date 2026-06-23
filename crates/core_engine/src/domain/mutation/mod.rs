@@ -57,6 +57,9 @@ mod tests;
 #[cfg(test)]
 mod cas_tests;
 
+#[cfg(test)]
+mod apply_edits_tests;
+
 /// Write `content` to `path` using the spec-08 shadow-file atomic pattern.
 ///
 /// 1. Write to `<path>.tmp_write` via the FS port.

@@ -22,7 +22,7 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **Native extension host** | Out-of-process native sidecar extensions over a JSON-RPC 2.0 protocol on stdio; OS-process isolation, per-call timeouts, restart/backoff, and quarantine |
 | **AST analysis** | `ast` extension — Tree-sitter outline and symbol search for Rust, Go, PHP |
 | **Code intelligence** | `lsp` extension — diagnostics, definition, references, hover via a language-server bridge |
-| **Standalone linting** | `lint` extension — on-demand diagnostics from configured external linters, using the same diagnostic shape as LSP |
+| **Standalone linting and fixes** | `lint` extension — on-demand diagnostics and structured fixes from configured external linters, using the same diagnostic shape as LSP |
 | **Single static binary** | No WASM, WASI SDK, JVM, Node, or container required at runtime |
 
 ---
@@ -103,6 +103,10 @@ echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_list
 # Run configured standalone linters for all supported indexed files
 echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{}}}' \
   | cargo run -p core_engine -q
+
+# Preview structured lint fixes without writing files
+echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_lint_fix","arguments":{"path":"src/main.rs","dry_run":true}}}' \
+  | cargo run -p core_engine -q
 ```
 
 Each request is a single newline-delimited JSON object on stdin; responses arrive on stdout.
@@ -174,7 +178,8 @@ tests can locate sidecars under `target/debug/`. There is no WASM build step and
 |---|---|
 | [`docs/getting-started.md`](docs/getting-started.md) | Prerequisites, build, quality gate, first MCP session |
 | [`docs/architecture.md`](docs/architecture.md) | Hexagonal boundary, crate layout, ports, data flow, design decisions |
-| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools, error codes |
+| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools including lint fix, error codes |
+| [`docs/user-guide/lint-fixes.md`](docs/user-guide/lint-fixes.md) | How to preview and apply structured linter fixes safely with `tower_lint_fix` |
 | [`docs/extensions.md`](docs/extensions.md) | Extension authoring guide — native sidecars, the JSON-RPC protocol, capabilities, manifest, fault model |
 | [`docs/development.md`](docs/development.md) | Contributing, TDD workflow, CI pipeline, test conventions |
 | [`docs/ADR/`](docs/ADR/) | Architecture Decision Records |

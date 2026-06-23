@@ -155,7 +155,7 @@ fn spec27_file_changed_and_deleted_both_route_correctly() {
 
 // ── TDD step 7: push → host re-emit (sidecar adapter) ───────────────────────
 
-/// Spec 27 O1: `dispatch_host_call("notify/resourceUpdated", ...)` sends to the
+/// Spec 27 O1: notify/resourceUpdated dispatch sends to the
 /// push channel when the `notify` capability is declared.
 ///
 /// This test exercises the sidecar adapter's `dispatch_host_call` function
@@ -167,6 +167,7 @@ fn spec27_notify_resource_updated_reaches_push_channel() {
     use std::sync::mpsc;
 
     use core_engine::adapters::extension::HostDeps;
+    use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
     use core_engine::adapters::formatter::NoOpFormatQueue;
     use core_engine::adapters::mcp::PushEvent;
     use core_engine::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -176,6 +177,7 @@ fn spec27_notify_resource_updated_reaches_push_channel() {
         fs: Arc::new(Mutex::new(InMemoryFs::new())),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: Some(tx),
     };
 

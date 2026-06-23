@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use crate::adapters::formatter::FormatQueuePort;
 use crate::adapters::mcp::PushEvent;
+use crate::domain::DomainError;
+use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest};
 use crate::ports::{AstIndexPort, FileSystemPort};
 
 /// Capability dependencies required by [`SidecarHostAdapter`].
@@ -32,6 +34,7 @@ use crate::ports::{AstIndexPort, FileSystemPort};
 ///     fs: Arc::new(std::sync::Mutex::new(InMemoryFs::new())),
 ///     ast_index: Arc::new(InMemoryAstIndex::new()),
 ///     format_queue: Arc::new(NoOpFormatQueue),
+///     apply_edits: Arc::new(core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost),
 ///     push_tx: None,
 /// };
 /// ```
@@ -49,6 +52,9 @@ pub struct HostDeps {
     /// Format queue port for `workspace/requestFormat`.
     pub format_queue: Arc<dyn FormatQueuePort>,
 
+    /// Apply-edits port for `workspace/applyEdits`.
+    pub apply_edits: Arc<dyn ApplyEditsHostPort>,
+
     /// Optional push sender for `notify/resourceUpdated` (spec 27 O1).
     ///
     /// When `Some`, the sidecar adapter forwards `NotifyResourceUpdated` host
@@ -56,6 +62,37 @@ pub struct HostDeps {
     /// subscribed MCP clients receive `notifications/resources/updated`.
     /// `None` means push is disabled (e.g. in unit tests or non-LSP setups).
     pub push_tx: Option<std::sync::mpsc::Sender<PushEvent>>,
+}
+
+/// Apply-edits dependency required by `workspace/applyEdits`.
+#[rustfmt::skip]
+pub trait ApplyEditsHostPort: Send + Sync {
+    fn apply_edits_cas(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>;
+    fn apply_edits_dry_run(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>;
+}
+
+pub struct UnsupportedApplyEditsHost;
+
+impl ApplyEditsHostPort for UnsupportedApplyEditsHost {
+    fn apply_edits_cas(
+        &self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError> {
+        Err(DomainError::UnsupportedOperation(format!(
+            "workspace/applyEdits is not wired for {}",
+            request.path.as_str()
+        )))
+    }
+
+    fn apply_edits_dry_run(
+        &self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError> {
+        Err(DomainError::UnsupportedOperation(format!(
+            "workspace/applyEdits dry-run is not wired for {}",
+            request.path.as_str()
+        )))
+    }
 }
 
 /// Object-safe wrapper around `FileSystemPort` for shared read access.

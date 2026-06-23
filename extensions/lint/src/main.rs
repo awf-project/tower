@@ -2,22 +2,30 @@
 
 mod protocol;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use core_engine::adapters::config::{self, LintConfig};
+use core_engine::domain::mutation::compute_content_version;
+use extension_protocol::messages::ApplyEditsHostCallTextEdit;
 use extension_protocol::{
     Capability, HostCall, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response,
     ToolDecl,
 };
 use lint_extension::config::RunnerLintConfig;
 use lint_extension::diagnostics::{LintDiagnostic, severity_json};
-use lint_extension::runner::{LintToolError, RunOutcome, RunRequest, run_linter};
-use protocol::{CheckRequest, CheckResult, LintDiagnosticDto, LintToolErrorResponse, QueuedFrame};
-use serde_json::Value;
+use lint_extension::fixes::{FixApplicability, LintByteEdit, LintFix};
+use lint_extension::runner::{LintToolError, RunOutcome, RunRequest, run_linter, run_linter_fixes};
+use protocol::{
+    CheckRequest, CheckResult, FixPreviewDto, FixPreviewEditDto, FixRequest, FixResult,
+    FixToolErrorResponse, LintDiagnosticDto, LintToolErrorResponse, QueuedFrame, SkippedFixDto,
+    SkippedFixReason,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 const HOST_CALL_START_ID: u64 = 10_000;
 const LINT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -68,14 +76,27 @@ fn serve_lint_check() {
 
 fn lint_init_result() -> InitResult {
     InitResult {
-        tools: vec![ToolDecl {
-            name: "check".to_owned(),
-            description: "Run configured lint commands for one file or the indexed workspace."
-                .to_owned(),
-            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to lint; omit to lint all configured files"}},"additionalProperties":false}"#.to_owned(),
-        }],
+        tools: vec![
+            ToolDecl {
+                name: "check".to_owned(),
+                description: "Run configured lint commands for one file or the indexed workspace."
+                    .to_owned(),
+                schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to lint; omit to lint all configured files"}},"additionalProperties":false}"#.to_owned(),
+            },
+            ToolDecl {
+                name: "fix".to_owned(),
+                description: "Apply structured lint fixes for one file or the indexed workspace."
+                    .to_owned(),
+                schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to fix; omit to inspect all configured files"},"unsafe":{"type":"boolean","description":"Apply fixes with unsafe or unknown applicability"},"dry_run":{"type":"boolean","description":"Preview fixes without writing files"}},"additionalProperties":false}"#.to_owned(),
+            },
+        ],
         events: Vec::new(),
-        capabilities: vec![Capability::ReadFile, Capability::ListFiles, Capability::Log],
+        capabilities: vec![
+            Capability::ReadFile,
+            Capability::ListFiles,
+            Capability::RequestApplyEdits,
+            Capability::Log,
+        ],
     }
 }
 
@@ -213,19 +234,34 @@ fn handle_invoke_tool<R>(
     let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let tool_params = params.get("params").cloned().unwrap_or(Value::Null);
 
-    if tool_name != "check" {
-        protocol::send_response(
-            out,
-            id,
-            &Response::Error(ProtocolError {
-                code: -32601,
-                message: format!("unknown tool: {tool_name}"),
-                data: None,
-            }),
-        );
-        return;
+    match tool_name {
+        "check" => invoke_check_tool(out, id, tool_params, workspace_root, lines, next_id, queued),
+        "fix" => invoke_fix_tool(out, id, tool_params, workspace_root, lines, next_id, queued),
+        _ => {
+            protocol::send_response(
+                out,
+                id,
+                &Response::Error(ProtocolError {
+                    code: -32601,
+                    message: format!("unknown tool: {tool_name}"),
+                    data: None,
+                }),
+            );
+        }
     }
+}
 
+fn invoke_check_tool<R>(
+    out: &Arc<Mutex<impl Write>>,
+    id: &Option<Value>,
+    tool_params: Value,
+    workspace_root: &Path,
+    lines: &mut R,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+) where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
     let request: CheckRequest = match serde_json::from_value(tool_params) {
         Ok(request) => request,
         Err(error) => {
@@ -258,6 +294,487 @@ fn handle_invoke_tool<R>(
             }),
         ),
     }
+}
+
+fn invoke_fix_tool<R>(
+    out: &Arc<Mutex<impl Write>>,
+    id: &Option<Value>,
+    tool_params: Value,
+    workspace_root: &Path,
+    lines: &mut R,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+) where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let request: FixRequest = match serde_json::from_value(tool_params) {
+        Ok(request) => request,
+        Err(error) => {
+            protocol::send_response(
+                out,
+                id,
+                &Response::ToolResult(fix_error_result(
+                    "lint_fix_invalid_request",
+                    format!("bad FixRequest: {error}"),
+                )),
+            );
+            return;
+        }
+    };
+
+    match fix_lint(request, workspace_root, lines, out, next_id, queued) {
+        Ok(result) => protocol::send_response(
+            out,
+            id,
+            &Response::ToolResult(serde_json::to_value(result).expect("serialize FixResult")),
+        ),
+        Err(error) => protocol::send_response(
+            out,
+            id,
+            &Response::ToolResult(fix_error_result(error.code, error.message)),
+        ),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FixFailure {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+struct FileFixPlan {
+    path: String,
+    expected_version: String,
+    fixes: Vec<LintFix>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedFix {
+    fix: LintFix,
+    accepted_edits: Vec<LintByteEdit>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixApplyOptions {
+    unsafe_fixes: bool,
+    dry_run: bool,
+}
+
+struct FixApplyAccum<'a> {
+    result: &'a mut FixResult,
+    changed_files: &'a mut BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ApplyEditsResultDto {
+    applied: Vec<FixPreviewEditDto>,
+    skipped: Vec<SkippedEditDto>,
+    new_version: Option<String>,
+    preview: Option<ApplyEditsPreviewDto>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ApplyEditsPreviewDto {
+    edits: Vec<FixPreviewEditDto>,
+    preview_content: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SkippedEditDto {
+    edit: FixPreviewEditDto,
+}
+
+fn fix_lint<R>(
+    request: FixRequest,
+    workspace_root: &Path,
+    lines: &mut R,
+    out: &Arc<Mutex<impl Write>>,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+) -> Result<FixResult, FixFailure>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    if let Some(path) = request.path.as_deref() {
+        validate_fix_path(path)?;
+    }
+
+    let config = config::load(workspace_root)
+        .map_err(|error| fix_unavailable(format!("failed to load lint config: {error}")))?
+        .lint;
+    if config.is_empty() {
+        return Err(fix_unavailable("missing lint configuration"));
+    }
+
+    let mut result = FixResult::default();
+    let mut changed_files = BTreeSet::new();
+
+    for path in fix_target_paths(&request, lines, out, next_id, queued)? {
+        if let Some(plan) =
+            collect_fix_plan(path, &config, workspace_root, lines, out, next_id, queued)?
+        {
+            apply_fix_plan(
+                plan,
+                FixApplyOptions {
+                    unsafe_fixes: request.unsafe_fixes,
+                    dry_run: request.dry_run,
+                },
+                lines,
+                out,
+                next_id,
+                queued,
+                FixApplyAccum {
+                    result: &mut result,
+                    changed_files: &mut changed_files,
+                },
+            )?;
+        }
+    }
+
+    result.files_changed = changed_files.len();
+    if !request.dry_run && result.files_changed > 0 {
+        result.remaining_diagnostics = run_follow_up_check(
+            request.path,
+            &config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+        )?;
+    }
+    sort_diagnostics(&mut result.remaining_diagnostics);
+    Ok(result)
+}
+
+fn fix_target_paths<R>(
+    request: &FixRequest,
+    lines: &mut R,
+    out: &Arc<Mutex<impl Write>>,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+) -> Result<Vec<String>, FixFailure>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    if let Some(path) = request.path.as_ref() {
+        return Ok(vec![path.clone()]);
+    }
+
+    let mut paths = list_files(lines, out, next_id, queued).map_err(fix_apply_failed)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_fix_plan<R>(
+    path: String,
+    config: &LintConfig,
+    workspace_root: &Path,
+    lines: &mut R,
+    out: &Arc<Mutex<impl Write>>,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+) -> Result<Option<FileFixPlan>, FixFailure>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let Some((_, command)) = config.command_for_path(&path) else {
+        return Ok(None);
+    };
+    let content = read_file(&path, lines, out, next_id, queued).map_err(fix_apply_failed)?;
+    let runner_config = RunnerLintConfig::from(command);
+    let outcome = run_linter_fixes(RunRequest {
+        config: &runner_config,
+        workspace_root,
+        target_path: Some(&path),
+        stdin_content: Some(&content),
+        timeout: LINT_TIMEOUT,
+    })
+    .map_err(|error| fix_unavailable(lint_fix_unavailable_message(error)))?;
+
+    Ok(outcome.supported.then(|| FileFixPlan {
+        path,
+        expected_version: compute_content_version(content.as_bytes()),
+        fixes: outcome.fixes,
+    }))
+}
+
+fn apply_fix_plan<R>(
+    plan: FileFixPlan,
+    options: FixApplyOptions,
+    lines: &mut R,
+    out: &Arc<Mutex<impl Write>>,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+    accum: FixApplyAccum<'_>,
+) -> Result<(), FixFailure>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let (prepared, mut skipped) = prepare_fixes(plan.fixes, options.unsafe_fixes, &plan.path);
+    accum.result.fixes_skipped.append(&mut skipped);
+    if prepared.is_empty() {
+        return Ok(());
+    }
+
+    let edits = prepared
+        .iter()
+        .flat_map(|prepared| prepared.accepted_edits.iter())
+        .map(|edit| ApplyEditsHostCallTextEdit {
+            start_byte: edit.start_byte,
+            end_byte: edit.end_byte,
+            replacement: edit.replacement.clone(),
+        })
+        .collect::<Vec<_>>();
+    if edits.is_empty() {
+        return Ok(());
+    }
+
+    let value = match protocol::host_call(
+        out,
+        lines,
+        next_id,
+        "workspace/applyEdits",
+        &HostCall::RequestApplyEdits {
+            path: plan.path.clone(),
+            expected_version: plan.expected_version,
+            edits,
+            dry_run: options.dry_run,
+        },
+        queued,
+    ) {
+        Ok(value) => value,
+        Err(message) if message.starts_with("precondition_failed:") => {
+            skip_prepared(
+                &mut accum.result.fixes_skipped,
+                &prepared,
+                SkippedFixReason::CasConflict,
+            );
+            return Ok(());
+        }
+        Err(message) if message.starts_with("invalid_range:") => {
+            skip_prepared(
+                &mut accum.result.fixes_skipped,
+                &prepared,
+                SkippedFixReason::InvalidRange,
+            );
+            return Ok(());
+        }
+        Err(message) => return Err(fix_apply_failed(message)),
+    };
+
+    let applied = serde_json::from_value::<ApplyEditsResultDto>(value).map_err(|error| {
+        fix_apply_failed(format!("malformed workspace/applyEdits response: {error}"))
+    })?;
+
+    if applied.new_version.is_some() {
+        accum.changed_files.insert(plan.path.clone());
+    }
+    count_applied_fixes(&mut accum.result.fixes_applied, &prepared, &applied.applied);
+    append_host_skips(&mut accum.result.fixes_skipped, &prepared, &applied.skipped);
+
+    if options.dry_run
+        && let Some(preview) = applied.preview
+    {
+        accum.result.previews.push(FixPreviewDto {
+            path: plan.path,
+            edits: preview.edits,
+            preview_content: preview.preview_content,
+        });
+    }
+
+    Ok(())
+}
+
+fn prepare_fixes(
+    fixes: Vec<LintFix>,
+    unsafe_fixes: bool,
+    target_path: &str,
+) -> (Vec<PreparedFix>, Vec<SkippedFixDto>) {
+    let mut prepared = Vec::new();
+    let mut skipped = Vec::new();
+    let mut accepted: Vec<LintByteEdit> = Vec::new();
+
+    for fix in fixes {
+        if fix.path != target_path {
+            skipped.push(skipped_fix(&fix, SkippedFixReason::Unsupported, true));
+            continue;
+        }
+
+        match fix.applicability {
+            FixApplicability::Unsupported => {
+                skipped.push(skipped_fix(&fix, SkippedFixReason::Unsupported, false));
+            }
+            FixApplicability::Unsafe if !unsafe_fixes => {
+                skipped.push(skipped_fix(&fix, SkippedFixReason::Unsafe, true));
+            }
+            FixApplicability::Safe | FixApplicability::Unsafe => {
+                let conflicts_with_accepted = fix.edits.iter().any(|edit| {
+                    accepted
+                        .iter()
+                        .any(|existing| edits_conflict(existing, edit))
+                });
+                let conflicts_within_fix = fix.edits.iter().enumerate().any(|(index, edit)| {
+                    fix.edits
+                        .iter()
+                        .skip(index + 1)
+                        .any(|other| edits_conflict(edit, other))
+                });
+
+                if conflicts_with_accepted || conflicts_within_fix {
+                    skipped.push(skipped_fix(&fix, SkippedFixReason::Conflict, true));
+                } else if !fix.edits.is_empty() {
+                    let accepted_edits = fix.edits.clone();
+                    accepted.extend(accepted_edits.clone());
+                    prepared.push(PreparedFix {
+                        fix,
+                        accepted_edits,
+                    });
+                }
+            }
+        }
+    }
+
+    (prepared, skipped)
+}
+
+fn edits_conflict(left: &LintByteEdit, right: &LintByteEdit) -> bool {
+    left.start_byte < right.end_byte && right.start_byte < left.end_byte
+}
+
+fn count_applied_fixes(
+    fixes_applied: &mut usize,
+    prepared: &[PreparedFix],
+    applied: &[FixPreviewEditDto],
+) {
+    for prepared in prepared {
+        if prepared.accepted_edits.iter().any(|edit| {
+            applied
+                .iter()
+                .any(|applied| preview_edit_matches(edit, applied))
+        }) {
+            *fixes_applied += 1;
+        }
+    }
+}
+
+fn append_host_skips(
+    fixes_skipped: &mut Vec<SkippedFixDto>,
+    prepared: &[PreparedFix],
+    skipped: &[SkippedEditDto],
+) {
+    for skipped_edit in skipped {
+        let Some(prepared) = prepared.iter().find(|prepared| {
+            prepared
+                .accepted_edits
+                .iter()
+                .any(|edit| preview_edit_matches(edit, &skipped_edit.edit))
+        }) else {
+            continue;
+        };
+        fixes_skipped.push(skipped_fix(&prepared.fix, SkippedFixReason::Conflict, true));
+    }
+}
+
+fn skip_prepared(
+    fixes_skipped: &mut Vec<SkippedFixDto>,
+    prepared: &[PreparedFix],
+    reason: SkippedFixReason,
+) {
+    for prepared in prepared {
+        fixes_skipped.push(skipped_fix(&prepared.fix, reason.clone(), true));
+    }
+}
+
+fn preview_edit_matches(edit: &LintByteEdit, preview: &FixPreviewEditDto) -> bool {
+    edit.start_byte == preview.start_byte
+        && edit.end_byte == preview.end_byte
+        && edit.replacement == preview.replacement
+}
+
+fn skipped_fix(fix: &LintFix, reason: SkippedFixReason, supported_fix: bool) -> SkippedFixDto {
+    SkippedFixDto {
+        path: fix.path.clone(),
+        reason,
+        diagnostic: Some(diagnostic_to_dto(fix.diagnostic.clone())),
+        supported_fix,
+    }
+}
+
+fn run_follow_up_check<R>(
+    path: Option<String>,
+    config: &LintConfig,
+    workspace_root: &Path,
+    lines: &mut R,
+    out: &Arc<Mutex<impl Write>>,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+) -> Result<Vec<LintDiagnosticDto>, FixFailure>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let check = if let Some(path) = path {
+        check_one(&path, config, workspace_root, lines, out, next_id, queued)
+    } else {
+        check_workspace(config, workspace_root, lines, out, next_id, queued)
+    }
+    .map_err(fix_apply_failed)?;
+
+    Ok(check.diagnostics)
+}
+
+fn validate_fix_path(path: &str) -> Result<(), FixFailure> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(fix_invalid_request("invalid path"));
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(fix_invalid_request("invalid path"));
+    }
+    Ok(())
+}
+
+fn lint_fix_unavailable_message(error: LintToolError) -> String {
+    match error {
+        LintToolError::MissingBinary { .. } => "lint command is unavailable".to_owned(),
+        LintToolError::UnparseableOutput => "lint output could not be parsed".to_owned(),
+        LintToolError::NonzeroExit { .. } => "lint command exited with errors".to_owned(),
+        LintToolError::Timeout => "lint command timed out".to_owned(),
+        LintToolError::InvalidConfig(message) => message,
+    }
+}
+
+fn fix_invalid_request(message: impl Into<String>) -> FixFailure {
+    FixFailure {
+        code: "lint_fix_invalid_request",
+        message: message.into(),
+    }
+}
+
+fn fix_unavailable(message: impl Into<String>) -> FixFailure {
+    FixFailure {
+        code: "lint_fix_unavailable",
+        message: message.into(),
+    }
+}
+
+fn fix_apply_failed(message: impl Into<String>) -> FixFailure {
+    FixFailure {
+        code: "lint_fix_apply_failed",
+        message: message.into(),
+    }
+}
+
+fn fix_error_result(code: &'static str, message: impl Into<String>) -> Value {
+    let error = FixToolErrorResponse {
+        code: code.to_owned(),
+        message: message.into(),
+    };
+    json!({ "error": error })
 }
 
 fn check_one<R>(

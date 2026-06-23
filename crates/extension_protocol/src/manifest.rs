@@ -163,6 +163,7 @@ pub enum Capability {
     IndexPut,
     /// `workspace/requestFormat` — enqueue a file for formatting.
     RequestFormat,
+    RequestApplyEdits,
     /// `log` — emit a log message through the host's logging subsystem.
     Log,
     /// `notify/resourceUpdated` — push a `notifications/resources/updated` event
@@ -184,4 +185,30 @@ pub enum EventKind {
     FileChanged,
     /// `event/fileDeleted` (spec 27 EV1).
     FileDeleted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Capability;
+
+    #[test]
+    fn request_apply_edits_capability_exists() {
+        let capability = Capability::RequestApplyEdits;
+
+        assert_eq!(capability, Capability::RequestApplyEdits);
+    }
+
+    #[test]
+    fn request_apply_edits_capability_serializes() {
+        let json = serde_json::to_string(&Capability::RequestApplyEdits).unwrap();
+
+        assert_eq!(json, "\"request_apply_edits\"");
+    }
+
+    #[test]
+    fn request_apply_edits_capability_deserializes_from_manifest_value() {
+        let capability: Capability = serde_json::from_str("\"request_apply_edits\"").unwrap();
+
+        assert_eq!(capability, Capability::RequestApplyEdits);
+    }
 }

@@ -112,6 +112,48 @@ pub struct TxReport {
     pub errors: Vec<FileReplaceError>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextEdit {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub replacement: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyEditsRequest {
+    pub path: RelativePath,
+    pub expected_version: String,
+    pub edits: Vec<TextEdit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedEdit {
+    pub edit: TextEdit,
+    pub reason: SkippedEditReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkippedEditReason {
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyEditsPreview {
+    pub path: RelativePath,
+    pub edits: Vec<TextEdit>,
+    pub skipped: Vec<SkippedEdit>,
+    pub preview_content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyEditsFileResult {
+    pub path: RelativePath,
+    pub applied: Vec<TextEdit>,
+    pub skipped: Vec<SkippedEdit>,
+    pub new_version: Option<String>,
+    pub preview: Option<ApplyEditsPreview>,
+}
+
 // ── Inbound port traits ──────────────────────────────────────────────────────
 
 /// Read-only search over the workspace.
@@ -334,6 +376,16 @@ pub trait FileMutationUseCase {
         replacement: &str,
         expected_version: Option<String>,
     ) -> Result<TxReport, DomainError>;
+
+    fn apply_edits_cas(
+        &mut self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError>;
+
+    fn apply_edits_dry_run(
+        &self,
+        request: ApplyEditsRequest,
+    ) -> Result<ApplyEditsFileResult, DomainError>;
 
     /// Global find-and-replace with per-file optimistic concurrency guards
     /// (spec 18, AC6).

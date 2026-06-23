@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
 use core_engine::adapters::extension::{HostDeps, SidecarHostAdapter};
 use core_engine::adapters::formatter::NoOpFormatQueue;
 use core_engine::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -90,6 +91,7 @@ fn make_deps() -> HostDeps {
         fs: Arc::new(Mutex::new(InMemoryFs::new())),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
 }
@@ -198,6 +200,7 @@ fn lsp_process_diagnostics_unsupported_when_no_lsp_configured() {
         fs: Arc::new(Mutex::new(fs)),
         ast_index: Arc::new(InMemoryAstIndex::new()),
         format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     };
 
@@ -323,7 +326,7 @@ fn lsp_process_push_response_frame_during_idle_is_discarded() {
         init_resp.get("result").is_some(),
         "initialize must return a result; got: {init_resp}"
     );
-    // Response is {"result": {"type":"Initialized","data":{tools:[...], ...}}, ...}
+    // Response carries Initialized data with the declared tools array.
     let tools = &init_resp["result"]["data"]["tools"];
     assert!(
         tools.is_array() && tools.as_array().unwrap().len() == 4,
@@ -332,7 +335,7 @@ fn lsp_process_push_response_frame_during_idle_is_discarded() {
 
     // ── 2. Inject a push-response frame (simulates host ACK of notify/resourceUpdated) ──
     //
-    // The push thread would have sent {"id": 20000, "method": "notify/resourceUpdated", ...}
+    // The push thread would have sent a notify/resourceUpdated request.
     // and the host would ACK with {"jsonrpc":"2.0","result":true,"id":20000}.
     // We inject this ACK directly into the extension's stdin while it is in idle.
     send(

@@ -48,7 +48,7 @@
 //! Trade-off: `Mutex` adds one word of overhead per instance; negligible.
 #![forbid(unsafe_code)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, TryLockError};
 
 use extension_protocol::{ExtensionFault, ExtensionManifest, ToolDecl};
 use serde_json::Value;
@@ -214,15 +214,11 @@ struct ExtensionHandle {
     /// Cached (immutable for the extension's lifetime) manifest.
     manifest: ExtensionManifest,
     /// Live instance, exclusively accessed via Mutex.
-    instance: Mutex<Box<dyn ExtensionInstance>>,
+    instance: Arc<Mutex<Box<dyn ExtensionInstance>>>,
     /// Consecutive-fault counter for quarantine policy (S1).
     ///
-    /// Protected by the same `Mutex` as `instance` so that fault counting and
-    /// the instance call are always atomic. We use a separate `Mutex` so that
-    /// reads of `fault_count` (e.g., in `declared_tools`) don't block on the
-    /// instance lock. However since fault_count is only written inside `invoke`
-    /// and `fan_out`, a separate `Mutex<u32>` is cleaner and avoids needing
-    /// `&mut self` to read the handle fields.
+    /// Kept outside the instance mutex so reads of `fault_count` (e.g., in
+    /// `declared_tools`) don't block on an in-flight sidecar RPC.
     ///
     /// Decision: `Mutex<u32>` separate from `Mutex<Box<dyn ExtensionInstance>>`.
     /// Why: the instance lock can be held for the full duration of an RPC call
@@ -231,7 +227,7 @@ struct ExtensionHandle {
     ///      updated after releasing the instance lock (load-then-store), which is
     ///      safe because `fan_out` and `invoke` are the only writers and they
     ///      hold the handle ref from an immutable `Vec`.
-    consecutive_faults: Mutex<u32>,
+    consecutive_faults: Arc<Mutex<u32>>,
 }
 
 impl ExtensionHandle {
@@ -239,8 +235,8 @@ impl ExtensionHandle {
         let manifest = instance.manifest().clone();
         Self {
             manifest,
-            instance: Mutex::new(instance),
-            consecutive_faults: Mutex::new(0),
+            instance: Arc::new(Mutex::new(instance)),
+            consecutive_faults: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -318,6 +314,12 @@ impl ExtensionHandle {
 /// ```
 pub struct ExtensionRegistry {
     handles: Vec<ExtensionHandle>,
+    deferred_events: Mutex<Vec<DeferredEvent>>,
+}
+
+struct DeferredEvent {
+    extension_name: String,
+    event: extension_protocol::Event,
 }
 
 impl std::fmt::Debug for ExtensionRegistry {
@@ -336,6 +338,7 @@ impl ExtensionRegistry {
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),
+            deferred_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -425,7 +428,9 @@ impl ExtensionRegistry {
             .find(|h| h.manifest.tools.iter().any(|t| t.name == tool_name))
             .ok_or_else(|| InvokeError::ToolNotFound(tool_name.to_owned()))?;
 
-        Self::invoke_handle(handle, tool_name, params)
+        let result = Self::invoke_handle(handle, tool_name, params);
+        self.drain_deferred_events();
+        result
     }
 
     /// Invoke a tool declared by a specific extension.
@@ -448,7 +453,9 @@ impl ExtensionRegistry {
             })
             .ok_or_else(|| InvokeError::ToolNotFound(tool_name.to_owned()))?;
 
-        Self::invoke_handle(handle, tool_name, params)
+        let result = Self::invoke_handle(handle, tool_name, params);
+        self.drain_deferred_events();
+        result
     }
 
     fn invoke_handle(
@@ -506,11 +513,20 @@ impl ExtensionRegistry {
             }
 
             let event = make_event();
-            let result = handle
-                .instance
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .deliver_event(event);
+            let result = match handle.instance.try_lock() {
+                Ok(mut instance) => instance.deliver_event(event),
+                Err(TryLockError::Poisoned(poison)) => poison.into_inner().deliver_event(event),
+                Err(TryLockError::WouldBlock) => {
+                    self.deferred_events
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(DeferredEvent {
+                            extension_name: handle.manifest.name.clone(),
+                            event,
+                        });
+                    continue;
+                }
+            };
 
             match result {
                 Ok(()) => {
@@ -523,6 +539,63 @@ impl ExtensionRegistry {
                         handle.manifest.name
                     );
                 }
+            }
+        }
+    }
+
+    fn drain_deferred_events(&self) {
+        loop {
+            let events = {
+                let mut guard = self
+                    .deferred_events
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if guard.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *guard)
+            };
+
+            let mut still_busy = Vec::new();
+            for deferred in events {
+                let Some(handle) = self
+                    .handles
+                    .iter()
+                    .find(|handle| handle.manifest.name == deferred.extension_name)
+                else {
+                    continue;
+                };
+                if handle.is_quarantined() {
+                    continue;
+                }
+                let result = match handle.instance.try_lock() {
+                    Ok(mut instance) => instance.deliver_event(deferred.event),
+                    Err(TryLockError::Poisoned(poison)) => {
+                        poison.into_inner().deliver_event(deferred.event)
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        still_busy.push(deferred);
+                        continue;
+                    }
+                };
+                match result {
+                    Ok(()) => handle.record_success(),
+                    Err(fault) => {
+                        let count = handle.record_fault();
+                        eprintln!(
+                            "[tower] extension '{}' deferred deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {fault}",
+                            handle.manifest.name
+                        );
+                    }
+                }
+            }
+
+            if !still_busy.is_empty() {
+                self.deferred_events
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend(still_busy);
+                return;
             }
         }
     }

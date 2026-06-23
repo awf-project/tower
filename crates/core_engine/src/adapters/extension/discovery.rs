@@ -368,7 +368,76 @@ pub fn load_extensions_into_registry(
     disabled: &[String],
 ) -> ExtensionRegistry {
     let mut registry = ExtensionRegistry::new();
+    load_extensions_into_existing_registry(&mut registry, dirs, deps, request_timeout, disabled);
+    registry
+}
 
+/// Discover and register extensions into an existing registry.
+///
+/// This is used by daemon startup so the shared registry can be injected into
+/// `EngineState` before eager extensions are spawned and initialize-time
+/// HostCalls can mutate files.
+pub fn load_extensions_into_existing_registry(
+    registry: &mut ExtensionRegistry,
+    dirs: &[PathBuf],
+    deps: HostDeps,
+    request_timeout: Duration,
+    disabled: &[String],
+) {
+    load_extensions_with_register(
+        dirs,
+        deps,
+        request_timeout,
+        disabled,
+        |instance, name, ext_dir| {
+            if let Err(e) = registry.register(instance) {
+                eprintln!(
+                    "tower: warning — skipping extension '{name}' from {}: {e}",
+                    ext_dir.display()
+                );
+            }
+        },
+    );
+}
+
+/// Discover and register extensions into a shared registry.
+///
+/// Unlike [`load_extensions_into_existing_registry`], this function never holds
+/// the registry write lock while spawning eager extensions. That lets
+/// initialize-time HostCalls broadcast through the same shared registry.
+pub fn load_extensions_into_shared_registry(
+    registry: &std::sync::Arc<std::sync::RwLock<ExtensionRegistry>>,
+    dirs: &[PathBuf],
+    deps: HostDeps,
+    request_timeout: Duration,
+    disabled: &[String],
+) {
+    load_extensions_with_register(
+        dirs,
+        deps,
+        request_timeout,
+        disabled,
+        |instance, name, ext_dir| {
+            let mut guard = registry
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Err(e) = guard.register(instance) {
+                eprintln!(
+                    "tower: warning — skipping extension '{name}' from {}: {e}",
+                    ext_dir.display()
+                );
+            }
+        },
+    );
+}
+
+fn load_extensions_with_register(
+    dirs: &[PathBuf],
+    deps: HostDeps,
+    request_timeout: Duration,
+    disabled: &[String],
+    mut register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
+) {
     // ── Phase 1: scan every scope, read manifests. ────────────────────────────
     let mut all_entries: Vec<(usize, PathBuf, ExtensionManifest)> = Vec::new();
     let mut load_errors: Vec<(PathBuf, ManifestLoadError)> = Vec::new();
@@ -442,12 +511,7 @@ pub fn load_extensions_into_registry(
                     }
                 };
 
-                if let Err(e) = registry.register(instance) {
-                    eprintln!(
-                        "tower: warning — skipping extension '{name}' from {}: {e}",
-                        ext_dir.display()
-                    );
-                }
+                register_instance(instance, &name, &ext_dir);
             }
             Shadow::Overridden => {
                 eprintln!(
@@ -462,8 +526,6 @@ pub fn load_extensions_into_registry(
             }
         }
     }
-
-    registry
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -505,6 +567,7 @@ fn clone_deps(deps: &HostDeps) -> HostDeps {
         fs: std::sync::Arc::clone(&deps.fs),
         ast_index: std::sync::Arc::clone(&deps.ast_index),
         format_queue: std::sync::Arc::clone(&deps.format_queue),
+        apply_edits: std::sync::Arc::clone(&deps.apply_edits),
         push_tx: deps.push_tx.clone(),
     }
 }
@@ -847,7 +910,7 @@ activation = "lazy"
 
     use std::sync::{Arc, Mutex};
 
-    use super::super::host_deps::HostDeps;
+    use super::super::host_deps::{HostDeps, UnsupportedApplyEditsHost};
     use crate::adapters::formatter::NoOpFormatQueue;
     use crate::adapters::{InMemoryAstIndex, InMemoryFs};
 
@@ -856,6 +919,7 @@ activation = "lazy"
             fs: Arc::new(Mutex::new(InMemoryFs::new())),
             ast_index: Arc::new(InMemoryAstIndex::new()),
             format_queue: Arc::new(NoOpFormatQueue),
+            apply_edits: Arc::new(UnsupportedApplyEditsHost),
             push_tx: None,
         }
     }

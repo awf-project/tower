@@ -4,9 +4,14 @@ command    = ["lint_extension"]
 activation = "lazy"
 
 [capabilities]
-required = ["read_file", "list_files", "log"]
+required = ["read_file", "list_files", "log", "request_apply_edits"]
 
 [[tools]]
 name        = "check"
 description = "Run configured linters for one workspace-relative path, or all supported indexed files when path is omitted."
 schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to lint; omit to lint all supported indexed files"}},"additionalProperties":false}'
+
+[[tools]]
+name        = "fix"
+description = "Apply structured lint fixes for one workspace-relative path, or all supported indexed files when path is omitted."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to fix; omit to inspect all supported indexed files"},"unsafe":{"type":"boolean","description":"Apply fixes with unsafe or unknown applicability"},"dry_run":{"type":"boolean","description":"Preview fixes without writing files"}},"additionalProperties":false}'
