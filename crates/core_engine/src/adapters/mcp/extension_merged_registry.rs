@@ -157,7 +157,7 @@ impl ToolRegistry for ExtensionMergedRegistry {
             let composed = format!("tower_{}_{}", ext_id.as_str(), tool_decl.name);
             if composed == name {
                 return host_guard
-                    .invoke(&tool_decl.name, args)
+                    .invoke_extension(&ext_id, &tool_decl.name, args)
                     .map_err(invoke_error_to_tool_error);
             }
         }
@@ -247,6 +247,41 @@ mod tests {
             params: JsonValue,
         ) -> Result<JsonValue, ExtensionFault> {
             Ok(params)
+        }
+
+        fn deliver_event(
+            &mut self,
+            _event: extension_protocol::Event,
+        ) -> Result<(), ExtensionFault> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    struct IdentifyingExtension {
+        manifest: ExtensionManifest,
+    }
+
+    impl IdentifyingExtension {
+        fn new(name: &str, tools: Vec<ToolDecl>) -> Self {
+            Self {
+                manifest: make_manifest(name, tools),
+            }
+        }
+    }
+
+    impl crate::domain::extension_host::ExtensionInstance for IdentifyingExtension {
+        fn manifest(&self) -> &ExtensionManifest {
+            &self.manifest
+        }
+
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _params: JsonValue,
+        ) -> Result<JsonValue, ExtensionFault> {
+            Ok(JsonValue::String(self.manifest.name.clone()))
         }
 
         fn deliver_event(
@@ -363,6 +398,26 @@ mod tests {
         );
     }
 
+    /// Existing extension merged registry tests cover namespacing without
+    /// hardcoded native tool count literals.
+    #[test]
+    fn extension_merged_registry_tests_cover_namespacing_without_hardcoded_native_tool_count_literals()
+     {
+        let source = include_str!("extension_merged_registry.rs");
+        let hardcoded_ten_assert = concat!("assert_eq!(tools.len(), ", "10", ")");
+        let hardcoded_eleven_assert = concat!("assert_eq!(tools.len(), ", "11", ")");
+        let hardcoded_ten_native = concat!("10", " native");
+        let hardcoded_eleven_native = concat!("11", " native");
+
+        assert!(
+            !source.contains(hardcoded_ten_assert)
+                && !source.contains(hardcoded_eleven_assert)
+                && !source.contains(hardcoded_ten_native)
+                && !source.contains(hardcoded_eleven_native),
+            "extension merged registry tests must use EXPECTED_NATIVE_TOOL_NAMES instead of hardcoded native counts"
+        );
+    }
+
     /// U2: `call()` routes to the extension and returns its result.
     #[test]
     fn call_routes_to_extension_and_returns_result() {
@@ -405,6 +460,31 @@ mod tests {
             .call("tower_lsp_diagnostics", lsp_args.clone())
             .expect("tower_lsp_diagnostics");
         assert_eq!(result_b, lsp_args, "lsp/diagnostics must echo args");
+    }
+
+    #[test]
+    fn call_routes_duplicate_local_tool_name_to_namespaced_extension() {
+        let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
+        {
+            let mut reg = ext_registry.write().unwrap();
+            reg.register(Box::new(IdentifyingExtension::new(
+                "fmt",
+                vec![make_tool("check")],
+            )))
+            .expect("register fmt");
+            reg.register(Box::new(IdentifyingExtension::new(
+                "lint",
+                vec![make_tool("check")],
+            )))
+            .expect("register lint");
+        }
+        let mut merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
+
+        let result = merged
+            .call("tower_lint_check", JsonValue::Null)
+            .expect("tower_lint_check");
+
+        assert_eq!(result, JsonValue::String("lint".to_owned()));
     }
 
     /// UN1: When no extensions are registered, only native tools are served.

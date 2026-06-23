@@ -1,0 +1,12 @@
+name       = "lint"
+version    = "0.1.0"
+command    = ["lint_extension"]
+activation = "lazy"
+
+[capabilities]
+required = ["read_file", "list_files", "log"]
+
+[[tools]]
+name        = "check"
+description = "Run configured linters for one workspace-relative path, or all supported indexed files when path is omitted."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to lint; omit to lint all supported indexed files"}},"additionalProperties":false}'

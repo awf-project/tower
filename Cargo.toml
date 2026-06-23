@@ -19,6 +19,8 @@ members = [
     "extensions/lsp",
     # Fmt sidecar extension — subscribes to fileChanged and triggers the format queue.
     "extensions/fmt",
+    # F002 lint sidecar extension.
+    "extensions/lint",
 ]
 
 default-members = [
@@ -42,6 +44,8 @@ default-members = [
     "extensions/lsp",
     # Fmt sidecar extension — compiled natively so e2e tests can locate the binary.
     "extensions/fmt",
+    # F002 lint sidecar extension.
+    "extensions/lint",
 ]
 
 [workspace.package]

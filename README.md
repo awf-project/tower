@@ -22,6 +22,7 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **Native extension host** | Out-of-process native sidecar extensions over a JSON-RPC 2.0 protocol on stdio; OS-process isolation, per-call timeouts, restart/backoff, and quarantine |
 | **AST analysis** | `ast` extension — Tree-sitter outline and symbol search for Rust, Go, PHP |
 | **Code intelligence** | `lsp` extension — diagnostics, definition, references, hover via a language-server bridge |
+| **Standalone linting** | `lint` extension — on-demand diagnostics from configured external linters, using the same diagnostic shape as LSP |
 | **Single static binary** | No WASM, WASI SDK, JVM, Node, or container required at runtime |
 
 ---
@@ -98,6 +99,10 @@ echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find
 # List indexed directory entries
 echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_list_dir","arguments":{"path":"src","recursive":true,"max_depth":1}}}' \
   | cargo run -p core_engine -q
+
+# Run configured standalone linters for all supported indexed files
+echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{}}}' \
+  | cargo run -p core_engine -q
 ```
 
 Each request is a single newline-delimited JSON object on stdin; responses arrive on stdout.
@@ -153,6 +158,7 @@ extensions/               Native sidecar extensions (separate binaries)
 ├── ast/                  Reference Tree-sitter AST extension (eager)
 ├── hello/                Minimal example extension (lazy)
 ├── lsp/                  Language-server bridge extension (lazy)
+├── lint/                 Standalone linter extension (lazy)
 └── fixtures/             Test-only fault-isolation fixtures (not shipped)
 ```
 

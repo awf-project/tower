@@ -901,6 +901,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lint_extension"
+version = "0.1.0"
+dependencies = [
+ "core_engine",
+ "extension_protocol",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

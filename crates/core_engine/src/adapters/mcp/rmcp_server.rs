@@ -42,6 +42,7 @@ use rmcp::{Peer, ServerHandler};
 use serde_json::Value;
 
 use crate::adapters::mcp::diagnostics::{DiagnosticsReader, PushEvent};
+use crate::adapters::mcp::diagnostics_json::{DiagnosticJson, diagnostics_response_json};
 use crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use crate::adapters::mcp::registry::ToolRegistry;
@@ -236,15 +237,17 @@ impl ServerHandler for TowerMcpHandler {
     ) -> Result<ReadResourceResult, McpError> {
         let uri = req.uri.clone();
         let diags = self.diag_reader.diagnostics_for(&uri);
-        let diags_json: Vec<Value> = diags
+        let diagnostics: Vec<DiagnosticJson<'_>> = diags
             .iter()
-            .map(crate::adapters::mcp::lsp_tools::diagnostic_to_json)
+            .map(|diagnostic| DiagnosticJson {
+                path: None,
+                diagnostic,
+            })
             .collect();
-        let payload = serde_json::json!({
-            "supported": true,
-            "uri": uri,
-            "diagnostics": diags_json
-        });
+        let mut payload = diagnostics_response_json(true, &diagnostics);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("uri".to_owned(), Value::String(uri.clone()));
+        }
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             payload.to_string(),
             uri,

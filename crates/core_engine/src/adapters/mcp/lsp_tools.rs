@@ -11,12 +11,14 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
 
+use crate::adapters::mcp::diagnostics_json::{
+    DiagnosticJson, diagnostics_response_json, unsupported_diagnostics_json,
+};
 use crate::adapters::mcp::lsp_support::{read_text, require_str};
 use crate::adapters::mcp::native_tools::EngineState;
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
 use crate::domain::RelativePath;
-use crate::domain::code_intel::{Diagnostic, Severity};
 use crate::ports::{CodeIntelError, CodeIntelligencePort};
 
 // ── SubscriptionRegistry ──────────────────────────────────────────────────────
@@ -78,28 +80,6 @@ impl LspToolRegistry {
     }
 }
 
-pub(crate) fn severity_str(s: Severity) -> &'static str {
-    match s {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Information => "information",
-        Severity::Hint => "hint",
-    }
-}
-
-pub(crate) fn diagnostic_to_json(d: &Diagnostic) -> Value {
-    json!({
-        "line": d.range.start.line,
-        "character": d.range.start.character,
-        "endLine": d.range.end.line,
-        "endCharacter": d.range.end.character,
-        "severity": severity_str(d.severity),
-        "message": d.message,
-        "source": d.source,
-        "code": d.code,
-    })
-}
-
 fn tool_lsp_diagnostics_desc() -> ToolDesc {
     ToolDesc {
         name: "tower_lsp_diagnostics".to_owned(),
@@ -137,12 +117,16 @@ impl ToolRegistry for LspToolRegistry {
 
         match self.code_intel.check(&rel, &text) {
             Ok(diags) => {
-                let arr: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
-                Ok(json!({ "supported": true, "diagnostics": arr }))
+                let diagnostics: Vec<DiagnosticJson<'_>> = diags
+                    .iter()
+                    .map(|diagnostic| DiagnosticJson {
+                        path: None,
+                        diagnostic,
+                    })
+                    .collect();
+                Ok(diagnostics_response_json(true, &diagnostics))
             }
-            Err(CodeIntelError::Unsupported) => {
-                Ok(json!({ "supported": false, "diagnostics": [] }))
-            }
+            Err(CodeIntelError::Unsupported) => Ok(unsupported_diagnostics_json()),
             Err(CodeIntelError::Backend(msg)) => Err(ToolError::ExecutionFailed(msg)),
         }
     }
@@ -159,9 +143,37 @@ mod tests {
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::{InMemoryCodeIntel, InMemoryFs, InMemoryStorage};
     use crate::domain::RelativePath;
+    use crate::domain::code_intel::{Diagnostic, Position, Range, Severity};
     use crate::domain::index::InvertedIndex;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::FileSystemPort;
+    use crate::ports::{CodeIntelError, CodeIntelligencePort, FileSystemPort};
+
+    struct InformationCodeIntel;
+
+    impl CodeIntelligencePort for InformationCodeIntel {
+        fn check(
+            &self,
+            _path: &RelativePath,
+            _text: &str,
+        ) -> Result<Vec<Diagnostic>, CodeIntelError> {
+            Ok(vec![Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 1,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 6,
+                    },
+                },
+                severity: Severity::Information,
+                message: "informational diagnostic".to_owned(),
+                source: Some("test-lsp".to_owned()),
+                code: Some("I0001".to_owned()),
+            }])
+        }
+    }
 
     fn state_with_file(path: &str, content: &[u8]) -> Arc<RwLock<EngineState>> {
         let mut fs = InMemoryFs::new();
@@ -205,6 +217,23 @@ mod tests {
         let diags = val["diagnostics"].as_array().unwrap();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0]["severity"], "error");
+        assert!(diags[0].get("path").is_none());
+    }
+
+    #[test]
+    fn diagnostics_tool_serializes_information_severity_as_info() {
+        let state = state_with_file("src/a.rs", b"fn main() {}");
+        let mut reg = LspToolRegistry::new(state, Arc::new(InformationCodeIntel));
+
+        let val = reg
+            .call("tower_lsp_diagnostics", json!({ "path": "src/a.rs" }))
+            .unwrap();
+        let diags = val["diagnostics"].as_array().unwrap();
+
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["severity"], "info");
+        assert_ne!(diags[0]["severity"], "information");
+        assert!(diags[0].get("path").is_none());
     }
 
     #[test]
@@ -237,6 +266,24 @@ mod tests {
             err,
             crate::adapters::mcp::types::ToolError::ResourceNotFound(_)
         ));
+    }
+
+    #[test]
+    fn lsp_tools_uses_shared_diagnostics_json_serializer() {
+        let source = include_str!("lsp_tools.rs");
+
+        assert!(
+            source.contains(concat!("diagnostics_response_json", "(true, &diagnostics)")),
+            "tower_lsp_diagnostics must serialize through diagnostics_response_json"
+        );
+        assert!(
+            source.contains(concat!("unsupported_diagnostics_json", "()")),
+            "unsupported diagnostics must serialize through unsupported_diagnostics_json"
+        );
+        assert!(
+            !source.contains(concat!("fn ", "diagnostic_to_json")),
+            "lsp_tools.rs must not retain an LSP-only diagnostic serializer"
+        );
     }
 
     #[test]

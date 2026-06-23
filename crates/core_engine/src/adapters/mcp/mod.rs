@@ -33,6 +33,7 @@
 
 pub mod chain_registry;
 pub mod diagnostics;
+pub mod diagnostics_json;
 pub mod extension_merged_registry;
 pub mod lsp_support;
 pub mod lsp_tools;
