@@ -223,7 +223,7 @@ fn debug_tool_specs() -> &'static [DebugToolSpec] {
     &DEBUG_TOOL_SPECS
 }
 
-const DEBUG_TOOL_SPECS: [DebugToolSpec; 12] = [
+const DEBUG_TOOL_SPECS: [DebugToolSpec; 13] = [
     DebugToolSpec::new("launch", "Launch a debug session.", LAUNCH_SCHEMA),
     DebugToolSpec::new(
         "set_breakpoints",
@@ -245,6 +245,7 @@ const DEBUG_TOOL_SPECS: [DebugToolSpec; 12] = [
         "Evaluate an expression in a debug session.",
         EVALUATE_SCHEMA,
     ),
+    DebugToolSpec::new("eval_at", "Run an eval-at debug probe.", EVAL_AT_SCHEMA),
     DebugToolSpec::new("terminate", "Terminate a debug session.", SESSION_ID_SCHEMA),
     DebugToolSpec::new(
         "disconnect",
@@ -279,4 +280,93 @@ const SESSION_ID_SCHEMA: &str = r#"{"type":"object","properties":{"session_id":{
 const STACK_SCHEMA: &str = r#"{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":"integer","minimum":0}},"required":["session_id","thread_id"],"additionalProperties":false}"#;
 const VARIABLES_SCHEMA: &str = r#"{"type":"object","properties":{"session_id":{"type":"string"},"variables_reference":{"type":"integer","minimum":0}},"required":["session_id","variables_reference"],"additionalProperties":false}"#;
 const EVALUATE_SCHEMA: &str = r#"{"type":"object","properties":{"session_id":{"type":"string"},"frame_id":{"type":"integer","minimum":0},"expression":{"type":"string"}},"required":["session_id","frame_id","expression"],"additionalProperties":false}"#;
+const EVAL_AT_SCHEMA: &str = r#"{"type":"object","properties":{"lang":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":["string","null"]},"env":{"type":"object","additionalProperties":{"type":"string"}},"breakpoint":{"type":["object","null"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":0},"condition":{"type":["string","null"]}},"required":["path","line"],"additionalProperties":false},"expressions":{"type":"array","items":{"type":"string"}},"capture":{"type":"object","properties":{"stack":{"type":"boolean"},"locals":{"type":"boolean"},"args":{"type":"boolean"}},"additionalProperties":false},"on_hit":{"type":"string","enum":["first","all"]},"max_hits":{"type":"integer","minimum":1},"max_depth":{"type":"integer","minimum":0},"max_children":{"type":"integer","minimum":0},"timeout_ms":{"type":["integer","null"],"minimum":0}},"required":["lang","program"],"additionalProperties":false}"#;
 const SESSIONS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::Value;
+
+    use super::{DebugAdapterConfig, DebugInitializeConfig, debug_tool_declarations};
+
+    #[test]
+    fn protocol_declares_a_thirteenth_debug_tool_spec_named_exactly_eval_at_with_eval_at_request_fields()
+     {
+        let declarations = debug_tool_declarations(Some(&debug_config()));
+        let names = declarations
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let eval_at = declarations
+            .iter()
+            .find(|tool| tool.name == "eval_at")
+            .expect("eval_at tool declaration must exist");
+        let schema: Value =
+            serde_json::from_str(&eval_at.schema_json).expect("eval_at schema must be valid JSON");
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("eval_at schema must declare object properties");
+
+        assert_eq!(declarations.len(), 13);
+        assert!(names.contains(&"eval_at"));
+        for field in [
+            "lang",
+            "program",
+            "args",
+            "cwd",
+            "env",
+            "breakpoint",
+            "expressions",
+            "capture",
+            "on_hit",
+            "max_hits",
+            "max_depth",
+            "max_children",
+            "timeout_ms",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "eval_at schema must include EvalAtRequest field {field}"
+            );
+        }
+        assert_eq!(schema["required"], serde_json::json!(["lang", "program"]));
+    }
+
+    #[test]
+    fn debug_tool_declarations_some_config_includes_eval_at_when_debug_config_has_at_least_one_language()
+     {
+        let declarations = debug_tool_declarations(Some(&debug_config()));
+
+        assert!(declarations.iter().any(|tool| tool.name == "eval_at"));
+    }
+
+    #[test]
+    fn debug_tool_declarations_none_and_empty_config_still_return_no_tools() {
+        let empty_config = DebugInitializeConfig {
+            languages: BTreeMap::new(),
+        };
+
+        assert!(debug_tool_declarations(None).is_empty());
+        assert!(debug_tool_declarations(Some(&empty_config)).is_empty());
+    }
+
+    fn debug_config() -> DebugInitializeConfig {
+        DebugInitializeConfig {
+            languages: BTreeMap::from([(
+                "rust".to_owned(),
+                DebugAdapterConfig {
+                    extensions: vec!["rs".to_owned()],
+                    command: "fake-debug-adapter".to_owned(),
+                    args: Vec::new(),
+                    adapter_type: "fake".to_owned(),
+                    launch: serde_json::Map::new(),
+                    default_timeout_secs: 1,
+                    idle_ttl_secs: 60,
+                },
+            )]),
+        }
+    }
+}

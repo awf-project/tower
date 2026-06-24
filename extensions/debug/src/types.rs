@@ -32,6 +32,8 @@ pub struct DebugStop {
     pub top_frame: Option<DebugStackFrame>,
     pub hit_breakpoint_ids: Vec<u64>,
     pub timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
     pub output_since: Vec<DebugOutput>,
 }
 
@@ -123,6 +125,7 @@ mod tests {
             top_frame: Some(frame.clone()),
             hit_breakpoint_ids: vec![9],
             timed_out: false,
+            exit_code: None,
             output_since: vec![DebugOutput {
                 sequence: 1,
                 category: Some("stdout".to_owned()),
@@ -235,5 +238,72 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(serde_json::to_value(error).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn debug_stop_includes_an_optional_exit_code_field_serialized_only_when_present() {
+        let absent = DebugStop {
+            state: DebugSessionState::Terminated,
+            reason: Some("terminated".to_owned()),
+            thread_id: None,
+            top_frame: None,
+            hit_breakpoint_ids: Vec::new(),
+            timed_out: false,
+            exit_code: None,
+            output_since: Vec::new(),
+        };
+        let present = DebugStop {
+            exit_code: Some(7),
+            ..absent.clone()
+        };
+
+        let absent = serde_json::to_value(absent).unwrap();
+        let present = serde_json::to_value(present).unwrap();
+
+        assert!(absent.get("exit_code").is_none());
+        assert_eq!(present["exit_code"], 7);
+    }
+
+    #[test]
+    fn existing_debug_stop_serialization_tests_continue_to_pass_when_exit_code_is_absent() {
+        let stop = DebugStop {
+            state: DebugSessionState::Stopped,
+            reason: Some("breakpoint".to_owned()),
+            thread_id: Some(1),
+            top_frame: None,
+            hit_breakpoint_ids: vec![9],
+            timed_out: false,
+            exit_code: None,
+            output_since: Vec::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(stop).unwrap(),
+            json!({
+                "state": "stopped",
+                "reason": "breakpoint",
+                "thread_id": 1,
+                "top_frame": null,
+                "hit_breakpoint_ids": [9],
+                "timed_out": false,
+                "output_since": []
+            })
+        );
+    }
+
+    #[test]
+    fn debug_stop_serialization_includes_exit_code_0_for_a_normal_exited_outcome_with_code_zero() {
+        let stop = DebugStop {
+            state: DebugSessionState::Terminated,
+            reason: Some("exited".to_owned()),
+            thread_id: None,
+            top_frame: None,
+            hit_breakpoint_ids: Vec::new(),
+            timed_out: false,
+            exit_code: Some(0),
+            output_since: Vec::new(),
+        };
+
+        assert_eq!(serde_json::to_value(stop).unwrap()["exit_code"], 0);
     }
 }

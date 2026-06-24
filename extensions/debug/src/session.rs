@@ -54,6 +54,15 @@ impl SessionManager {
     }
 
     pub fn launch(&self, params: LaunchRequest) -> Result<LaunchResult, DebugRuntimeError> {
+        self.launch_with_initial_breakpoints(params, Vec::new())
+            .map(|(result, _)| result)
+    }
+
+    pub fn launch_with_initial_breakpoints(
+        &self,
+        params: LaunchRequest,
+        initial_breakpoints: Vec<DebugBreakpoint>,
+    ) -> Result<(LaunchResult, Vec<DebugBreakpoint>), DebugRuntimeError> {
         let adapter_config = self.config.languages.get(&params.language).ok_or_else(|| {
             DebugRuntimeError::LaunchFailed(format!(
                 "no debug adapter configured for language {}",
@@ -72,6 +81,17 @@ impl SessionManager {
             let _ = adapter.terminate(timeout);
             return Err(error);
         }
+        let configured_breakpoints = if initial_breakpoints.is_empty() {
+            Vec::new()
+        } else {
+            match adapter.set_breakpoints(&initial_breakpoints, timeout) {
+                Ok(breakpoints) => breakpoints,
+                Err(error) => {
+                    let _ = adapter.terminate(timeout);
+                    return Err(error);
+                }
+            }
+        };
         if let Err(error) = adapter.set_breakpoints(&[], timeout) {
             let _ = adapter.terminate(timeout);
             return Err(error);
@@ -88,6 +108,7 @@ impl SessionManager {
             top_frame,
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            exit_code: None,
             output_since: Vec::new(),
         };
 
@@ -112,11 +133,14 @@ impl SessionManager {
             },
         );
 
-        Ok(LaunchResult {
-            session_id,
-            state: DebugSessionState::Stopped,
-            stop: Some(stop),
-        })
+        Ok((
+            LaunchResult {
+                session_id,
+                state: DebugSessionState::Stopped,
+                stop: Some(stop),
+            },
+            configured_breakpoints,
+        ))
     }
 
     pub fn set_breakpoints(
@@ -136,8 +160,7 @@ impl SessionManager {
         {
             Ok(breakpoints) => Ok(breakpoints),
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                state.sessions.remove(&session_id.0);
-                Err(session_not_found(session_id))
+                Err(Self::reap_adapter_exit_locked(&mut state, session_id))
             }
             Err(error) => Err(error),
         }
@@ -181,8 +204,7 @@ impl SessionManager {
                 Ok(stop)
             }
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                state.sessions.remove(&session_id.0);
-                Err(session_not_found(session_id))
+                Err(Self::reap_adapter_exit_locked(&mut state, session_id))
             }
             Err(error) => Err(error),
         }
@@ -201,8 +223,7 @@ impl SessionManager {
         match session.adapter.threads(session.timeout) {
             Ok(threads) => Ok(threads),
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                state.sessions.remove(&session_id.0);
-                Err(session_not_found(session_id))
+                Err(Self::reap_adapter_exit_locked(&mut state, session_id))
             }
             Err(error) => Err(error),
         }
@@ -355,8 +376,7 @@ impl SessionManager {
                 Ok(stop)
             }
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                state.sessions.remove(&session_id.0);
-                Err(session_not_found(session_id))
+                Err(Self::reap_adapter_exit_locked(&mut state, session_id))
             }
             Err(DebugRuntimeError::DebugTimeout(_)) => {
                 let stop = DebugStop {
@@ -366,6 +386,7 @@ impl SessionManager {
                     top_frame: None,
                     hit_breakpoint_ids: Vec::new(),
                     timed_out: true,
+                    exit_code: None,
                     output_since: Vec::new(),
                 };
                 update_session_stop(session, &stop);
@@ -395,11 +416,20 @@ impl SessionManager {
         match operation(session) {
             Ok(result) => Ok(result),
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                state.sessions.remove(&session_id.0);
-                Err(session_not_found(session_id))
+                Err(Self::reap_adapter_exit_locked(&mut state, session_id))
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn reap_adapter_exit_locked(
+        state: &mut ManagerState,
+        session_id: &DebugSessionId,
+    ) -> DebugRuntimeError {
+        if let Some(mut session) = state.sessions.remove(&session_id.0) {
+            let _ = session.adapter.terminate(session.timeout);
+        }
+        session_not_found(session_id)
     }
 
     fn cleanup_expired_locked(&self, state: &mut ManagerState) {
@@ -546,6 +576,7 @@ mod tests {
         starts: Arc<Mutex<Vec<LaunchRequest>>>,
         calls: Arc<Mutex<Vec<FakeAdapterCall>>>,
         lost_on_threads: bool,
+        lost_on_evaluate: bool,
         launch_error: bool,
         terminate_error: bool,
         disconnect_error: bool,
@@ -555,6 +586,13 @@ mod tests {
         fn lost_on_threads() -> Self {
             Self {
                 lost_on_threads: true,
+                ..Self::default()
+            }
+        }
+
+        fn lost_on_evaluate() -> Self {
+            Self {
+                lost_on_evaluate: true,
                 ..Self::default()
             }
         }
@@ -599,6 +637,7 @@ mod tests {
             Ok(Box::new(FakeAdapterSession {
                 calls: Arc::clone(&self.calls),
                 lost_on_threads: self.lost_on_threads,
+                lost_on_evaluate: self.lost_on_evaluate,
                 launch_error: self.launch_error,
                 terminate_error: self.terminate_error,
                 disconnect_error: self.disconnect_error,
@@ -616,6 +655,7 @@ mod tests {
         terminated: bool,
         disconnected: bool,
         lost_on_threads: bool,
+        lost_on_evaluate: bool,
         launch_error: bool,
         terminate_error: bool,
         disconnect_error: bool,
@@ -741,6 +781,11 @@ mod tests {
             expression: &str,
             _timeout: Duration,
         ) -> Result<DebugVariable, DebugRuntimeError> {
+            if self.lost_on_evaluate {
+                return Err(DebugRuntimeError::AdapterExited(
+                    "fake adapter exited before evaluate response".to_owned(),
+                ));
+            }
             Ok(DebugVariable {
                 name: expression.to_owned(),
                 value: "42".to_owned(),
@@ -846,6 +891,7 @@ mod tests {
             top_frame: Some(top_frame()),
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            exit_code: None,
             output_since: Vec::new(),
         }
     }
@@ -894,6 +940,36 @@ mod tests {
                 FakeAdapterCall::SetBreakpoints(Vec::new()),
             ],
             "launch must initialize the adapter, launch the program, then complete breakpoint/configuration setup"
+        );
+    }
+
+    #[test]
+    fn session_manager_launch_with_initial_breakpoints_sets_them_before_configuration_done() {
+        let factory = Arc::new(FakeAdapterFactory::default());
+        let manager = SessionManager::new(config(), factory.clone());
+
+        let (result, breakpoints) = manager
+            .launch_with_initial_breakpoints(launch_request(), vec![source_breakpoint(12)])
+            .expect("launch with initial breakpoints should configure and complete the session");
+
+        assert!(!result.session_id.0.is_empty());
+        assert_eq!(
+            breakpoints,
+            vec![DebugBreakpoint {
+                verified: true,
+                verified_id: Some(1),
+                ..source_breakpoint(12)
+            }]
+        );
+        assert_eq!(
+            *factory.calls.lock().unwrap(),
+            vec![
+                FakeAdapterCall::Initialize,
+                FakeAdapterCall::Launch,
+                FakeAdapterCall::SetBreakpoints(vec![12]),
+                FakeAdapterCall::SetBreakpoints(Vec::new()),
+            ],
+            "initial breakpoints must be sent before configurationDone"
         );
     }
 
@@ -1145,5 +1221,30 @@ mod tests {
             manager.threads(&result.session_id).is_ok(),
             "caller must be able to retry or inspect a session whose cleanup failed"
         );
+    }
+
+    #[test]
+    fn evaluate_reaps_session_when_adapter_exits_during_expression_evaluation() {
+        let factory = Arc::new(FakeAdapterFactory::lost_on_evaluate());
+        let manager = SessionManager::new(config(), factory.clone());
+        let result = manager.launch(launch_request()).unwrap();
+        manager
+            .continue_session(&result.session_id, None)
+            .expect("session should be stopped before evaluate");
+
+        assert_session_not_found(
+            manager
+                .evaluate(&result.session_id, 1, "answer".to_owned())
+                .unwrap_err(),
+        );
+
+        assert!(
+            factory
+                .calls
+                .lock()
+                .unwrap()
+                .contains(&FakeAdapterCall::Terminate)
+        );
+        assert!(manager.sessions().is_empty());
     }
 }

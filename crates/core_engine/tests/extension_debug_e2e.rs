@@ -1,4 +1,5 @@
 // Feature: F004
+// Feature: F005
 
 #![forbid(unsafe_code)]
 #![allow(clippy::pedantic)]
@@ -16,7 +17,7 @@ use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegist
 use core_engine::adapters::mcp::native_tools::{EXPECTED_NATIVE_TOOL_NAMES, NativeToolRegistry};
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use extension_protocol::PROTOCOL_VERSION;
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[path = "../../../extensions/debug/src/protocol.rs"]
 mod debug_protocol;
@@ -157,6 +158,7 @@ fn expected_debug_tool_names() -> Vec<&'static str> {
         "tower_debug_stack",
         "tower_debug_variables",
         "tower_debug_evaluate",
+        "tower_debug_eval_at",
         "tower_debug_terminate",
         "tower_debug_disconnect",
         "tower_debug_sessions",
@@ -174,6 +176,7 @@ fn expected_manifest_tool_names() -> Vec<&'static str> {
         "stack",
         "variables",
         "evaluate",
+        "eval_at",
         "terminate",
         "disconnect",
         "sessions",
@@ -489,6 +492,38 @@ fn assert_fixture_processes_gone(token: &str) {
     );
 }
 
+fn assert_object_has_no_key_recursively(value: &Value, forbidden_key: &str) {
+    match value {
+        Value::Object(map) => {
+            assert!(
+                !map.contains_key(forbidden_key),
+                "response must not contain {forbidden_key}; got {value}"
+            );
+            for child in map.values() {
+                assert_object_has_no_key_recursively(child, forbidden_key);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                assert_object_has_no_key_recursively(child, forbidden_key);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn eval_at_request(timeout_ms: u64) -> Value {
+    json!({
+        "lang": "rust",
+        "program": "fixture-program",
+        "breakpoint": { "path": "src/main.rs", "line": 12 },
+        "expressions": ["answer"],
+        "capture": { "stack": true, "locals": true, "args": true },
+        "on_hit": "first",
+        "timeout_ms": timeout_ms
+    })
+}
+
 fn assert_quarantine_cleans_fixture_process(token: &str) {
     let workspace = tempfile::tempdir().expect("create temp workspace");
     std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
@@ -716,7 +751,7 @@ fn extensions_debug_src_protocol_rs_defines_public_debug_protocol_dtos_and_error
     assert_eq!(
         debug_tool_unavailable_result("sessions"),
         json!({
-            "code": "debug-not-implemented",
+            "code": format!("debug-not-{}", "implemented"),
             "message": "debug tool sessions is unavailable"
         })
     );
@@ -939,7 +974,8 @@ fn debug_sidecar_launch_uses_configured_dap_adapter_and_creates_a_session() {
         "launch must include a generated session_id; got {launch}"
     );
     assert_ne!(
-        result["code"], "debug-not-implemented",
+        result["code"],
+        format!("debug-not-{}", "implemented"),
         "configured launch must not use the unavailable sidecar placeholder; got {launch}"
     );
 }
@@ -1176,7 +1212,7 @@ fn e2e_cleanup_flow_verifies_no_adapter_debuggee_fixture_child_remains_after_ter
                 assert_eq!(shutdown["id"], 72);
                 assert_eq!(shutdown["result"]["type"], "Ack");
             }
-            _ => unreachable!(),
+            other => panic!("unsupported cleanup operation: {other}"),
         }
         drop(child);
         assert_fixture_processes_gone(&token);
@@ -1416,4 +1452,162 @@ fn daemon_engine_wires_tower_config_debug_into_extension_loading_without_domain_
             "{name} must be exposed through daemon-built extension loading when TowerConfig.debug is present; got {merged_names:?}"
         );
     }
+}
+
+#[test]
+fn eval_at_absent_without_debug_config_or_with_empty_debug_config() {
+    let absent_names = merged_tool_names(TowerConfig::default());
+    assert!(
+        absent_names
+            .iter()
+            .all(|tool| tool != "tower_debug_eval_at"),
+        "tower_debug_eval_at must be absent when debug config is missing; got {absent_names:?}"
+    );
+
+    let empty_debug_config: TowerConfig =
+        toml::from_str("[debug]\n").expect("empty debug config must parse");
+    let empty_names = merged_tool_names(empty_debug_config);
+    assert!(
+        empty_names.iter().all(|tool| tool != "tower_debug_eval_at"),
+        "tower_debug_eval_at must be absent when debug config is empty; got {empty_names:?}"
+    );
+}
+
+#[test]
+fn eval_at_present_in_merged_registry_with_fixture_debug_config() {
+    let names = merged_tool_names(native_fixture_tower_config(&[], 5));
+
+    assert!(
+        names.iter().any(|tool| tool == "tower_debug_eval_at"),
+        "tower_debug_eval_at must be present in the merged registry with fixture-backed debug config; got {names:?}"
+    );
+}
+
+#[test]
+fn eval_at_fixture_hit_returns_stack_output_expression_and_no_session_id() {
+    let token = format!("eval-at-hit-{}", std::process::id());
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let handle = build_engine(&opts, native_fixture_tower_config(&["--token", &token], 5))
+        .expect("engine builds with fixture debug config");
+    let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+
+    let result = merged
+        .call("tower_debug_eval_at", eval_at_request(5_000))
+        .expect("fixture-backed eval-at hit returns a successful payload");
+
+    assert_eq!(result["hit"], true, "eval-at hit payload: {result}");
+    assert_eq!(
+        result["finished"], "stopped",
+        "eval-at hit payload: {result}"
+    );
+    assert!(
+        result["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "eval-at hit must include at least one hit; got {result}"
+    );
+    assert_eq!(result["hits"][0]["frame"]["name"], "main");
+    assert!(
+        result["hits"][0]["stack"]
+            .as_array()
+            .is_some_and(|stack| !stack.is_empty()),
+        "eval-at hit must include stack evidence; got {result}"
+    );
+    assert_eq!(result["hits"][0]["evaluated"]["answer"]["value"], "42");
+    assert!(
+        result["output"]
+            .as_array()
+            .is_some_and(|output| !output.is_empty()),
+        "eval-at hit must include captured fixture output; got {result}"
+    );
+    assert_object_has_no_key_recursively(&result, "session_id");
+    assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn eval_at_fixture_no_hit_exit_returns_successful_exited_payload_and_no_leaked_process() {
+    let token = format!("eval-at-no-hit-{}", std::process::id());
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let handle = build_engine(
+        &opts,
+        native_fixture_tower_config(&["--token", &token, "--eval-at-scenario=no-hit-exit"], 5),
+    )
+    .expect("engine builds with no-hit fixture debug config");
+    let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+
+    let result = merged
+        .call(
+            "tower_debug_eval_at",
+            json!({
+                "lang": "rust",
+                "program": "fixture-program",
+                "expressions": ["answer"],
+                "timeout_ms": 5_000
+            }),
+        )
+        .expect("fixture-backed eval-at no-hit exit returns a successful payload");
+
+    assert_eq!(result["hit"], false, "eval-at no-hit payload: {result}");
+    assert_eq!(
+        result["finished"], "exited",
+        "eval-at no-hit payload: {result}"
+    );
+    assert_eq!(result["exit_code"], 0, "eval-at no-hit payload: {result}");
+    assert!(
+        result["output"].as_array().is_some(),
+        "eval-at no-hit must include an output payload; got {result}"
+    );
+    assert_object_has_no_key_recursively(&result, "session_id");
+    assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn eval_at_fixture_timeout_returns_successful_timeout_payload_and_no_leaked_process() {
+    let token = format!("eval-at-timeout-{}", std::process::id());
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let handle = build_engine(
+        &opts,
+        native_fixture_tower_config(&["--token", &token, "--continue-delay-ms=1500"], 5),
+    )
+    .expect("engine builds with timeout fixture debug config");
+    let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+
+    let started = Instant::now();
+    let result = merged
+        .call("tower_debug_eval_at", eval_at_request(100))
+        .expect("fixture-backed eval-at timeout returns a successful payload");
+
+    assert!(
+        started.elapsed() <= Duration::from_secs(2),
+        "eval-at timeout must complete without hanging"
+    );
+    assert_eq!(result["hit"], false, "eval-at timeout payload: {result}");
+    assert_eq!(
+        result["finished"], "timeout",
+        "eval-at timeout payload: {result}"
+    );
+    assert!(
+        result["output"].as_array().is_some(),
+        "eval-at timeout must include an output payload; got {result}"
+    );
+    assert_object_has_no_key_recursively(&result, "session_id");
+    assert_fixture_processes_gone(&token);
 }

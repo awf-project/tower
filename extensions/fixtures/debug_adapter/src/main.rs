@@ -19,6 +19,7 @@ struct DebugAdapterFixture<R, W> {
     continue_count: u64,
     suppress_continue_response: bool,
     continue_event_delay: Duration,
+    eval_at_scenario: EvalAtScenario,
 }
 
 impl<R, W> DebugAdapterFixture<R, W>
@@ -35,6 +36,7 @@ where
             continue_count: 0,
             suppress_continue_response: continue_delay > Duration::ZERO,
             continue_event_delay: continue_event_delay_from_args(),
+            eval_at_scenario: eval_at_scenario_from_args(),
         }
     }
 
@@ -114,12 +116,28 @@ where
             return Ok(None);
         }
 
+        let response = self.response(request, Some(json!({ "allThreadsContinued": true })));
+
+        if self.eval_at_scenario == EvalAtScenario::NoHitExit {
+            if self.continue_event_delay > Duration::ZERO {
+                write_frame(&mut self.output, &response)?;
+                thread::sleep(self.continue_event_delay);
+            }
+            self.write_event("exited", json!({ "exitCode": 0 }))?;
+            self.write_event("terminated", json!({}))?;
+            return Ok((self.continue_event_delay == Duration::ZERO).then_some(response));
+        }
+
         let (event, body) = if self.continue_count == 1 {
             ("stopped", json!({ "reason": "breakpoint", "threadId": 1 }))
         } else {
             ("terminated", json!({}))
         };
-        let response = self.response(request, Some(json!({ "allThreadsContinued": true })));
+        let output = if self.continue_count == 1 {
+            "fixture stopped at breakpoint with answer=42\n"
+        } else {
+            "fixture terminated after continue\n"
+        };
 
         if self.continue_event_delay > Duration::ZERO {
             write_frame(&mut self.output, &response)?;
@@ -128,6 +146,7 @@ where
             return Ok(None);
         }
 
+        self.write_output_event(output)?;
         self.write_event(event, body)?;
         Ok(Some(response))
     }
@@ -252,6 +271,16 @@ where
             },
         )
     }
+
+    fn write_output_event(&mut self, output: &str) -> io::Result<()> {
+        self.write_event("output", json!({ "category": "stdout", "output": output }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvalAtScenario {
+    BreakpointThenTerminate,
+    NoHitExit,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,6 +364,28 @@ fn continue_delay_from_args() -> Duration {
 
 fn continue_event_delay_from_args() -> Duration {
     delay_from_named_arg("--continue-event-delay-ms")
+}
+
+fn eval_at_scenario_from_args() -> EvalAtScenario {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--eval-at-scenario=") {
+            return eval_at_scenario_from_value(value);
+        }
+        if arg == "--eval-at-scenario"
+            && let Some(value) = args.next()
+        {
+            return eval_at_scenario_from_value(&value);
+        }
+    }
+    EvalAtScenario::BreakpointThenTerminate
+}
+
+fn eval_at_scenario_from_value(value: &str) -> EvalAtScenario {
+    match value {
+        "no-hit-exit" => EvalAtScenario::NoHitExit,
+        _ => EvalAtScenario::BreakpointThenTerminate,
+    }
 }
 
 fn delay_from_named_arg(name: &str) -> Duration {
