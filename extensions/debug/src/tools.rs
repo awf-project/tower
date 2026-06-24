@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::eval_at::{EvalAtRequest, run_eval_at};
 use crate::protocol::{DebugToolError, DebugToolErrorCode};
 use crate::session::{DebugSessionSummary, LaunchRequest, LaunchResult, SessionManager};
 use crate::types::{
@@ -266,6 +267,17 @@ pub fn tower_debug_evaluate(
     )
 }
 
+pub fn tower_debug_eval_at(
+    params: Value,
+    sessions: &SessionManager,
+) -> Result<Value, DebugToolError> {
+    let params: EvalAtRequest = parse_params(params)?;
+    match run_eval_at(params, sessions) {
+        Ok(result) => serialize(result),
+        Err(error) => serialize(tool_error_failure(error)),
+    }
+}
+
 pub fn tower_debug_terminate(
     params: Value,
     sessions: &SessionManager,
@@ -362,10 +374,33 @@ fn runtime_failure(error: DebugRuntimeError) -> RuntimeFailureResult {
     }
 }
 
+fn tool_error_failure(error: DebugToolError) -> RuntimeFailureResult {
+    let code = debug_tool_error_code(&error.code).to_owned();
+    RuntimeFailureResult {
+        ok: false,
+        error: RuntimeFailure {
+            code,
+            message: error.message,
+            data: None,
+        },
+    }
+}
+
+fn debug_tool_error_code(code: &DebugToolErrorCode) -> &'static str {
+    match code {
+        DebugToolErrorCode::DebugNotInitialized => "debug-not-initialized",
+        DebugToolErrorCode::DebugNotImplemented => "debug-not-implemented",
+        DebugToolErrorCode::SessionNotFound => "session-not-found",
+        DebugToolErrorCode::NotStopped => "not-stopped",
+        DebugToolErrorCode::DebugTimeout => "debug-timeout",
+        DebugToolErrorCode::InvalidParams => "invalid-params",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use serde_json::{Map, Value, json};
@@ -378,9 +413,10 @@ mod tests {
     };
 
     use super::{
-        tower_debug_continue, tower_debug_disconnect, tower_debug_evaluate, tower_debug_launch,
-        tower_debug_pause, tower_debug_sessions, tower_debug_set_breakpoints, tower_debug_stack,
-        tower_debug_step, tower_debug_terminate, tower_debug_threads, tower_debug_variables,
+        tower_debug_continue, tower_debug_disconnect, tower_debug_eval_at, tower_debug_evaluate,
+        tower_debug_launch, tower_debug_pause, tower_debug_sessions, tower_debug_set_breakpoints,
+        tower_debug_stack, tower_debug_step, tower_debug_terminate, tower_debug_threads,
+        tower_debug_variables,
     };
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -390,15 +426,52 @@ mod tests {
         Terminated,
     }
 
-    #[derive(Default)]
     struct FakeAdapterFactory {
         resume_behavior: ResumeBehavior,
+        supports_breakpoint_conditions: bool,
+        fail_evaluate: bool,
+        calls: Option<Arc<Mutex<Vec<String>>>>,
+    }
+
+    impl Default for FakeAdapterFactory {
+        fn default() -> Self {
+            Self {
+                resume_behavior: ResumeBehavior::Stopped,
+                supports_breakpoint_conditions: true,
+                fail_evaluate: false,
+                calls: None,
+            }
+        }
     }
 
     impl FakeAdapterFactory {
         fn terminated_on_resume() -> Self {
             Self {
                 resume_behavior: ResumeBehavior::Terminated,
+                supports_breakpoint_conditions: true,
+                fail_evaluate: false,
+                calls: None,
+            }
+        }
+
+        fn without_breakpoint_condition_support() -> Self {
+            Self {
+                supports_breakpoint_conditions: false,
+                ..Self::default()
+            }
+        }
+
+        fn with_evaluate_failure() -> Self {
+            Self {
+                fail_evaluate: true,
+                ..Self::default()
+            }
+        }
+
+        fn recording(calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                calls: Some(calls),
+                ..Self::default()
             }
         }
     }
@@ -410,6 +483,9 @@ mod tests {
         ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
             Ok(Box::new(FakeAdapterSession {
                 resume_behavior: self.resume_behavior,
+                supports_breakpoint_conditions: self.supports_breakpoint_conditions,
+                fail_evaluate: self.fail_evaluate,
+                calls: self.calls.clone(),
             }))
         }
     }
@@ -417,10 +493,14 @@ mod tests {
     #[derive(Default)]
     struct FakeAdapterSession {
         resume_behavior: ResumeBehavior,
+        supports_breakpoint_conditions: bool,
+        fail_evaluate: bool,
+        calls: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl DebugAdapterSession for FakeAdapterSession {
         fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            self.record("initialize");
             Ok(())
         }
 
@@ -429,6 +509,7 @@ mod tests {
             _request: &LaunchRequest,
             _timeout: Duration,
         ) -> Result<(), DebugRuntimeError> {
+            self.record("launch");
             Ok(())
         }
 
@@ -437,11 +518,17 @@ mod tests {
             breakpoints: &[DebugBreakpoint],
             _timeout: Duration,
         ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
+            let conditions = breakpoints
+                .iter()
+                .filter_map(|breakpoint| breakpoint.condition.as_deref())
+                .collect::<Vec<_>>()
+                .join(",");
+            self.record(format!("set_breakpoints:{conditions}"));
             Ok(breakpoints
                 .iter()
                 .enumerate()
                 .map(|(index, breakpoint)| DebugBreakpoint {
-                    verified: true,
+                    verified: breakpoint.condition.is_none() || self.supports_breakpoint_conditions,
                     verified_id: Some((index + 1) as u64),
                     ..breakpoint.clone()
                 })
@@ -449,6 +536,7 @@ mod tests {
         }
 
         fn continue_session(&mut self, timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+            self.record("continue");
             if timeout <= Duration::from_millis(1) {
                 return Err(DebugRuntimeError::DebugTimeout(
                     "fake adapter timed out".to_owned(),
@@ -462,6 +550,7 @@ mod tests {
             _thread_id: Option<u64>,
             timeout: Duration,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record("step");
             if timeout <= Duration::from_millis(1) {
                 return Err(DebugRuntimeError::DebugTimeout(
                     "fake adapter timed out".to_owned(),
@@ -475,6 +564,7 @@ mod tests {
             thread_id: Option<u64>,
             _timeout: Duration,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record("pause");
             Ok(DebugStop {
                 reason: Some("pause".to_owned()),
                 thread_id,
@@ -483,6 +573,7 @@ mod tests {
         }
 
         fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+            self.record("threads");
             Ok(vec![DebugThread {
                 id: 1,
                 name: "main".to_owned(),
@@ -494,6 +585,7 @@ mod tests {
             _thread_id: u64,
             _timeout: Duration,
         ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
+            self.record("stack");
             Ok(vec![top_frame()])
         }
 
@@ -502,6 +594,7 @@ mod tests {
             _frame_id: u64,
             _timeout: Duration,
         ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
+            self.record("scopes");
             Ok(vec![DebugScope {
                 name: "Locals".to_owned(),
                 variables_reference: 100,
@@ -514,6 +607,7 @@ mod tests {
             _variables_reference: u64,
             _timeout: Duration,
         ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
+            self.record("variables");
             Ok(vec![DebugVariable {
                 name: "answer".to_owned(),
                 value: "42".to_owned(),
@@ -528,6 +622,12 @@ mod tests {
             expression: &str,
             _timeout: Duration,
         ) -> Result<DebugVariable, DebugRuntimeError> {
+            self.record(format!("evaluate:{expression}"));
+            if self.fail_evaluate {
+                return Err(DebugRuntimeError::LaunchFailed(format!(
+                    "fake evaluate failed for {expression}"
+                )));
+            }
             Ok(DebugVariable {
                 name: expression.to_owned(),
                 value: "42".to_owned(),
@@ -537,11 +637,24 @@ mod tests {
         }
 
         fn terminate(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            self.record("terminate");
             Ok(())
         }
 
         fn disconnect(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            self.record("disconnect");
             Ok(())
+        }
+    }
+
+    impl FakeAdapterSession {
+        fn record(&self, call: impl Into<String>) {
+            if let Some(calls) = &self.calls {
+                calls
+                    .lock()
+                    .expect("call log lock should not be poisoned")
+                    .push(call.into());
+            }
         }
     }
 
@@ -718,6 +831,138 @@ mod tests {
     }
 
     #[test]
+    fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sessions = manager_with_factory(FakeAdapterFactory::recording(Arc::clone(&calls)));
+
+        let result =
+            tower_debug_eval_at(eval_at_params(), &sessions).expect("eval_at should succeed");
+
+        assert_eq!(
+            calls
+                .lock()
+                .expect("call log lock should not be poisoned")
+                .as_slice(),
+            [
+                "initialize",
+                "launch",
+                "set_breakpoints:answer == 42",
+                "set_breakpoints:",
+                "stack",
+                "continue",
+                "stack",
+                "scopes",
+                "variables",
+                "evaluate:answer",
+                "terminate",
+            ],
+            "tower_debug_eval_at must delegate orchestration to run_eval_at"
+        );
+        assert_eq!(result["hit"], true);
+        assert_eq!(result["finished"], "stopped");
+        assert_eq!(result["hits"][0]["frame"], json!(top_frame()));
+        assert_eq!(result["hits"][0]["evaluated"]["answer"]["value"], "42");
+        assert_object_has_no_key_recursively(&result, "session_id");
+    }
+
+    #[test]
+    fn malformed_eval_at_params_return_invalid_params() {
+        let sessions = manager();
+
+        assert_invalid_params(
+            tower_debug_eval_at(json!({ "program": "target/debug/app" }), &sessions),
+            "tower_debug_eval_at",
+        );
+    }
+
+    #[test]
+    fn eval_at_params_reject_unknown_top_level_and_nested_fields() {
+        let sessions = manager();
+
+        assert_invalid_params(
+            tower_debug_eval_at(
+                json!({
+                    "lang": "rust",
+                    "program": "target/debug/app",
+                    "max_hit": 99
+                }),
+                &sessions,
+            ),
+            "tower_debug_eval_at",
+        );
+        assert_invalid_params(
+            tower_debug_eval_at(
+                json!({
+                    "lang": "rust",
+                    "program": "target/debug/app",
+                    "breakpoint": {
+                        "path": "src/main.rs",
+                        "line": 12,
+                        "hit_condition": "3"
+                    }
+                }),
+                &sessions,
+            ),
+            "tower_debug_eval_at",
+        );
+        assert_invalid_params(
+            tower_debug_eval_at(
+                json!({
+                    "lang": "rust",
+                    "program": "target/debug/app",
+                    "capture": {
+                        "stack": true,
+                        "locals": true,
+                        "args": true,
+                        "globals": true
+                    }
+                }),
+                &sessions,
+            ),
+            "tower_debug_eval_at",
+        );
+    }
+
+    #[test]
+    fn tower_debug_eval_at_runtime_probe_outcomes_serialize_as_successful_json_payloads() {
+        let timeout_sessions = manager();
+        let unsupported_condition_sessions =
+            manager_with_factory(FakeAdapterFactory::without_breakpoint_condition_support());
+        let expression_error_sessions =
+            manager_with_factory(FakeAdapterFactory::with_evaluate_failure());
+
+        let timeout = tower_debug_eval_at(
+            json!({
+                "lang": "rust",
+                "program": "target/debug/app",
+                "timeout_ms": 0
+            }),
+            &timeout_sessions,
+        )
+        .expect("timeout is probe evidence, not a transport error");
+        let condition_unsupported =
+            tower_debug_eval_at(eval_at_params(), &unsupported_condition_sessions)
+                .expect("unsupported conditions are probe evidence");
+        let expression_error = tower_debug_eval_at(
+            json!({
+                "lang": "rust",
+                "program": "target/debug/app",
+                "breakpoint": { "path": "src/main.rs", "line": 12 },
+                "expressions": ["answer"]
+            }),
+            &expression_error_sessions,
+        )
+        .expect("per-expression failures are probe evidence");
+
+        assert_eq!(timeout["finished"], "timeout");
+        assert_eq!(condition_unsupported["condition_unsupported"], json!(true));
+        assert_eq!(
+            expression_error["hits"][0]["evaluated"]["answer"]["error"],
+            "fake evaluate failed for answer"
+        );
+    }
+
+    #[test]
     fn tower_debug_terminate_and_tower_debug_disconnect_clean_up_and_remove_sessions() {
         let sessions = manager();
         let terminated = launch_session(&sessions);
@@ -778,7 +1023,7 @@ mod tests {
         let sessions = manager();
         type ToolHandler = fn(Value, &SessionManager) -> Result<Value, DebugToolError>;
 
-        let handlers: [(&str, ToolHandler); 12] = [
+        let handlers: [(&str, ToolHandler); 13] = [
             ("tower_debug_launch", tower_debug_launch),
             ("tower_debug_set_breakpoints", tower_debug_set_breakpoints),
             ("tower_debug_continue", tower_debug_continue),
@@ -788,6 +1033,7 @@ mod tests {
             ("tower_debug_stack", tower_debug_stack),
             ("tower_debug_variables", tower_debug_variables),
             ("tower_debug_evaluate", tower_debug_evaluate),
+            ("tower_debug_eval_at", tower_debug_eval_at),
             ("tower_debug_terminate", tower_debug_terminate),
             ("tower_debug_disconnect", tower_debug_disconnect),
             ("tower_debug_sessions", tower_debug_sessions),
@@ -862,6 +1108,21 @@ mod tests {
             assert_eq!(value["error"]["code"], expected_code);
         }
 
+        let eval_at_launch_error = tower_debug_eval_at(
+            json!({
+                "lang": "python",
+                "program": "target/debug/app"
+            }),
+            &sessions,
+        )
+        .expect("eval-at launch failure should use the runtime failure envelope");
+        assert_eq!(eval_at_launch_error["ok"], false);
+        assert_eq!(eval_at_launch_error["error"]["code"], "invalid-params");
+        assert_eq!(
+            eval_at_launch_error["error"]["message"],
+            "no debug adapter configured for language python"
+        );
+
         let sessions_result =
             tower_debug_sessions(json!({}), &sessions).expect("sessions should succeed");
         assert_eq!(sessions_result, json!({ "sessions": [] }));
@@ -903,6 +1164,32 @@ mod tests {
         })
     }
 
+    fn eval_at_params() -> serde_json::Value {
+        json!({
+            "lang": "rust",
+            "program": "target/debug/app",
+            "args": ["--flag"],
+            "cwd": "/workspace",
+            "env": { "RUST_LOG": "debug" },
+            "breakpoint": {
+                "path": "src/main.rs",
+                "line": 12,
+                "condition": "answer == 42"
+            },
+            "expressions": ["answer"],
+            "capture": {
+                "stack": true,
+                "locals": true,
+                "args": true
+            },
+            "on_hit": "first",
+            "max_hits": 1,
+            "max_depth": 1,
+            "max_children": 4,
+            "timeout_ms": 1000
+        })
+    }
+
     fn launch_session(sessions: &SessionManager) -> DebugSessionId {
         sessions
             .launch(LaunchRequest {
@@ -935,6 +1222,7 @@ mod tests {
             top_frame: Some(top_frame()),
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            exit_code: None,
             output_since: Vec::new(),
         }
     }
@@ -953,6 +1241,7 @@ mod tests {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                exit_code: None,
                 output_since: fake_output(),
             },
         }
@@ -970,6 +1259,26 @@ mod tests {
             error_json["message"], "InvalidParams",
             "{handler_name} malformed params must use the JSON-RPC InvalidParams message"
         );
+    }
+
+    fn assert_object_has_no_key_recursively(value: &Value, forbidden: &str) {
+        match value {
+            Value::Object(map) => {
+                assert!(
+                    !map.contains_key(forbidden),
+                    "debug eval-at response must not expose {forbidden}: {value}"
+                );
+                for child in map.values() {
+                    assert_object_has_no_key_recursively(child, forbidden);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    assert_object_has_no_key_recursively(item, forbidden);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
     }
 
     fn fake_output() -> Vec<DebugOutput> {

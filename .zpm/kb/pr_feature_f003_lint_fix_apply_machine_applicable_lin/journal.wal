@@ -1,8 +1,0 @@
-{"ts":1782234605,"op":"retractall","clause":"resolved(stub, _)"}
-{"ts":1782234605,"op":"assert","clause":"resolved(stub, 'issue_1_538')"}
-{"ts":1782234605,"op":"retractall","clause":"resolved(stub, _)"}
-{"ts":1782234605,"op":"assert","clause":"resolved(stub, 'issue_1_298')"}
-{"ts":1782234605,"op":"retractall","clause":"resolved(stub, _)"}
-{"ts":1782234605,"op":"assert","clause":"resolved(stub, 'issue_1_545')"}
-{"ts":1782234624,"op":"assert","clause":"resolved(stub, 'issue_1_298')"}
-{"ts":1782234625,"op":"assert","clause":"resolved(stub, 'issue_1_538')"}

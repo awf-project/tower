@@ -52,6 +52,11 @@ description = "Evaluate an expression in a debug session."
 schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"frame_id":{"type":"integer","minimum":0},"expression":{"type":"string"}},"required":["session_id","frame_id","expression"],"additionalProperties":false}'
 
 [[tools]]
+name        = "eval_at"
+description = "Run an eval-at debug probe."
+schema_json = '{"type":"object","properties":{"lang":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":["string","null"]},"env":{"type":"object","additionalProperties":{"type":"string"}},"breakpoint":{"type":["object","null"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":0},"condition":{"type":["string","null"]}},"required":["path","line"],"additionalProperties":false},"expressions":{"type":"array","items":{"type":"string"}},"capture":{"type":"object","properties":{"stack":{"type":"boolean"},"locals":{"type":"boolean"},"args":{"type":"boolean"}},"additionalProperties":false},"on_hit":{"type":"string","enum":["first","all"]},"max_hits":{"type":"integer","minimum":1},"max_depth":{"type":"integer","minimum":0},"max_children":{"type":"integer","minimum":0},"timeout_ms":{"type":["integer","null"],"minimum":0}},"required":["lang","program"],"additionalProperties":false}'
+
+[[tools]]
 name        = "terminate"
 description = "Terminate a debug session."
 schema_json = '{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}'

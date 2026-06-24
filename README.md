@@ -23,7 +23,7 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **AST analysis** | `ast` extension — Tree-sitter outline and symbol search for Rust, Go, PHP |
 | **Code intelligence** | `lsp` extension — diagnostics, definition, references, hover via a language-server bridge |
 | **Standalone linting and fixes** | `lint` extension — on-demand diagnostics and structured fixes from configured external linters, using the same diagnostic shape as LSP |
-| **Interactive debugging** | `debug` extension — opt-in Debug Adapter Protocol sessions with launch, breakpoints, resume, runtime inspection, and cleanup tools |
+| **Debugging** | `debug` extension — opt-in Debug Adapter Protocol sessions plus one-shot `tower_debug_eval_at` probes for breakpoint evidence capture |
 | **Single static binary** | No WASM, WASI SDK, JVM, Node, or container required at runtime |
 
 ---
@@ -180,8 +180,8 @@ tests can locate sidecars under `target/debug/`. There is no WASM build step and
 |---|---|
 | [`docs/getting-started.md`](docs/getting-started.md) | Prerequisites, build, quality gate, first MCP session |
 | [`docs/architecture.md`](docs/architecture.md) | Hexagonal boundary, crate layout, ports, data flow, design decisions |
-| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools including lint fix and debug sessions, error codes |
-| [`docs/user-guide/debug-sessions.md`](docs/user-guide/debug-sessions.md) | How to configure and drive interactive Debug Adapter Protocol sessions with `tower_debug_*` tools |
+| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools including lint fix, interactive debug sessions, and `tower_debug_eval_at`, error codes |
+| [`docs/user-guide/debug-sessions.md`](docs/user-guide/debug-sessions.md) | How to configure and drive interactive Debug Adapter Protocol sessions and one-shot `tower_debug_eval_at` probes |
 | [`docs/user-guide/lint-fixes.md`](docs/user-guide/lint-fixes.md) | How to preview and apply structured linter fixes safely with `tower_lint_fix` |
 | [`docs/extensions.md`](docs/extensions.md) | Extension authoring guide — native sidecars, the JSON-RPC protocol, capabilities, manifest, fault model |
 | [`docs/development.md`](docs/development.md) | Contributing, TDD workflow, CI pipeline, test conventions |

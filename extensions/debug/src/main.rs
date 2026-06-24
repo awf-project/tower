@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dap;
+pub mod eval_at;
 pub mod process;
 mod protocol;
 pub mod session;
@@ -260,6 +261,7 @@ fn dispatch_debug_tool(
         "stack" => tools::tower_debug_stack(params, sessions),
         "variables" => tools::tower_debug_variables(params, sessions),
         "evaluate" => tools::tower_debug_evaluate(params, sessions),
+        "eval_at" => tools::tower_debug_eval_at(params, sessions),
         "terminate" => tools::tower_debug_terminate(params, sessions),
         "disconnect" => tools::tower_debug_disconnect(params, sessions),
         "sessions" => tools::tower_debug_sessions(params, sessions),
@@ -664,15 +666,14 @@ impl ProcessDebugAdapterSession {
     ) -> Result<DebugStop, DebugRuntimeError> {
         let response = self.client.request(command, arguments, timeout)?;
         ensure_success(response)?;
-        if let Some(event) = self
+        match self
             .client
-            .wait_for_event(&["stopped", "terminated"], timeout)?
+            .wait_for_event(&["stopped", "exited", "terminated"], timeout)
         {
-            return Ok(self.stop_from_event(event, timeout));
+            Ok(Some(event)) => Ok(self.stop_from_event(event, timeout)),
+            Ok(None) | Err(DapError::Timeout { .. }) => Ok(self.timeout_stop()),
+            Err(error) => Err(error.into()),
         }
-        Err(DebugRuntimeError::DebugTimeout(format!(
-            "debug adapter did not report a stop before {timeout:?}"
-        )))
     }
 
     fn stop_from_event(&mut self, event: DapEvent, timeout: Duration) -> DebugStop {
@@ -700,9 +701,20 @@ impl ProcessDebugAdapterSession {
                     top_frame,
                     hit_breakpoint_ids: Vec::new(),
                     timed_out: false,
+                    exit_code: None,
                     output_since,
                 }
             }
+            "exited" => DebugStop {
+                state: DebugSessionState::Terminated,
+                reason: Some("exited".to_owned()),
+                thread_id: None,
+                top_frame: None,
+                hit_breakpoint_ids: Vec::new(),
+                timed_out: false,
+                exit_code: event.body.get("exitCode").and_then(Value::as_i64),
+                output_since,
+            },
             "terminated" => DebugStop {
                 state: DebugSessionState::Terminated,
                 reason: Some("terminated".to_owned()),
@@ -710,6 +722,7 @@ impl ProcessDebugAdapterSession {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                exit_code: None,
                 output_since,
             },
             _ => DebugStop {
@@ -719,8 +732,22 @@ impl ProcessDebugAdapterSession {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: true,
+                exit_code: None,
                 output_since,
             },
+        }
+    }
+
+    fn timeout_stop(&mut self) -> DebugStop {
+        DebugStop {
+            state: DebugSessionState::Running,
+            reason: None,
+            thread_id: None,
+            top_frame: None,
+            hit_breakpoint_ids: Vec::new(),
+            timed_out: true,
+            exit_code: None,
+            output_since: self.drain_output_events(),
         }
     }
 
@@ -862,6 +889,275 @@ where
 }
 
 #[cfg(test)]
+#[test]
+fn process_debug_adapter_session_maps_exited_event_with_exit_code() {
+    struct ExactTestTransport {
+        frames: VecDeque<Result<Option<Value>, DapError>>,
+    }
+
+    impl DapTransport for ExactTestTransport {
+        fn send(&mut self, _message: &Value) -> Result<(), DapError> {
+            Ok(())
+        }
+
+        fn recv(&mut self, _timeout: Duration) -> Result<Option<Value>, DapError> {
+            self.frames.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    let transport = ExactTestTransport {
+        frames: VecDeque::from([
+            Ok(Some(json!({
+                "seq": 10,
+                "type": "response",
+                "request_seq": 1,
+                "command": "continue",
+                "success": true,
+                "body": {}
+            }))),
+            Ok(Some(json!({
+                "seq": 11,
+                "type": "event",
+                "event": "exited",
+                "body": { "exitCode": 0 }
+            }))),
+        ]),
+    };
+    let mut session = ProcessDebugAdapterSession {
+        adapter_type: "fixture".to_owned(),
+        launch_defaults: Map::new(),
+        client: DapClient::new(Box::new(transport)),
+        next_output_sequence: 1,
+    };
+
+    let stop = session
+        .continue_session(Duration::from_millis(50))
+        .expect("exited event should produce a terminated stop");
+
+    assert_eq!(stop.state, DebugSessionState::Terminated);
+    assert_eq!(stop.reason.as_deref(), Some("exited"));
+    assert_eq!(stop.exit_code, Some(0));
+    assert!(!stop.timed_out);
+}
+
+#[cfg(test)]
+#[test]
+fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::protocol::{DebugAdapterConfig, DebugInitializeConfig};
+    use crate::session::{DebugAdapterFactory, LaunchRequest, SessionManager};
+    use crate::types::{DebugOutput, DebugScope, DebugThread, DebugVariable};
+
+    #[derive(Default)]
+    struct ExactEvalAtFactory;
+
+    impl DebugAdapterFactory for ExactEvalAtFactory {
+        fn start(
+            &self,
+            _request: &LaunchRequest,
+        ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+            Ok(Box::new(ExactEvalAtSession))
+        }
+    }
+
+    struct ExactEvalAtSession;
+
+    impl DebugAdapterSession for ExactEvalAtSession {
+        fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            Ok(())
+        }
+
+        fn launch(
+            &mut self,
+            _request: &LaunchRequest,
+            _timeout: Duration,
+        ) -> Result<(), DebugRuntimeError> {
+            Ok(())
+        }
+
+        fn set_breakpoints(
+            &mut self,
+            breakpoints: &[DebugBreakpoint],
+            _timeout: Duration,
+        ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
+            Ok(breakpoints
+                .iter()
+                .enumerate()
+                .map(|(index, breakpoint)| DebugBreakpoint {
+                    verified: true,
+                    verified_id: Some((index + 1) as u64),
+                    ..breakpoint.clone()
+                })
+                .collect())
+        }
+
+        fn continue_session(&mut self, _timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+            Ok(DebugStop {
+                state: DebugSessionState::Stopped,
+                reason: Some("breakpoint".to_owned()),
+                thread_id: Some(1),
+                top_frame: Some(DebugStackFrame {
+                    id: 10,
+                    name: "main".to_owned(),
+                    path: Some("src/main.rs".to_owned()),
+                    line: 12,
+                    column: 5,
+                }),
+                hit_breakpoint_ids: vec![1],
+                timed_out: false,
+                exit_code: None,
+                output_since: vec![DebugOutput {
+                    sequence: 1,
+                    category: Some("stdout".to_owned()),
+                    text: "building\n".to_owned(),
+                }],
+            })
+        }
+
+        fn step(
+            &mut self,
+            _thread_id: Option<u64>,
+            _timeout: Duration,
+        ) -> Result<DebugStop, DebugRuntimeError> {
+            Err(DebugRuntimeError::LaunchFailed(
+                "unexpected eval_at step call".to_owned(),
+            ))
+        }
+
+        fn pause(
+            &mut self,
+            _thread_id: Option<u64>,
+            _timeout: Duration,
+        ) -> Result<DebugStop, DebugRuntimeError> {
+            Err(DebugRuntimeError::LaunchFailed(
+                "unexpected eval_at pause call".to_owned(),
+            ))
+        }
+
+        fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+            Ok(vec![DebugThread {
+                id: 1,
+                name: "main".to_owned(),
+            }])
+        }
+
+        fn stack(
+            &mut self,
+            _thread_id: u64,
+            _timeout: Duration,
+        ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
+            Ok(vec![DebugStackFrame {
+                id: 10,
+                name: "main".to_owned(),
+                path: Some("src/main.rs".to_owned()),
+                line: 12,
+                column: 5,
+            }])
+        }
+
+        fn scopes(
+            &mut self,
+            _frame_id: u64,
+            _timeout: Duration,
+        ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn variables(
+            &mut self,
+            _variables_reference: u64,
+            _timeout: Duration,
+        ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
+            Ok(Vec::new())
+        }
+
+        fn evaluate(
+            &mut self,
+            _frame_id: u64,
+            expression: &str,
+            _timeout: Duration,
+        ) -> Result<DebugVariable, DebugRuntimeError> {
+            Ok(DebugVariable {
+                name: expression.to_owned(),
+                value: "42".to_owned(),
+                r#type: Some("i32".to_owned()),
+                variables_reference: 0,
+            })
+        }
+
+        fn terminate(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            Ok(())
+        }
+
+        fn disconnect(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn assert_object_has_no_key_recursively(value: &Value, forbidden: &str) {
+        match value {
+            Value::Object(map) => {
+                assert!(
+                    !map.contains_key(forbidden),
+                    "debug eval-at response must not expose {forbidden}: {value}"
+                );
+                for child in map.values() {
+                    assert_object_has_no_key_recursively(child, forbidden);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    assert_object_has_no_key_recursively(item, forbidden);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+
+    let sessions = SessionManager::new(
+        DebugInitializeConfig {
+            languages: BTreeMap::from([(
+                "rust".to_owned(),
+                DebugAdapterConfig {
+                    extensions: vec!["rs".to_owned()],
+                    command: "fake-debug-adapter".to_owned(),
+                    args: Vec::new(),
+                    adapter_type: "fake".to_owned(),
+                    launch: Map::new(),
+                    default_timeout_secs: 1,
+                    idle_ttl_secs: 60,
+                },
+            )]),
+        },
+        Arc::new(ExactEvalAtFactory),
+    );
+
+    let result = tools::tower_debug_eval_at(
+        json!({
+            "lang": "rust",
+            "program": "target/debug/app",
+            "breakpoint": {
+                "path": "src/main.rs",
+                "line": 12,
+                "condition": "answer == 42"
+            },
+            "expressions": ["answer"],
+            "timeout_ms": 1000
+        }),
+        &sessions,
+    )
+    .expect("eval_at should succeed");
+
+    assert_eq!(result["hit"], true);
+    assert_eq!(result["finished"], "stopped");
+    assert_eq!(result["hits"][0]["evaluated"]["answer"]["value"], "42");
+    assert_object_has_no_key_recursively(&result, "session_id");
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -870,9 +1166,83 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DapClient, DapError, DapTransport, DebugAdapterSession, DebugBreakpoint,
-        ProcessDebugAdapterSession,
+        DapClient, DapError, DapTransport, DebugAdapterSession, DebugBreakpoint, DebugRuntimeError,
+        DebugSessionState, ProcessDebugAdapterSession, dispatch_debug_tool,
     };
+    use crate::protocol::{DebugAdapterConfig, DebugInitializeConfig, DebugToolErrorCode};
+    use crate::session::{DebugAdapterFactory, LaunchRequest, SessionManager};
+
+    #[test]
+    fn main_dispatches_incoming_eval_at_requests_through_tower_debug_eval_at_and_preserves_spec_33_handlers()
+     {
+        struct DispatchOnlyFactory;
+
+        impl DebugAdapterFactory for DispatchOnlyFactory {
+            fn start(
+                &self,
+                _request: &LaunchRequest,
+            ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+                Err(DebugRuntimeError::LaunchFailed(
+                    "adapter factory invoked for malformed params".to_owned(),
+                ))
+            }
+        }
+
+        let sessions = SessionManager::new(
+            DebugInitializeConfig {
+                languages: std::collections::BTreeMap::from([(
+                    "rust".to_owned(),
+                    DebugAdapterConfig {
+                        extensions: vec!["rs".to_owned()],
+                        command: "fake-debug-adapter".to_owned(),
+                        args: Vec::new(),
+                        adapter_type: "fake".to_owned(),
+                        launch: serde_json::Map::new(),
+                        default_timeout_secs: 1,
+                        idle_ttl_secs: 60,
+                    },
+                )]),
+            },
+            Arc::new(DispatchOnlyFactory),
+        );
+
+        for tool_name in [
+            "launch",
+            "set_breakpoints",
+            "continue",
+            "step",
+            "pause",
+            "threads",
+            "stack",
+            "variables",
+            "evaluate",
+            "eval_at",
+            "terminate",
+            "disconnect",
+            "sessions",
+        ] {
+            let params = if tool_name == "sessions" {
+                json!({})
+            } else {
+                json!("malformed")
+            };
+            let result = dispatch_debug_tool(tool_name, params, &sessions);
+
+            if tool_name == "sessions" {
+                assert_eq!(
+                    result.expect("sessions accepts empty object params"),
+                    json!({ "sessions": [] })
+                );
+            } else {
+                let error = result.expect_err("malformed params must be rejected");
+                assert_eq!(
+                    error.code,
+                    DebugToolErrorCode::InvalidParams,
+                    "{tool_name} must dispatch to its public facade and preserve invalid-param mapping"
+                );
+            }
+        }
+    }
 
     struct ScriptedTransport {
         frames: VecDeque<Result<Option<Value>, DapError>>,
@@ -1002,6 +1372,122 @@ mod tests {
         assert_eq!(stop.output_since[0].category.as_deref(), Some("stdout"));
         assert_eq!(stop.output_since[0].text, "ready\n");
         assert_eq!(stop.top_frame.expect("top frame").id, 99);
+    }
+
+    #[test]
+    fn process_debug_adapter_session_maps_exited_event_with_exit_code() {
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({
+                "seq": 10,
+                "type": "response",
+                "request_seq": 1,
+                "command": "continue",
+                "success": true,
+                "body": {}
+            }))),
+            Ok(Some(json!({
+                "seq": 11,
+                "type": "event",
+                "event": "exited",
+                "body": { "exitCode": 0 }
+            }))),
+        ]);
+        let mut session = process_session(transport);
+
+        let stop = session
+            .continue_session(Duration::from_millis(50))
+            .expect("exited event should produce a terminated stop");
+
+        assert_eq!(stop.state, DebugSessionState::Terminated);
+        assert_eq!(stop.reason.as_deref(), Some("exited"));
+        assert_eq!(stop.exit_code, Some(0));
+        assert!(!stop.timed_out);
+    }
+
+    #[test]
+    fn process_debug_adapter_session_resume_preserves_buffered_output_when_an_exited_event_is_observed()
+     {
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({
+                "seq": 10,
+                "type": "response",
+                "request_seq": 1,
+                "command": "continue",
+                "success": true,
+                "body": {}
+            }))),
+            Ok(Some(json!({
+                "seq": 11,
+                "type": "event",
+                "event": "output",
+                "body": { "category": "stdout", "output": "finished\n" }
+            }))),
+            Ok(Some(json!({
+                "seq": 12,
+                "type": "event",
+                "event": "exited",
+                "body": { "exitCode": 0 }
+            }))),
+        ]);
+        let mut session = process_session(transport);
+
+        let stop = session
+            .continue_session(Duration::from_millis(50))
+            .expect("exited event should preserve buffered output");
+
+        assert_eq!(stop.output_since.len(), 1);
+        assert_eq!(stop.output_since[0].category.as_deref(), Some("stdout"));
+        assert_eq!(stop.output_since[0].text, "finished\n");
+        assert_eq!(stop.exit_code, Some(0));
+    }
+
+    #[test]
+    fn process_debug_adapter_session_resume_still_maps_timeout_to_timed_out_true_and_does_not_fabricate_exit_code()
+     {
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({
+                "seq": 10,
+                "type": "response",
+                "request_seq": 1,
+                "command": "continue",
+                "success": true,
+                "body": {}
+            }))),
+            Err(DapError::Timeout {
+                command: "recv".to_owned(),
+            }),
+        ]);
+        let mut session = process_session(transport);
+
+        let stop = session
+            .continue_session(Duration::from_millis(50))
+            .expect("timeout should be reported as a DebugStop");
+
+        assert_eq!(stop.state, DebugSessionState::Running);
+        assert!(stop.timed_out);
+        assert_eq!(stop.exit_code, None);
+    }
+
+    #[test]
+    fn process_debug_adapter_session_resume_propagates_adapter_exited_after_continue_response() {
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({
+                "seq": 10,
+                "type": "response",
+                "request_seq": 1,
+                "command": "continue",
+                "success": true,
+                "body": {}
+            }))),
+            Err(DapError::AdapterExited),
+        ]);
+        let mut session = process_session(transport);
+
+        let error = session
+            .continue_session(Duration::from_millis(50))
+            .expect_err("adapter EOF must remain an adapter-exited error");
+
+        assert!(matches!(error, DebugRuntimeError::AdapterExited(_)));
     }
 
     fn process_session(transport: ScriptedTransport) -> ProcessDebugAdapterSession {

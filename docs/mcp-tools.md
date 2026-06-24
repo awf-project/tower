@@ -996,10 +996,11 @@ Stable fix error codes are `lint_fix_unavailable`, `lint_fix_apply_failed`, and
 
 ---
 
-## Interactive debug tools
+## Debug tools
 
 The `debug` extension (manifest `name = "debug"`) bridges configured Debug Adapter Protocol
-adapters. Its tools are lazy extension tools and appear only when all of the following are true:
+adapters and also provides a stateless one-shot eval-at probe. Its tools are lazy extension tools and
+appear only when all of the following are true:
 
 - the bundled debug sidecar binary is available next to `tower`, or a `debug` extension is discovered
   from an extension scope;
@@ -1166,6 +1167,76 @@ Evaluate an expression in a stopped frame.
 
 **Returns** `{"result": {"name": string, "value": string, "type": string|null, "variables_reference": uint}}`
 
+### tower_debug_eval_at
+
+Run a stateless one-shot debug probe. The tool launches a configured program, sets one optional
+breakpoint, continues until stop, exit, timeout, termination, or adapter exit, captures requested
+evidence, and always tears down the internal session before returning. It does not expose a
+`session_id`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `lang` | string | yes | Configured `[debug.<language>]` key |
+| `program` | string | yes | Program path or adapter-specific program value; the program must already be built |
+| `args` | string array | no | Program arguments; defaults to `[]` |
+| `cwd` | string or null | no | Working directory passed to the adapter |
+| `env` | string map | no | Environment variables passed to launch; defaults to `{}` |
+| `breakpoint` | object or null | no | Optional single breakpoint with `path`, `line`, and optional `condition` |
+| `expressions` | string array | no | Expressions to evaluate at each captured hit; defaults to `[]` |
+| `capture` | object | no | Booleans `stack`, `locals`, and `args`; each defaults to `true` |
+| `on_hit` | `"first"` or `"all"` | no | Capture only the first hit or continue until `max_hits`; defaults to `"first"` |
+| `max_hits` | integer | no | Positive hit bound; defaults to `1` |
+| `max_depth` | integer | no | Recursive variable expansion depth; defaults to `2` |
+| `max_children` | integer | no | Maximum expanded children per node or scope; defaults to `50` |
+| `timeout_ms` | integer or null | no | Probe continue timeout in milliseconds; omit to use the configured default |
+
+`breakpoint` shape:
+
+```json
+{ "path": "src/main.rs", "line": 42, "condition": "answer == 42" }
+```
+
+**Returns**
+
+```json
+{
+  "hit": true,
+  "hits": [
+    {
+      "thread_id": 1,
+      "frame": { "id": 7, "name": "main", "path": "src/main.rs", "line": 42, "column": 1 },
+      "stack": [
+        { "id": 7, "name": "main", "path": "src/main.rs", "line": 42, "column": 1 }
+      ],
+      "locals": [
+        {
+          "name": "answer",
+          "value": "42",
+          "type": "i32",
+          "children": [],
+          "truncated": false
+        }
+      ],
+      "args": [],
+      "evaluated": {
+        "answer": { "value": "42", "type": "i32" },
+        "missing": { "error": "evaluation failed" }
+      }
+    }
+  ],
+  "output": [],
+  "finished": "stopped",
+  "exit_code": null,
+  "condition_unsupported": null
+}
+```
+
+`finished` is one of `"stopped"`, `"exited"`, `"timeout"`, `"terminated"`, or
+`"adapter_exited"`. A no-hit normal exit returns `hit:false`, `finished:"exited"`, optional
+`exit_code`, captured `output`, and an empty `hits` array. A timeout returns
+`finished:"timeout"` after cleanup. If a requested breakpoint condition cannot be honored, the result
+sets `condition_unsupported:true` instead of silently ignoring the condition.
+
 ### tower_debug_terminate
 
 Terminate the debuggee and adapter process tree, then remove the session.
@@ -1196,7 +1267,7 @@ List live ephemeral sessions.
 
 **Returns** `{"sessions": [{"session_id": string, "language": string, "state": "initializing"|"stopped"|"running"|"terminated", "last_stop": object|null}]}`
 
-See [interactive debug sessions](user-guide/debug-sessions.md) for a task-oriented workflow.
+See [debug sessions and probes](user-guide/debug-sessions.md) for task-oriented workflows.
 
 ---
 

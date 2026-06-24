@@ -18,18 +18,6 @@
       "path": ".zpm/kb/architecture",
       "scope": "project",
       "mode": "rw"
-    },
-    {
-      "name": "pr_feature_f002_standalone_linter_sidecar_extension",
-      "path": ".zpm/kb/pr_feature_f002_standalone_linter_sidecar_extension",
-      "scope": "project",
-      "mode": "rw"
-    },
-    {
-      "name": "pr_feature_f003_lint_fix_apply_machine_applicable_lin",
-      "path": ".zpm/kb/pr_feature_f003_lint_fix_apply_machine_applicable_lin",
-      "scope": "project",
-      "mode": "rw"
     }
   ]
 }

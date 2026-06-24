@@ -1,7 +1,7 @@
-# Interactive Debug Sessions
+# Debug Sessions And Probes
 
-This guide shows how to configure the `debug` extension and drive a live Debug Adapter Protocol
-session through `tower_debug_*` MCP tools.
+This guide shows how to configure the `debug` extension, drive a live Debug Adapter Protocol
+session, and run a stateless one-shot probe through `tower_debug_*` MCP tools.
 
 Debugging is opt-in. The tools are absent from `tools/list` unless the workspace has a valid
 `[debug.<language>]` config entry and the `debug` extension is enabled. A discovered `debug`
@@ -36,8 +36,8 @@ extension-contributed MCP tools:
 ```
 
 Expected tool names include `tower_debug_launch`, `tower_debug_set_breakpoints`,
-`tower_debug_continue`, `tower_debug_stack`, `tower_debug_variables`, `tower_debug_evaluate`, and
-`tower_debug_terminate`.
+`tower_debug_continue`, `tower_debug_stack`, `tower_debug_variables`, `tower_debug_evaluate`,
+`tower_debug_eval_at`, and `tower_debug_terminate`.
 
 ## Launch and Stop
 
@@ -97,24 +97,66 @@ Evaluate an expression in a frame:
 Stack, variables, and evaluate calls require a stopped session. A running session returns a stable
 payload error with code `not-stopped`.
 
+## Run A One-Shot Probe
+
+Use `tower_debug_eval_at` when you need breakpoint evidence without keeping an interactive session
+alive. The probe launches the configured program, sets one optional breakpoint, continues until a
+hit, normal exit, timeout, or adapter exit, captures requested evidence, and then terminates the
+session internally. The response never contains a `session_id`.
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tower_debug_eval_at","arguments":{"lang":"rust","program":"target/debug/app","breakpoint":{"path":"src/main.rs","line":42,"condition":null},"expressions":["answer"],"capture":{"stack":true,"locals":true,"args":true},"on_hit":"first","max_depth":2,"max_children":50,"timeout_ms":5000}}}
+```
+
+On a hit, the payload includes `hit:true`, `finished:"stopped"`, captured stack/frame data,
+expanded locals and args according to the requested bounds, evaluated expression results, and
+captured output:
+
+```json
+{
+  "hit": true,
+  "hits": [
+    {
+      "thread_id": 1,
+      "frame": { "id": 7, "name": "main", "path": "src/main.rs", "line": 42, "column": 1 },
+      "stack": [],
+      "locals": [],
+      "args": [],
+      "evaluated": {
+        "answer": { "value": "42", "type": "i32" }
+      }
+    }
+  ],
+  "output": [],
+  "finished": "stopped",
+  "exit_code": null,
+  "condition_unsupported": null
+}
+```
+
+If the breakpoint is not reached before normal process exit, the payload has `hit:false`,
+`finished:"exited"`, and an `exit_code` when the adapter provides one. A timeout returns
+`finished:"timeout"` after teardown. Individual expression failures appear under that expression as
+`{"error":"..."}` without failing the whole probe.
+
 ## Cleanup
 
 Terminate the debuggee and adapter process tree:
 
 ```json
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tower_debug_terminate","arguments":{"session_id":"debug-1"}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tower_debug_terminate","arguments":{"session_id":"debug-1"}}}
 ```
 
 Use `tower_debug_disconnect` when the adapter should disconnect instead of terminate:
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tower_debug_disconnect","arguments":{"session_id":"debug-1"}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"tower_debug_disconnect","arguments":{"session_id":"debug-1"}}}
 ```
 
 List live sessions at any time:
 
 ```json
-{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"tower_debug_sessions","arguments":{}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"tower_debug_sessions","arguments":{}}}
 ```
 
 Sessions are ephemeral and are not restored after extension restart. Unknown, ended, expired, or lost

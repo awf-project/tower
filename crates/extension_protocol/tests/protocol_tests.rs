@@ -1,15 +1,3 @@
-//! Integration tests encoding the Definition of Done for spec 21.
-//!
-//! TDD sequence (spec 21):
-//! 1. RED:  round-trip serde for Request/Response/Event
-//! 2. GREEN
-//! 3. RED:  ExtensionManifest TOML parse including activation
-//! 4. GREEN
-//! 5. RED:  malformed input → ProtocolError, no panic
-//! 6. GREEN
-//!
-//! All tests here are integration-level — they import the public API only.
-
 use extension_protocol::{
     Activation, Capability, Event, ExtensionFault, ExtensionManifest, HostCall, InitParams,
     InitResult, PROTOCOL_VERSION, ProtocolError, Request, Response, ToolDecl,
@@ -44,8 +32,6 @@ fn toml_string_array<'a>(value: &'a toml::Value, key: &str) -> Vec<&'a str> {
         })
         .collect()
 }
-
-// ── AC1: Round-trip serde for all protocol message types ─────────────────────
 
 #[test]
 fn request_initialize_round_trips_json() {
@@ -670,6 +656,7 @@ fn debug_manifest_declares_exactly_the_required_local_tool_names() {
             "stack",
             "variables",
             "evaluate",
+            "eval_at",
             "terminate",
             "disconnect",
             "sessions",
@@ -702,6 +689,23 @@ fn debug_manifest_does_not_declare_workspace_write_or_request_apply_edits_capabi
 }
 
 #[test]
+fn debug_manifest_includes_eval_at_and_still_requests_no_workspace_mutation_capability() {
+    let manifest = shipped_debug_manifest();
+    let tool_names = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(tool_names.contains(&"eval_at"));
+    assert!(
+        manifest.capabilities.required.is_empty(),
+        "debug manifest must not request workspace mutation capabilities; got {:?}",
+        manifest.capabilities.required
+    );
+}
+
+#[test]
 fn extension_manifest_parses_debug_tools_and_preserves_all_debug_tool_names() {
     let manifest = shipped_debug_manifest();
     let tool_names = manifest
@@ -712,10 +716,46 @@ fn extension_manifest_parses_debug_tools_and_preserves_all_debug_tool_names() {
 
     assert_eq!(manifest.name, "debug");
     assert_eq!(manifest.command, vec!["debug_extension"]);
-    assert_eq!(tool_names.len(), 12);
+    assert_eq!(tool_names.len(), 13);
     assert!(tool_names.contains(&"launch"));
     assert!(tool_names.contains(&"set_breakpoints"));
+    assert!(tool_names.contains(&"eval_at"));
     assert!(tool_names.contains(&"sessions"));
+}
+
+#[test]
+fn debug_protocol_stability_includes_eval_at_without_workspace_mutation_capabilities() {
+    let manifest = shipped_debug_manifest();
+    let tool_names = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        tool_names,
+        vec![
+            "launch",
+            "set_breakpoints",
+            "continue",
+            "step",
+            "pause",
+            "threads",
+            "stack",
+            "variables",
+            "evaluate",
+            "eval_at",
+            "terminate",
+            "disconnect",
+            "sessions",
+        ],
+        "debug protocol stability must include eval_at in the shipped tool order"
+    );
+    assert!(
+        manifest.capabilities.required.is_empty(),
+        "debug extension must still request no workspace mutation capabilities; got {:?}",
+        manifest.capabilities.required
+    );
 }
 
 // ── AC3: Malformed input → ProtocolError, no panic ───────────────────────────
@@ -759,18 +799,10 @@ fn protocol_error_has_display() {
     assert!(display.contains("Parse error") || display.contains("-32700"));
 }
 
-// ── AC4: PROTOCOL_VERSION constant is meaningful ──────────────────────────────
-
-// Compile-time assertion: PROTOCOL_VERSION must be a positive constant.
-// Expressed as a const assertion so it is checked at compile time, not
-// as a runtime `assert!` that clippy flags as "this assertion has a constant value".
 const _: () = assert!(PROTOCOL_VERSION > 0, "PROTOCOL_VERSION must be positive");
 
 #[test]
 fn protocol_version_is_nonzero() {
-    // The compile-time assertion above is authoritative. This test verifies
-    // the constant survives a JSON round-trip (i.e. it is correctly serialised
-    // and deserialised as part of InitParams).
     let params = InitParams {
         protocol_version: PROTOCOL_VERSION,
         client_info: "test".to_owned(),
@@ -778,7 +810,6 @@ fn protocol_version_is_nonzero() {
     };
     let json = serde_json::to_string(&params).expect("serialize InitParams");
     let decoded: InitParams = serde_json::from_str(&json).expect("deserialize InitParams");
-    // `decoded.protocol_version` is a runtime value (result of deserialisation).
     assert_ne!(
         decoded.protocol_version, 0,
         "PROTOCOL_VERSION must survive JSON round-trip as a positive value"
