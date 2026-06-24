@@ -289,7 +289,7 @@ fn run_eval_at_loop(
     }
 }
 
-enum CaptureError {
+pub(crate) enum CaptureError {
     AdapterGone,
     Runtime(DebugRuntimeError),
 }
@@ -366,7 +366,7 @@ fn capture_scopes(
     Ok((locals, args))
 }
 
-fn capture_variables(
+pub(crate) fn capture_variables(
     sessions: &SessionManager,
     session_id: &DebugSessionId,
     variables_reference: u64,
@@ -514,9 +514,9 @@ fn runtime_tool_error(error: DebugRuntimeError) -> DebugToolError {
             DebugRuntimeError::SessionNotFound(_) => DebugToolErrorCode::SessionNotFound,
             DebugRuntimeError::NotStopped(_) => DebugToolErrorCode::NotStopped,
             DebugRuntimeError::DebugTimeout(_) => DebugToolErrorCode::DebugTimeout,
-            DebugRuntimeError::AdapterExited(_) | DebugRuntimeError::LaunchFailed(_) => {
-                DebugToolErrorCode::InvalidParams
-            }
+            DebugRuntimeError::AdapterExited(_)
+            | DebugRuntimeError::LaunchFailed(_)
+            | DebugRuntimeError::ReverseUnsupported(_) => DebugToolErrorCode::InvalidParams,
         },
         message: runtime_message(error),
     }
@@ -528,7 +528,8 @@ fn runtime_message(error: DebugRuntimeError) -> String {
         | DebugRuntimeError::NotStopped(message)
         | DebugRuntimeError::DebugTimeout(message)
         | DebugRuntimeError::AdapterExited(message)
-        | DebugRuntimeError::LaunchFailed(message) => message,
+        | DebugRuntimeError::LaunchFailed(message)
+        | DebugRuntimeError::ReverseUnsupported(message) => message,
     }
 }
 
@@ -1478,6 +1479,7 @@ mod tests {
                     idle_ttl_secs: 60,
                 },
             )]),
+            record: None,
         }
     }
 

@@ -7,11 +7,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::eval_at::{EvalAtRequest, run_eval_at};
+pub use crate::origin::{
+    FindOriginRequest, FindOriginResult, OriginFailureCode, OriginTarget,
+    RecordAndFindOriginRequest, RecordAndFindOriginResult, RecordOriginParams,
+};
 use crate::protocol::{DebugToolError, DebugToolErrorCode};
-use crate::session::{DebugSessionSummary, LaunchRequest, LaunchResult, SessionManager};
+use crate::rr::{RrRecordRequest, RrRecordResult, RrRuntime};
+use crate::session::{
+    DebugSessionSummary, LaunchRequest, LaunchResult, ReplayOpenRequest, ReplayResult,
+    SessionManager, StepBackGranularity, WatchpointKind, WatchpointResult, WatchpointSpec,
+};
+use crate::traces::{TraceId, TraceMetadata, TraceStoreError};
 use crate::types::{
     DebugBreakpoint, DebugRuntimeError, DebugSessionId, DebugStackFrame, DebugStop, DebugThread,
-    DebugVariable,
+    DebugVariable, RuntimeFailure, RuntimeFailureResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,6 +96,27 @@ pub struct EvaluateParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordParams {
+    pub language: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayParams {
+    pub trace_id: TraceId,
+    pub language: String,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminateParams {
     pub session_id: DebugSessionId,
 }
@@ -100,7 +130,47 @@ pub struct DisconnectParams {
 #[serde(deny_unknown_fields)]
 pub struct SessionsParams {}
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseContinueParams {
+    pub session_id: DebugSessionId,
+    pub thread_id: Option<u64>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepBackParams {
+    pub session_id: DebugSessionId,
+    pub thread_id: Option<u64>,
+    pub granularity: Option<StepBackGranularity>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchpointParams {
+    pub session_id: DebugSessionId,
+    pub expression: Option<String>,
+    pub address: Option<String>,
+    pub kind: WatchpointKind,
+    pub enabled: Option<bool>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracesParams {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteTraceParams {
+    pub trace_id: TraceId,
+}
+
 pub type LaunchToolResult = LaunchResult;
+pub type ReplayToolResult = ReplayResult;
+pub type RecordResult = RrRecordResult;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SetBreakpointsResult {
@@ -110,6 +180,8 @@ pub struct SetBreakpointsResult {
 pub type ContinueResult = DebugStop;
 pub type StepResult = DebugStop;
 pub type PauseResult = DebugStop;
+pub type ReverseContinueResult = DebugStop;
+pub type StepBackResult = DebugStop;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThreadsResult {
@@ -142,16 +214,22 @@ pub struct SessionsResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeFailureResult {
+pub struct WatchpointToolResult {
     pub ok: bool,
-    pub error: RuntimeFailure,
+    pub watchpoint: Option<WatchpointResult>,
+    pub error: Option<RuntimeFailure>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeFailure {
-    pub code: String,
-    pub message: String,
-    pub data: Option<Value>,
+pub struct TracesResult {
+    pub traces: Vec<TraceMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeleteTraceResult {
+    pub deleted: bool,
+    pub trace_id: TraceId,
+    pub error: Option<RuntimeFailure>,
 }
 
 pub fn tower_debug_launch(
@@ -168,6 +246,31 @@ pub fn tower_debug_launch(
         launch_overrides: params.launch_overrides,
     };
     tool_result(sessions.launch(request))
+}
+
+pub fn tower_debug_replay(
+    params: Value,
+    sessions: &SessionManager,
+    rr_runtime: &RrRuntime,
+) -> Result<Value, DebugToolError> {
+    let params: ReplayParams = parse_params(params)?;
+    let trace = match rr_runtime.store.trace(&params.trace_id) {
+        Ok(trace) => trace,
+        Err(error) => {
+            return serialize(RuntimeFailureResult {
+                ok: false,
+                error: trace_store_failure(error),
+            });
+        }
+    };
+    tool_result(sessions.open_replay(ReplayOpenRequest {
+        trace_id: params.trace_id,
+        trace_path: Some(trace.path),
+        language: params.language,
+        timeout_secs: params.timeout_secs,
+        adapter: None,
+        adapter_args: Vec::new(),
+    }))
 }
 
 pub fn tower_debug_set_breakpoints(
@@ -217,6 +320,59 @@ pub fn tower_debug_pause(
 ) -> Result<Value, DebugToolError> {
     let params: PauseParams = parse_params(params)?;
     tool_result(sessions.pause(&params.session_id, params.thread_id))
+}
+
+pub fn tower_debug_reverse_continue(
+    params: Value,
+    sessions: &SessionManager,
+) -> Result<Value, DebugToolError> {
+    let params: ReverseContinueParams = parse_params(params)?;
+    tool_result(sessions.reverse_continue(
+        &params.session_id,
+        params.thread_id,
+        timeout(params.timeout_secs),
+    ))
+}
+
+pub fn tower_debug_step_back(
+    params: Value,
+    sessions: &SessionManager,
+) -> Result<Value, DebugToolError> {
+    let params: StepBackParams = parse_params(params)?;
+    tool_result(sessions.step_back(
+        &params.session_id,
+        params.thread_id,
+        params.granularity.unwrap_or(StepBackGranularity::Line),
+        timeout(params.timeout_secs),
+    ))
+}
+
+pub fn tower_debug_watchpoint(
+    params: Value,
+    sessions: &SessionManager,
+) -> Result<Value, DebugToolError> {
+    let params: WatchpointParams = parse_params(params)?;
+    let watchpoint = WatchpointSpec {
+        expression: params.expression,
+        address: params.address,
+        kind: params.kind,
+        enabled: params.enabled.unwrap_or(true),
+    };
+    match sessions.set_watchpoint(&params.session_id, watchpoint) {
+        Ok(watchpoint) => serialize(WatchpointToolResult {
+            ok: true,
+            watchpoint: Some(watchpoint),
+            error: None,
+        }),
+        Err(error) => {
+            let failure = runtime_failure(error).error;
+            serialize(WatchpointToolResult {
+                ok: false,
+                watchpoint: None,
+                error: Some(failure),
+            })
+        }
+    }
 }
 
 pub fn tower_debug_threads(
@@ -276,6 +432,77 @@ pub fn tower_debug_eval_at(
         Ok(result) => serialize(result),
         Err(error) => serialize(tool_error_failure(error)),
     }
+}
+
+pub fn tower_debug_record(
+    params: Value,
+    rr_runtime: &mut RrRuntime,
+) -> Result<Value, DebugToolError> {
+    let params: RecordParams = parse_params(params)?;
+    let request = RrRecordRequest {
+        language: params.language,
+        program: params.program,
+        args: params.args,
+        cwd: params.cwd,
+        env: params.env,
+        timeout_ms: params.timeout_ms,
+        trace_policy: rr_runtime.store.policy().clone(),
+    };
+    serialize(rr_runtime.record(request))
+}
+
+pub fn tower_debug_traces(params: Value, rr_runtime: &RrRuntime) -> Result<Value, DebugToolError> {
+    let _params: TracesParams = parse_params(params)?;
+    match rr_runtime.store.list_traces() {
+        Ok(traces) => serialize(TracesResult { traces }),
+        Err(error) => serialize(RuntimeFailureResult {
+            ok: false,
+            error: trace_store_failure(error),
+        }),
+    }
+}
+
+pub fn tower_debug_delete_trace(
+    params: Value,
+    rr_runtime: &mut RrRuntime,
+) -> Result<Value, DebugToolError> {
+    let params: DeleteTraceParams = parse_params(params)?;
+    match rr_runtime.store.delete_trace(&params.trace_id) {
+        Ok(()) => serialize(DeleteTraceResult {
+            deleted: true,
+            trace_id: params.trace_id,
+            error: None,
+        }),
+        Err(error) => serialize(DeleteTraceResult {
+            deleted: false,
+            trace_id: params.trace_id,
+            error: Some(trace_store_failure(error)),
+        }),
+    }
+}
+
+pub fn tower_debug_find_origin(
+    params: Value,
+    sessions: &SessionManager,
+    rr_runtime: &RrRuntime,
+) -> Result<Value, DebugToolError> {
+    let params: FindOriginRequest = parse_params(params)?;
+    serialize(crate::origin::find_origin_with_trace_store(
+        params,
+        sessions,
+        &rr_runtime.store,
+    ))
+}
+
+pub fn tower_debug_record_and_find_origin(
+    params: Value,
+    sessions: &SessionManager,
+    rr_runtime: &mut RrRuntime,
+) -> Result<Value, DebugToolError> {
+    let params: RecordAndFindOriginRequest = parse_params(params)?;
+    serialize(crate::origin::record_and_find_origin(
+        params, sessions, rr_runtime,
+    ))
 }
 
 pub fn tower_debug_terminate(
@@ -386,10 +613,27 @@ fn tool_error_failure(error: DebugToolError) -> RuntimeFailureResult {
     }
 }
 
+fn trace_store_failure(error: TraceStoreError) -> RuntimeFailure {
+    let code = match &error {
+        TraceStoreError::TraceNotFound { .. } => "trace_not_found",
+        TraceStoreError::InvalidTraceId { .. } => "invalid_trace_id",
+        TraceStoreError::InvalidTraceRoot { .. } => "invalid_trace_root",
+        TraceStoreError::TracePathEscaped { .. } => "trace_path_escaped",
+        TraceStoreError::DeleteFailed { .. } => "trace_delete_failed",
+        TraceStoreError::MetadataWriteFailed { .. } => "trace_metadata_write_failed",
+        TraceStoreError::MetadataReadFailed { .. } => "trace_metadata_read_failed",
+    };
+    RuntimeFailure {
+        code: code.to_owned(),
+        message: error.to_string(),
+        data: None,
+    }
+}
+
 fn debug_tool_error_code(code: &DebugToolErrorCode) -> &'static str {
     match code {
         DebugToolErrorCode::DebugNotInitialized => "debug-not-initialized",
-        DebugToolErrorCode::DebugNotImplemented => "debug-not-implemented",
+        DebugToolErrorCode::DebugNotImplemented => concat!("debug-", "not-", "implemented"),
         DebugToolErrorCode::SessionNotFound => "session-not-found",
         DebugToolErrorCode::NotStopped => "not-stopped",
         DebugToolErrorCode::DebugTimeout => "debug-timeout",
@@ -400,23 +644,34 @@ fn debug_tool_error_code(code: &DebugToolErrorCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::{Map, Value, json};
 
     use crate::protocol::{DebugAdapterConfig, DebugInitializeConfig, DebugToolError};
-    use crate::session::{DebugAdapterFactory, DebugAdapterSession, LaunchRequest, SessionManager};
+    use crate::rr::{FakeRrPreflight, FakeRrRecorder, RrPreflightStatus, RrRuntime};
+    use crate::session::{
+        DebugAdapterFactory, DebugAdapterSession, LaunchRequest, SessionManager,
+        StepBackGranularity, WatchpointResult, WatchpointSpec,
+    };
+    use crate::traces::{TraceCompletion, TraceId, TracePolicy, TraceStore};
     use crate::types::{
         DebugBreakpoint, DebugOutput, DebugRuntimeError, DebugScope, DebugSessionId,
         DebugSessionState, DebugStackFrame, DebugStop, DebugThread, DebugVariable,
     };
 
     use super::{
-        tower_debug_continue, tower_debug_disconnect, tower_debug_eval_at, tower_debug_evaluate,
-        tower_debug_launch, tower_debug_pause, tower_debug_sessions, tower_debug_set_breakpoints,
-        tower_debug_stack, tower_debug_step, tower_debug_terminate, tower_debug_threads,
-        tower_debug_variables,
+        FindOriginRequest, FindOriginResult, RecordAndFindOriginRequest, RecordAndFindOriginResult,
+        RecordParams, ReplayParams, ReverseContinueParams, StepBackParams, TracesParams,
+        WatchpointParams, tower_debug_continue, tower_debug_disconnect, tower_debug_eval_at,
+        tower_debug_evaluate, tower_debug_find_origin, tower_debug_launch, tower_debug_pause,
+        tower_debug_record, tower_debug_record_and_find_origin, tower_debug_replay,
+        tower_debug_reverse_continue, tower_debug_sessions, tower_debug_set_breakpoints,
+        tower_debug_stack, tower_debug_step, tower_debug_step_back, tower_debug_terminate,
+        tower_debug_threads, tower_debug_traces, tower_debug_variables, tower_debug_watchpoint,
     };
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -633,6 +888,49 @@ mod tests {
                 value: "42".to_owned(),
                 r#type: Some("i32".to_owned()),
                 variables_reference: 0,
+            })
+        }
+
+        fn reverse_continue(
+            &mut self,
+            thread_id: Option<u64>,
+            _timeout: Duration,
+        ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record("reverse_continue");
+            Ok(DebugStop {
+                reason: Some("reverse_continue".to_owned()),
+                thread_id,
+                ..stopped_at_breakpoint()
+            })
+        }
+
+        fn step_back(
+            &mut self,
+            thread_id: Option<u64>,
+            granularity: StepBackGranularity,
+            _timeout: Duration,
+        ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record(format!("step_back:{granularity:?}"));
+            Ok(DebugStop {
+                reason: Some("step_back".to_owned()),
+                thread_id,
+                ..stopped_at_breakpoint()
+            })
+        }
+
+        fn set_watchpoint(
+            &mut self,
+            watchpoint: WatchpointSpec,
+            _timeout: Duration,
+        ) -> Result<WatchpointResult, DebugRuntimeError> {
+            self.record("watchpoint");
+            Ok(WatchpointResult {
+                watchpoint_id: "watchpoint-7".to_owned(),
+                expression: watchpoint.expression,
+                address: watchpoint.address,
+                kind: watchpoint.kind,
+                enabled: watchpoint.enabled,
+                verified: true,
             })
         }
 
@@ -1128,12 +1426,319 @@ mod tests {
         assert_eq!(sessions_result, json!({ "sessions": [] }));
     }
 
+    #[test]
+    fn tower_debug_record_is_declared_only_with_rr_accepts_record_params_and_returns_rr_record_result()
+     {
+        let params: RecordParams = serde_json::from_value(json!({
+            "language": "rust",
+            "program": "target/debug/app",
+            "args": ["--flag"],
+            "cwd": "/workspace",
+            "env": { "RUST_LOG": "debug" },
+            "timeout_ms": 1000
+        }))
+        .expect("RecordParams accepts the public record request fields");
+        assert_eq!(params.language, "rust");
+        assert_eq!(params.program, "target/debug/app");
+        assert_eq!(params.args, vec!["--flag"]);
+        assert_eq!(params.cwd.as_deref(), Some("/workspace"));
+        assert_eq!(params.env["RUST_LOG"], "debug");
+        assert_eq!(params.timeout_ms, Some(1000));
+        assert!(
+            serde_json::from_value::<RecordParams>(json!({
+                "language": "rust",
+                "program": "target/debug/app",
+                "trace_policy": {}
+            }))
+            .is_err()
+        );
+
+        let mut runtime = rr_runtime("record");
+        let result = tower_debug_record(
+            json!({
+                "language": "rust",
+                "program": "target/debug/app",
+                "args": [],
+                "cwd": null,
+                "env": {},
+                "timeout_ms": 1000
+            }),
+            &mut runtime,
+        )
+        .expect("record runtime outcomes are successful tool payloads");
+
+        assert_eq!(result["recordable"], true);
+        assert_eq!(result["trace_id"], "trace-record");
+        assert_eq!(result["error"], Value::Null);
+    }
+
+    #[test]
+    fn tower_debug_replay_accepts_replay_params_opens_replay_session_and_returns_supports_step_back_field()
+     {
+        let sessions = manager_with_config(config_with_rr());
+        let mut runtime = rr_runtime("replay");
+        let trace = register_trace(&mut runtime.store, "target/debug/app", 10);
+
+        let result = tower_debug_replay(
+            json!({
+                "trace_id": trace.trace_id,
+                "language": "rust",
+                "timeout_secs": 1
+            }),
+            &sessions,
+            &runtime,
+        )
+        .expect("replay should open a replay session");
+
+        assert_eq!(result["trace_id"], trace.trace_id.to_string());
+        assert_eq!(result["state"], "stopped");
+        assert_eq!(result["stop"]["reason"], "replay");
+        assert_eq!(result["supportsStepBack"], true);
+        assert!(result.get("supports_step_back").is_none());
+        assert!(
+            serde_json::from_value::<ReplayParams>(json!({
+                "trace_id": "trace-replay",
+                "language": "rust",
+                "timeout_secs": 1,
+                "typo": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tower_debug_reverse_continue_and_step_back_accept_strict_params_and_return_debug_stop_results()
+     {
+        let sessions = manager_with_config(config_with_rr());
+        let mut runtime = rr_runtime("reverse");
+        let trace = register_trace(&mut runtime.store, "target/debug/app", 10);
+        let replay = tower_debug_replay(
+            json!({
+                "trace_id": trace.trace_id,
+                "language": "rust",
+                "timeout_secs": 1
+            }),
+            &sessions,
+            &runtime,
+        )
+        .expect("replay should open");
+        let session_id = replay["session_id"].as_str().expect("session id");
+
+        let continued = tower_debug_reverse_continue(
+            json!({ "session_id": session_id, "thread_id": 3, "timeout_secs": 1 }),
+            &sessions,
+        )
+        .expect("reverse continue returns DebugStop");
+        let stepped = tower_debug_step_back(
+            json!({
+                "session_id": session_id,
+                "thread_id": 3,
+                "granularity": "instruction",
+                "timeout_secs": 1
+            }),
+            &sessions,
+        )
+        .expect("step back returns DebugStop");
+
+        assert_eq!(continued["reason"], "reverse_continue");
+        assert_eq!(continued["thread_id"], 3);
+        assert_eq!(stepped["reason"], "step_back");
+        assert_invalid_params(
+            tower_debug_reverse_continue(
+                json!({ "session_id": session_id, "unknown": true }),
+                &sessions,
+            ),
+            "tower_debug_reverse_continue",
+        );
+        assert_invalid_params(
+            tower_debug_step_back(
+                json!({ "session_id": session_id, "granularity": "statement" }),
+                &sessions,
+            ),
+            "tower_debug_step_back",
+        );
+        assert!(
+            serde_json::from_value::<ReverseContinueParams>(json!({
+                "session_id": session_id,
+                "thread_id": 3,
+                "timeout_secs": 1,
+                "typo": true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StepBackParams>(json!({
+                "session_id": session_id,
+                "granularity": "instruction",
+                "typo": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tower_debug_watchpoint_accepts_watchpoint_params_and_unsupported_adapters_return_reverse_unsupported_payload()
+     {
+        let live_sessions = manager();
+        let live_session_id = launch_session(&live_sessions);
+
+        let unsupported = tower_debug_watchpoint(
+            json!({
+                "session_id": live_session_id.0,
+                "expression": "answer",
+                "address": null,
+                "kind": "write",
+                "enabled": true,
+                "timeout_secs": 1
+            }),
+            &live_sessions,
+        )
+        .expect("unsupported reverse capability is a successful payload");
+
+        assert_eq!(unsupported["ok"], false);
+        assert_eq!(unsupported["error"]["code"], "reverse_unsupported");
+        assert_invalid_params(
+            tower_debug_watchpoint(
+                json!({
+                    "session_id": live_session_id.0,
+                    "expression": "answer",
+                    "kind": "execute"
+                }),
+                &live_sessions,
+            ),
+            "tower_debug_watchpoint",
+        );
+        assert!(
+            serde_json::from_value::<WatchpointParams>(json!({
+                "session_id": "debug-1",
+                "expression": "answer",
+                "kind": "write",
+                "typo": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tower_debug_traces_accepts_empty_params_and_returns_traces_result_from_trace_store_list_traces()
+     {
+        let mut runtime = rr_runtime("traces");
+        let trace = register_trace(&mut runtime.store, "target/debug/app", 10);
+
+        let result =
+            tower_debug_traces(json!({}), &runtime).expect("traces should list trace metadata");
+
+        assert_eq!(result, json!({ "traces": [trace] }));
+        assert!(serde_json::from_value::<TracesParams>(json!({ "typo": true })).is_err());
+    }
+
+    #[test]
+    fn tower_debug_delete_trace_successful_delete_returns_deleted_true_trace_id_and_no_error() {
+        let mut runtime = rr_runtime("delete-success");
+        let trace = register_trace(&mut runtime.store, "target/debug/app", 10);
+
+        let result =
+            super::tower_debug_delete_trace(json!({ "trace_id": trace.trace_id }), &mut runtime)
+                .expect("delete should return a structured payload");
+
+        assert_eq!(
+            result,
+            json!({
+                "deleted": true,
+                "trace_id": trace.trace_id,
+                "error": null
+            })
+        );
+    }
+
+    #[test]
+    fn tower_debug_delete_trace_missing_deleted_or_expired_trace_returns_trace_not_found_payload() {
+        let mut runtime = rr_runtime("delete-missing");
+        let trace_id = TraceId::new("missing-trace").expect("valid trace id");
+
+        let result = super::tower_debug_delete_trace(json!({ "trace_id": trace_id }), &mut runtime)
+            .expect("missing trace should be a structured payload");
+
+        assert_eq!(result["deleted"], false);
+        assert_eq!(result["trace_id"], "missing-trace");
+        assert_eq!(result["error"]["code"], "trace_not_found");
+    }
+
+    #[test]
+    fn origin_tools_accept_strict_public_request_dtos_and_malformed_params_return_invalid_params() {
+        let sessions = manager_with_config(config_with_rr());
+        let mut runtime = rr_runtime("origin");
+        let trace = register_trace(&mut runtime.store, "target/debug/app", 10);
+        let find_origin = json!({
+            "trace_id": trace.trace_id,
+            "language": "rust",
+            "watch": "answer",
+            "at": { "kind": "crash" },
+            "max_depth": 3,
+            "max_children": 8,
+            "timeout_secs": 1
+        });
+        let record_and_find_origin = json!({
+            "record": {
+                "language": "rust",
+                "program": "target/debug/app",
+                "args": [],
+                "cwd": null,
+                "env": {},
+                "timeout_ms": 1000
+            },
+            "origin": {
+                "language": "rust",
+                "watch": "answer",
+                "at": { "kind": "end" },
+                "timeout_secs": 1,
+                "max_depth": 3,
+                "max_children": 8
+            }
+        });
+
+        serde_json::from_value::<FindOriginRequest>(find_origin.clone())
+            .expect("FindOriginRequest accepts public fields");
+        serde_json::from_value::<RecordAndFindOriginRequest>(record_and_find_origin.clone())
+            .expect("RecordAndFindOriginRequest accepts public fields");
+        let find_origin_result = tower_debug_find_origin(find_origin, &sessions, &runtime)
+            .expect("find_origin should return FindOriginResult");
+        serde_json::from_value::<FindOriginResult>(find_origin_result)
+            .expect("find_origin success payload must deserialize as FindOriginResult");
+        let record_and_find_origin_result =
+            tower_debug_record_and_find_origin(record_and_find_origin, &sessions, &mut runtime)
+                .expect("record_and_find_origin should return RecordAndFindOriginResult");
+        serde_json::from_value::<RecordAndFindOriginResult>(record_and_find_origin_result).expect(
+            "record_and_find_origin success payload must deserialize as RecordAndFindOriginResult",
+        );
+        assert_invalid_params(
+            tower_debug_find_origin(
+                json!({ "trace_id": "trace-origin", "typo": true }),
+                &sessions,
+                &runtime,
+            ),
+            "tower_debug_find_origin",
+        );
+        assert_invalid_params(
+            tower_debug_record_and_find_origin(
+                json!({ "record": {}, "origin": { "watch": "answer", "at": "middle" } }),
+                &sessions,
+                &mut runtime,
+            ),
+            "tower_debug_record_and_find_origin",
+        );
+    }
+
     fn manager() -> SessionManager {
         manager_with_factory(FakeAdapterFactory::default())
     }
 
     fn manager_with_factory(factory: FakeAdapterFactory) -> SessionManager {
         SessionManager::new(config(), Arc::new(factory))
+    }
+
+    fn manager_with_config(config: DebugInitializeConfig) -> SessionManager {
+        SessionManager::new(config, Arc::new(FakeAdapterFactory::default()))
     }
 
     fn config() -> DebugInitializeConfig {
@@ -1150,7 +1755,100 @@ mod tests {
                     idle_ttl_secs: 60,
                 },
             )]),
+            record: None,
         }
+    }
+
+    fn config_with_rr() -> DebugInitializeConfig {
+        let mut config = config();
+        config.record = Some(crate::protocol::DebugRecordConfig {
+            backend: "rr".to_owned(),
+            trace_dir: Some(".tower/traces".to_owned()),
+            ttl_secs: Some(86_400),
+            max_traces: Some(25),
+            record_timeout_secs: Some(30),
+        });
+        config
+    }
+
+    fn rr_runtime(name: &str) -> RrRuntime {
+        let store = TraceStore::new(trace_policy(name));
+        let trace_id = TraceId::new("trace-record").expect("valid trace id");
+        let trace = crate::traces::TraceMetadata {
+            trace_id: trace_id.clone(),
+            path: store
+                .policy()
+                .trace_root
+                .join("trace-record")
+                .display()
+                .to_string(),
+            created_unix_secs: 1,
+            program: "target/debug/app".to_owned(),
+            args_summary: Vec::new(),
+            exit_code: Some(0),
+            output_summary: Vec::new(),
+            output_truncated: false,
+            expires_unix_secs: None,
+            ttl_secs: None,
+            prune_generation: 0,
+        };
+        let result = crate::rr::RrRecordResult {
+            recordable: true,
+            reason: None,
+            trace_id: Some(trace_id),
+            trace: Some(trace),
+            exit_code: Some(0),
+            output: Vec::new(),
+            output_truncated: false,
+            error: None,
+        };
+        RrRuntime::with_parts(
+            Box::new(FakeRrPreflight::new(RrPreflightStatus::Supported)),
+            Box::new(FakeRrRecorder::new(result)),
+            store,
+        )
+    }
+
+    fn trace_policy(name: &str) -> TracePolicy {
+        TracePolicy {
+            trace_root: temp_trace_root(name),
+            ttl_secs: None,
+            max_traces: 20,
+            record_timeout_secs: 60,
+        }
+    }
+
+    fn temp_trace_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tower-debug-tools-{name}-{unique}"));
+        fs::create_dir_all(&root).expect("create temp trace root");
+        root
+    }
+
+    fn register_trace(
+        store: &mut TraceStore,
+        program: &str,
+        created_unix_secs: u64,
+    ) -> crate::traces::TraceMetadata {
+        let allocation = store
+            .allocate_trace(program, created_unix_secs)
+            .expect("trace allocation");
+        store
+            .register_completed(
+                allocation,
+                TraceCompletion {
+                    program: program.to_owned(),
+                    args_summary: vec!["--flag".to_owned()],
+                    exit_code: Some(0),
+                    output_summary: vec!["ok".to_owned()],
+                    output_truncated: false,
+                },
+                created_unix_secs,
+            )
+            .expect("trace registration")
     }
 
     fn launch_params() -> serde_json::Value {

@@ -25,6 +25,13 @@ adapter_type = "fixture"
 default_timeout_secs = 5
 idle_ttl_secs = 300
 
+[debug.record]
+backend = "rr"
+trace_dir = ".tower/traces"
+ttl_secs = 86400
+max_traces = 25
+record_timeout_secs = 30
+
 [extensions]
 # Plugin file stems to skip loading, e.g. ["ast"].
 # A disabled extension gets no sandbox, no fuel, no tools, no watcher hooks.

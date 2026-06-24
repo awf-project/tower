@@ -49,7 +49,7 @@ cargo build            # or: make build
 ```
 
 The host binary produced is `target/debug/tower`; the reference extension binaries
-(`ast_extension`, `hello_extension`, `lsp_extension`, `lint_extension`) are also under
+(`ast_extension`, `debug_extension`, `hello_extension`, `lsp_extension`, `lint_extension`) are also under
 `target/debug/`.
 
 ---
@@ -129,8 +129,8 @@ database there. This directory is created automatically; no manual setup is requ
 
 ### Initial scan
 
-On the first run against a workspace, `tower` walks the directory tree (respecting `.gitignore`),
-indexes every text file, and reports progress to `stderr`:
+On the first run against a workspace, `tower` walks the directory tree, respects `.towerignore`
+when present, indexes every non-hidden text file, and reports progress to `stderr`:
 
 ```
 tower: initial scan complete — 312 files indexed

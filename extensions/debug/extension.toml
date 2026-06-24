@@ -57,6 +57,51 @@ description = "Run an eval-at debug probe."
 schema_json = '{"type":"object","properties":{"lang":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":["string","null"]},"env":{"type":"object","additionalProperties":{"type":"string"}},"breakpoint":{"type":["object","null"],"properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":0},"condition":{"type":["string","null"]}},"required":["path","line"],"additionalProperties":false},"expressions":{"type":"array","items":{"type":"string"}},"capture":{"type":"object","properties":{"stack":{"type":"boolean"},"locals":{"type":"boolean"},"args":{"type":"boolean"}},"additionalProperties":false},"on_hit":{"type":"string","enum":["first","all"]},"max_hits":{"type":"integer","minimum":1},"max_depth":{"type":"integer","minimum":0},"max_children":{"type":"integer","minimum":0},"timeout_ms":{"type":["integer","null"],"minimum":0}},"required":["lang","program"],"additionalProperties":false}'
 
 [[tools]]
+name        = "record"
+description = "Record a debug trace."
+schema_json = '{"type":"object","properties":{"language":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":["string","null"]},"env":{"type":"object","additionalProperties":{"type":"string"}},"timeout_ms":{"type":["integer","null"],"minimum":1}},"required":["language","program"],"additionalProperties":false}'
+
+[[tools]]
+name        = "replay"
+description = "Replay a debug trace."
+schema_json = '{"type":"object","properties":{"trace_id":{"type":"string"},"language":{"type":"string"},"timeout_secs":{"type":["integer","null"],"minimum":0}},"required":["trace_id","language"],"additionalProperties":false}'
+
+[[tools]]
+name        = "reverse_continue"
+description = "Continue a replay session backwards."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":["integer","null"],"minimum":0},"timeout_secs":{"type":["integer","null"],"minimum":0}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "step_back"
+description = "Step a replay session backwards."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":["integer","null"],"minimum":0},"granularity":{"type":["string","null"],"enum":["line","instruction","over",null]},"timeout_secs":{"type":["integer","null"],"minimum":0}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "watchpoint"
+description = "Set a replay watchpoint."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"expression":{"type":["string","null"]},"address":{"type":["string","null"]},"kind":{"type":"string","enum":["write","read","access"]},"enabled":{"type":["boolean","null"]},"timeout_secs":{"type":["integer","null"],"minimum":0}},"required":["session_id","kind"],"additionalProperties":false}'
+
+[[tools]]
+name        = "traces"
+description = "List recorded debug traces."
+schema_json = '{"type":"object","properties":{},"additionalProperties":false}'
+
+[[tools]]
+name        = "delete_trace"
+description = "Delete a debug trace."
+schema_json = '{"type":"object","properties":{"trace_id":{"type":"string"}},"required":["trace_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "find_origin"
+description = "Find the origin of a value in a replay session."
+schema_json = '{"type":"object","properties":{"trace_id":{"type":"string"},"language":{"type":"string"},"at":{"oneOf":[{"type":"object","properties":{"kind":{"const":"crash"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"end"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"source"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"column":{"type":["integer","null"],"minimum":0}},"required":["kind","path","line"],"additionalProperties":false}]},"watch":{"type":"string"},"timeout_secs":{"type":["integer","null"],"minimum":0},"max_depth":{"type":["integer","null"],"minimum":0},"max_children":{"type":["integer","null"],"minimum":0}},"required":["trace_id","language","at","watch"],"additionalProperties":false}'
+
+[[tools]]
+name        = "record_and_find_origin"
+description = "Record a trace and find a value origin."
+schema_json = '{"type":"object","properties":{"record":{"type":"object","properties":{"language":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":["string","null"]},"env":{"type":"object","additionalProperties":{"type":"string"}},"timeout_ms":{"type":["integer","null"],"minimum":1}},"required":["language","program"],"additionalProperties":false},"origin":{"type":"object","properties":{"language":{"type":"string"},"at":{"oneOf":[{"type":"object","properties":{"kind":{"const":"crash"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"end"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"source"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"column":{"type":["integer","null"],"minimum":0}},"required":["kind","path","line"],"additionalProperties":false}]},"watch":{"type":"string"},"timeout_secs":{"type":["integer","null"],"minimum":0},"max_depth":{"type":["integer","null"],"minimum":0},"max_children":{"type":["integer","null"],"minimum":0}},"required":["language","at","watch"],"additionalProperties":false}},"required":["record","origin"],"additionalProperties":false}'
+
+[[tools]]
 name        = "terminate"
 description = "Terminate a debug session."
 schema_json = '{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}'

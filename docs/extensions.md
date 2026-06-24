@@ -273,6 +273,13 @@ adapter_type = "lldb"
 launch = { request = "launch", program = "target/debug/app" }
 default_timeout_secs = 15
 idle_ttl_secs = 300
+
+[debug.record]
+backend = "rr"
+trace_dir = ".tower/traces"
+ttl_secs = 86400
+max_traces = 20
+record_timeout_secs = 60
 ```
 
 | Field | Meaning |
@@ -285,11 +292,23 @@ idle_ttl_secs = 300
 | `default_timeout_secs` | Positive per-operation timeout used by launch, resume, inspect, and cleanup calls unless a tool overrides it. |
 | `idle_ttl_secs` | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it. |
 
+Add `[debug.record] backend = "rr"` only when rr record/replay tools should be exposed. The host
+validates this section at startup and forwards it through the sidecar initialize payload; the sidecar
+does not reread `.tower/config.toml`.
+
+| Field | Meaning |
+|-------|---------|
+| `backend` | Required record backend. The only supported value is `"rr"`. |
+| `trace_dir` | Optional workspace-relative trace root. Defaults to `.tower/traces`; absolute paths and `..` traversal are rejected. |
+| `ttl_secs` | Optional positive trace TTL in seconds. Omit for no TTL expiry. |
+| `max_traces` | Optional positive retained trace limit. Defaults to `20`; pruning still applies without TTL. |
+| `record_timeout_secs` | Optional positive default record timeout. Defaults to `60`; tool calls may pass `timeout_ms`. |
+
 The debug sidecar declares no workspace mutation capabilities. A discovered extension named `debug`
 takes priority over the bundled fallback. It owns adapter and debuggee process lifecycle inside the
 extension process and removes ephemeral sessions on terminate, disconnect, shutdown, quarantine, or
 idle expiry. See [debug sessions](user-guide/debug-sessions.md) for the operator workflow and
-[MCP tool reference](mcp-tools.md#interactive-debug-tools) for the tool contract.
+[MCP tool reference](mcp-tools.md#debug-tools) for the tool contract.
 
 ---
 

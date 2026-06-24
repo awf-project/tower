@@ -38,6 +38,17 @@ use extension_protocol::ExtensionManifest;
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
 type FormatterEchoSet = Arc<Mutex<HashMap<String, ()>>>;
 const BUNDLED_DEBUG_MANIFEST: &str = include_str!("../../../../../extensions/debug/extension.toml");
+const RR_DEBUG_TOOL_NAMES: &[&str] = &[
+    "record",
+    "replay",
+    "reverse_continue",
+    "step_back",
+    "watchpoint",
+    "traces",
+    "delete_trace",
+    "find_origin",
+    "record_and_find_origin",
+];
 
 struct EngineApplyEditsHost {
     state: Arc<RwLock<EngineState>>,
@@ -394,6 +405,17 @@ fn register_bundled_debug_extension(
         && let Some(argv0) = manifest.command.first_mut()
     {
         *argv0 = command;
+    }
+
+    if tower_config
+        .debug
+        .record
+        .as_ref()
+        .is_none_or(|record| record.backend != "rr")
+    {
+        manifest
+            .tools
+            .retain(|tool| !RR_DEBUG_TOOL_NAMES.contains(&tool.name.as_str()));
     }
 
     let instance = Box::new(ExtensionSupervisor::new(
