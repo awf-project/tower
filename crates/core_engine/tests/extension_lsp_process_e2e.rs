@@ -26,8 +26,9 @@
 
 #![allow(clippy::pedantic)]
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,6 +97,62 @@ fn make_deps() -> HostDeps {
     }
 }
 
+struct RawLspChild {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl RawLspChild {
+    fn spawn() -> Self {
+        Self::spawn_with_workspace(None)
+    }
+
+    fn spawn_with_workspace(workspace: Option<&std::path::Path>) -> Self {
+        let mut command = Command::new(lsp_extension_bin());
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::inherit());
+        if let Some(path) = workspace {
+            command.env("TOWER_WORKSPACE", path);
+        }
+
+        let mut child = command.spawn().expect("spawn lsp extension");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+        Self {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    fn write_frame(&mut self, frame: serde_json::Value) {
+        let line = serde_json::to_string(&frame).expect("serialize frame");
+        self.stdin.write_all(line.as_bytes()).expect("write frame");
+        self.stdin.write_all(b"\n").expect("write newline");
+        self.stdin.flush().expect("flush frame");
+    }
+
+    fn read_frame(&mut self) -> serde_json::Value {
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("read frame");
+        assert!(
+            !line.is_empty(),
+            "child stdout closed before a frame arrived"
+        );
+        serde_json::from_str(line.trim()).expect("valid JSON frame")
+    }
+}
+
+impl Drop for RawLspChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 // ── AC1/U1: spawn and initialize ─────────────────────────────────────────────
 
 /// AC1/U1: `lsp_extension` spawns, completes the initialize handshake, and
@@ -106,8 +163,8 @@ fn lsp_process_spawns_and_declares_four_tools() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("lsp_extension must spawn");
 
     let m = adapter.manifest();
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
@@ -143,8 +200,8 @@ fn lsp_process_subscribes_to_file_events() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("lsp_extension must spawn");
 
     let m = adapter.manifest();
     assert!(
@@ -168,8 +225,8 @@ fn lsp_process_declares_notify_capability() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("lsp_extension must spawn");
 
     let m = adapter.manifest();
     assert!(
@@ -179,6 +236,186 @@ fn lsp_process_declares_notify_capability() {
     );
 
     adapter.shutdown();
+}
+
+#[test]
+fn lsp_process_queues_host_requests_seen_during_read_file_hostcall_and_discards_idle_responses() {
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    let tower_dir = workspace.path().join(".tower");
+    fs::create_dir_all(&tower_dir).expect("create .tower");
+    fs::write(
+        tower_dir.join("config.toml"),
+        r#"
+[lsp.rust]
+command = "definitely-missing-tower-lsp-server"
+extensions = ["rs"]
+"#,
+    )
+    .expect("write lsp config");
+
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocol_version": extension_protocol::PROTOCOL_VERSION,
+            "client_info": "lsp-e2e/0.1.0"
+        }
+    }));
+    let initialized = child.read_frame();
+    assert!(
+        initialized.get("result").is_some(),
+        "initialize must succeed; got: {initialized}"
+    );
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "invokeTool",
+        "params": {
+            "name": "diagnostics",
+            "params": { "path": "src/lib.rs" }
+        }
+    }));
+    let first_read = child.read_frame();
+    assert_eq!(
+        first_read["method"], "workspace/readFile",
+        "configured diagnostics must request file contents before answering; got: {first_read}"
+    );
+    let first_read_id = first_read["id"].clone();
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "invokeTool",
+        "params": {
+            "name": "diagnostics",
+            "params": { "path": "src/lib.rs" }
+        }
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 20_000,
+        "result": true
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "shutdown",
+        "params": {}
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": first_read_id,
+        "result": "fn main() {}\n"
+    }));
+
+    let first_response = child.read_frame();
+    assert_eq!(
+        first_response["id"], 1,
+        "original invokeTool response must be returned before queued frames; got: {first_response}"
+    );
+
+    let queued_read = child.read_frame();
+    assert_eq!(
+        queued_read["method"], "workspace/readFile",
+        "queued invokeTool must replay before shutdown and issue its own readFile; got: {queued_read}"
+    );
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": queued_read["id"].clone(),
+        "result": "fn main() {}\n"
+    }));
+
+    let queued_response = child.read_frame();
+    assert_eq!(
+        queued_response["id"], 2,
+        "queued invokeTool response must preserve FIFO order before shutdown; got: {queued_response}"
+    );
+
+    let shutdown = child.read_frame();
+    assert_eq!(
+        shutdown["id"], 3,
+        "shutdown request queued during HostCall wait must run after earlier invokeTool; got: {shutdown}"
+    );
+    assert!(
+        shutdown.get("result").is_some(),
+        "shutdown must return a result; got: {shutdown}"
+    );
+}
+
+#[test]
+fn lsp_initialize_errors_preserve_json_rpc_codes_for_malformed_params_version_mismatch_and_unknown_methods()
+ {
+    let mut child = RawLspChild::spawn();
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "initialize",
+        "params": { "protocol_version": extension_protocol::PROTOCOL_VERSION }
+    }));
+    let malformed = child.read_frame();
+    assert_eq!(malformed["id"], 10);
+    assert_eq!(malformed["error"]["code"], -32602);
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "initialize",
+        "params": {
+            "protocol_version": extension_protocol::PROTOCOL_VERSION + 1,
+            "client_info": "lsp-e2e/0.1.0"
+        }
+    }));
+    let mismatch = child.read_frame();
+    assert_eq!(mismatch["id"], 11);
+    assert_eq!(mismatch["error"]["code"], -32600);
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "definitelyUnknown",
+        "params": null
+    }));
+    let unknown = child.read_frame();
+    assert_eq!(unknown["id"], 12);
+    assert_eq!(unknown["error"]["code"], -32601);
+}
+
+#[test]
+fn lsp_sidecar_loop_uses_shared_harness_queue_and_id_allocator_directly() {
+    let root = workspace_root();
+    let main_rs =
+        fs::read_to_string(root.join("extensions/lsp/src/main.rs")).expect("read lsp main.rs");
+    let protocol_rs = fs::read_to_string(root.join("extensions/lsp/src/protocol.rs"))
+        .expect("read lsp protocol.rs");
+
+    assert!(
+        main_rs.contains("HostCallIdAllocator::new(10_000)"),
+        "LSP main loop must allocate host-call ids through the shared harness allocator"
+    );
+    assert!(
+        main_rs.contains("VecDeque<QueuedFrame>"),
+        "LSP main loop must queue harness QueuedFrame values, not tuple compatibility frames"
+    );
+    assert!(
+        main_rs.contains("protocol::frame_from_envelope(envelope)"),
+        "LSP idle loop must classify inbound frames through the harness frame parser"
+    );
+    assert!(
+        !main_rs.contains("next_hcall_id: u64"),
+        "LSP main loop must not keep a local raw u64 host-call counter"
+    );
+    assert!(
+        !main_rs.contains("VecDeque<(Option<Value>, String, Value)>"),
+        "LSP main loop must not retain tuple-shaped deferred frames"
+    );
+    assert!(
+        !protocol_rs.contains("DeferredFrame"),
+        "LSP protocol layer must not convert harness QueuedFrame values back into local tuples"
+    );
 }
 
 // ── Diagnostics unsupported path ──────────────────────────────────────────────
@@ -204,8 +441,8 @@ fn lsp_process_diagnostics_unsupported_when_no_lsp_configured() {
         push_tx: None,
     };
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("lsp_extension must spawn");
 
     let result = adapter
         .call_tool("diagnostics", serde_json::json!({ "path": "src/lib.rs" }))
@@ -231,8 +468,8 @@ fn lsp_process_file_changed_event_completes() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("lsp_extension must spawn");
 
     let event = Event::FileChanged {
         file_id: 1,
@@ -252,8 +489,8 @@ fn lsp_process_file_deleted_event_completes() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("lsp_extension must spawn");
 
     let event = Event::FileDeleted {
         path: "src/lib.rs".to_owned(),
@@ -440,7 +677,7 @@ fn lsp_process_concurrent_spawn_stress_20_parallel() {
                 let manifest = lsp_manifest(&bin);
                 let deps = make_deps();
 
-                let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT)
+                let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
                     .unwrap_or_else(|e| panic!("spawn #{i} failed: {e:?}"));
 
                 // Call a tool that completes without a real LSP.

@@ -1,0 +1,16 @@
+[package]
+publish = false
+name = "fixture_debug_adapter"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic Debug Adapter Protocol fixture for core e2e tests"
+
+[[bin]]
+name = "fixture_debug_adapter"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

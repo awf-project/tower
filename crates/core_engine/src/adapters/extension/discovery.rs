@@ -36,10 +36,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use extension_protocol::{Activation, ExtensionManifest};
+use serde_json::Value;
 
 use super::host_deps::HostDeps;
 use super::supervisor::ExtensionSupervisor;
@@ -53,6 +55,8 @@ pub const DEFAULT_EXTENSIONS_SUBDIR: &str = ".tower/extensions";
 /// XDG data sub-path for the global extensions scope (appended to
 /// `$XDG_DATA_HOME` or `~/.local/share`).
 pub const XDG_EXTENSIONS_SUBDIR: &str = "tower/extensions";
+
+pub type ExtensionInitConfigMap = BTreeMap<String, Value>;
 
 // ── Error / warning types ─────────────────────────────────────────────────────
 
@@ -366,9 +370,17 @@ pub fn load_extensions_into_registry(
     deps: HostDeps,
     request_timeout: Duration,
     disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
 ) -> ExtensionRegistry {
     let mut registry = ExtensionRegistry::new();
-    load_extensions_into_existing_registry(&mut registry, dirs, deps, request_timeout, disabled);
+    load_extensions_into_existing_registry(
+        &mut registry,
+        dirs,
+        deps,
+        request_timeout,
+        disabled,
+        init_configs,
+    );
     registry
 }
 
@@ -383,12 +395,14 @@ pub fn load_extensions_into_existing_registry(
     deps: HostDeps,
     request_timeout: Duration,
     disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
 ) {
     load_extensions_with_register(
         dirs,
         deps,
         request_timeout,
         disabled,
+        init_configs,
         |instance, name, ext_dir| {
             if let Err(e) = registry.register(instance) {
                 eprintln!(
@@ -411,12 +425,14 @@ pub fn load_extensions_into_shared_registry(
     deps: HostDeps,
     request_timeout: Duration,
     disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
 ) {
     load_extensions_with_register(
         dirs,
         deps,
         request_timeout,
         disabled,
+        init_configs,
         |instance, name, ext_dir| {
             let mut guard = registry
                 .write()
@@ -436,6 +452,7 @@ fn load_extensions_with_register(
     deps: HostDeps,
     request_timeout: Duration,
     disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
     mut register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
 ) {
     // ── Phase 1: scan every scope, read manifests. ────────────────────────────
@@ -454,7 +471,7 @@ fn load_extensions_with_register(
         eprintln!("tower: warning — skipping extension: {err}");
     }
 
-    // ── Phase 2: apply disable list. ─────────────────────────────────────────
+    // ── Phase 2: apply disable list and opt-in extension gates. ──────────────
     let mut after_disable: Vec<(usize, PathBuf, ExtensionManifest)> = Vec::new();
     for (scope_idx, ext_dir, manifest) in all_entries {
         if disabled.iter().any(|d| d == &manifest.name) {
@@ -462,6 +479,9 @@ fn load_extensions_with_register(
                 "tower: info — extension '{}' disabled by [extensions] disabled",
                 manifest.name
             );
+            continue;
+        }
+        if manifest.name == "debug" && !init_configs.contains_key("debug") {
             continue;
         }
         after_disable.push((scope_idx, ext_dir, manifest));
@@ -477,6 +497,7 @@ fn load_extensions_with_register(
     // ── Phase 4: activate survivors and register. ─────────────────────────────
     for ((scope_idx, ext_dir, manifest), decision) in after_disable.into_iter().zip(decisions) {
         let name = manifest.name.clone();
+        let init_config = init_configs.get(&name).cloned();
         match decision {
             Shadow::Keep => {
                 // Resolve the command: if the first element is a relative path
@@ -490,6 +511,7 @@ fn load_extensions_with_register(
                             manifest.clone(),
                             clone_deps(&deps),
                             request_timeout,
+                            init_config.clone(),
                         ) {
                             Ok(inst) => inst,
                             Err(e) => {
@@ -507,6 +529,7 @@ fn load_extensions_with_register(
                             manifest,
                             clone_deps(&deps),
                             request_timeout,
+                            init_config,
                         ))
                     }
                 };
@@ -583,8 +606,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ManifestLoadError, Shadow, decide_shadowing, read_manifests_from_dir,
-        resolve_extension_dirs,
+        ExtensionInitConfigMap, ManifestLoadError, Shadow, decide_shadowing,
+        read_manifests_from_dir, resolve_extension_dirs,
     };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -962,6 +985,7 @@ schema_json = "{}"
             make_host_deps(),
             std::time::Duration::from_secs(1),
             &["ast".to_owned()], // disable "ast"
+            &ExtensionInitConfigMap::new(),
         );
 
         let tools = registry.declared_tools();
@@ -1014,6 +1038,7 @@ schema_json = "{}"
             make_host_deps(),
             std::time::Duration::from_secs(1),
             &[],
+            &ExtensionInitConfigMap::new(),
         );
 
         let tools = registry.declared_tools();
@@ -1052,6 +1077,7 @@ schema_json = "{}"
             make_host_deps(),
             std::time::Duration::from_secs(1),
             &[],
+            &ExtensionInitConfigMap::new(),
         );
 
         let tools = registry.declared_tools();
@@ -1089,6 +1115,7 @@ subscribe = ["event/fileChanged"]
             make_host_deps(),
             std::time::Duration::from_secs(1),
             &[],
+            &ExtensionInitConfigMap::new(),
         );
 
         let tools = registry.declared_tools();
@@ -1107,10 +1134,127 @@ subscribe = ["event/fileChanged"]
             make_host_deps(),
             std::time::Duration::from_secs(1),
             &[],
+            &ExtensionInitConfigMap::new(),
         );
         assert!(
             registry.declared_tools().is_empty(),
             "missing scope must yield empty registry"
+        );
+    }
+
+    fn write_shell_script(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn eager_manifest_toml(name: &str, script: &Path) -> String {
+        format!(
+            r#"name = "{name}"
+version = "0.1.0"
+command = ["/bin/sh", "{}"]
+activation = "eager"
+
+[[tools]]
+name = "declared_before_spawn"
+description = "Declared before spawn"
+schema_json = "{{}}"
+"#,
+            script.display()
+        )
+    }
+
+    #[test]
+    fn discovery_tests_prove_debug_is_filtered_before_spawn_when_parsed_debug_config_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("debug-spawn-marker.sh");
+        let marker = tmp.path().join("debug-was-spawned");
+        write_shell_script(
+            &script,
+            &format!(
+                "touch '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"type\":\"Initialized\",\"data\":{{\"tools\":[],\"events\":[],\"capabilities\":[]}}}}}}'\n",
+                marker.display()
+            ),
+        );
+        write_manifest(tmp.path(), "debug", &eager_manifest_toml("debug", &script));
+
+        let registry = super::load_extensions_into_registry(
+            &[tmp.path().to_owned()],
+            make_host_deps(),
+            std::time::Duration::from_secs(1),
+            &[],
+            &ExtensionInitConfigMap::new(),
+        );
+
+        assert!(
+            !marker.exists(),
+            "debug must be filtered before spawn when parsed debug config is empty"
+        );
+        assert!(
+            registry.declared_tools().is_empty(),
+            "debug tools must not be declared when parsed debug config is empty"
+        );
+    }
+
+    #[test]
+    fn extension_supervisor_new_and_sidecar_host_adapter_spawn_receive_per_extension_initialize_config_only_for_debug_extension()
+     {
+        let tmp = TempDir::new().unwrap();
+        let debug_script = tmp.path().join("debug-requires-config.sh");
+        write_shell_script(
+            &debug_script,
+            r#"read -r line
+case "$line" in
+  *'"extension_config"'*'"lldb-dap"'*) ;;
+  *) printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"debug initialize config missing"}}'; exit 0 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[{"name":"debug_config_seen","description":"debug config seen","schema_json":"{}"}],"events":[],"capabilities":[]}}}'
+"#,
+        );
+        let other_script = tmp.path().join("other-rejects-config.sh");
+        write_shell_script(
+            &other_script,
+            r#"read -r line
+case "$line" in
+  *'"extension_config"'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"non-debug extension received config"}}'; exit 0 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[{"name":"other_no_config","description":"other no config","schema_json":"{}"}],"events":[],"capabilities":[]}}}'
+"#,
+        );
+        write_manifest(
+            tmp.path(),
+            "debug",
+            &eager_manifest_toml("debug", &debug_script),
+        );
+        write_manifest(
+            tmp.path(),
+            "lsp",
+            &eager_manifest_toml("lsp", &other_script),
+        );
+        let mut init_configs = ExtensionInitConfigMap::new();
+        init_configs.insert(
+            "debug".to_owned(),
+            serde_json::json!({"languages": {"rust": {"command": "lldb-dap"}}}),
+        );
+
+        let registry = super::load_extensions_into_registry(
+            &[tmp.path().to_owned()],
+            make_host_deps(),
+            std::time::Duration::from_secs(1),
+            &[],
+            &init_configs,
+        );
+
+        let tool_names = registry
+            .declared_tools()
+            .into_iter()
+            .map(|(_, tool)| tool.name)
+            .collect::<Vec<_>>();
+        assert!(
+            tool_names.iter().any(|name| name == "debug_config_seen"),
+            "debug extension must receive its initialize config; got {tool_names:?}"
+        );
+        assert!(
+            tool_names.iter().any(|name| name == "other_no_config"),
+            "non-debug extensions must receive None for initialize config; got {tool_names:?}"
         );
     }
 

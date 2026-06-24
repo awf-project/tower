@@ -13,9 +13,9 @@
 //!
 //! When the push thread sends a `notify/resourceUpdated` HostCall, the host
 //! replies with `{"result": true, "id": <id>}`. That response arrives on stdin,
-//! where the main loop's `read_host_response` might be waiting for a different
+//! where the main loop's `host_call` helper might be waiting for a different
 //! id (e.g. a `workspace/readFile` response id=10000 while the push HostCall id
-//! is 20000). The main loop's `read_host_response` in `protocol.rs` handles this
+//! is 20000). The shared harness response reader handles this
 //! by queuing unmatched frames — so the push-thread response is queued and safely
 //! ignored (it is not a host request and the push thread has already moved on).
 //!
@@ -55,7 +55,7 @@ pub fn run_push_forwarder<W: Write + Send + 'static>(
             protocol::send_notify_resource_updated(&mut *guard, &mut next_id, uri);
         }
         // The response from the host (if any) arrives on stdin. The push thread
-        // does NOT read stdin — the main loop's `read_host_response` will
+        // does NOT read stdin — the main loop's host_call response reader will
         // encounter it as an unmatched frame and queue/discard it safely.
     }
     // rx dropped — SessionPool gone; push thread exits cleanly.

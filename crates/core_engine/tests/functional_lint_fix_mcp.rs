@@ -65,6 +65,7 @@ fn handler(workspace: &TestWorkspace, indexed_paths: &[&str]) -> TowerMcpHandler
         lint_fix_manifest(&lint_extension_bin()),
         host_deps(workspace.real_fs()),
         TEST_TIMEOUT,
+        None,
     )
     .expect("spawn lint extension");
     extension_registry

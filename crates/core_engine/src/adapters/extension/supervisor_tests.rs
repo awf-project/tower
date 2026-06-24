@@ -83,7 +83,7 @@ fn ac1_initialize_timeout_returns_fault_host_survives() {
     // Use a very short timeout so the test completes quickly.
     let short = Duration::from_millis(300);
 
-    let result = SidecarHostAdapter::spawn(manifest, make_deps(), short);
+    let result = SidecarHostAdapter::spawn(manifest, make_deps(), short, None);
 
     // spawn returns Result<Box<dyn ExtensionInstance>, ExtensionFault>.
     // Box<dyn ExtensionInstance> lacks Debug, so extract the error.
@@ -104,7 +104,7 @@ fn ac1_supervisor_timeout_returns_fault() {
     let manifest = make_manifest(&bin);
     let short = Duration::from_millis(300);
 
-    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), short);
+    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), short, None);
 
     // call_tool returns Result<Value, ExtensionFault>; Value: Debug.
     let result = sup.call_tool("run", json!({}));
@@ -126,7 +126,7 @@ fn ac2_crash_on_init_spawn_returns_crashed() {
     let bin = fixture_bin("fixture_crash_on_init");
     let manifest = make_manifest(&bin);
 
-    let result = SidecarHostAdapter::spawn(manifest, make_deps(), Duration::from_secs(5));
+    let result = SidecarHostAdapter::spawn(manifest, make_deps(), Duration::from_secs(5), None);
 
     assert!(result.is_err(), "crash-on-init must fault");
     let fault = result.err().expect("just checked is_err()");
@@ -143,8 +143,9 @@ fn ac2_exit_nonzero_call_tool_returns_crashed() {
     let bin = fixture_bin("fixture_exit_nonzero");
     let manifest = make_manifest(&bin);
 
-    let mut instance = SidecarHostAdapter::spawn(manifest, make_deps(), Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("exit_nonzero must initialize successfully, got: {e:?}"));
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(), Duration::from_secs(5), None)
+            .unwrap_or_else(|e| panic!("exit_nonzero must initialize successfully, got: {e:?}"));
 
     // The fixture exits(42) when it receives invokeTool.
     // call_tool returns Result<Value, ExtensionFault>; Value: Debug.
@@ -166,7 +167,7 @@ fn ac2_supervisor_respawns_lazily_after_crash() {
     let manifest = make_manifest(&bin);
     let timeout = Duration::from_secs(5);
 
-    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), timeout);
+    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), timeout, None);
 
     // First call: spawn succeeds, call_tool crashes → Crashed.
     let fault1 = sup
@@ -199,8 +200,9 @@ fn ac3_garbage_frames_returns_protocol_error() {
     let bin = fixture_bin("fixture_garbage_frames");
     let manifest = make_manifest(&bin);
 
-    let mut instance = SidecarHostAdapter::spawn(manifest, make_deps(), Duration::from_secs(5))
-        .unwrap_or_else(|e| panic!("garbage_frames must initialize successfully, got: {e:?}"));
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(), Duration::from_secs(5), None)
+            .unwrap_or_else(|e| panic!("garbage_frames must initialize successfully, got: {e:?}"));
 
     // call_tool returns Result<Value, ExtensionFault>; Value: Debug.
     let result = instance.call_tool("run", json!({}));
@@ -222,7 +224,7 @@ fn ac3_supervisor_garbage_frames_reports_fault() {
     let bin = fixture_bin("fixture_garbage_frames");
     let manifest = make_manifest(&bin);
 
-    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), Duration::from_secs(5));
+    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), Duration::from_secs(5), None);
 
     let result = sup.call_tool("run", json!({}));
 
@@ -250,7 +252,7 @@ fn ac4_supervisor_never_generates_quarantined_fault() {
     let manifest = make_manifest(&bin);
     let timeout = Duration::from_secs(2);
 
-    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), timeout);
+    let mut sup = ExtensionSupervisor::new(manifest, make_deps(), timeout, None);
 
     for i in 0..5u32 {
         // Wait past any backoff before each retry.
@@ -287,7 +289,7 @@ fn ac5_misbehaving_ext_does_not_affect_cooperative_ext() {
 
     // Spawn the bad extension — expect it to fault.
     let crash_result =
-        SidecarHostAdapter::spawn(crash_manifest, make_deps(), Duration::from_secs(3));
+        SidecarHostAdapter::spawn(crash_manifest, make_deps(), Duration::from_secs(3), None);
     assert!(
         crash_result.is_err(),
         "crash-on-init must fault at spawn time"
@@ -312,7 +314,7 @@ fn ac5_misbehaving_ext_does_not_affect_cooperative_ext() {
     };
 
     let mut helper =
-        SidecarHostAdapter::spawn(helper_manifest, make_deps(), Duration::from_secs(10))
+        SidecarHostAdapter::spawn(helper_manifest, make_deps(), Duration::from_secs(10), None)
             .unwrap_or_else(|e| {
                 panic!("test_helper must still spawn after crash-on-init fault; got: {e:?}")
             });
@@ -370,7 +372,7 @@ fn shutdown_reaps_extension_that_ignores_shutdown_request() {
     let manifest = make_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, Duration::from_secs(15))
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, Duration::from_secs(15), None)
         .expect("ignore_shutdown fixture must complete initialize and spawn");
 
     let start = std::time::Instant::now();

@@ -15,6 +15,36 @@ use extension_protocol::{
     InitResult, PROTOCOL_VERSION, ProtocolError, Request, Response, ToolDecl,
 };
 
+fn workspace_root() -> std::path::PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::path::Path::new(manifest_dir)
+        .parent()
+        .expect("crates dir")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn shipped_debug_manifest() -> ExtensionManifest {
+    let path = workspace_root().join("extensions/debug/extension.toml");
+    let contents = std::fs::read_to_string(&path).expect("read shipped debug extension manifest");
+    toml::from_str(&contents).expect("shipped debug extension manifest must parse")
+}
+
+fn toml_string_array<'a>(value: &'a toml::Value, key: &str) -> Vec<&'a str> {
+    value
+        .get("workspace")
+        .and_then(|workspace| workspace.get(key))
+        .and_then(toml::Value::as_array)
+        .unwrap_or_else(|| panic!("workspace.{key} must be an array"))
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .unwrap_or_else(|| panic!("workspace.{key} entries must be strings"))
+        })
+        .collect()
+}
+
 // ── AC1: Round-trip serde for all protocol message types ─────────────────────
 
 #[test]
@@ -22,6 +52,19 @@ fn request_initialize_round_trips_json() {
     let req = Request::Initialize(InitParams {
         protocol_version: PROTOCOL_VERSION,
         client_info: "tower-host/0.1.0".to_owned(),
+        extension_config: Some(serde_json::json!({
+            "languages": {
+                "rust": {
+                    "extensions": ["rs"],
+                    "command": "lldb-dap",
+                    "args": ["--quiet"],
+                    "adapter_type": "lldb",
+                    "launch": {},
+                    "default_timeout_secs": 15,
+                    "idle_ttl_secs": 300
+                }
+            }
+        })),
     });
     let json = serde_json::to_string(&req).expect("serialize");
     let decoded: Request = serde_json::from_str(&json).expect("deserialize");
@@ -29,9 +72,128 @@ fn request_initialize_round_trips_json() {
         Request::Initialize(p) => {
             assert_eq!(p.protocol_version, PROTOCOL_VERSION);
             assert_eq!(p.client_info, "tower-host/0.1.0");
+            assert_eq!(
+                p.extension_config
+                    .as_ref()
+                    .and_then(|config| config.pointer("/languages/rust/command"))
+                    .and_then(serde_json::Value::as_str),
+                Some("lldb-dap")
+            );
         }
         _ => panic!("wrong variant"),
     }
+}
+
+#[test]
+fn init_params_has_optional_per_extension_config_payload_field_with_stable_serde_naming() {
+    let params = InitParams {
+        protocol_version: PROTOCOL_VERSION,
+        client_info: "tower-host/0.1.0".to_owned(),
+        extension_config: None,
+    };
+
+    let value = serde_json::to_value(params).expect("serialize InitParams");
+
+    assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(value["client_info"], "tower-host/0.1.0");
+    assert!(
+        value.get("extension_config").is_none(),
+        "extension_config must keep optional initialize params backward compatible"
+    );
+}
+
+#[test]
+fn init_params_optional_extension_config_round_trips() {
+    let params = InitParams {
+        protocol_version: PROTOCOL_VERSION,
+        client_info: "tower-host/0.1.0".to_owned(),
+        extension_config: Some(serde_json::json!({
+            "languages": {
+                "rust": {
+                    "extensions": ["rs"],
+                    "command": "lldb-dap",
+                    "args": ["--quiet"],
+                    "adapter_type": "lldb",
+                    "default_timeout_secs": 15,
+                    "idle_ttl_secs": 300
+                }
+            }
+        })),
+    };
+
+    let json = serde_json::to_string(&params).expect("serialize InitParams");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("deserialize JSON value");
+    let decoded: InitParams =
+        serde_json::from_value(value.clone()).expect("deserialize InitParams");
+
+    assert!(value.get("extension_config").is_some());
+    assert_eq!(
+        decoded
+            .extension_config
+            .as_ref()
+            .and_then(|config| config.pointer("/languages/rust/command"))
+            .and_then(serde_json::Value::as_str),
+        Some("lldb-dap")
+    );
+}
+
+#[test]
+fn initialize_params_without_the_optional_config_field_still_deserialize_for_existing_extensions() {
+    let json = serde_json::json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "client_info": "tower-host/0.1.0"
+    });
+
+    let decoded: InitParams = serde_json::from_value(json).expect("deserialize InitParams");
+
+    assert_eq!(decoded.extension_config, None);
+}
+
+#[test]
+fn config_payload_type_supports_serialized_debug_config_data_without_core_engine_dependency() {
+    let debug_config = serde_json::json!({
+        "languages": {
+            "rust": {
+                "extensions": ["rs"],
+                "command": "lldb-dap",
+                "args": ["--quiet"],
+                "adapter_type": "lldb",
+                "launch": {
+                    "request": "launch",
+                    "program": "target/debug/tower"
+                },
+                "default_timeout_secs": 15,
+                "idle_ttl_secs": 300
+            }
+        }
+    });
+
+    let params = InitParams {
+        protocol_version: PROTOCOL_VERSION,
+        client_info: "tower-host/0.1.0".to_owned(),
+        extension_config: Some(debug_config),
+    };
+
+    let decoded: InitParams =
+        serde_json::from_value(serde_json::to_value(params).expect("serialize InitParams"))
+            .expect("deserialize InitParams");
+
+    assert_eq!(
+        decoded
+            .extension_config
+            .as_ref()
+            .and_then(|config| config.pointer("/languages/rust/adapter_type"))
+            .and_then(serde_json::Value::as_str),
+        Some("lldb")
+    );
+    assert_eq!(
+        decoded
+            .extension_config
+            .as_ref()
+            .and_then(|config| config.pointer("/languages/rust/launch/program"))
+            .and_then(serde_json::Value::as_str),
+        Some("target/debug/tower")
+    );
 }
 
 #[test]
@@ -309,6 +471,23 @@ fn existing_host_call_and_manifest_serialization_contracts_stay_unchanged() {
         manifest.capabilities.required,
         vec!["read_file", "list_files", "request_format", "log"]
     );
+    let manifest_value = toml::Value::try_from(&manifest).expect("serialize existing manifest");
+    let serialized_required = manifest_value
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("required"))
+        .and_then(toml::Value::as_array)
+        .expect("serialized manifest capabilities.required must stay present")
+        .iter()
+        .map(|capability| {
+            capability
+                .as_str()
+                .expect("serialized manifest capability names must be strings")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serialized_required,
+        vec!["read_file", "list_files", "request_format", "log"]
+    );
 
     let capabilities = [
         (Capability::ReadFile, "\"read_file\""),
@@ -400,6 +579,145 @@ fn extension_manifest_empty_tools_is_valid() {
     assert!(manifest.tools.is_empty());
 }
 
+#[test]
+fn workspace_cargo_toml_includes_extensions_debug_as_a_workspace_default_member_consistently_with_existing_extension_crates()
+ {
+    let path = workspace_root().join("Cargo.toml");
+    let contents = std::fs::read_to_string(&path).expect("read workspace Cargo.toml");
+    let cargo: toml::Value = toml::from_str(&contents).expect("workspace Cargo.toml must parse");
+    let members = toml_string_array(&cargo, "members");
+    let default_members = toml_string_array(&cargo, "default-members");
+
+    assert!(
+        members.contains(&"extensions/debug"),
+        "workspace members must include extensions/debug; got {members:?}"
+    );
+    assert!(
+        default_members.contains(&"extensions/debug"),
+        "workspace default-members must include extensions/debug so cargo build --workspace --bins builds debug_extension; got {default_members:?}"
+    );
+}
+
+#[test]
+fn extensions_debug_cargo_toml_defines_a_binary_crate_named_debug_extension_without_dap_runtime_dependencies()
+ {
+    let path = workspace_root().join("extensions/debug/Cargo.toml");
+    let contents = std::fs::read_to_string(&path).expect("read extensions/debug/Cargo.toml");
+    let cargo: toml::Value = toml::from_str(&contents).expect("debug Cargo.toml must parse");
+
+    assert_eq!(cargo["package"]["name"].as_str(), Some("debug_extension"));
+    assert_eq!(cargo["bin"][0]["name"].as_str(), Some("debug_extension"));
+    assert_eq!(cargo["bin"][0]["path"].as_str(), Some("src/main.rs"));
+
+    let dependencies = cargo["dependencies"]
+        .as_table()
+        .expect("debug dependencies must be a TOML table");
+    assert!(
+        dependencies.contains_key("extension_protocol"),
+        "debug scaffold must depend on extension_protocol for the sidecar wire contract; got {:?}",
+        dependencies.keys().collect::<Vec<_>>()
+    );
+
+    let runtime_dependencies = [
+        "dap",
+        "debug-adapter-protocol",
+        "lsp-types",
+        "notify",
+        "rmcp",
+        "sled",
+        "tokio",
+        "tower-lsp",
+    ];
+    let unexpected = dependencies
+        .keys()
+        .filter(|dependency| runtime_dependencies.contains(&dependency.as_str()))
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "debug scaffold must not add DAP/session/runtime dependencies before tool behavior is implemented; got {unexpected:?}"
+    );
+}
+
+#[test]
+fn extensions_debug_extension_toml_declares_lazy_activation_and_no_event_subscriptions() {
+    let manifest = shipped_debug_manifest();
+
+    assert!(matches!(manifest.activation, Activation::Lazy));
+    assert!(
+        manifest.events.subscribe.is_empty(),
+        "debug extension must not subscribe to workspace file events"
+    );
+}
+
+#[test]
+fn debug_manifest_declares_exactly_the_required_local_tool_names() {
+    let manifest = shipped_debug_manifest();
+    let tool_names = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        tool_names,
+        vec![
+            "launch",
+            "set_breakpoints",
+            "continue",
+            "step",
+            "pause",
+            "threads",
+            "stack",
+            "variables",
+            "evaluate",
+            "terminate",
+            "disconnect",
+            "sessions",
+        ],
+    );
+}
+
+#[test]
+fn debug_manifest_does_not_declare_workspace_write_or_request_apply_edits_capabilities() {
+    let manifest = shipped_debug_manifest();
+    let forbidden = [
+        "request_apply_edits",
+        "workspace_write",
+        "write_file",
+        "create_file",
+        "edit_range",
+        "global_replace",
+        "delete_file",
+    ];
+
+    assert!(
+        forbidden.iter().all(|capability| !manifest
+            .capabilities
+            .required
+            .iter()
+            .any(|required| required == capability)),
+        "debug manifest must not request workspace mutation capabilities; got {:?}",
+        manifest.capabilities.required
+    );
+}
+
+#[test]
+fn extension_manifest_parses_debug_tools_and_preserves_all_debug_tool_names() {
+    let manifest = shipped_debug_manifest();
+    let tool_names = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(manifest.name, "debug");
+    assert_eq!(manifest.command, vec!["debug_extension"]);
+    assert_eq!(tool_names.len(), 12);
+    assert!(tool_names.contains(&"launch"));
+    assert!(tool_names.contains(&"set_breakpoints"));
+    assert!(tool_names.contains(&"sessions"));
+}
+
 // ── AC3: Malformed input → ProtocolError, no panic ───────────────────────────
 
 #[test]
@@ -456,6 +774,7 @@ fn protocol_version_is_nonzero() {
     let params = InitParams {
         protocol_version: PROTOCOL_VERSION,
         client_info: "test".to_owned(),
+        extension_config: None,
     };
     let json = serde_json::to_string(&params).expect("serialize InitParams");
     let decoded: InitParams = serde_json::from_str(&json).expect("deserialize InitParams");
@@ -471,6 +790,7 @@ fn protocol_version_carried_in_initialize() {
     let req = Request::Initialize(InitParams {
         protocol_version: PROTOCOL_VERSION,
         client_info: "test".to_owned(),
+        extension_config: None,
     });
     let json = serde_json::to_string(&req).expect("serialize");
     assert!(

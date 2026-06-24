@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core_engine",
+    "crates/extension_sidecar_harness",
     "crates/extension_protocol",
     # Test-only sidecar extension binary for spec 23 integration tests.
     "extensions/test_helper",
@@ -12,6 +13,8 @@ members = [
     "extensions/fixtures/garbage_frames",
     # Regression fixture: completes init then ignores `shutdown` (forces host kill escalation).
     "extensions/fixtures/ignore_shutdown",
+    # F004 deterministic Debug Adapter Protocol fixture for debug e2e tests.
+    "extensions/fixtures/debug_adapter",
     # Spec 26 native extensions (native binaries, no WASM).
     "extensions/ast",
     "extensions/hello",
@@ -21,10 +24,13 @@ members = [
     "extensions/fmt",
     # F002 lint sidecar extension.
     "extensions/lint",
+    # F004 debug sidecar extension.
+    "extensions/debug",
 ]
 
 default-members = [
     "crates/core_engine",
+    "crates/extension_sidecar_harness",
     "crates/extension_protocol",
     # test_helper extension binary — compiled natively by the pre-test
     # `cargo build --workspace --bins` step so spec 23 tests can spawn it.
@@ -37,6 +43,8 @@ default-members = [
     "extensions/fixtures/garbage_frames",
     # Regression fixture: completes init then ignores `shutdown` (bug #1, shutdown deadlock).
     "extensions/fixtures/ignore_shutdown",
+    # F004 deterministic Debug Adapter Protocol fixture for debug e2e tests.
+    "extensions/fixtures/debug_adapter",
     # Spec 26 native extensions — compiled natively (no WASM, no WASI SDK).
     "extensions/ast",
     "extensions/hello",
@@ -46,6 +54,8 @@ default-members = [
     "extensions/fmt",
     # F002 lint sidecar extension.
     "extensions/lint",
+    # F004 debug sidecar extension.
+    "extensions/debug",
 ]
 
 [workspace.package]

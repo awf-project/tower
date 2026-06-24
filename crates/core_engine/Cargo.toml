@@ -30,6 +30,7 @@ tempfile = "3.27.0"
 core_engine = { path = ".", features = ["testing"] }
 # rmcp client feature used in mcp handler unit tests (in-process duplex transport).
 rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
+extension_sidecar_harness = { path = "../extension_sidecar_harness" }
 
 [dependencies]
 # Decision: extension_protocol provides the ExtensionManifest, ExtensionFault,

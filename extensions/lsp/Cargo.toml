@@ -16,6 +16,7 @@ testing = []
 
 [dependencies]
 extension_protocol = { path = "../../crates/extension_protocol" }
+extension_sidecar_harness = { path = "../../crates/extension_sidecar_harness" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Re-use the existing LSP adapter logic from core_engine.

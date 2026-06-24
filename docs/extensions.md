@@ -256,6 +256,41 @@ disabled = ["lsp"]
 A disabled extension is never spawned — the check happens before any process starts. An absent config
 file means defaults (30 s timeout, nothing disabled); a malformed config file fails startup (exit 1).
 
+### Opt-in debug configuration
+
+The `debug` extension is available only when at least one `[debug.<language>]` entry exists in
+`<workspace>/.tower/config.toml` and the extension is not listed in `[extensions].disabled`.
+The host parses this configuration strictly at startup and passes it to the sidecar during
+`initialize`; malformed debug config fails startup instead of exposing a partially configured
+debugger.
+
+```toml
+[debug.rust]
+extensions = ["rs"]
+command = "lldb-dap"
+args = ["--stdio"]
+adapter_type = "lldb"
+launch = { request = "launch", program = "target/debug/app" }
+default_timeout_secs = 15
+idle_ttl_secs = 300
+```
+
+| Field | Meaning |
+|-------|---------|
+| `extensions` | File extensions, without leading `.`, associated with this debug language. Must not be empty. |
+| `command` | Debug adapter executable. Must not be empty. |
+| `args` | Optional adapter arguments. |
+| `adapter_type` | DAP adapter identifier sent during initialize, for example `lldb`, `go`, or `python`. |
+| `launch` | Adapter-specific default launch arguments. Tool-level `launch_overrides` are merged into this object. |
+| `default_timeout_secs` | Positive per-operation timeout used by launch, resume, inspect, and cleanup calls unless a tool overrides it. |
+| `idle_ttl_secs` | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it. |
+
+The debug sidecar declares no workspace mutation capabilities. A discovered extension named `debug`
+takes priority over the bundled fallback. It owns adapter and debuggee process lifecycle inside the
+extension process and removes ephemeral sessions on terminate, disconnect, shutdown, quarantine, or
+idle expiry. See [debug sessions](user-guide/debug-sessions.md) for the operator workflow and
+[MCP tool reference](mcp-tools.md#interactive-debug-tools) for the tool contract.
+
 ---
 
 ## Authoring an extension

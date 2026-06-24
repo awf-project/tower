@@ -1,5 +1,6 @@
 #![allow(clippy::pedantic)]
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -25,6 +26,7 @@ use core_engine::domain::{DomainError, RelativePath};
 use core_engine::ports::FileSystemPort;
 use core_engine::ports::inbound::{ApplyEditsRequest, TextEdit};
 use extension_protocol::{ExtensionManifest, PROTOCOL_VERSION};
+use extension_sidecar_harness::{HostCallIdAllocator, QueuedFrame, read_host_response};
 use lint_support::{
     SEVERITY_CODE_GENERIC_REGEX, TestWorkspace, host_deps, lint_empty_manifest, lint_extension_bin,
     lint_fix_manifest, workspace_root,
@@ -32,9 +34,6 @@ use lint_support::{
 use serde_json::{Value, json};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[path = "../../../extensions/lint/src/protocol.rs"]
-mod lint_protocol;
 
 fn shipped_lint_manifest() -> ExtensionManifest {
     let path = workspace_root().join("extensions/lint/extension.toml");
@@ -387,6 +386,7 @@ fn spawn_lint_fix_adapter(
         lint_fix_manifest(&lint_extension_bin()),
         host_deps(workspace.real_fs()),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn")
 }
@@ -472,94 +472,6 @@ fn lint_manifest_declares_read_file_list_files_log_and_request_apply_edits_capab
         vec!["read_file", "list_files", "log", "request_apply_edits"],
         "lint must request read/list/log plus request_apply_edits for future fix orchestration"
     );
-}
-
-#[test]
-fn lint_fix_protocol_dtos_serialize_stable_request_result_skip_preview_and_error_fields() {
-    let request: lint_protocol::FixRequest = serde_json::from_value(json!({
-        "path": "src/main.rs",
-        "unsafe": true,
-        "dry_run": true
-    }))
-    .expect("FixRequest must accept external unsafe field");
-    assert_eq!(request.path.as_deref(), Some("src/main.rs"));
-    assert!(request.unsafe_fixes);
-    assert!(request.dry_run);
-
-    let result = lint_protocol::FixResult {
-        files_changed: 1,
-        fixes_applied: 1,
-        fixes_skipped: vec![lint_protocol::SkippedFixDto {
-            path: "src/main.rs".to_owned(),
-            reason: lint_protocol::SkippedFixReason::CasConflict,
-            diagnostic: None,
-            supported_fix: true,
-        }],
-        remaining_diagnostics: Vec::new(),
-        previews: vec![lint_protocol::FixPreviewDto {
-            path: "src/main.rs".to_owned(),
-            edits: vec![lint_protocol::FixPreviewEditDto {
-                start_byte: 0,
-                end_byte: 4,
-                replacement: "yep".to_owned(),
-            }],
-            preview_content: "yep\n".to_owned(),
-        }],
-    };
-
-    assert_eq!(
-        serde_json::to_value(result).expect("serialize FixResult"),
-        json!({
-            "files_changed": 1,
-            "fixes_applied": 1,
-            "fixes_skipped": [{
-                "path": "src/main.rs",
-                "reason": "cas_conflict",
-                "diagnostic": null,
-                "supported_fix": true
-            }],
-            "remaining_diagnostics": [],
-            "previews": [{
-                "path": "src/main.rs",
-                "edits": [{
-                    "start_byte": 0,
-                    "end_byte": 4,
-                    "replacement": "yep"
-                }],
-                "preview_content": "yep\n"
-            }]
-        })
-    );
-
-    for reason in [
-        lint_protocol::SkippedFixReason::Conflict,
-        lint_protocol::SkippedFixReason::Unsafe,
-        lint_protocol::SkippedFixReason::Unsupported,
-        lint_protocol::SkippedFixReason::CasConflict,
-        lint_protocol::SkippedFixReason::InvalidRange,
-    ] {
-        let value = serde_json::to_value(reason).expect("serialize skipped reason");
-        assert!(matches!(
-            value.as_str(),
-            Some("conflict" | "unsafe" | "unsupported" | "cas_conflict" | "invalid_range")
-        ));
-    }
-
-    let error_codes = [
-        "lint_fix_unavailable",
-        "lint_fix_apply_failed",
-        "lint_fix_invalid_request",
-    ];
-    for code in error_codes {
-        let error = lint_protocol::FixToolErrorResponse {
-            code: code.to_owned(),
-            message: "stable error".to_owned(),
-        };
-        assert_eq!(
-            serde_json::to_value(error).expect("serialize FixToolErrorResponse")["code"],
-            code
-        );
-    }
 }
 
 #[test]
@@ -747,6 +659,7 @@ fn extension_tool_appears_in_list_with_tower_prefix() {
         host_deps(workspace.real_fs()),
         TEST_TIMEOUT,
         &disabled,
+        &std::collections::BTreeMap::new(),
     );
     let merged = ExtensionMergedRegistry::new(
         empty_engine_state(&workspace),
@@ -780,6 +693,7 @@ fn lint_fix_tool_appears_in_merged_registry_and_is_not_registered_as_native_mcp_
         host_deps(workspace.real_fs()),
         TEST_TIMEOUT,
         &disabled,
+        &std::collections::BTreeMap::new(),
     );
     let merged = ExtensionMergedRegistry::new(
         empty_engine_state(&workspace),
@@ -1338,6 +1252,7 @@ fn the_check_tool_accepts_optional_path_and_with_a_path_lints_one_workspace_rela
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1372,6 +1287,7 @@ esac
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1414,6 +1330,7 @@ fn unsupported_file_extensions_return_supported_false_diagnostics_empty_and_no_p
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1437,6 +1354,7 @@ fn main_rs_returns_runner_failures_as_tool_result_error_with_stable_missing_bina
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1462,6 +1380,7 @@ fn main_rs_returns_runner_failures_as_tool_result_error_with_stable_invalid_conf
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1490,6 +1409,7 @@ fn unparseable_nonzero_output_preserves_success_result_path_with_stable_lint_err
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1534,6 +1454,7 @@ source = "fixture-lint"
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1559,6 +1480,7 @@ fn hanging_linter_preserves_success_result_path_with_stable_timeout_code() {
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1586,6 +1508,7 @@ fn workspace_check_propagates_per_file_runner_error_with_stable_lint_error_code(
         lint_empty_manifest(&lint_extension_bin()),
         host_deps(fs),
         TEST_TIMEOUT,
+        None,
     )
     .expect("lint extension must spawn");
     let result = adapter
@@ -1670,6 +1593,102 @@ impl Drop for ProtocolChild {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn sidecar_harness_public_contract_exposes_queueing_types_used_by_lint_sidecar() {
+    let mut ids = HostCallIdAllocator::new(10_000);
+    assert_eq!(ids.next_id(), 10_000);
+    assert_eq!(ids.next_id(), 10_001);
+
+    let frame = QueuedFrame::Request {
+        id: Some(json!(42)),
+        method: "invokeTool".to_owned(),
+        params: json!({ "name": "check", "params": {} }),
+    };
+    assert_eq!(
+        serde_json::to_value(&frame).expect("serialize queued request"),
+        json!({
+            "type": "Request",
+            "id": 42,
+            "method": "invokeTool",
+            "params": { "name": "check", "params": {} }
+        })
+    );
+}
+
+#[test]
+fn lint_initialize_errors_preserve_json_rpc_codes_for_malformed_params_version_mismatch_and_unknown_methods()
+ {
+    let workspace = TestWorkspace::new();
+    let mut child = ProtocolChild::spawn(&workspace);
+
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "initialize",
+        "params": { "protocol_version": PROTOCOL_VERSION }
+    }));
+    let malformed = child.read_frame();
+    assert_eq!(malformed["id"], 10);
+    assert_eq!(malformed["error"]["code"], -32602);
+
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "initialize",
+        "params": {
+            "protocol_version": PROTOCOL_VERSION + 1,
+            "client_info": "lint-e2e/0.1.0"
+        }
+    }));
+    let mismatch = child.read_frame();
+    assert_eq!(mismatch["id"], 11);
+    assert_eq!(mismatch["error"]["code"], -32600);
+
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "definitelyUnknown",
+        "params": null
+    }));
+    let unknown = child.read_frame();
+    assert_eq!(unknown["id"], 12);
+    assert_eq!(unknown["error"]["code"], -32601);
+}
+
+#[test]
+fn no_lint_sidecar_loop_discards_non_matching_frames_while_waiting_for_host_call_response() {
+    let mut lines = vec![
+        Ok(json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "invokeTool",
+            "params": { "name": "check", "params": {} }
+        })
+        .to_string()),
+        Ok(json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": { "ok": true }
+        })
+        .to_string()),
+    ]
+    .into_iter();
+    let mut queued = VecDeque::new();
+
+    let result = read_host_response(&mut lines, 42, &mut queued)
+        .expect("expected HostCall response must be returned");
+
+    assert_eq!(result, json!({ "ok": true }));
+    assert_eq!(
+        queued,
+        VecDeque::from([QueuedFrame::Request {
+            id: Some(json!(77)),
+            method: "invokeTool".to_owned(),
+            params: json!({ "name": "check", "params": {} })
+        }])
+    );
 }
 
 #[test]

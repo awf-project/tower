@@ -214,7 +214,7 @@ fn ac1_ast_extension_declares_five_tools() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let manifest = adapter.manifest();
     assert_eq!(manifest.name, "ast");
@@ -251,7 +251,7 @@ fn ac1_ast_extension_subscribes_to_both_events() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let m = adapter.manifest();
     assert!(
@@ -286,7 +286,7 @@ fn ac1_get_outline_rust_returns_structural_items() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool("get_outline", serde_json::json!({"path": "src/counter.rs"}))
@@ -328,7 +328,7 @@ fn ac1_get_outline_unsupported_language_returns_unsupported() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool("get_outline", serde_json::json!({"path": "README.md"}))
@@ -362,7 +362,7 @@ fn ac2_file_indexed_event_updates_index() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     // Deliver fileIndexed event for the file.
     adapter
@@ -404,7 +404,7 @@ fn ac2_file_changed_event_updates_index() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     // Deliver fileChanged event.
     adapter
@@ -453,7 +453,7 @@ fn ac3_get_outline_go_returns_structural_items() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool("get_outline", serde_json::json!({"path": "main.go"}))
@@ -490,7 +490,7 @@ fn ac3_get_outline_php_returns_structural_items() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool("get_outline", serde_json::json!({"path": "app.php"}))
@@ -527,7 +527,7 @@ fn ac3_find_symbols_go_finds_function() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool(
@@ -563,7 +563,7 @@ fn ac3_find_symbols_go_inapplicable_kind_returns_empty() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool(
@@ -612,7 +612,7 @@ fn u1_read_symbol_returns_symbol_content() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
         .call_tool(
@@ -664,7 +664,7 @@ fn un1_malformed_rust_file_does_not_crash_extension() {
     let deps = make_deps(fs);
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     // Outline the broken file — must not crash, must return Parsed (partial).
     let result = adapter
@@ -701,7 +701,7 @@ fn ac4_hello_extension_greet_returns_greeting() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("hello must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("hello must spawn");
 
     let result = adapter
         .call_tool("greet", serde_json::json!({"name": "Tower"}))
@@ -727,7 +727,7 @@ fn ac4_hello_extension_declares_greet_no_events() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("hello must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("hello must spawn");
 
     let m = adapter.manifest();
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
@@ -751,7 +751,7 @@ fn ac4_hello_greet_default_name() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("hello must spawn");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("hello must spawn");
 
     let result = adapter
         .call_tool("greet", serde_json::json!({}))
@@ -815,7 +815,7 @@ fn reg_spawn_then_immediate_tool_call_never_deadlocks() {
         let manifest = ast_manifest(&bin);
         let deps = make_deps(InMemoryFs::new());
 
-        let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT)
+        let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
             .unwrap_or_else(|e| panic!("iteration {iteration}: spawn must succeed, got: {e:?}"));
 
         // Call a zero-I/O tool (search_symbols with empty index) immediately after
@@ -851,7 +851,8 @@ fn ac5_ast_extension_via_registry() {
     let manifest = ast_manifest(&bin);
     let deps = make_deps(fs);
 
-    let adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("ast must spawn");
+    let adapter =
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let mut registry = ExtensionRegistry::new();
     registry.register(adapter).expect("must register ast");

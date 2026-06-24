@@ -38,6 +38,7 @@ use crate::ports::{AstIndexPort, FileSystemPort};
 ///     push_tx: None,
 /// };
 /// ```
+#[derive(Clone)]
 pub struct HostDeps {
     /// Filesystem port for `workspace/readFile` and `workspace/listFiles`.
     ///

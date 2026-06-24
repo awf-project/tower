@@ -84,7 +84,8 @@ version and capability advertisement.
 Enumerate every available tool. The response lists the native `tower_*` tools
 plus any namespaced tools contributed by discovered extensions (e.g.
 `"tower_ast_get_outline"` from the `ast` extension, `"tower_lsp_diagnostics"` from
-the `lsp` extension, or `"tower_lint_check"` from the `lint` extension).
+the `lsp` extension, `"tower_debug_launch"` from the `debug` extension, or
+`"tower_lint_check"` from the `lint` extension).
 
 **Request**
 
@@ -992,6 +993,210 @@ error when the request reached the extension:
 
 Stable fix error codes are `lint_fix_unavailable`, `lint_fix_apply_failed`, and
 `lint_fix_invalid_request`.
+
+---
+
+## Interactive debug tools
+
+The `debug` extension (manifest `name = "debug"`) bridges configured Debug Adapter Protocol
+adapters. Its tools are lazy extension tools and appear only when all of the following are true:
+
+- the bundled debug sidecar binary is available next to `tower`, or a `debug` extension is discovered
+  from an extension scope;
+- the workspace has at least one valid `[debug.<language>]` entry in `.tower/config.toml`;
+- the `debug` extension is not listed in `[extensions].disabled`.
+
+Configure one language entry per adapter:
+
+```toml
+[debug.rust]
+extensions = ["rs"]
+command = "lldb-dap"
+args = ["--stdio"]
+adapter_type = "lldb"
+launch = { request = "launch", program = "target/debug/app" }
+default_timeout_secs = 15
+idle_ttl_secs = 300
+```
+
+The debug extension declares no workspace mutation capabilities. Sessions are ephemeral and owned by
+the sidecar; terminate, disconnect, shutdown, quarantine, and idle TTL expiry clean up the adapter and
+debuggee process tree.
+
+### Runtime result shape
+
+Expected runtime failures are successful tool payloads with stable error codes, not JSON-RPC transport
+errors:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "session-not-found",
+    "message": "debug session missing",
+    "data": null
+  }
+}
+```
+
+Stable debug error codes are `session-not-found`, `not-stopped`, `debug-timeout`, `adapter-exited`,
+and `launch-failed`. Malformed tool parameters still return protocol-level invalid-params errors.
+
+### tower_debug_launch
+
+Launch a configured adapter session.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `language` | string | yes | Configured `[debug.<language>]` key |
+| `program` | string | yes | Program path or adapter-specific program value |
+| `cwd` | string or null | no | Working directory passed to the adapter |
+| `args` | string array | no | Program arguments |
+| `env` | object | no | Environment variables passed to launch |
+| `launch_overrides` | object | yes | Adapter-specific launch arguments merged over configured defaults; use `{}` when no override is needed |
+
+**Returns**
+
+```json
+{
+  "session_id": "debug-1",
+  "state": "stopped",
+  "stop": {
+    "state": "stopped",
+    "reason": "entry",
+    "thread_id": 1,
+    "top_frame": { "id": 7, "name": "main", "path": "src/main.rs", "line": 1, "column": 1 },
+    "hit_breakpoint_ids": [],
+    "timed_out": false,
+    "output_since": []
+  }
+}
+```
+
+### tower_debug_set_breakpoints
+
+Replace the session's breakpoints for one source file.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `path` | string | yes | Workspace-relative source path |
+| `breakpoints` | array | yes | Breakpoints with `line`, optional `condition`, optional `hit_condition` |
+
+**Returns** `{"breakpoints": [{"path": string, "line": uint, "condition": string|null, "hit_condition": string|null, "verified": bool, "verified_id": uint|null}]}`
+
+### tower_debug_continue
+
+Resume a session until it stops, terminates, or times out.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `thread_id` | integer or null | no | Adapter thread to resume; omit for adapter default |
+| `timeout_secs` | integer or null | no | Override the configured `default_timeout_secs` for this call |
+
+**Returns** a stop object with `state`, `reason`, `thread_id`, `top_frame`, `hit_breakpoint_ids`,
+`timed_out`, and `output_since`. A timeout returns `state:"running"` with `timed_out:true`; the
+session remains available for `tower_debug_pause` or cleanup.
+
+### tower_debug_step
+
+Step a session until it stops, terminates, or times out.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `thread_id` | integer or null | no | Adapter thread to step |
+| `timeout_secs` | integer or null | no | Override the configured `default_timeout_secs` for this call |
+
+**Returns** the same stop object as `tower_debug_continue`.
+
+### tower_debug_pause
+
+Pause a running session.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `thread_id` | integer or null | no | Adapter thread to pause |
+
+**Returns** the same stop object as `tower_debug_continue`.
+
+### tower_debug_threads
+
+List session threads.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+
+**Returns** `{"threads": [{"id": uint, "name": string}]}`
+
+### tower_debug_stack
+
+Read stack frames for a stopped thread.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `thread_id` | integer | yes | Thread id returned by `tower_debug_threads` or a stop result |
+
+**Returns** `{"frames": [{"id": uint, "name": string, "path": string|null, "line": uint, "column": uint}]}`
+
+### tower_debug_variables
+
+Read variables from a DAP `variables_reference`.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `variables_reference` | integer | yes | Adapter variable reference returned by prior debug data |
+
+**Returns** `{"variables": [{"name": string, "value": string, "type": string|null, "variables_reference": uint}]}`
+
+### tower_debug_evaluate
+
+Evaluate an expression in a stopped frame.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| `frame_id` | integer | yes | Frame id returned by `tower_debug_stack` |
+| `expression` | string | yes | Expression passed to the adapter |
+
+**Returns** `{"result": {"name": string, "value": string, "type": string|null, "variables_reference": uint}}`
+
+### tower_debug_terminate
+
+Terminate the debuggee and adapter process tree, then remove the session.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+
+**Returns** `{"ok": true}`
+
+### tower_debug_disconnect
+
+Ask the adapter to disconnect, then remove the session.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+
+**Returns** `{"ok": true}`
+
+### tower_debug_sessions
+
+List live ephemeral sessions.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| _(none)_ | — | — | This tool takes no arguments |
+
+**Returns** `{"sessions": [{"session_id": string, "language": string, "state": "initializing"|"stopped"|"running"|"terminated", "last_stop": object|null}]}`
+
+See [interactive debug sessions](user-guide/debug-sessions.md) for a task-oriented workflow.
 
 ---
 

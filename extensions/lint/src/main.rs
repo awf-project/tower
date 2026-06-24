@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod protocol;
-
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -15,9 +13,11 @@ use extension_protocol::{
     Capability, HostCall, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response,
     ToolDecl,
 };
+use extension_sidecar_harness::{frame_from_envelope, send_error, send_response};
 use lint_extension::config::RunnerLintConfig;
 use lint_extension::diagnostics::{LintDiagnostic, severity_json};
 use lint_extension::fixes::{FixApplicability, LintByteEdit, LintFix};
+use lint_extension::protocol;
 use lint_extension::runner::{LintToolError, RunOutcome, RunRequest, run_linter, run_linter_fixes};
 use protocol::{
     CheckRequest, CheckResult, FixPreviewDto, FixPreviewEditDto, FixRequest, FixResult,
@@ -57,17 +57,17 @@ fn serve_lint_check() {
                     &mut queued,
                 ),
                 "deliverEvent" => {
-                    protocol::send_response(&stdout, &id, &Response::Ack);
+                    let _ = send_response(&stdout, &id, &Response::Ack);
                 }
                 "shutdown" => {
-                    protocol::send_response(&stdout, &id, &Response::Ack);
+                    let _ = send_response(&stdout, &id, &Response::Ack);
                     if let Ok(mut out) = stdout.lock() {
                         let _ = out.flush();
                     }
                     break;
                 }
                 other => {
-                    protocol::send_error(&stdout, &id, -32601, &format!("unknown method: {other}"));
+                    let _ = send_error(&stdout, &id, -32601, &format!("unknown method: {other}"));
                 }
             },
         }
@@ -189,7 +189,7 @@ where
             Ok(envelope) => envelope,
             Err(_) => continue,
         };
-        if let Some(frame) = protocol::frame_from_envelope(envelope) {
+        if let Some(frame) = frame_from_envelope(envelope) {
             return Some(frame);
         }
     }
@@ -199,13 +199,13 @@ fn handle_initialize(out: &Arc<Mutex<impl Write>>, id: &Option<Value>, params: V
     let init_params: InitParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
-            protocol::send_error(out, id, -32602, &format!("bad InitParams: {error}"));
+            let _ = send_error(out, id, -32602, &format!("bad InitParams: {error}"));
             return;
         }
     };
 
     if init_params.protocol_version != PROTOCOL_VERSION {
-        protocol::send_error(
+        let _ = send_error(
             out,
             id,
             -32600,
@@ -217,7 +217,7 @@ fn handle_initialize(out: &Arc<Mutex<impl Write>>, id: &Option<Value>, params: V
         return;
     }
 
-    protocol::send_response(out, id, &Response::Initialized(lint_init_result()));
+    let _ = send_response(out, id, &Response::Initialized(lint_init_result()));
 }
 
 fn handle_invoke_tool<R>(
@@ -238,7 +238,7 @@ fn handle_invoke_tool<R>(
         "check" => invoke_check_tool(out, id, tool_params, workspace_root, lines, next_id, queued),
         "fix" => invoke_fix_tool(out, id, tool_params, workspace_root, lines, next_id, queued),
         _ => {
-            protocol::send_response(
+            let _ = send_response(
                 out,
                 id,
                 &Response::Error(ProtocolError {
@@ -265,7 +265,7 @@ fn invoke_check_tool<R>(
     let request: CheckRequest = match serde_json::from_value(tool_params) {
         Ok(request) => request,
         Err(error) => {
-            protocol::send_response(
+            let _ = send_response(
                 out,
                 id,
                 &Response::Error(ProtocolError {
@@ -279,20 +279,24 @@ fn invoke_check_tool<R>(
     };
 
     match check_lint(request, workspace_root, lines, out, next_id, queued) {
-        Ok(result) => protocol::send_response(
-            out,
-            id,
-            &Response::ToolResult(serde_json::to_value(result).expect("serialize CheckResult")),
-        ),
-        Err(message) => protocol::send_response(
-            out,
-            id,
-            &Response::Error(ProtocolError {
-                code: -32000,
-                message,
-                data: None,
-            }),
-        ),
+        Ok(result) => {
+            let _ = send_response(
+                out,
+                id,
+                &Response::ToolResult(serde_json::to_value(result).expect("serialize CheckResult")),
+            );
+        }
+        Err(message) => {
+            let _ = send_response(
+                out,
+                id,
+                &Response::Error(ProtocolError {
+                    code: -32000,
+                    message,
+                    data: None,
+                }),
+            );
+        }
     }
 }
 
@@ -310,7 +314,7 @@ fn invoke_fix_tool<R>(
     let request: FixRequest = match serde_json::from_value(tool_params) {
         Ok(request) => request,
         Err(error) => {
-            protocol::send_response(
+            let _ = send_response(
                 out,
                 id,
                 &Response::ToolResult(fix_error_result(
@@ -323,16 +327,20 @@ fn invoke_fix_tool<R>(
     };
 
     match fix_lint(request, workspace_root, lines, out, next_id, queued) {
-        Ok(result) => protocol::send_response(
-            out,
-            id,
-            &Response::ToolResult(serde_json::to_value(result).expect("serialize FixResult")),
-        ),
-        Err(error) => protocol::send_response(
-            out,
-            id,
-            &Response::ToolResult(fix_error_result(error.code, error.message)),
-        ),
+        Ok(result) => {
+            let _ = send_response(
+                out,
+                id,
+                &Response::ToolResult(serde_json::to_value(result).expect("serialize FixResult")),
+            );
+        }
+        Err(error) => {
+            let _ = send_response(
+                out,
+                id,
+                &Response::ToolResult(fix_error_result(error.code, error.message)),
+            );
+        }
     }
 }
 

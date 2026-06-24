@@ -17,7 +17,7 @@ use core_engine::ports::CodeIntelError;
 use extension_protocol::HostCall;
 use serde_json::{Value, json};
 
-use crate::protocol;
+use crate::protocol::{self, HostCallIdAllocator, QueuedFrame};
 use crate::session::LspSessionPool;
 
 /// Dispatch an `invokeTool` call to the appropriate LSP tool.
@@ -31,8 +31,8 @@ pub fn dispatch<W, R>(
     workspace_root: &PathBuf,
     out: &Arc<Mutex<W>>,
     lines: &mut R,
-    next_id: &mut u64,
-    deferred: &mut VecDeque<(Option<Value>, String, Value)>,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
 ) -> Result<Value, String>
 where
     W: Write,
@@ -52,8 +52,8 @@ fn read_file<W, R>(
     path: &str,
     out: &Arc<Mutex<W>>,
     lines: &mut R,
-    next_id: &mut u64,
-    deferred: &mut VecDeque<(Option<Value>, String, Value)>,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
 ) -> Result<String, String>
 where
     W: Write,
@@ -89,7 +89,7 @@ fn severity_str(s: Severity) -> &'static str {
     match s {
         Severity::Error => "error",
         Severity::Warning => "warning",
-        Severity::Information => "information",
+        Severity::Information => "info",
         Severity::Hint => "hint",
     }
 }
@@ -120,8 +120,8 @@ fn diagnostics<W, R>(
     _workspace_root: &PathBuf,
     out: &Arc<Mutex<W>>,
     lines: &mut R,
-    next_id: &mut u64,
-    deferred: &mut VecDeque<(Option<Value>, String, Value)>,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
 ) -> Result<Value, String>
 where
     W: Write,
@@ -157,8 +157,8 @@ fn definition<W, R>(
     _workspace_root: &PathBuf,
     out: &Arc<Mutex<W>>,
     lines: &mut R,
-    next_id: &mut u64,
-    deferred: &mut VecDeque<(Option<Value>, String, Value)>,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
 ) -> Result<Value, String>
 where
     W: Write,
@@ -203,8 +203,8 @@ fn references<W, R>(
     _workspace_root: &PathBuf,
     out: &Arc<Mutex<W>>,
     lines: &mut R,
-    next_id: &mut u64,
-    deferred: &mut VecDeque<(Option<Value>, String, Value)>,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
 ) -> Result<Value, String>
 where
     W: Write,
@@ -249,8 +249,8 @@ fn hover<W, R>(
     _workspace_root: &PathBuf,
     out: &Arc<Mutex<W>>,
     lines: &mut R,
-    next_id: &mut u64,
-    deferred: &mut VecDeque<(Option<Value>, String, Value)>,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
 ) -> Result<Value, String>
 where
     W: Write,
@@ -282,5 +282,43 @@ where
         Ok(None) => Ok(json!({ "supported": true, "hover": null })),
         Err(CodeIntelError::Unsupported) => Ok(json!({ "supported": false, "hover": null })),
         Err(CodeIntelError::Backend(msg)) => Err(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core_engine::domain::code_intel::Range;
+
+    use super::*;
+
+    #[test]
+    fn diagnostic_severities_use_shared_mcp_vocabulary() {
+        let severities = [
+            (Severity::Error, "error"),
+            (Severity::Warning, "warning"),
+            (Severity::Information, "info"),
+            (Severity::Hint, "hint"),
+        ];
+
+        for (severity, expected) in severities {
+            let diagnostic = Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 1,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 4,
+                    },
+                },
+                severity,
+                message: "diagnostic".to_owned(),
+                source: Some("test".to_owned()),
+                code: Some("T001".to_owned()),
+            };
+
+            assert_eq!(diagnostic_to_json(&diagnostic)["severity"], expected);
+        }
     }
 }

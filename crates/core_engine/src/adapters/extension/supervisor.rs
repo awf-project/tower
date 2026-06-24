@@ -119,7 +119,7 @@ enum RespawnState {
 ///     apply_edits: Arc::new(core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost),
 ///     push_tx: None,
 /// };
-/// let _supervisor = ExtensionSupervisor::new(manifest, deps, Duration::from_secs(30));
+/// let _supervisor = ExtensionSupervisor::new(manifest, deps, Duration::from_secs(30), None);
 /// ```
 pub struct ExtensionSupervisor {
     /// The extension manifest (immutable for lifetime of this supervisor).
@@ -128,6 +128,8 @@ pub struct ExtensionSupervisor {
     deps: HostDeps,
     /// Per-request wall-clock deadline forwarded to the adapter.
     request_timeout: Duration,
+    /// Optional host-provided configuration sent during extension initialize.
+    extension_config: Option<Value>,
     /// Live adapter instance, `None` when the child has crashed/timed-out.
     instance: Option<Box<dyn ExtensionInstance>>,
     /// Current respawn readiness.
@@ -150,11 +152,17 @@ impl ExtensionSupervisor {
     /// Create a new supervisor. The child is **not** spawned yet — spawning is
     /// lazy: the first `call_tool` or `deliver_event` triggers it.
     #[must_use]
-    pub fn new(manifest: ExtensionManifest, deps: HostDeps, request_timeout: Duration) -> Self {
+    pub fn new(
+        manifest: ExtensionManifest,
+        deps: HostDeps,
+        request_timeout: Duration,
+        extension_config: Option<Value>,
+    ) -> Self {
         Self {
             manifest,
             deps,
             request_timeout,
+            extension_config,
             instance: None,
             respawn_state: RespawnState::Ready,
             consecutive_faults: 0,
@@ -188,6 +196,7 @@ impl ExtensionSupervisor {
             self.manifest.clone(),
             self.clone_deps(),
             self.request_timeout,
+            self.extension_config.clone(),
         ) {
             Ok(instance) => {
                 self.instance = Some(instance);

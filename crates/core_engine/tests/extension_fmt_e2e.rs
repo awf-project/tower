@@ -144,8 +144,8 @@ fn fmt_process_spawns_and_declares_format_tool() {
     let manifest = fmt_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("fmt_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("fmt_extension must spawn");
 
     let m = adapter.manifest();
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
@@ -169,8 +169,8 @@ fn fmt_process_subscribes_to_file_changed() {
     let manifest = fmt_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("fmt_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("fmt_extension must spawn");
 
     let m = adapter.manifest();
     assert!(
@@ -193,8 +193,8 @@ fn fmt_process_file_changed_event_enqueues_path() {
     let recording = RecordingFormatQueue::new();
     let deps = make_deps_with_recording(recording.clone());
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("fmt_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("fmt_extension must spawn");
 
     let event = Event::FileChanged {
         file_id: 1,
@@ -225,8 +225,8 @@ fn fmt_process_tmp_write_path_not_forwarded() {
     let recording = RecordingFormatQueue::new();
     let deps = make_deps_with_recording(recording.clone());
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("fmt_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("fmt_extension must spawn");
 
     let event = Event::FileChanged {
         file_id: 2,
@@ -256,8 +256,8 @@ fn fmt_tool_with_path_enqueues_one_file() {
     let recording = RecordingFormatQueue::new();
     let deps = make_deps_with_recording(recording.clone());
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("fmt_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("fmt_extension must spawn");
 
     let result = adapter
         .call_tool("format", serde_json::json!({ "path": "src/lib.rs" }))
@@ -313,8 +313,8 @@ fn fmt_tool_without_path_enqueues_all_files() {
     let recording = RecordingFormatQueue::new();
     let deps = make_deps_with_fs_and_recording(fs, recording.clone());
 
-    let mut adapter =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("fmt_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
+        .expect("fmt_extension must spawn");
 
     let result = adapter
         .call_tool("format", serde_json::json!({}))

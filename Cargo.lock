@@ -284,6 +284,7 @@ dependencies = [
  "crossbeam-channel",
  "directories",
  "extension_protocol",
+ "extension_sidecar_harness",
  "ignore",
  "notify",
  "postcard",
@@ -402,6 +403,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "debug_extension"
+version = "0.1.0"
+dependencies = [
+ "extension_protocol",
+ "extension_sidecar_harness",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -484,6 +495,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "extension_sidecar_harness"
+version = "0.1.0"
+dependencies = [
+ "extension_protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -498,6 +519,14 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "fixture_crash_on_init"
 version = "0.1.0"
+
+[[package]]
+name = "fixture_debug_adapter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fixture_exit_nonzero"
@@ -906,6 +935,7 @@ version = "0.1.0"
 dependencies = [
  "core_engine",
  "extension_protocol",
+ "extension_sidecar_harness",
  "regex",
  "serde",
  "serde_json",
@@ -938,6 +968,7 @@ version = "0.1.0"
 dependencies = [
  "core_engine",
  "extension_protocol",
+ "extension_sidecar_harness",
  "ignore",
  "serde",
  "serde_json",

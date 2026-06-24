@@ -38,3 +38,37 @@
 {"ts":1782212312,"op":"assert","clause":"arch_convention('conv_daemon_wire', 'daemon socket protocol', 'daemon socket clients send one newline-delimited JSON handshake first, and protocol version changes require bumping PROTOCOL_VERSION', 'feature_f001_directory_listing')"}
 {"ts":1782212313,"op":"retractall","clause":"arch_convention('conv_daemon_idle_config', _, _, _)"}
 {"ts":1782212313,"op":"assert","clause":"arch_convention('conv_daemon_idle_config', 'daemon config', '[daemon].idle_timeout_secs defaults to 30 seconds and unknown daemon config keys are rejected', 'feature_f001_directory_listing')"}
+{"ts":1782295005,"op":"retractall","clause":"arch_component(_,_,_,'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295005,"op":"retractall","clause":"arch_port(_,_,'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295006,"op":"retractall","clause":"arch_decision(_,_,_,_,'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295006,"op":"retractall","clause":"arch_convention(_,_,_,'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295006,"op":"retractall","clause":"arch_adr(_,_,'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295006,"op":"retractall","clause":"arch_feature('feature_f004_interactive_debug_session_sidecar',_,_)"}
+{"ts":1782295007,"op":"retractall","clause":"arch_component('config', _, _, _)"}
+{"ts":1782295007,"op":"assert","clause":"arch_component('config', infrastructure, '', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295007,"op":"retractall","clause":"arch_component('daemon', _, _, _)"}
+{"ts":1782295007,"op":"assert","clause":"arch_component('daemon', infrastructure, '', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295007,"op":"retractall","clause":"arch_component('extension', _, _, _)"}
+{"ts":1782295007,"op":"assert","clause":"arch_component('extension', infrastructure, '', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295007,"op":"retractall","clause":"arch_component('mcp', _, _, _)"}
+{"ts":1782295007,"op":"assert","clause":"arch_component('mcp', infrastructure, '', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295008,"op":"retractall","clause":"arch_decision('dec_debug_sidecar_owned', _, _, _, _, _, _, _, _)"}
+{"ts":1782295008,"op":"assert","clause":"arch_decision('dec_debug_sidecar_owned', 'debug runtime placement', 'keep DAP adapters, debuggee lifecycle, session state, output buffering, and cleanup inside the debug sidecar', 'preserves the host/domain boundary and uses existing extension supervision for fault isolation instead of moving debugger runtime state into core_engine', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295008,"op":"retractall","clause":"arch_decision('dec_debug_opt_in_host_config', _, _, _, _, _, _, _)"}
+{"ts":1782295008,"op":"assert","clause":"arch_decision('dec_debug_opt_in_host_config', 'debug capability gating', 'make debug tools available only when host-parsed debug config exists and the extension is not disabled', 'debugging executes user code and process control, so capability discovery must be explicit, auditable, and absent by default', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295008,"op":"retractall","clause":"arch_decision('dec_extension_init_config_payload', _, _, _, _, _)"}
+{"ts":1782295008,"op":"assert","clause":"arch_decision('dec_extension_init_config_payload', 'extension initialization config', 'add optional per-extension initialize config payloads serialized by the host', 'host-parsed config can reach sidecars without sidecars rereading workspace config, while omitting the field keeps existing extension initialize messages backward compatible', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295008,"op":"retractall","clause":"arch_decision('dec_shared_sidecar_harness', _, _, _, _, _, _, _)"}
+{"ts":1782295008,"op":"assert","clause":"arch_decision('dec_shared_sidecar_harness', 'sidecar JSON-RPC loop reuse', 'extract shared JSON-RPC helpers for responses, HostCall ids, and queued inbound frames', 'F004 would otherwise be a third hand-rolled sidecar loop, and consistent queued-frame behavior avoids known HostCall multiplexing deadlocks', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295009,"op":"retractall","clause":"arch_decision('dec_debug_runtime_error_payloads', _, _, _, _)"}
+{"ts":1782295009,"op":"assert","clause":"arch_decision('dec_debug_runtime_error_payloads', 'debug tool error handling', 'return expected runtime failures as successful tool payloads with stable debug error codes', 'clients can branch on predictable session and runtime states while malformed parameters still use protocol-level invalid-params errors', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295009,"op":"retractall","clause":"arch_convention('conv_debug_config_shape', _, _, _, _, _, _)"}
+{"ts":1782295009,"op":"assert","clause":"arch_convention('conv_debug_config_shape', 'config/debug', 'parse debug adapter settings as strict per-language [debug.<language>] entries with non-empty command, adapter_type, extension names without leading dots, and positive timeout and idle TTL seconds', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295009,"op":"retractall","clause":"arch_convention('conv_debug_no_workspace_writes', _, _, _)"}
+{"ts":1782295009,"op":"assert","clause":"arch_convention('conv_debug_no_workspace_writes', 'extensions/debug', 'debug extensions must not declare workspace mutation capabilities', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295009,"op":"retractall","clause":"arch_convention('conv_debug_sessions_ephemeral', _, _, _, _, _)"}
+{"ts":1782295009,"op":"assert","clause":"arch_convention('conv_debug_sessions_ephemeral', 'extensions/debug', 'debug session ids are ephemeral and must return session-not-found after termination, expiry, or extension restart', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295010,"op":"retractall","clause":"arch_convention('conv_debug_inspection_requires_stop', _, _, _, _, _)"}
+{"ts":1782295010,"op":"assert","clause":"arch_convention('conv_debug_inspection_requires_stop', 'extensions/debug', 'stack, variables, and evaluate require a stopped session and return not-stopped while the debuggee is running', 'feature_f004_interactive_debug_session_sidecar')"}
+{"ts":1782295010,"op":"retractall","clause":"arch_convention('conv_sidecar_hostcall_queue', _, _, _)"}
+{"ts":1782295010,"op":"assert","clause":"arch_convention('conv_sidecar_hostcall_queue', 'extension sidecars', 'sidecars that await HostCall responses must queue inbound host requests and replay them instead of discarding non-matching frames', 'feature_f004_interactive_debug_session_sidecar')"}

@@ -8,8 +8,10 @@
 //! Absent file → `TowerConfig::default()` (silent). Present but unreadable or
 //! invalid (bad TOML / unknown key) → `Err` → the binary fails fast (exit 1).
 
+pub mod debug;
 pub mod lint;
 pub mod lsp;
+pub use debug::{DebugConfig, DebugLanguageConfig};
 pub use lint::{LintCommandConfig, LintConfig, ParserFormat, TargetMode};
 pub use lsp::{LspConfig, LspServerConfig, parse_lsp_config};
 
@@ -35,6 +37,8 @@ pub struct TowerConfig {
     pub lsp: LspConfig,
     #[serde(default)]
     pub lint: LintConfig,
+    #[serde(default)]
+    pub debug: DebugConfig,
     /// `[extensions]` section — sidecar extension runtime settings (spec 24).
     ///
     /// Absent → `ExtensionConfig::default()` (30-second timeout).
