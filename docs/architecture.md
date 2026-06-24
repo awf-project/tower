@@ -108,6 +108,11 @@ extensions/                Native sidecar extensions (separate binaries)
 │                          Tools: check, fix; runs configured external linters
 │                                 read-only and applies structured fixes through
 │                                 manifest-gated host apply-edits
+├── debug/                 Debug Adapter Protocol bridge extension (lazy, opt-in)
+│                          Tools: launch, set_breakpoints, continue, step, pause,
+│                                 threads, stack, variables, evaluate, terminate,
+│                                 disconnect, sessions
+│                          Owns adapter/debuggee processes and ephemeral sessions
 └── fixtures/              Test-only fault-isolation fixtures
 ```
 

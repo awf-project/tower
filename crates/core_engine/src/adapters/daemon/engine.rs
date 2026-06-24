@@ -16,8 +16,8 @@ use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_works
 use crate::adapters::config::{TowerConfig, legacy_plugins_dir_fallback};
 use crate::adapters::extension::host_deps::ApplyEditsHostPort;
 use crate::adapters::extension::{
-    HostDeps as ExtensionHostDeps, global_extensions_dir, load_extensions_into_shared_registry,
-    resolve_extension_dirs,
+    ExtensionInitConfigMap, ExtensionSupervisor, HostDeps as ExtensionHostDeps,
+    global_extensions_dir, load_extensions_into_shared_registry, resolve_extension_dirs,
 };
 use crate::adapters::fs::scan::reconcile_pruned;
 use crate::adapters::fs::{RealFs, workspace_scan};
@@ -26,16 +26,18 @@ use crate::adapters::mcp::diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader
 use crate::adapters::mcp::native_tools::EngineState;
 use crate::adapters::watcher::NotifyWatcherAdapter;
 use crate::domain::DomainError;
-use crate::domain::extension_host::ExtensionRegistry;
+use crate::domain::extension_host::{ExtensionRegistry, RegistrationError};
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::FileMutationService;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{FileId, RelativePath};
 use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest, FileMutationUseCase};
 use crate::ports::{AstIndexPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
+use extension_protocol::ExtensionManifest;
 
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
 type FormatterEchoSet = Arc<Mutex<HashMap<String, ()>>>;
+const BUNDLED_DEBUG_MANIFEST: &str = include_str!("../../../../../extensions/debug/extension.toml");
 
 struct EngineApplyEditsHost {
     state: Arc<RwLock<EngineState>>,
@@ -286,7 +288,7 @@ fn load_extension_registry(
     ext_registry: &Arc<RwLock<ExtensionRegistry>>,
     ext_ast_index: Arc<dyn AstIndexPort + Send + Sync>,
     format_queue: Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>,
-) -> mpsc::Receiver<PushEvent> {
+) -> Result<mpsc::Receiver<PushEvent>, String> {
     let (push_tx, push_rx) = mpsc::channel::<PushEvent>();
     let extensions_dir_local = workspace_root.join(".tower/extensions");
     let plugins_dir_legacy = workspace_root.join(".tower/plugins");
@@ -327,13 +329,26 @@ fn load_extension_registry(
         push_tx: Some(push_tx),
     };
 
+    let mut init_configs = ExtensionInitConfigMap::new();
+    if let Some(debug_config) = tower_config.debug.for_extension_initialize() {
+        init_configs.insert("debug".to_owned(), debug_config);
+    }
+
     load_extensions_into_shared_registry(
         ext_registry,
         &extension_dirs,
-        ext_deps,
+        ext_deps.clone(),
         tower_config.extensions.request_timeout(),
         &tower_config.extensions.disabled,
+        &init_configs,
     );
+
+    register_bundled_debug_extension(
+        ext_registry,
+        ext_deps,
+        tower_config.extensions.request_timeout(),
+        tower_config,
+    )?;
     let ext_tool_count = ext_registry
         .read()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -349,7 +364,62 @@ fn load_extension_registry(
             scopes.join(", ")
         );
     }
-    push_rx
+    Ok(push_rx)
+}
+
+fn register_bundled_debug_extension(
+    ext_registry: &Arc<RwLock<ExtensionRegistry>>,
+    ext_deps: ExtensionHostDeps,
+    request_timeout: std::time::Duration,
+    tower_config: &TowerConfig,
+) -> Result<(), String> {
+    if tower_config.debug.is_empty()
+        || tower_config
+            .extensions
+            .disabled
+            .iter()
+            .any(|name| name == "debug")
+    {
+        return Ok(());
+    }
+
+    let mut manifest: ExtensionManifest = match toml::from_str(BUNDLED_DEBUG_MANIFEST) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return Err(format!("invalid bundled debug extension manifest: {err}"));
+        }
+    };
+
+    if let Some(command) = debug_extension_binary_path()
+        && let Some(argv0) = manifest.command.first_mut()
+    {
+        *argv0 = command;
+    }
+
+    let instance = Box::new(ExtensionSupervisor::new(
+        manifest,
+        ext_deps,
+        request_timeout,
+        tower_config.debug.for_extension_initialize(),
+    ));
+    let mut guard = ext_registry
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match guard.register(instance) {
+        Ok(()) | Err(RegistrationError::DuplicateName(_)) => Ok(()),
+    }
+}
+
+fn debug_extension_binary_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let bin_dir = if exe_dir.file_name().is_some_and(|name| name == "deps") {
+        exe_dir.parent()?
+    } else {
+        exe_dir
+    };
+    let bin = bin_dir.join(format!("debug_extension{}", std::env::consts::EXE_SUFFIX));
+    bin.exists().then(|| bin.to_string_lossy().into_owned())
 }
 
 fn inject_extension_host(
@@ -473,7 +543,7 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         &ext_registry,
         ext_ast_index,
         format_queue,
-    );
+    )?;
     let _watcher = start_watcher(
         &workspace_root,
         &state,

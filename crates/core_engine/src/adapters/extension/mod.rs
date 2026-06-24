@@ -61,8 +61,9 @@ mod supervisor_tests;
 mod tests;
 
 pub use discovery::{
-    ManifestLoadError, Shadow, global_extensions_dir, load_extensions_into_existing_registry,
-    load_extensions_into_registry, load_extensions_into_shared_registry, resolve_extension_dirs,
+    ExtensionInitConfigMap, ManifestLoadError, Shadow, global_extensions_dir,
+    load_extensions_into_existing_registry, load_extensions_into_registry,
+    load_extensions_into_shared_registry, resolve_extension_dirs,
 };
 pub use host_deps::HostDeps;
 pub use sidecar::SidecarHostAdapter;

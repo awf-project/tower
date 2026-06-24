@@ -111,6 +111,31 @@ struct PendingSlot {
     state: SlotState,
 }
 
+struct InitializeError {
+    fault: ExtensionFault,
+    reader_thread: Option<JoinHandle<()>>,
+}
+
+impl InitializeError {
+    fn before_reader(fault: ExtensionFault) -> Self {
+        Self {
+            fault,
+            reader_thread: None,
+        }
+    }
+
+    fn after_reader(fault: ExtensionFault, reader_thread: JoinHandle<()>) -> Self {
+        Self {
+            fault,
+            reader_thread: Some(reader_thread),
+        }
+    }
+
+    fn into_parts(self) -> (ExtensionFault, Option<JoinHandle<()>>) {
+        (self.fault, self.reader_thread)
+    }
+}
+
 // ── SidecarHostAdapter ────────────────────────────────────────────────────────
 
 /// Implements [`ExtensionInstance`] over a child process speaking JSON-RPC 2.0
@@ -178,6 +203,18 @@ impl SidecarHostAdapter {
         manifest: ExtensionManifest,
         deps: HostDeps,
         request_timeout: Duration,
+        extension_config: Option<Value>,
+    ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault> {
+        Self::spawn_with_config(manifest, deps, request_timeout, extension_config)
+    }
+
+    /// Spawn the extension and include host-provided extension configuration in
+    /// the `initialize` request.
+    pub fn spawn_with_config(
+        manifest: ExtensionManifest,
+        deps: HostDeps,
+        request_timeout: Duration,
+        extension_config: Option<Value>,
     ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault> {
         let argv = &manifest.command;
         if argv.is_empty() {
@@ -218,14 +255,22 @@ impl SidecarHostAdapter {
 
         // Perform the initialize handshake before starting the reader loop.
         // We read directly from stdout here (single-threaded, before reader starts).
-        let (init_result, reader_thread) = Self::do_initialize(
+        let (init_result, reader_thread) = match Self::do_initialize(
             &stdin,
             stdout,
             Arc::clone(&pending),
             deps,
             &manifest,
             request_timeout,
-        )?;
+            extension_config,
+        ) {
+            Ok(initialized) => initialized,
+            Err(err) => {
+                let (fault, reader_thread) = err.into_parts();
+                Self::cleanup_failed_initialize(&mut child, reader_thread);
+                return Err(fault);
+            }
+        };
 
         // Reconstruct the manifest using the extension's declared tools/events/capabilities.
         let final_manifest = ExtensionManifest {
@@ -273,26 +318,32 @@ impl SidecarHostAdapter {
         deps: HostDeps,
         manifest: &ExtensionManifest,
         request_timeout: Duration,
-    ) -> Result<(InitResult, JoinHandle<()>), ExtensionFault> {
+        extension_config: Option<Value>,
+    ) -> Result<(InitResult, JoinHandle<()>), InitializeError> {
         // Send the initialize request (id = 0).
         let params = serde_json::to_value(InitParams {
             protocol_version: PROTOCOL_VERSION,
             client_info: "tower-host/0.1.0".to_owned(),
+            extension_config,
         })
-        .map_err(|e| ExtensionFault::ProtocolError {
-            message: format!("serialize InitParams: {e}"),
+        .map_err(|e| {
+            InitializeError::before_reader(ExtensionFault::ProtocolError {
+                message: format!("serialize InitParams: {e}"),
+            })
         })?;
 
         {
             let frame = encode_request(0, "initialize", params);
-            let mut guard = stdin.lock().map_err(|_| ExtensionFault::ProtocolError {
-                message: "stdin mutex poisoned".to_owned(),
+            let mut guard = stdin.lock().map_err(|_| {
+                InitializeError::before_reader(ExtensionFault::ProtocolError {
+                    message: "stdin mutex poisoned".to_owned(),
+                })
             })?;
-            guard
-                .write_all(frame.as_bytes())
-                .map_err(|e| ExtensionFault::ProtocolError {
+            guard.write_all(frame.as_bytes()).map_err(|e| {
+                InitializeError::before_reader(ExtensionFault::ProtocolError {
                     message: format!("write initialize: {e}"),
-                })?;
+                })
+            })?;
         }
 
         // Set up the pending slot for id=0 before starting the reader.
@@ -325,13 +376,23 @@ impl SidecarHostAdapter {
         // Wait for the Initialized response (id=0) — with timeout (spec 24 U1).
         // We do NOT have a `Child` handle here so we cannot kill on timeout during
         // initialize; instead we return `Timeout` and the caller must drop/kill.
-        let raw = Self::wait_response_timed(&pending, request_timeout, None)?;
+        let raw = match Self::wait_response_timed(&pending, request_timeout, None) {
+            Ok(raw) => raw,
+            Err(fault) => return Err(InitializeError::after_reader(fault, reader)),
+        };
 
         // Parse the Response from the result value.
-        let response: Response =
-            serde_json::from_value(raw).map_err(|e| ExtensionFault::ProtocolError {
-                message: format!("parse Initialized response: {e}"),
-            })?;
+        let response: Response = match serde_json::from_value(raw) {
+            Ok(response) => response,
+            Err(e) => {
+                return Err(InitializeError::after_reader(
+                    ExtensionFault::ProtocolError {
+                        message: format!("parse Initialized response: {e}"),
+                    },
+                    reader,
+                ));
+            }
+        };
 
         match response {
             Response::Initialized(init_result) => {
@@ -342,12 +403,26 @@ impl SidecarHostAdapter {
                 // this arm.
                 Ok((init_result, reader))
             }
-            Response::Error(err) => Err(ExtensionFault::ProtocolError {
-                message: format!("initialize rejected: {} (code {})", err.message, err.code),
-            }),
-            other => Err(ExtensionFault::ProtocolError {
-                message: format!("expected Initialized, got: {other:?}"),
-            }),
+            Response::Error(err) => Err(InitializeError::after_reader(
+                ExtensionFault::ProtocolError {
+                    message: format!("initialize rejected: {} (code {})", err.message, err.code),
+                },
+                reader,
+            )),
+            other => Err(InitializeError::after_reader(
+                ExtensionFault::ProtocolError {
+                    message: format!("expected Initialized, got: {other:?}"),
+                },
+                reader,
+            )),
+        }
+    }
+
+    fn cleanup_failed_initialize(child: &mut Child, reader_thread: Option<JoinHandle<()>>) {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(handle) = reader_thread {
+            let _ = handle.join();
         }
     }
 

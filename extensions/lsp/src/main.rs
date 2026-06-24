@@ -56,6 +56,7 @@ use std::sync::{Arc, Mutex};
 use extension_protocol::{
     Capability, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response, ToolDecl,
 };
+use protocol::{HostCallIdAllocator, QueuedFrame};
 use serde_json::Value;
 
 use session::LspSessionPool;
@@ -68,10 +69,10 @@ fn main() {
     let mut lines = BufReader::new(io::stdin()).lines();
 
     // Incremental host-call id counter — start well away from any host request ids.
-    let mut next_hcall_id: u64 = 10_000;
+    let mut host_call_ids = HostCallIdAllocator::new(10_000);
 
     // Pending frames that arrived while waiting for a HostCall response.
-    let mut deferred: VecDeque<(Option<Value>, String, Value)> = VecDeque::new();
+    let mut deferred: VecDeque<QueuedFrame> = VecDeque::new();
 
     // Session pool — populated after initialize.
     let mut pool: Option<LspSessionPool> = None;
@@ -106,21 +107,23 @@ fn main() {
                     if is_response {
                         continue;
                     }
-                    let id = envelope.get("id").cloned();
-                    let method = envelope
-                        .get("method")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let params = envelope.get("params").cloned().unwrap_or(Value::Null);
-                    Some((id, method, params))
+                    protocol::frame_from_envelope(envelope)
                 }
                 Some(Err(_)) | None => break,
             }
         };
 
-        let Some((id, method, params_val)) = frame_opt else {
+        let Some(frame) = frame_opt else {
             break;
+        };
+
+        let QueuedFrame::Request {
+            id,
+            method,
+            params: params_val,
+        } = frame
+        else {
+            continue;
         };
 
         match method.as_str() {
@@ -233,7 +236,7 @@ fn main() {
                         &workspace_root,
                         &stdout_lock,
                         &mut lines,
-                        &mut next_hcall_id,
+                        &mut host_call_ids,
                         &mut deferred,
                     )
                 } else {

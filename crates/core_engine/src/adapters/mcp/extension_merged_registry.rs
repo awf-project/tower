@@ -178,7 +178,7 @@ fn invoke_error_to_tool_error(err: InvokeError) -> ToolError {
     match err {
         InvokeError::ToolNotFound(name) => ToolError::NotFound(name),
         InvokeError::Fault(fault) => {
-            ToolError::ExecutionFailed(format!("extension fault: {fault}"))
+            ToolError::ExecutionFailed(format!("extension fault: {fault:?}"))
         }
     }
 }

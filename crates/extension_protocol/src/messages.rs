@@ -40,6 +40,7 @@ use crate::manifest::{Capability, ToolDecl};
 /// let p = InitParams {
 ///     protocol_version: PROTOCOL_VERSION,
 ///     client_info: "tower-host/0.1.0".to_owned(),
+///     extension_config: None,
 /// };
 /// assert_eq!(p.protocol_version, PROTOCOL_VERSION);
 /// ```
@@ -49,6 +50,9 @@ pub struct InitParams {
     pub protocol_version: u32,
     /// Human-readable host identifier for logging/diagnostics.
     pub client_info: String,
+    /// Host-provided per-extension configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_config: Option<serde_json::Value>,
 }
 
 /// Result returned by the extension in response to `initialize`.
@@ -93,6 +97,7 @@ pub struct InitResult {
 /// let req = Request::Initialize(InitParams {
 ///     protocol_version: PROTOCOL_VERSION,
 ///     client_info: "host".to_owned(),
+///     extension_config: None,
 /// });
 /// let json = serde_json::to_string(&req).unwrap();
 /// let back: Request = serde_json::from_str(&json).unwrap();

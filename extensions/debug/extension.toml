@@ -1,0 +1,67 @@
+name       = "debug"
+version    = "0.1.0"
+command    = ["debug_extension"]
+activation = "lazy"
+
+[capabilities]
+required = []
+
+[[tools]]
+name        = "launch"
+description = "Launch a debug session."
+schema_json = '{"type":"object","properties":{"language":{"type":"string"},"program":{"type":"string"},"cwd":{"type":["string","null"]},"args":{"type":"array","items":{"type":"string"}},"env":{"type":"object","additionalProperties":{"type":"string"}},"launch_overrides":{"type":"object"}},"required":["language","program"],"additionalProperties":false}'
+
+[[tools]]
+name        = "set_breakpoints"
+description = "Set breakpoints for a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"path":{"type":"string"},"breakpoints":{"type":"array","items":{"type":"object","properties":{"line":{"type":"integer","minimum":0},"condition":{"type":["string","null"]},"hit_condition":{"type":["string","null"]}},"required":["line"],"additionalProperties":false}}},"required":["session_id","path","breakpoints"],"additionalProperties":false}'
+
+[[tools]]
+name        = "continue"
+description = "Continue a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":["integer","null"],"minimum":0},"timeout_secs":{"type":["integer","null"],"minimum":0}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "step"
+description = "Step a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":["integer","null"],"minimum":0},"timeout_secs":{"type":["integer","null"],"minimum":0}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "pause"
+description = "Pause a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":["integer","null"],"minimum":0}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "threads"
+description = "List debug session threads."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "stack"
+description = "Read a debug session stack."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"thread_id":{"type":"integer","minimum":0}},"required":["session_id","thread_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "variables"
+description = "Read debug session variables."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"variables_reference":{"type":"integer","minimum":0}},"required":["session_id","variables_reference"],"additionalProperties":false}'
+
+[[tools]]
+name        = "evaluate"
+description = "Evaluate an expression in a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"},"frame_id":{"type":"integer","minimum":0},"expression":{"type":"string"}},"required":["session_id","frame_id","expression"],"additionalProperties":false}'
+
+[[tools]]
+name        = "terminate"
+description = "Terminate a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "disconnect"
+description = "Disconnect from a debug session."
+schema_json = '{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"],"additionalProperties":false}'
+
+[[tools]]
+name        = "sessions"
+description = "List debug sessions."
+schema_json = '{"type":"object","properties":{},"additionalProperties":false}'

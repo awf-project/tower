@@ -17,6 +17,14 @@ extensions = ["rs"]
 format = "rustc-json"
 target = "none"
 
+[debug.rust]
+command = "target/debug/fixture_debug_adapter"
+args = []
+extensions = ["rs"]
+adapter_type = "fixture"
+default_timeout_secs = 5
+idle_ttl_secs = 300
+
 [extensions]
 # Plugin file stems to skip loading, e.g. ["ast"].
 # A disabled extension gets no sandbox, no fuel, no tools, no watcher hooks.

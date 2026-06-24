@@ -13,6 +13,10 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{
+    fs,
+    process::{Command, Stdio},
+};
 
 use serde_json::json;
 
@@ -22,8 +26,8 @@ use crate::adapters::formatter::NoOpFormatQueue;
 use crate::adapters::{InMemoryAstIndex, InMemoryFs};
 use crate::domain::RelativePath;
 use crate::ports::FileSystemPort;
-use extension_protocol::ExtensionManifest;
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
+use extension_protocol::{ExtensionFault, ExtensionManifest};
 
 /// Default timeout for spec 23 tests — long enough that cooperative extensions
 /// always respond well within it.
@@ -106,7 +110,7 @@ fn ac1_spawn_initialize_handshake_populates_tools() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let m = instance.manifest();
     assert_eq!(m.name, "test_helper");
@@ -129,6 +133,181 @@ fn ac1_spawn_initialize_handshake_populates_tools() {
     instance.shutdown();
 }
 
+#[test]
+fn sidecar_host_adapter_do_initialize_can_populate_the_new_field_without_changing_protocol_version_semantics()
+ {
+    let script = r#"
+        read -r line
+        ok=1
+        case "$line" in *'"method":"initialize"'*) ;; *) ok=0 ;; esac
+        case "$line" in *'"protocol_version":1'*) ;; *) ok=0 ;; esac
+        case "$line" in *'"extension_config"'*) ;; *) ok=0 ;; esac
+        case "$line" in *'"lldb-dap"'*) ;; *) ok=0 ;; esac
+        if [ "$ok" = 1 ]; then
+            echo '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[],"events":[],"capabilities":[]}}}'
+        else
+            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"initialize config missing or protocol version changed"}}'
+        fi
+    "#;
+    let manifest = ExtensionManifest {
+        name: "captures_initialize_config".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    };
+    let deps = make_deps(InMemoryFs::new());
+
+    let instance = SidecarHostAdapter::spawn_with_config(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(json!({
+            "languages": {
+                "rust": {
+                    "command": "lldb-dap"
+                }
+            }
+        })),
+    )
+    .expect("initialize request must include extension_config without changing protocol version");
+
+    assert!(instance.manifest().tools.is_empty());
+}
+
+#[test]
+fn sidecar_host_adapter_initialize_surfaces_extension_config_validation_errors() {
+    let script = r#"
+        read -r line
+        case "$line" in
+            *'"extension_config":["not-object"]'*)
+                echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"extension_config must be an object"}}'
+                ;;
+            *)
+                echo '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[],"events":[],"capabilities":[]}}}'
+                ;;
+        esac
+    "#;
+    let manifest = ExtensionManifest {
+        name: "rejects_bad_initialize_config".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    };
+    let deps = make_deps(InMemoryFs::new());
+
+    let result = SidecarHostAdapter::spawn_with_config(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(json!(["not-object"])),
+    );
+    let fault = match result {
+        Ok(mut instance) => {
+            instance.shutdown();
+            panic!("malformed extension_config must be rejected by the initializing extension");
+        }
+        Err(fault) => fault,
+    };
+
+    match fault {
+        ExtensionFault::ProtocolError { message } => {
+            assert!(
+                message.contains("extension_config"),
+                "fault must identify the invalid initialize config field: {message}"
+            );
+            assert!(
+                message.contains("object"),
+                "fault must preserve the extension's validation message: {message}"
+            );
+        }
+        other => panic!("expected protocol error for invalid extension_config, got {other:?}"),
+    }
+}
+
+#[test]
+fn spawn_with_config_reaps_child_when_initialize_is_rejected() {
+    let pid_file = tempfile::NamedTempFile::new().expect("pid file must be creatable");
+    let pid_path = pid_file.path().to_owned();
+    let script = r#"
+        printf '%s\n' "$$" > "$1"
+        read -r _line
+        echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32602,"message":"extension_config must be an object"}}'
+        while true; do sleep 1; done
+    "#;
+    let manifest = ExtensionManifest {
+        name: "rejects_initialize_and_keeps_running".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "rejects_initialize_and_keeps_running".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        ],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    };
+    let deps = make_deps(InMemoryFs::new());
+
+    let result = SidecarHostAdapter::spawn_with_config(
+        manifest,
+        deps,
+        Duration::from_secs(2),
+        Some(json!(["not-object"])),
+    );
+    match result {
+        Err(ExtensionFault::ProtocolError { .. }) => {}
+        Err(other) => {
+            panic!("initialize rejection must surface as a protocol error, got {other:?}")
+        }
+        Ok(mut instance) => {
+            instance.shutdown();
+            panic!("initialize rejection must not produce a live extension instance");
+        }
+    }
+
+    let pid_text = fs::read_to_string(&pid_path).expect("sidecar must record its pid");
+    let pid = pid_text
+        .trim()
+        .parse::<u32>()
+        .expect("pid file must contain a process id");
+    for _ in 0..20 {
+        if !process_is_running(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    terminate_process(pid);
+    panic!("initialize rejection must kill and reap the sidecar process {pid}");
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn terminate_process(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status();
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // AC2: Tool round-trip (echo) via invokeTool
 // ═════════════════════════════════════════════════════════════════════════════
@@ -141,7 +320,7 @@ fn u3_call_tool_echo_round_trip() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let params = json!({"message": "hello"});
     let result = instance
@@ -170,7 +349,7 @@ fn ac2_read_file_capability_through_filesystem_port() {
     let deps = make_deps(fs);
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let result = instance
         .call_tool("read_file", json!({"path": "hello.txt"}))
@@ -197,7 +376,7 @@ fn ac3_dotdot_traversal_path_is_denied() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     // The "read_bad_path" tool calls readFile with whatever path we give it.
     // With "../secret" the host should deny it.
@@ -228,7 +407,7 @@ fn ac3_absolute_path_is_denied() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let result = instance.call_tool("read_bad_path", json!({"path": "/etc/passwd"}));
 
@@ -247,7 +426,7 @@ fn ac3_empty_path_is_denied() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let result = instance.call_tool("read_bad_path", json!({"path": ""}));
 
@@ -304,7 +483,7 @@ fn ac4_protocol_version_mismatch_is_rejected() {
     };
     let deps = make_deps(InMemoryFs::new());
 
-    let result = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT);
+    let result = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None);
 
     let fault = result
         .err()
@@ -330,7 +509,7 @@ fn ac5_index_put_get_round_trip_through_ast_index_port() {
     let deps = make_deps_with_index(InMemoryFs::new(), index);
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     // The "index_roundtrip" tool calls index/put{key,value} then index/get{key}
     // and returns the retrieved bytes.
@@ -368,7 +547,7 @@ fn u3_deliver_event_receives_ack() {
     let deps = make_deps(InMemoryFs::new());
 
     let mut instance =
-        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT).expect("spawn must succeed");
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let event = extension_protocol::Event::FileIndexed {
         file_id: 42,

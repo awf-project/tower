@@ -81,6 +81,7 @@ write is rejected with `PreconditionFailed` if the file changed since it was rea
 | `tower_global_replace` | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
 | `tower_create_directory` | Recursive `mkdir`. |
 | `tower_delete_file` | Delete a file. |
+| `tower_list_dir` | List indexed files and synthesized directories under a workspace-relative directory path. |
 | `tower_find_file` | Match a substring/fuzzy `query` against file paths. |
 | `tower_search_text` | Grep `pattern` across all indexed file contents. |
 | `tower_reindex` | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete). |
@@ -109,6 +110,37 @@ Positions are **0-based** `line` + **UTF-16** `character` offset.
 | `tower_lsp_references` | Find all references to the symbol at a position. |
 | `tower_lsp_hover` | Hover info for the symbol at a position. |
 | `tower_lsp_diagnostics` | Errors/warnings for a file. |
+
+### Debug — interactive sessions (`debug` extension, spec 33)
+
+Opt-in; tools appear only when `[debug.<language>]` is configured and the `debug` extension is
+enabled. A discovered `debug` extension takes priority; otherwise the bundled sidecar is used when
+`debug_extension` is available next to `tower`.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_debug_launch` | Launch a configured Debug Adapter Protocol session; returns `session_id` and initial stop state. |
+| `tower_debug_set_breakpoints` | Replace the breakpoint set for a source path within a session. |
+| `tower_debug_continue` | Resume execution until stop, termination, or timeout. |
+| `tower_debug_step` | Step execution for a session/thread until the adapter reports a stop. |
+| `tower_debug_pause` | Pause a running session/thread. |
+| `tower_debug_threads` | List threads for a debug session. |
+| `tower_debug_stack` | Read stack frames for a thread. |
+| `tower_debug_variables` | Read variables for a DAP variables reference. |
+| `tower_debug_evaluate` | Evaluate an expression in a stack frame. |
+| `tower_debug_terminate` | Terminate a debug session and clean up the adapter process. |
+| `tower_debug_disconnect` | Disconnect from a debug session. |
+| `tower_debug_sessions` | List active debug sessions and their last known state. |
+
+### Linting (`lint` extension)
+
+Runs configured linters from `.tower/config.toml`; unsupported paths return a successful unsupported
+result rather than a transport error.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_lint_check` | Run configured linters for one workspace-relative path, or all supported indexed files when `path` is omitted. |
+| `tower_lint_fix` | Apply structured lint fixes for one path or all supported indexed files; supports `dry_run` and `unsafe`. |
 
 ### Formatting
 
@@ -252,6 +284,7 @@ Mutating tools accept an optional `expected_version` (hex SHA-256 from a prior `
 | `tower_global_replace` | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
 | `tower_create_directory` | Recursive `mkdir`. |
 | `tower_delete_file` | Delete a file. |
+| `tower_list_dir` | List indexed files and synthesized directories under a workspace-relative directory path. |
 | `tower_find_file` | Match a substring/fuzzy `query` against file paths. |
 | `tower_search_text` | Grep `pattern` across all indexed file contents. |
 | `tower_reindex` | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete). |
@@ -280,6 +313,37 @@ Positions are **0-based** `line` + **UTF-16** `character` offset.
 | `tower_lsp_references` | Find all references to the symbol at a position. |
 | `tower_lsp_hover` | Hover info for the symbol at a position. |
 | `tower_lsp_diagnostics` | Errors/warnings for a file. |
+
+### Debug — interactive sessions (`debug` extension)
+
+Opt-in; tools appear only when `[debug.<language>]` is configured and the `debug` extension is
+enabled. A discovered `debug` extension takes priority; otherwise the bundled sidecar is used when
+`debug_extension` is available next to `tower`.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_debug_launch` | Launch a configured Debug Adapter Protocol session; returns `session_id` and initial stop state. |
+| `tower_debug_set_breakpoints` | Replace the breakpoint set for a source path within a session. |
+| `tower_debug_continue` | Resume execution until stop, termination, or timeout. |
+| `tower_debug_step` | Step execution for a session/thread until the adapter reports a stop. |
+| `tower_debug_pause` | Pause a running session/thread. |
+| `tower_debug_threads` | List threads for a debug session. |
+| `tower_debug_stack` | Read stack frames for a thread. |
+| `tower_debug_variables` | Read variables for a DAP variables reference. |
+| `tower_debug_evaluate` | Evaluate an expression in a stack frame. |
+| `tower_debug_terminate` | Terminate a debug session and clean up the adapter process. |
+| `tower_debug_disconnect` | Disconnect from a debug session. |
+| `tower_debug_sessions` | List active debug sessions and their last known state. |
+
+### Linting (`lint` extension)
+
+Runs configured linters from `.tower/config.toml`; unsupported paths return a successful unsupported
+result rather than a transport error.
+
+| Tool | Purpose |
+|------|---------|
+| `tower_lint_check` | Run configured linters for one workspace-relative path, or all supported indexed files when `path` is omitted. |
+| `tower_lint_fix` | Apply structured lint fixes for one path or all supported indexed files; supports `dry_run` and `unsafe`. |
 
 ### Formatting
 

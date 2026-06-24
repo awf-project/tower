@@ -1,9 +1,8 @@
 #![allow(clippy::pedantic)]
 
-#[path = "../src/protocol.rs"]
-mod protocol;
-
-use protocol::{CheckRequest, CheckResult, LintDiagnosticDto, LintToolErrorResponse, QueuedFrame};
+use lint_extension::protocol::{
+    CheckRequest, CheckResult, LintDiagnosticDto, LintToolErrorResponse, QueuedFrame,
+};
 use serde_json::json;
 
 #[test]

@@ -36,6 +36,7 @@
 //! let req = Request::Initialize(InitParams {
 //!     protocol_version: PROTOCOL_VERSION,
 //!     client_info: "tower-host/0.1.0".to_owned(),
+//!     extension_config: None,
 //! });
 //! let json = serde_json::to_string(&req).unwrap();
 //! assert!(json.contains("Initialize"));
