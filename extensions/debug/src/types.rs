@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DebugSessionId(pub String);
@@ -75,6 +76,21 @@ pub struct DebugOutput {
     pub text: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct RuntimeFailureResult {
+    pub ok: bool,
+    pub error: RuntimeFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct RuntimeFailure {
+    pub code: String,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", content = "message")]
 pub enum DebugRuntimeError {
@@ -88,6 +104,8 @@ pub enum DebugRuntimeError {
     AdapterExited(String),
     #[serde(rename = "launch-failed")]
     LaunchFailed(String),
+    #[serde(rename = "reverse_unsupported")]
+    ReverseUnsupported(String),
 }
 
 #[cfg(test)]
@@ -232,6 +250,10 @@ mod tests {
             (
                 DebugRuntimeError::LaunchFailed("launch failed".to_owned()),
                 json!({ "code": "launch-failed", "message": "launch failed" }),
+            ),
+            (
+                DebugRuntimeError::ReverseUnsupported("reverse_unsupported".to_owned()),
+                json!({ "code": "reverse_unsupported", "message": "reverse_unsupported" }),
             ),
         ];
 

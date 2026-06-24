@@ -12,6 +12,10 @@ mod types;
 mod protocol;
 
 #[allow(dead_code)]
+#[path = "../src/traces.rs"]
+mod traces;
+
+#[allow(dead_code)]
 #[path = "../src/session.rs"]
 mod session;
 
@@ -19,8 +23,8 @@ mod session;
 mod eval_at;
 
 use eval_at::{
-    CaptureOptions, EvalAtExpressionResult, EvalAtFinished, EvalAtHit, EvalAtHitMode,
-    EvalAtRequest, EvalAtResult,
+    CaptureOptions, CapturedVariable, EvalAtExpressionResult, EvalAtFinished, EvalAtHit,
+    EvalAtHitMode, EvalAtRequest, EvalAtResult,
 };
 
 #[test]
@@ -77,6 +81,47 @@ fn eval_at_request_defaults_and_result_serialization() {
         })
     );
     assert_object_has_no_key_recursively(&result_json, "session_id");
+}
+
+#[test]
+fn eval_at_captured_variable_serialization_and_truncation_semantics_remain_compatible_after_origin_capture_helper_extraction()
+ {
+    let captured = CapturedVariable {
+        name: "root".to_owned(),
+        value: "{...}".to_owned(),
+        r#type: Some("Fixture".to_owned()),
+        children: vec![CapturedVariable {
+            name: "child".to_owned(),
+            value: "1".to_owned(),
+            r#type: Some("i32".to_owned()),
+            children: Vec::new(),
+            truncated: false,
+        }],
+        truncated: true,
+    };
+
+    let value = serde_json::to_value(&captured).unwrap();
+
+    assert_eq!(
+        value,
+        json!({
+            "name": "root",
+            "value": "{...}",
+            "type": "Fixture",
+            "children": [{
+                "name": "child",
+                "value": "1",
+                "type": "i32",
+                "children": [],
+                "truncated": false
+            }],
+            "truncated": true
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<CapturedVariable>(value).unwrap(),
+        captured
+    );
 }
 
 fn assert_object_has_no_key_recursively(value: &Value, forbidden_key: &str) {

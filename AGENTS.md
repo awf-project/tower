@@ -111,11 +111,13 @@ Positions are **0-based** `line` + **UTF-16** `character` offset.
 | `tower_lsp_hover` | Hover info for the symbol at a position. |
 | `tower_lsp_diagnostics` | Errors/warnings for a file. |
 
-### Debug — interactive sessions (`debug` extension, spec 33)
+### Debug — interactive sessions and reverse debugging (`debug` extension, spec 33)
 
 Opt-in; tools appear only when `[debug.<language>]` is configured and the `debug` extension is
 enabled. A discovered `debug` extension takes priority; otherwise the bundled sidecar is used when
-`debug_extension` is available next to `tower`.
+`debug_extension` is available next to `tower`. rr-backed record/replay tools appear only when
+`[debug.record] backend = "rr"` is configured; unsupported rr hosts return structured tool payloads
+rather than transport errors.
 
 | Tool | Purpose |
 |------|---------|
@@ -128,6 +130,16 @@ enabled. A discovered `debug` extension takes priority; otherwise the bundled si
 | `tower_debug_stack` | Read stack frames for a thread. |
 | `tower_debug_variables` | Read variables for a DAP variables reference. |
 | `tower_debug_evaluate` | Evaluate an expression in a stack frame. |
+| `tower_debug_eval_at` | Run a stateless one-shot breakpoint probe and capture bounded stack/variable evidence. |
+| `tower_debug_record` | Record one native execution through rr and register a trace. |
+| `tower_debug_replay` | Open a replay-backed debug session for a recorded trace. |
+| `tower_debug_reverse_continue` | Continue a replay session backward until a stop, trace start, or timeout. |
+| `tower_debug_step_back` | Step a replay session backward by line, instruction, or over granularity. |
+| `tower_debug_watchpoint` | Set a replay-session data watchpoint by expression or address. |
+| `tower_debug_traces` | List recorded debug traces known to the sidecar trace store. |
+| `tower_debug_delete_trace` | Delete a recorded trace by id, contained to the configured trace root. |
+| `tower_debug_find_origin` | Open replay, seek, set a write watchpoint, reverse-continue, capture origin evidence, and clean up. |
+| `tower_debug_record_and_find_origin` | Record a trace and immediately run the origin-finding recipe against it. |
 | `tower_debug_terminate` | Terminate a debug session and clean up the adapter process. |
 | `tower_debug_disconnect` | Disconnect from a debug session. |
 | `tower_debug_sessions` | List active debug sessions and their last known state. |
@@ -314,11 +326,13 @@ Positions are **0-based** `line` + **UTF-16** `character` offset.
 | `tower_lsp_hover` | Hover info for the symbol at a position. |
 | `tower_lsp_diagnostics` | Errors/warnings for a file. |
 
-### Debug — interactive sessions (`debug` extension)
+### Debug — interactive sessions and reverse debugging (`debug` extension)
 
 Opt-in; tools appear only when `[debug.<language>]` is configured and the `debug` extension is
 enabled. A discovered `debug` extension takes priority; otherwise the bundled sidecar is used when
-`debug_extension` is available next to `tower`.
+`debug_extension` is available next to `tower`. rr-backed record/replay tools appear only when
+`[debug.record] backend = "rr"` is configured; unsupported rr hosts return structured tool payloads
+rather than transport errors.
 
 | Tool | Purpose |
 |------|---------|
@@ -331,6 +345,16 @@ enabled. A discovered `debug` extension takes priority; otherwise the bundled si
 | `tower_debug_stack` | Read stack frames for a thread. |
 | `tower_debug_variables` | Read variables for a DAP variables reference. |
 | `tower_debug_evaluate` | Evaluate an expression in a stack frame. |
+| `tower_debug_eval_at` | Run a stateless one-shot breakpoint probe and capture bounded stack/variable evidence. |
+| `tower_debug_record` | Record one native execution through rr and register a trace. |
+| `tower_debug_replay` | Open a replay-backed debug session for a recorded trace. |
+| `tower_debug_reverse_continue` | Continue a replay session backward until a stop, trace start, or timeout. |
+| `tower_debug_step_back` | Step a replay session backward by line, instruction, or over granularity. |
+| `tower_debug_watchpoint` | Set a replay-session data watchpoint by expression or address. |
+| `tower_debug_traces` | List recorded debug traces known to the sidecar trace store. |
+| `tower_debug_delete_trace` | Delete a recorded trace by id, contained to the configured trace root. |
+| `tower_debug_find_origin` | Open replay, seek, set a write watchpoint, reverse-continue, capture origin evidence, and clean up. |
+| `tower_debug_record_and_find_origin` | Record a trace and immediately run the origin-finding recipe against it. |
 | `tower_debug_terminate` | Terminate a debug session and clean up the adapter process. |
 | `tower_debug_disconnect` | Disconnect from a debug session. |
 | `tower_debug_sessions` | List active debug sessions and their last known state. |

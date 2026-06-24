@@ -999,8 +999,9 @@ Stable fix error codes are `lint_fix_unavailable`, `lint_fix_apply_failed`, and
 ## Debug tools
 
 The `debug` extension (manifest `name = "debug"`) bridges configured Debug Adapter Protocol
-adapters and also provides a stateless one-shot eval-at probe. Its tools are lazy extension tools and
-appear only when all of the following are true:
+adapters, provides a stateless one-shot eval-at probe, and can expose rr-backed record/replay
+reverse debugging. Its live-session tools are lazy extension tools and appear only when all of the
+following are true:
 
 - the bundled debug sidecar binary is available next to `tower`, or a `debug` extension is discovered
   from an extension scope;
@@ -1019,6 +1020,25 @@ launch = { request = "launch", program = "target/debug/app" }
 default_timeout_secs = 15
 idle_ttl_secs = 300
 ```
+
+Enable rr-backed record/replay tools with an explicit record section:
+
+```toml
+[debug.record]
+backend = "rr"
+trace_dir = ".tower/traces"
+ttl_secs = 86400
+max_traces = 20
+record_timeout_secs = 60
+```
+
+`trace_dir` is workspace-relative and defaults to `.tower/traces`. `ttl_secs`,
+`max_traces`, and `record_timeout_secs` must be positive when present; the defaults are no TTL,
+`20` retained traces, and `60` seconds.
+
+Record/replay tools are omitted from `tools/list` unless `[debug.record] backend = "rr"` is present.
+rr itself is preflighted at record time, so unsupported hosts return a structured payload instead of
+crashing the extension.
 
 The debug extension declares no workspace mutation capabilities. Sessions are ephemeral and owned by
 the sidecar; terminate, disconnect, shutdown, quarantine, and idle TTL expiry clean up the adapter and
@@ -1040,8 +1060,12 @@ errors:
 }
 ```
 
-Stable debug error codes are `session-not-found`, `not-stopped`, `debug-timeout`, `adapter-exited`,
-and `launch-failed`. Malformed tool parameters still return protocol-level invalid-params errors.
+Stable debug error codes include `session-not-found`, `not-stopped`, `debug-timeout`,
+`adapter-exited`, `launch-failed`, and `reverse_unsupported`. rr record failures use stable payload
+codes such as `rr_unsupported`, `record_timeout`, and `record_failed`. Origin-finding failures use
+stable reasons such as `no_prior_write_reached`, `trace_not_found`, `watch_evaluation_failed`,
+`replay_open_failed`, `origin_timeout`, `record_failed`, and `capture_failed`. Malformed tool parameters still return
+protocol-level invalid-params errors.
 
 ### tower_debug_launch
 
@@ -1236,6 +1260,136 @@ evidence, and always tears down the internal session before returning. It does n
 `exit_code`, captured `output`, and an empty `hits` array. A timeout returns
 `finished:"timeout"` after cleanup. If a requested breakpoint condition cannot be honored, the result
 sets `condition_unsupported:true` instead of silently ignoring the condition.
+
+### tower_debug_record
+
+Record one native execution through rr and register the resulting trace. This tool is present only
+when `[debug.record] backend = "rr"` is configured.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `language` | string | yes | Configured `[debug.<language>]` key |
+| `program` | string | yes | Program path to run under `rr record`; the program must already be built |
+| `args` | string array | no | Program arguments; defaults to `[]` |
+| `cwd` | string or null | no | Working directory for the recorded process |
+| `env` | string map | no | Environment variables for the recorded process; defaults to `{}` |
+| `timeout_ms` | integer or null | no | Record timeout in milliseconds; omit to use `debug.record.record_timeout_secs` |
+
+**Returns** `{"recordable": bool, "reason": string|null, "trace_id": string|null, "trace": object|null, "exit_code": integer|null, "output": array, "output_truncated": bool, "error": object|null}`.
+
+Unsupported rr environments return `recordable:false`, `reason:"rr_unsupported"`, and
+`error.data.unsupported_reason` such as `rr_missing`, `non_linux_host`,
+`unsupported_cpu`, `unsupported_perf_counters`, or `rr_unsupported`. Record output is bounded across
+stdout and stderr; `output_truncated:true` signals that the cap was reached.
+
+### tower_debug_replay
+
+Open a replay-backed debug session for a recorded trace. Replay sessions reuse the normal session
+tools (`tower_debug_continue`, `tower_debug_step`, `tower_debug_threads`, `tower_debug_stack`,
+`tower_debug_variables`, `tower_debug_evaluate`, `tower_debug_terminate`, and
+`tower_debug_disconnect`) and advertise reverse execution support.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `trace_id` | string | yes | Trace returned by `tower_debug_record` or `tower_debug_traces` |
+| `language` | string | yes | Configured `[debug.<language>]` key |
+| `timeout_secs` | integer or null | no | Override the configured debug timeout for replay startup |
+
+**Returns** `{"session_id": string, "trace_id": string, "state": "stopped", "stop": object|null, "supportsStepBack": bool}`.
+
+### tower_debug_reverse_continue
+
+Resume a replay session backward until the previous matching stop, breakpoint, watchpoint, start of
+trace, or timeout.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Replay session returned by `tower_debug_replay` |
+| `thread_id` | integer or null | no | Adapter thread to reverse-continue |
+| `timeout_secs` | integer or null | no | Override the configured timeout for this call |
+
+**Returns** the same stop object as `tower_debug_continue`. Live non-replay sessions return a
+structured `reverse_unsupported` payload.
+
+### tower_debug_step_back
+
+Step a replay session backward.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Replay session returned by `tower_debug_replay` |
+| `thread_id` | integer or null | no | Adapter thread to step backward |
+| `granularity` | `"line"`, `"instruction"`, or `"over"` | no | Backward step granularity; defaults to `"line"` |
+| `timeout_secs` | integer or null | no | Override the configured timeout for this call |
+
+**Returns** the same stop object as `tower_debug_continue`. Live non-replay sessions return a
+structured `reverse_unsupported` payload.
+
+### tower_debug_watchpoint
+
+Set a replay-session watchpoint by expression or address.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | yes | Replay session returned by `tower_debug_replay` |
+| `expression` | string or null | no | Expression to watch, for example a variable name |
+| `address` | string or null | no | Address to watch when expression-based watchpoints are not desired |
+| `kind` | `"write"`, `"read"`, or `"access"` | yes | Watchpoint access kind |
+| `enabled` | boolean or null | no | Defaults to `true` |
+| `timeout_secs` | integer or null | no | Reserved timeout override for adapters that need it |
+
+**Returns** `{"ok": bool, "watchpoint": {"watchpoint_id": string, "expression": string|null, "address": string|null, "kind": string, "enabled": bool, "verified": bool}|null, "error": object|null}`.
+
+### tower_debug_traces
+
+List recorded traces known to the debug sidecar.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| _(none)_ | — | — | This tool takes no arguments |
+
+**Returns** `{"traces": [{"trace_id": string, "path": string, "created_unix_secs": uint, "program": string, "args_summary": array, "exit_code": integer|null, "output_summary": array, "output_truncated": bool, "expires_unix_secs": uint|null, "ttl_secs": uint|null, "prune_generation": uint}]}`.
+
+### tower_debug_delete_trace
+
+Delete one recorded trace by id. Deletion is contained to the configured trace root.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `trace_id` | string | yes | Trace id returned by `tower_debug_record` or `tower_debug_traces` |
+
+**Returns** `{"deleted": bool, "trace_id": string, "error": object|null}`.
+
+### tower_debug_find_origin
+
+Open replay, seek to a target point, set a write watchpoint for a watched value, reverse-continue to
+the last write, capture bounded evidence, and clean up the replay session before returning.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `trace_id` | string | yes | Trace to inspect |
+| `language` | string | yes | Configured `[debug.<language>]` key |
+| `at` | object | yes | Target point: `{"kind":"crash"}`, `{"kind":"end"}`, or `{"kind":"source","path":"src/main.rs","line":42,"column":1}` |
+| `watch` | string | yes | Watched expression or value location |
+| `timeout_secs` | integer or null | no | Timeout for replay seek and reverse operations |
+| `max_depth` | integer or null | no | Recursive variable expansion depth |
+| `max_children` | integer or null | no | Maximum expanded children per node or scope |
+
+**Returns** `{"found": bool, "reason": string|null, "trace_id": string|null, "write_frame": object|null, "stack": array, "value": object|null, "locals": array, "args": array, "output": array, "truncated": bool, "error": object|null}`.
+
+When reverse execution reaches the start of the trace without finding a prior write, the result has
+`found:false` and `reason:"no_prior_write_reached"` rather than a transport error.
+
+### tower_debug_record_and_find_origin
+
+Record a program and immediately run the origin-finding recipe against the new trace.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `record` | object | yes | Same shape as `tower_debug_record` arguments |
+| `origin` | object | yes | Origin request without `trace_id`: `language`, `at`, `watch`, `timeout_secs`, `max_depth`, and `max_children` |
+
+**Returns** `{"record": <tower_debug_record result>, "origin": <tower_debug_find_origin result>|null}`. If recording is unsupported, `origin` is `null`; if recording succeeds but origin search fails, both the trace record result and origin failure are returned.
 
 ### tower_debug_terminate
 

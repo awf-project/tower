@@ -18,7 +18,7 @@ INSTALL_DIR  ?= $(HOME)/.local/bin
 #                 For the global XDG scope, pass
 #                   EXT_DEST=$(HOME)/.local/share/tower/extensions
 #   EXT_PROFILE — release (default, deployable) or debug (fast, reuses dev build).
-EXTENSIONS   ?= ast lsp fmt lint debug
+EXTENSIONS   ?= ast debug fmt lint lsp
 EXT_DEST     ?= .tower/extensions
 EXT_PROFILE  ?= release
 

@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::TowerConfig;
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 mod debug_protocol;
 
 use debug_protocol::{
-    DebugInitError, DebugInitializeConfig, DebugToolError, DebugToolErrorCode,
+    DebugInitError, DebugInitializeConfig, DebugRecordConfig, DebugToolError, DebugToolErrorCode,
     debug_not_initialized_result, debug_tool_declarations, debug_tool_unavailable_result,
 };
 
@@ -147,6 +147,77 @@ idle_ttl_secs = 300
     .expect("native fixture debug config must parse")
 }
 
+fn rr_fixture_tower_config() -> TowerConfig {
+    rr_fixture_tower_config_with_args(&[])
+}
+
+fn rr_fixture_tower_config_with_args(args: &[&str]) -> TowerConfig {
+    let args = args
+        .iter()
+        .map(|arg| serde_json::to_string(arg).expect("fixture arg must serialize"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let command = serde_json::to_string(
+        fixture_debug_adapter_bin()
+            .to_str()
+            .expect("fixture path must be utf8"),
+    )
+    .expect("fixture path must serialize");
+    toml::from_str(&format!(
+        r#"
+[extensions]
+request_timeout_secs = 5
+
+[debug.rust]
+extensions = ["rs"]
+command = {command}
+args = [{args}]
+adapter_type = "fixture"
+default_timeout_secs = 5
+idle_ttl_secs = 300
+
+[debug.record]
+backend = "rr"
+trace_dir = ".tower/traces"
+ttl_secs = 86400
+max_traces = 25
+record_timeout_secs = 30
+"#
+    ))
+    .expect("native fixture debug config with rr record backend must parse")
+}
+
+fn real_rr_native_fixture_tower_config() -> TowerConfig {
+    let command = serde_json::to_string(
+        fixture_debug_adapter_bin()
+            .to_str()
+            .expect("fixture path must be utf8"),
+    )
+    .expect("fixture path must serialize");
+    toml::from_str(&format!(
+        r#"
+[extensions]
+request_timeout_secs = 10
+
+[debug.rust]
+extensions = ["rs"]
+command = {command}
+args = []
+adapter_type = "fixture"
+default_timeout_secs = 5
+idle_ttl_secs = 300
+
+[debug.record]
+backend = "rr"
+trace_dir = ".tower/traces"
+ttl_secs = 86400
+max_traces = 25
+record_timeout_secs = 30
+"#
+    ))
+    .expect("real rr native fixture config must parse")
+}
+
 fn expected_debug_tool_names() -> Vec<&'static str> {
     vec![
         "tower_debug_launch",
@@ -183,6 +254,20 @@ fn expected_manifest_tool_names() -> Vec<&'static str> {
     ]
 }
 
+fn expected_rr_specific_manifest_tool_names() -> Vec<&'static str> {
+    vec![
+        "record",
+        "replay",
+        "reverse_continue",
+        "step_back",
+        "watchpoint",
+        "traces",
+        "delete_trace",
+        "find_origin",
+        "record_and_find_origin",
+    ]
+}
+
 fn valid_debug_init_payload() -> serde_json::Value {
     json!({
         "languages": {
@@ -197,6 +282,60 @@ fn valid_debug_init_payload() -> serde_json::Value {
                 "default_timeout_secs": 15,
                 "idle_ttl_secs": 300
             }
+        }
+    })
+}
+
+fn valid_rr_debug_init_payload() -> serde_json::Value {
+    valid_rr_debug_init_payload_with_trace_dir(".tower/traces")
+}
+
+fn valid_rr_debug_init_payload_with_trace_dir(trace_dir: &str) -> serde_json::Value {
+    let mut payload = valid_debug_init_payload();
+    payload["record"] = json!({
+        "backend": "rr",
+        "trace_dir": trace_dir,
+        "ttl_secs": 86400,
+        "max_traces": 25,
+        "record_timeout_secs": 30
+    });
+    payload
+}
+
+fn unique_relative_trace_dir(label: &str) -> String {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    format!(".tower/test-traces-{label}-{}-{unique}", std::process::id())
+}
+
+fn reverse_debug_fixture_init_payload(token: &str) -> serde_json::Value {
+    let command = fixture_debug_adapter_bin();
+    let command = command
+        .to_str()
+        .expect("fixture path must be utf8")
+        .to_owned();
+    json!({
+        "languages": {
+            "rust": {
+                "extensions": ["rs"],
+                "command": command,
+                "args": ["--token", token],
+                "adapter_type": "fixture",
+                "launch": {
+                    "request": "launch"
+                },
+                "default_timeout_secs": 5,
+                "idle_ttl_secs": 300
+            }
+        },
+        "record": {
+            "backend": "rr",
+            "trace_dir": ".tower/traces",
+            "ttl_secs": 86400,
+            "max_traces": 25,
+            "record_timeout_secs": 30,
         }
     })
 }
@@ -397,6 +536,95 @@ fn merged_tool_names(config: TowerConfig) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn reverse_debug_fixture_registry(
+    token: &str,
+    fixture_args: &[&str],
+) -> (tempfile::TempDir, ExtensionMergedRegistry) {
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+
+    let mut args = vec!["--token".to_owned(), token.to_owned()];
+    args.extend(
+        fixture_args
+            .iter()
+            .copied()
+            .filter(|arg| *arg != "--scenario" && !arg.starts_with("--scenario="))
+            .map(str::to_owned),
+    );
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let handle = build_engine(&opts, rr_fixture_tower_config_with_args(&arg_refs))
+        .expect("engine builds with fixture-backed reverse debug config");
+    (
+        workspace,
+        ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry),
+    )
+}
+
+fn reverse_debug_record_request(token: &str, scenario: &str) -> serde_json::Value {
+    json!({
+        "language": "rust",
+        "program": "fixture-program",
+        "args": [scenario],
+        "cwd": null,
+        "env": {
+            "TOWER_DEBUG_FIXTURE_CLEANUP_TOKEN": token,
+            "TOWER_DEBUG_FIXTURE_SCENARIO": scenario
+        },
+        "timeout_ms": 5_000
+    })
+}
+
+fn reverse_debug_record_trace(
+    merged: &mut ExtensionMergedRegistry,
+    token: &str,
+    scenario: &str,
+) -> String {
+    let record = merged
+        .call(
+            "tower_debug_record",
+            reverse_debug_record_request(token, scenario),
+        )
+        .expect("tower_debug_record returns a structured fixture result");
+    assert_eq!(record["recordable"], true, "record payload: {record}");
+    record["trace_id"]
+        .as_str()
+        .expect("record result includes trace_id")
+        .to_owned()
+}
+
+fn reverse_debug_cleanup_record_request(token: &str, scenario: &str) -> serde_json::Value {
+    json!({
+        "language": "rust",
+        "program": fixture_debug_adapter_bin(),
+        "args": ["--scenario", scenario],
+        "cwd": null,
+        "env": {
+            "TOWER_DEBUG_FIXTURE_CLEANUP_TOKEN": token
+        },
+        "timeout_ms": 5_000
+    })
+}
+
+fn assert_cleanup_event_emitted_exactly_once(record_result: &Value, token: &str) {
+    let cleanup_count = record_result["output"]
+        .as_array()
+        .expect("record result includes captured output array")
+        .iter()
+        .flat_map(|output| output["text"].as_str().unwrap_or_default().lines())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["event"] == "cleanup" && event["token"] == token)
+        .count();
+    assert_eq!(
+        cleanup_count, 1,
+        "cleanup token {token} must emit exactly one cleanup event in record output: {record_result}"
+    );
+}
+
 fn initialize_debug_child(child: &mut RawDebugChild, id: u64, extension_config: serde_json::Value) {
     child.write_frame(json!({
         "jsonrpc": "2.0",
@@ -448,6 +676,68 @@ fn invoke_debug_tool(
         "{name} response id mismatch: {response}"
     );
     response["result"]["data"].clone()
+}
+
+fn invoke_debug_tool_raw(
+    child: &mut RawDebugChild,
+    id: u64,
+    name: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "invokeTool",
+        "params": {
+            "name": name,
+            "params": params
+        }
+    }));
+    let host_call = child.read_frame();
+    assert_eq!(
+        host_call["method"], "log",
+        "{name} dispatch must perform the sidecar HostCall before returning; got {host_call}"
+    );
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": host_call["id"].clone(),
+        "result": true
+    }));
+    let response = child.read_frame();
+    assert_eq!(
+        response["id"], id,
+        "{name} response id mismatch: {response}"
+    );
+    response
+}
+
+fn shutdown_debug_child(child: &mut RawDebugChild, id: u64) {
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "shutdown",
+        "params": {}
+    }));
+    let shutdown = child.read_frame();
+    assert_eq!(shutdown["id"], id);
+    assert_eq!(shutdown["result"]["type"], "Ack");
+}
+
+fn manifest_tool_names() -> Vec<String> {
+    let manifest = fs::read_to_string(workspace_root().join("extensions/debug/extension.toml"))
+        .expect("read debug manifest");
+    let value: toml::Value = toml::from_str(&manifest).expect("debug manifest parses as TOML");
+    value["tools"]
+        .as_array()
+        .expect("debug manifest tools array")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("manifest tool name")
+                .to_owned()
+        })
+        .collect()
 }
 
 fn launch_fixture_session(child: &mut RawDebugChild, id: u64) -> serde_json::Value {
@@ -776,6 +1066,23 @@ fn debug_initialize_config_from_init_payload_accepts_absent_valid_non_empty_and_
         "present payload without languages must be rejected as DebugInitError::InvalidConfig; got {missing_languages:?}"
     );
 
+    let record_without_languages = DebugInitializeConfig::from_init_payload(Some(json!({
+        "record": {
+            "backend": "rr",
+            "trace_dir": ".tower/traces",
+            "ttl_secs": 86400,
+            "max_traces": 25,
+            "record_timeout_secs": 30
+        }
+    })));
+    assert!(
+        matches!(
+            record_without_languages,
+            Err(DebugInitError::InvalidConfig(_))
+        ),
+        "present payload with record but without languages must be rejected as DebugInitError::InvalidConfig; got {record_without_languages:?}"
+    );
+
     let malformed = DebugInitializeConfig::from_init_payload(Some(json!({
         "languages": {
             "rust": {
@@ -858,6 +1165,161 @@ fn debug_tool_declarations_returns_empty_for_none_or_empty_config_and_complete_m
 }
 
 #[test]
+fn debug_tool_declarations_existing_debug_tools_remain_absent_when_debug_language_config_is_absent_or_empty()
+ {
+    let record_only_config = DebugInitializeConfig::from_init_payload(Some(json!({
+        "languages": {},
+        "record": {
+            "backend": "rr",
+            "trace_dir": ".tower/traces",
+            "ttl_secs": 86400,
+            "max_traces": 25,
+            "record_timeout_secs": 30
+        }
+    })))
+    .expect("record-only initialize config parses")
+    .expect("present record-only config");
+    let empty_config = DebugInitializeConfig::from_init_payload(Some(json!({ "languages": {} })))
+        .expect("empty map is a valid config")
+        .expect("empty map still yields config");
+
+    for config in [None, Some(&empty_config), Some(&record_only_config)] {
+        let declarations = debug_tool_declarations(config);
+        for name in expected_manifest_tool_names() {
+            assert!(
+                declarations.iter().all(|tool| tool.name != name),
+                "{name} must be absent when debug language config is absent or empty; got {declarations:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn debug_tool_declarations_rr_specific_tools_remain_absent_when_debug_config_exists_but_record_backend_rr_is_absent()
+ {
+    let mut no_record = DebugInitializeConfig::from_init_payload(Some(valid_debug_init_payload()))
+        .expect("valid debug config")
+        .expect("present config");
+    no_record.record = None;
+    let non_rr_record = DebugInitializeConfig {
+        record: Some(DebugRecordConfig {
+            backend: "gdb".to_owned(),
+            trace_dir: None,
+            ttl_secs: None,
+            max_traces: None,
+            record_timeout_secs: None,
+        }),
+        ..no_record.clone()
+    };
+
+    for config in [&no_record, &non_rr_record] {
+        let declarations = debug_tool_declarations(Some(config));
+        for name in expected_rr_specific_manifest_tool_names() {
+            assert!(
+                declarations.iter().all(|tool| tool.name != name),
+                "{name} must be absent when [debug.record] backend = \"rr\" is absent; got {declarations:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn debug_tool_declarations_rr_specific_tools_appear_when_record_backend_rr_is_configured() {
+    let mut payload = valid_debug_init_payload();
+    payload["record"] = json!({
+        "backend": "rr",
+        "trace_dir": ".tower/traces",
+        "ttl_secs": 86400,
+        "max_traces": 25,
+        "record_timeout_secs": 30
+    });
+    let config = DebugInitializeConfig::from_init_payload(Some(payload))
+        .expect("valid rr record config")
+        .expect("present config");
+
+    let declarations = debug_tool_declarations(Some(&config));
+    let tool_names = declarations
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    for name in expected_manifest_tool_names()
+        .into_iter()
+        .chain(expected_rr_specific_manifest_tool_names())
+    {
+        assert!(
+            tool_names.contains(&name),
+            "{name} must be declared when debug languages and record.backend = \"rr\" are configured; got {tool_names:?}"
+        );
+    }
+}
+
+#[test]
+fn debug_initialize_config_rejects_invalid_record_payloads() {
+    for (record, expected_message) in [
+        (
+            json!({
+                "backend": "gdb",
+                "trace_dir": ".tower/traces",
+                "ttl_secs": 86400,
+                "max_traces": 25,
+                "record_timeout_secs": 30
+            }),
+            "debug.record.backend",
+        ),
+        (
+            json!({
+                "backend": "rr",
+                "trace_dir": "/tmp/traces",
+                "ttl_secs": 86400,
+                "max_traces": 25,
+                "record_timeout_secs": 30
+            }),
+            "debug.record.trace_dir",
+        ),
+        (
+            json!({
+                "backend": "rr",
+                "trace_dir": ".tower/traces",
+                "ttl_secs": 0,
+                "max_traces": 25,
+                "record_timeout_secs": 30
+            }),
+            "debug.record.ttl_secs",
+        ),
+        (
+            json!({
+                "backend": "rr",
+                "trace_dir": ".tower/traces",
+                "ttl_secs": 86400,
+                "max_traces": 0,
+                "record_timeout_secs": 30
+            }),
+            "debug.record.max_traces",
+        ),
+        (
+            json!({
+                "backend": "rr",
+                "trace_dir": ".tower/traces",
+                "ttl_secs": 86400,
+                "max_traces": 25,
+                "record_timeout_secs": 0
+            }),
+            "debug.record.record_timeout_secs",
+        ),
+    ] {
+        let mut payload = valid_debug_init_payload();
+        payload["record"] = record;
+        let error = DebugInitializeConfig::from_init_payload(Some(payload))
+            .expect_err("invalid record initialize payload must fail closed");
+        assert!(
+            error.jsonrpc_message().contains(expected_message),
+            "expected {expected_message} in error message; got {error}"
+        );
+    }
+}
+
+#[test]
 fn debug_init_error_maps_malformed_initialize_config_to_json_rpc_minus_32602_with_stable_message_prefix()
  {
     let mut child = RawDebugChild::spawn();
@@ -907,6 +1369,139 @@ fn debug_process_spawns_and_declares_configured_tools() {
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect::<Vec<_>>();
     assert_eq!(tool_names, expected_manifest_tool_names());
+}
+
+#[test]
+fn debug_process_with_rr_record_backend_declares_manifest_parity_for_rr_tool_surface() {
+    let mut child = RawDebugChild::spawn();
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": 33,
+        "method": "initialize",
+        "params": {
+            "protocol_version": PROTOCOL_VERSION,
+            "client_info": "debug-e2e/0.1.0",
+            "extension_config": valid_rr_debug_init_payload()
+        }
+    }));
+
+    let initialized = child.read_frame();
+    assert_eq!(initialized["id"], 33);
+    let runtime_names = initialized["result"]["data"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name").to_owned())
+        .collect::<Vec<_>>();
+    let manifest_names = manifest_tool_names();
+    let expected = expected_manifest_tool_names()
+        .into_iter()
+        .chain(expected_rr_specific_manifest_tool_names())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        runtime_names, expected,
+        "rr runtime declarations must expose the exact debug plus rr tool surface"
+    );
+    for name in &expected {
+        assert!(
+            manifest_names.contains(name),
+            "debug manifest must ship tool {name}; manifest names: {manifest_names:?}"
+        );
+    }
+}
+
+#[test]
+fn debug_process_declared_rr_handlers_return_their_public_dtos() {
+    let mut child = RawDebugChild::spawn();
+    initialize_debug_child(
+        &mut child,
+        34,
+        valid_rr_debug_init_payload_with_trace_dir(&unique_relative_trace_dir("public-dtos")),
+    );
+
+    let traces = invoke_debug_tool_raw(&mut child, 35, "traces", json!({}));
+    assert_eq!(traces["result"]["data"], json!({ "traces": [] }));
+
+    let delete_trace = invoke_debug_tool_raw(
+        &mut child,
+        36,
+        "delete_trace",
+        json!({ "trace_id": "missing-trace" }),
+    );
+    assert_eq!(delete_trace["result"]["data"]["deleted"], false);
+    assert_eq!(
+        delete_trace["result"]["data"]["error"]["code"],
+        "trace_not_found"
+    );
+
+    let find_origin = invoke_debug_tool_raw(
+        &mut child,
+        37,
+        "find_origin",
+        json!({
+            "trace_id": "trace-origin",
+            "language": "rust",
+            "watch": "answer",
+            "at": { "kind": "crash" }
+        }),
+    );
+    assert_eq!(find_origin["result"]["data"]["found"], false);
+    assert_eq!(find_origin["result"]["data"]["reason"], "trace_not_found");
+
+    let record_and_find_origin = invoke_debug_tool_raw(
+        &mut child,
+        38,
+        "record_and_find_origin",
+        json!({
+            "record": {
+                "language": "rust",
+                "program": "target/debug/app",
+                "args": [],
+                "cwd": null,
+                "env": {},
+                "timeout_ms": 1000
+            },
+            "origin": {
+                "language": "rust",
+                "watch": "answer",
+                "at": { "kind": "end" },
+                "timeout_secs": 1,
+                "max_depth": 2,
+                "max_children": 4
+            }
+        }),
+    );
+    assert!(record_and_find_origin["result"]["data"]["record"].is_object());
+    assert!(
+        record_and_find_origin["result"]["data"]["origin"].is_null()
+            || record_and_find_origin["result"]["data"]["origin"].is_object(),
+        "origin must be null when recording is unsupported or a structured result when recording succeeds: {record_and_find_origin}"
+    );
+    assert_eq!(
+        record_and_find_origin["result"]["data"]["error"],
+        Value::Null
+    );
+}
+
+#[test]
+fn debug_process_record_rejects_fields_outside_public_record_params_contract() {
+    let mut child = RawDebugChild::spawn();
+    initialize_debug_child(&mut child, 39, valid_rr_debug_init_payload());
+
+    let response = invoke_debug_tool_raw(
+        &mut child,
+        40,
+        "record",
+        json!({
+            "language": "rust",
+            "program": "target/debug/app",
+            "launch_overrides": {}
+        }),
+    );
+
+    assert_eq!(response["error"]["code"], -32602);
 }
 
 #[test]
@@ -1306,6 +1901,434 @@ fn debug_tools_absent_without_config_and_present_with_valid_debug_config() {
             present_names.iter().any(|tool| tool == name),
             "{name} must be present when valid [debug.rust] config exists; got {present_names:?}"
         );
+    }
+    for name in expected_rr_specific_manifest_tool_names() {
+        let mcp_name = format!("tower_debug_{name}");
+        assert!(
+            present_names.iter().all(|tool| tool != &mcp_name),
+            "{mcp_name} must be omitted from normal MCP discovery when [debug.record] backend = \"rr\" is absent; got {present_names:?}"
+        );
+    }
+}
+
+#[test]
+fn rr_specific_tools_appear_in_merged_registry_only_when_record_backend_rr_is_configured() {
+    let names = merged_tool_names(rr_fixture_tower_config());
+
+    for name in expected_rr_specific_manifest_tool_names() {
+        let mcp_name = format!("tower_debug_{name}");
+        assert!(
+            names.iter().any(|tool| tool == &mcp_name),
+            "{mcp_name} must be present in normal MCP discovery when [debug.record] backend = \"rr\" is configured; got {names:?}"
+        );
+    }
+}
+
+#[test]
+fn reverse_debug_rr_tools_are_absent_without_record_backend_rr_and_present_with_valid_debug_plus_record_config()
+ {
+    let names_without_record = merged_tool_names(native_fixture_tower_config(&[], 5));
+    for name in expected_rr_specific_manifest_tool_names() {
+        let mcp_name = format!("tower_debug_{name}");
+        assert!(
+            names_without_record.iter().all(|tool| tool != &mcp_name),
+            "{mcp_name} must be absent without [debug.record] backend = \"rr\"; got {names_without_record:?}"
+        );
+    }
+
+    let names_with_record = merged_tool_names(rr_fixture_tower_config());
+    for name in expected_rr_specific_manifest_tool_names() {
+        let mcp_name = format!("tower_debug_{name}");
+        assert!(
+            names_with_record.iter().any(|tool| tool == &mcp_name),
+            "{mcp_name} must be present with valid debug plus rr record config; got {names_with_record:?}"
+        );
+    }
+}
+
+#[test]
+fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_back_watchpoint_traces_and_delete_trace()
+ {
+    let token = format!("reverse-debug-tool-surface-{}", std::process::id());
+    let (_workspace, mut merged) =
+        reverse_debug_fixture_registry(&token, &["--scenario=record_ok"]);
+
+    let record = merged
+        .call(
+            "tower_debug_record",
+            reverse_debug_record_request(&token, "record_ok"),
+        )
+        .expect("tower_debug_record returns fixture-backed record result");
+    assert_eq!(record["recordable"], true, "record payload: {record}");
+    let trace_id = record["trace_id"]
+        .as_str()
+        .expect("record returns trace_id")
+        .to_owned();
+
+    let traces = merged
+        .call("tower_debug_traces", json!({}))
+        .expect("tower_debug_traces returns recorded fixture trace");
+    assert!(
+        traces["traces"]
+            .as_array()
+            .expect("traces array")
+            .iter()
+            .any(|trace| trace["trace_id"] == trace_id),
+        "traces should include {trace_id}; got {traces}"
+    );
+
+    let replay = merged
+        .call(
+            "tower_debug_replay",
+            json!({ "trace_id": trace_id, "language": "rust", "timeout_secs": 5 }),
+        )
+        .expect("tower_debug_replay opens fixture replay");
+    assert_eq!(replay["state"], "stopped", "replay payload: {replay}");
+    assert_eq!(replay["supportsStepBack"], true, "replay payload: {replay}");
+    let session_id = replay["session_id"]
+        .as_str()
+        .expect("replay returns session_id")
+        .to_owned();
+
+    let reverse = merged
+        .call(
+            "tower_debug_reverse_continue",
+            json!({ "session_id": session_id, "thread_id": 1, "timeout_secs": 5 }),
+        )
+        .expect("tower_debug_reverse_continue returns a deterministic stop");
+    assert_eq!(reverse["state"], "stopped", "reverse payload: {reverse}");
+    assert_eq!(
+        reverse["reason"], "watchpoint",
+        "reverse payload: {reverse}"
+    );
+
+    let stepped = merged
+        .call(
+            "tower_debug_step_back",
+            json!({ "session_id": session_id, "thread_id": 1, "granularity": "line", "timeout_secs": 5 }),
+        )
+        .expect("tower_debug_step_back returns a deterministic line stop");
+    assert_eq!(stepped["state"], "stopped", "step_back payload: {stepped}");
+    assert_eq!(
+        stepped["top_frame"]["line"], 11,
+        "step_back payload: {stepped}"
+    );
+
+    let watchpoint = merged
+        .call(
+            "tower_debug_watchpoint",
+            json!({ "session_id": session_id, "expression": "answer", "address": null, "kind": "write", "enabled": true }),
+        )
+        .expect("tower_debug_watchpoint sets a replay watchpoint");
+    assert_eq!(watchpoint["ok"], true, "watchpoint payload: {watchpoint}");
+    assert_eq!(
+        watchpoint["watchpoint"]["expression"], "answer",
+        "watchpoint payload: {watchpoint}"
+    );
+
+    let deleted = merged
+        .call("tower_debug_delete_trace", json!({ "trace_id": trace_id }))
+        .expect("tower_debug_delete_trace removes the fixture trace");
+    assert_eq!(deleted["deleted"], true, "delete payload: {deleted}");
+    let terminated = merged
+        .call("tower_debug_terminate", json!({ "session_id": session_id }))
+        .expect("tower_debug_terminate cleans up the replay session");
+    assert_eq!(terminated["ok"], true, "terminate payload: {terminated}");
+    assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn reverse_debug_fixture_backed_e2e_find_origin_returns_found_true_with_frame_and_value_evidence() {
+    let token = format!("reverse-debug-origin-found-{}", std::process::id());
+    let (_workspace, mut merged) =
+        reverse_debug_fixture_registry(&token, &["--scenario=watchpoint_stop"]);
+    let trace_id = reverse_debug_record_trace(&mut merged, &token, "watchpoint_stop");
+
+    let origin = merged
+        .call(
+            "tower_debug_find_origin",
+            json!({
+                "trace_id": trace_id,
+                "language": "rust",
+                "watch": "answer",
+                "at": { "kind": "end" },
+                "timeout_secs": 5,
+                "max_depth": 8,
+                "max_children": 8
+            }),
+        )
+        .expect("tower_debug_find_origin returns fixture origin result");
+
+    assert_eq!(origin["found"], true, "origin payload: {origin}");
+    assert_eq!(origin["reason"], Value::Null, "origin payload: {origin}");
+    assert_eq!(
+        origin["write_frame"]["name"], "main",
+        "origin payload: {origin}"
+    );
+    assert_eq!(
+        origin["value"]["name"], "answer",
+        "origin payload: {origin}"
+    );
+    assert_eq!(origin["value"]["value"], "42", "origin payload: {origin}");
+    assert!(
+        origin["stack"]
+            .as_array()
+            .is_some_and(|stack| !stack.is_empty()),
+        "origin should include stack evidence; got {origin}"
+    );
+    assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn reverse_debug_fixture_backed_e2e_find_origin_returns_found_false_with_reason_no_prior_write_reached()
+ {
+    let token = format!("reverse-debug-origin-none-{}", std::process::id());
+    let (_workspace, mut merged) =
+        reverse_debug_fixture_registry(&token, &["--scenario=no_prior_write"]);
+    let trace_id = reverse_debug_record_trace(&mut merged, &token, "no_prior_write");
+
+    let origin = merged
+        .call(
+            "tower_debug_find_origin",
+            json!({
+                "trace_id": trace_id,
+                "language": "rust",
+                "watch": "answer",
+                "at": { "kind": "end" },
+                "timeout_secs": 5,
+                "max_depth": 8,
+                "max_children": 8
+            }),
+        )
+        .expect("tower_debug_find_origin returns fixture no-prior-write result");
+
+    assert_eq!(origin["found"], false, "origin payload: {origin}");
+    assert_eq!(
+        origin["reason"], "no_prior_write_reached",
+        "origin payload: {origin}"
+    );
+    assert_eq!(origin["error"], Value::Null, "origin payload: {origin}");
+    assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn reverse_debug_fixture_backed_e2e_record_and_find_origin_success_and_recording_success_origin_failure_cleanup()
+ {
+    for (scenario, expected_found, expected_reason, expected_error_code) in [
+        ("watchpoint_stop", true, Value::Null, Value::Null),
+        (
+            "no_prior_write",
+            false,
+            json!("no_prior_write_reached"),
+            Value::Null,
+        ),
+        (
+            "adapter_exited",
+            false,
+            Value::Null,
+            json!("adapter_exited"),
+        ),
+    ] {
+        let token = format!("reverse-debug-combined-{scenario}-{}", std::process::id());
+        let (_workspace, mut merged) =
+            reverse_debug_fixture_registry(&token, &[&format!("--scenario={scenario}")]);
+        let result = merged
+            .call(
+                "tower_debug_record_and_find_origin",
+                json!({
+                    "record": reverse_debug_record_request(&token, scenario),
+                    "origin": {
+                        "language": "rust",
+                        "watch": "answer",
+                        "at": { "kind": "end" },
+                        "timeout_secs": 5,
+                        "max_depth": 8,
+                        "max_children": 8
+                    }
+                }),
+            )
+            .expect("tower_debug_record_and_find_origin returns fixture result");
+
+        assert_eq!(
+            result["record"]["recordable"], true,
+            "combined payload: {result}"
+        );
+        assert_eq!(
+            result["origin"]["found"], expected_found,
+            "combined payload: {result}"
+        );
+        assert_eq!(
+            result["origin"]["reason"], expected_reason,
+            "combined payload: {result}"
+        );
+        assert_eq!(
+            result["origin"]["error"]["code"], expected_error_code,
+            "combined payload: {result}"
+        );
+        assert_fixture_processes_gone(&token);
+    }
+}
+
+#[test]
+fn reverse_debug_cleanup_token_assertions_prove_record_and_replay_process_trees_are_reaped_after_success_timeout_no_prior_write_adapter_exit_and_recipe_failure()
+ {
+    for (case, scenario) in [
+        ("record", "record_ok"),
+        ("replay", "replay_open"),
+        ("timeout", "timeout"),
+        ("no_prior_write", "no_prior_write"),
+        ("adapter_exit", "adapter_exited"),
+        ("recipe_failure", "adapter_exited"),
+    ] {
+        let replay_token = format!("reverse-debug-cleanup-replay-{case}-{}", std::process::id());
+        let record_token = format!("reverse-debug-cleanup-record-{case}-{}", std::process::id());
+        let (_workspace, mut merged) =
+            reverse_debug_fixture_registry(&replay_token, &[&format!("--scenario={scenario}")]);
+        let result = merged.call(
+            "tower_debug_record_and_find_origin",
+            json!({
+                "record": reverse_debug_cleanup_record_request(&record_token, scenario),
+                "origin": {
+                    "language": "rust",
+                    "watch": "answer",
+                    "at": { "kind": "end" },
+                    "timeout_secs": 1,
+                    "max_depth": 4,
+                    "max_children": 4
+                }
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "scenario {scenario} must return a structured result before cleanup assertion: {result:?}"
+        );
+        let result = result.expect("structured cleanup result");
+        assert_cleanup_event_emitted_exactly_once(&result["record"], &record_token);
+        assert_cleanup_event_emitted_exactly_once(&result["origin"], &replay_token);
+        assert_fixture_processes_gone(&record_token);
+        assert_fixture_processes_gone(&replay_token);
+    }
+}
+
+#[test]
+fn reverse_debug_gated_real_rr_native_fixture_records_and_replays_tiny_program_when_preflight_passes_or_skips_cleanly()
+ {
+    let preflight = Command::new("rr").arg("--version").output();
+    let Ok(preflight) = preflight else {
+        println!("SKIP reverse_debug real rr native fixture: rr binary is missing");
+        return;
+    };
+    if !preflight.status.success() {
+        println!(
+            "SKIP reverse_debug real rr native fixture: rr preflight failed: {}",
+            String::from_utf8_lossy(&preflight.stderr)
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let handle = build_engine(&opts, real_rr_native_fixture_tower_config())
+        .expect("engine builds with real rr native fixture config");
+    let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+    let fixture_path = fixture_debug_adapter_bin()
+        .to_str()
+        .expect("fixture path must be utf8")
+        .to_owned();
+    let record = merged
+        .call(
+            "tower_debug_record",
+            json!({
+                "language": "rust",
+                "program": fixture_path,
+                "args": [],
+                "cwd": null,
+                "env": {},
+                "timeout_ms": 30_000
+            }),
+        )
+        .expect("real rr native fixture record returns structured result");
+    assert_eq!(record["recordable"], true, "record payload: {record}");
+    assert_eq!(
+        record["trace"]["program"], fixture_path,
+        "real rr record must trace the native fixture binary, not the scripted scenario fixture: {record}"
+    );
+    let trace_id = record["trace_id"]
+        .as_str()
+        .expect("real rr record returns trace_id")
+        .to_owned();
+    let replay = merged
+        .call(
+            "tower_debug_replay",
+            json!({ "trace_id": trace_id, "language": "rust", "timeout_secs": 5 }),
+        )
+        .expect("real-rr gated fixture replay opens");
+    assert_eq!(replay["state"], "stopped", "replay payload: {replay}");
+}
+
+#[test]
+fn reverse_debug_twenty_parallel_initialize_record_or_replay_cleanup_shutdown_stress_test_completes_without_deadlock()
+ {
+    let handles = (0..20)
+        .map(|index| {
+            std::thread::spawn(move || {
+                let scenario = if index % 2 == 0 {
+                    "record_ok"
+                } else {
+                    "replay_open"
+                };
+                let token = format!("reverse-debug-stress-{index}-{}", std::process::id());
+                let mut child = RawDebugChild::spawn();
+                initialize_debug_child(&mut child, 1, reverse_debug_fixture_init_payload(&token));
+                let record = invoke_debug_tool(
+                    &mut child,
+                    2,
+                    "record",
+                    reverse_debug_record_request(&token, scenario),
+                );
+                assert_eq!(
+                    record["recordable"], true,
+                    "stress record payload: {record}"
+                );
+                assert_cleanup_event_emitted_exactly_once(&record, &token);
+                if index % 2 == 1 {
+                    let trace_id = record["trace_id"]
+                        .as_str()
+                        .expect("stress record returns trace id")
+                        .to_owned();
+                    let replay = invoke_debug_tool(
+                        &mut child,
+                        3,
+                        "replay",
+                        json!({ "trace_id": trace_id, "language": "rust", "timeout_secs": 5 }),
+                    );
+                    let session_id = replay["session_id"]
+                        .as_str()
+                        .expect("stress replay returns session")
+                        .to_owned();
+                    let terminated = invoke_debug_tool(
+                        &mut child,
+                        4,
+                        "terminate",
+                        json!({ "session_id": session_id }),
+                    );
+                    assert_eq!(terminated["ok"], true);
+                }
+                shutdown_debug_child(&mut child, 5);
+                assert_fixture_processes_gone(&token);
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("reverse debug stress worker should not panic");
     }
 }
 

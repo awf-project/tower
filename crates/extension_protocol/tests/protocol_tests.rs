@@ -657,6 +657,15 @@ fn debug_manifest_declares_exactly_the_required_local_tool_names() {
             "variables",
             "evaluate",
             "eval_at",
+            "record",
+            "replay",
+            "reverse_continue",
+            "step_back",
+            "watchpoint",
+            "traces",
+            "delete_trace",
+            "find_origin",
+            "record_and_find_origin",
             "terminate",
             "disconnect",
             "sessions",
@@ -716,10 +725,12 @@ fn extension_manifest_parses_debug_tools_and_preserves_all_debug_tool_names() {
 
     assert_eq!(manifest.name, "debug");
     assert_eq!(manifest.command, vec!["debug_extension"]);
-    assert_eq!(tool_names.len(), 13);
+    assert_eq!(tool_names.len(), 22);
     assert!(tool_names.contains(&"launch"));
     assert!(tool_names.contains(&"set_breakpoints"));
     assert!(tool_names.contains(&"eval_at"));
+    assert!(tool_names.contains(&"record"));
+    assert!(tool_names.contains(&"record_and_find_origin"));
     assert!(tool_names.contains(&"sessions"));
 }
 
@@ -745,11 +756,20 @@ fn debug_protocol_stability_includes_eval_at_without_workspace_mutation_capabili
             "variables",
             "evaluate",
             "eval_at",
+            "record",
+            "replay",
+            "reverse_continue",
+            "step_back",
+            "watchpoint",
+            "traces",
+            "delete_trace",
+            "find_origin",
+            "record_and_find_origin",
             "terminate",
             "disconnect",
             "sessions",
         ],
-        "debug protocol stability must include eval_at in the shipped tool order"
+        "debug protocol stability must include rr tools in the shipped tool order"
     );
     assert!(
         manifest.capabilities.required.is_empty(),

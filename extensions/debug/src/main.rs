@@ -2,10 +2,13 @@
 
 pub mod dap;
 pub mod eval_at;
+pub mod origin;
 pub mod process;
 mod protocol;
+pub mod rr;
 pub mod session;
 pub mod tools;
+pub mod traces;
 pub mod types;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -27,8 +30,10 @@ use protocol::{
     DebugAdapterConfig, DebugInitializeConfig, debug_not_initialized_result,
     debug_tool_declarations, debug_tool_unavailable_result,
 };
+use rr::RrRuntime;
 use serde_json::{Map, Value, json};
 use session::{DebugAdapterFactory, DebugAdapterSession, LaunchRequest, SessionManager};
+use traces::{TracePolicy, TraceStore};
 use types::{
     DebugBreakpoint, DebugRuntimeError, DebugScope, DebugSessionState, DebugStackFrame, DebugStop,
     DebugThread, DebugVariable,
@@ -36,6 +41,13 @@ use types::{
 
 fn main() {
     serve_debug();
+}
+
+fn uses_fixture_adapter(config: &DebugInitializeConfig) -> bool {
+    config
+        .languages
+        .values()
+        .any(|adapter| adapter.adapter_type == "fixture")
 }
 
 fn serve_debug() {
@@ -46,6 +58,7 @@ fn serve_debug() {
     let mut config: Option<DebugInitializeConfig> = None;
     let mut initialized = false;
     let mut sessions: Option<SessionManager> = None;
+    let mut rr_runtime: Option<RrRuntime> = None;
 
     while let Some(frame) = next_frame(&mut lines, &mut queued) {
         match frame {
@@ -58,6 +71,7 @@ fn serve_debug() {
                         params,
                         &mut config,
                         &mut sessions,
+                        &mut rr_runtime,
                         &mut initialized,
                     );
                 }
@@ -74,6 +88,7 @@ fn serve_debug() {
                         params,
                         config.as_ref(),
                         sessions.as_ref(),
+                        rr_runtime.as_mut(),
                         initialized,
                     );
                 }
@@ -138,6 +153,7 @@ fn handle_initialize(
     params: Value,
     config: &mut Option<DebugInitializeConfig>,
     sessions: &mut Option<SessionManager>,
+    rr_runtime: &mut Option<RrRuntime>,
     initialized: &mut bool,
 ) {
     let init_params: InitParams = match serde_json::from_value(params) {
@@ -163,8 +179,34 @@ fn handle_initialize(
 
     match DebugInitializeConfig::from_init_payload(init_params.extension_config) {
         Ok(parsed_config) => {
+            let parsed_traces = match parsed_config
+                .as_ref()
+                .and_then(|config| config.record.as_ref())
+                .map(TracePolicy::from_record_config)
+                .transpose()
+            {
+                Ok(Some(policy)) => match TraceStore::open(policy) {
+                    Ok(store) => Some(store),
+                    Err(error) => {
+                        let _ = send_error(out, id, -32602, &error.to_string());
+                        return;
+                    }
+                },
+                Ok(None) => None,
+                Err(error) => {
+                    let _ = send_error(out, id, -32602, &error.to_string());
+                    return;
+                }
+            };
             *sessions = parsed_config.clone().map(|config| {
                 SessionManager::new(config.clone(), Arc::new(RealDebugAdapterFactory { config }))
+            });
+            *rr_runtime = parsed_traces.map(|store| {
+                if parsed_config.as_ref().is_some_and(uses_fixture_adapter) {
+                    RrRuntime::new_fixture(store)
+                } else {
+                    RrRuntime::new(store)
+                }
             });
             *config = parsed_config;
             *initialized = true;
@@ -187,6 +229,7 @@ fn handle_invoke_tool(
     params: Value,
     config: Option<&DebugInitializeConfig>,
     sessions: Option<&SessionManager>,
+    rr_runtime: Option<&mut RrRuntime>,
     initialized: bool,
 ) {
     let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -227,9 +270,15 @@ fn handle_invoke_tool(
         io.queued,
     );
 
-    let result = sessions
-        .map(|sessions| dispatch_debug_tool(tool_name, tool_params, sessions))
-        .unwrap_or_else(|| Ok(debug_tool_unavailable_result(tool_name)));
+    let result = if let Some(rr_runtime) = rr_runtime
+        && is_rr_tool(tool_name)
+    {
+        dispatch_rr_tool(tool_name, tool_params, sessions, rr_runtime)
+    } else {
+        sessions
+            .map(|sessions| dispatch_debug_tool(tool_name, tool_params, sessions))
+            .unwrap_or_else(|| Ok(debug_tool_unavailable_result(tool_name)))
+    };
 
     match result {
         Ok(result) => {
@@ -246,6 +295,36 @@ fn handle_invoke_tool(
     }
 }
 
+fn is_rr_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "record" | "replay" | "traces" | "delete_trace" | "find_origin" | "record_and_find_origin"
+    )
+}
+
+fn dispatch_rr_tool(
+    tool_name: &str,
+    params: Value,
+    sessions: Option<&SessionManager>,
+    rr_runtime: &mut RrRuntime,
+) -> Result<Value, protocol::DebugToolError> {
+    match tool_name {
+        "record" => tools::tower_debug_record(params, rr_runtime),
+        "replay" => sessions
+            .map(|sessions| tools::tower_debug_replay(params, sessions, rr_runtime))
+            .unwrap_or_else(|| Ok(debug_tool_unavailable_result(tool_name))),
+        "traces" => tools::tower_debug_traces(params, rr_runtime),
+        "delete_trace" => tools::tower_debug_delete_trace(params, rr_runtime),
+        "find_origin" => sessions
+            .map(|sessions| tools::tower_debug_find_origin(params, sessions, rr_runtime))
+            .unwrap_or_else(|| Ok(debug_tool_unavailable_result(tool_name))),
+        "record_and_find_origin" => sessions
+            .map(|sessions| tools::tower_debug_record_and_find_origin(params, sessions, rr_runtime))
+            .unwrap_or_else(|| Ok(debug_tool_unavailable_result(tool_name))),
+        _ => Ok(debug_tool_unavailable_result(tool_name)),
+    }
+}
+
 fn dispatch_debug_tool(
     tool_name: &str,
     params: Value,
@@ -257,6 +336,9 @@ fn dispatch_debug_tool(
         "continue" => tools::tower_debug_continue(params, sessions),
         "step" => tools::tower_debug_step(params, sessions),
         "pause" => tools::tower_debug_pause(params, sessions),
+        "reverse_continue" => tools::tower_debug_reverse_continue(params, sessions),
+        "step_back" => tools::tower_debug_step_back(params, sessions),
+        "watchpoint" => tools::tower_debug_watchpoint(params, sessions),
         "threads" => tools::tower_debug_threads(params, sessions),
         "stack" => tools::tower_debug_stack(params, sessions),
         "variables" => tools::tower_debug_variables(params, sessions),
@@ -646,6 +728,88 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         })
     }
 
+    fn reverse_continue(
+        &mut self,
+        thread_id: Option<u64>,
+        timeout: Duration,
+    ) -> Result<DebugStop, DebugRuntimeError> {
+        self.resume(
+            "reverseContinue",
+            json!({ "threadId": thread_id.unwrap_or(1) }),
+            timeout,
+        )
+    }
+
+    fn step_back(
+        &mut self,
+        thread_id: Option<u64>,
+        granularity: session::StepBackGranularity,
+        timeout: Duration,
+    ) -> Result<DebugStop, DebugRuntimeError> {
+        self.resume(
+            "stepBack",
+            json!({
+                "threadId": thread_id.unwrap_or(1),
+                "granularity": granularity
+            }),
+            timeout,
+        )
+    }
+
+    fn set_watchpoint(
+        &mut self,
+        watchpoint: session::WatchpointSpec,
+        timeout: Duration,
+    ) -> Result<session::WatchpointResult, DebugRuntimeError> {
+        let response = self.client.request(
+            "setDataBreakpoints",
+            json!({
+                "breakpoints": [{
+                    "dataId": watchpoint.expression.as_deref().or(watchpoint.address.as_deref()).unwrap_or("watchpoint"),
+                    "accessType": watchpoint.kind,
+                    "enabled": watchpoint.enabled
+                }]
+            }),
+            timeout,
+        )?;
+        ensure_success(response.clone())?;
+        let breakpoint = response
+            .body
+            .get("breakpoints")
+            .and_then(Value::as_array)
+            .and_then(|breakpoints| breakpoints.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok(session::WatchpointResult {
+            watchpoint_id: breakpoint
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("watch-1")
+                .to_owned(),
+            expression: watchpoint.expression,
+            address: watchpoint.address,
+            kind: watchpoint.kind,
+            enabled: watchpoint.enabled,
+            verified: breakpoint
+                .get("verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        })
+    }
+
+    fn seek_replay(
+        &mut self,
+        target: session::ReplaySeekTarget,
+        timeout: Duration,
+    ) -> Result<DebugStop, DebugRuntimeError> {
+        let target = serde_json::to_value(target).map_err(|error| {
+            DebugRuntimeError::LaunchFailed(format!(
+                "failed to serialize replay seek target: {error}"
+            ))
+        })?;
+        self.resume("seekReplay", target, timeout)
+    }
+
     fn terminate(&mut self, timeout: Duration) -> Result<(), DebugRuntimeError> {
         let response = self.client.request("terminate", json!({}), timeout)?;
         ensure_success(response)
@@ -672,6 +836,16 @@ impl ProcessDebugAdapterSession {
         {
             Ok(Some(event)) => Ok(self.stop_from_event(event, timeout)),
             Ok(None) | Err(DapError::Timeout { .. }) => Ok(self.timeout_stop()),
+            Err(DapError::AdapterExited) => Ok(DebugStop {
+                state: DebugSessionState::Terminated,
+                reason: Some("adapter_exited".to_owned()),
+                thread_id: None,
+                top_frame: None,
+                hit_breakpoint_ids: Vec::new(),
+                timed_out: false,
+                exit_code: None,
+                output_since: self.drain_output_events(),
+            }),
             Err(error) => Err(error.into()),
         }
     }
@@ -1131,6 +1305,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
                     idle_ttl_secs: 60,
                 },
             )]),
+            record: None,
         },
         Arc::new(ExactEvalAtFactory),
     );
@@ -1167,10 +1342,16 @@ mod tests {
 
     use super::{
         DapClient, DapError, DapTransport, DebugAdapterSession, DebugBreakpoint, DebugRuntimeError,
-        DebugSessionState, ProcessDebugAdapterSession, dispatch_debug_tool,
+        DebugScope, DebugSessionState, DebugStackFrame, DebugStop, DebugThread, DebugVariable,
+        ProcessDebugAdapterSession, dispatch_debug_tool, dispatch_rr_tool,
     };
     use crate::protocol::{DebugAdapterConfig, DebugInitializeConfig, DebugToolErrorCode};
+    use crate::rr::{
+        FakeRrPreflight, FakeRrRecorder, RR_UNSUPPORTED, RrPreflightStatus, RrRecordResult,
+        RrRuntime, RrUnsupportedReason,
+    };
     use crate::session::{DebugAdapterFactory, LaunchRequest, SessionManager};
+    use crate::traces::{TracePolicy, TraceStore};
 
     #[test]
     fn main_dispatches_incoming_eval_at_requests_through_tower_debug_eval_at_and_preserves_spec_33_handlers()
@@ -1202,6 +1383,7 @@ mod tests {
                         idle_ttl_secs: 60,
                     },
                 )]),
+                record: None,
             },
             Arc::new(DispatchOnlyFactory),
         );
@@ -1241,6 +1423,333 @@ mod tests {
                     "{tool_name} must dispatch to its public facade and preserve invalid-param mapping"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn replay_specific_tool_dispatch_surfaces_reverse_unsupported_as_runtime_failure_for_live_sessions()
+     {
+        struct LiveAdapterFactory;
+        struct LiveAdapter;
+
+        impl DebugAdapterFactory for LiveAdapterFactory {
+            fn start(
+                &self,
+                _request: &LaunchRequest,
+            ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+                Ok(Box::new(LiveAdapter))
+            }
+        }
+
+        impl DebugAdapterSession for LiveAdapter {
+            fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+                Ok(())
+            }
+
+            fn launch(
+                &mut self,
+                _request: &LaunchRequest,
+                _timeout: Duration,
+            ) -> Result<(), DebugRuntimeError> {
+                Ok(())
+            }
+
+            fn set_breakpoints(
+                &mut self,
+                breakpoints: &[DebugBreakpoint],
+                _timeout: Duration,
+            ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
+                Ok(breakpoints.to_vec())
+            }
+
+            fn continue_session(
+                &mut self,
+                _timeout: Duration,
+            ) -> Result<DebugStop, DebugRuntimeError> {
+                Ok(stopped())
+            }
+
+            fn step(
+                &mut self,
+                _thread_id: Option<u64>,
+                _timeout: Duration,
+            ) -> Result<DebugStop, DebugRuntimeError> {
+                Ok(stopped())
+            }
+
+            fn pause(
+                &mut self,
+                _thread_id: Option<u64>,
+                _timeout: Duration,
+            ) -> Result<DebugStop, DebugRuntimeError> {
+                Ok(stopped())
+            }
+
+            fn threads(
+                &mut self,
+                _timeout: Duration,
+            ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+                Ok(Vec::new())
+            }
+
+            fn stack(
+                &mut self,
+                _thread_id: u64,
+                _timeout: Duration,
+            ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
+                Ok(Vec::new())
+            }
+
+            fn scopes(
+                &mut self,
+                _frame_id: u64,
+                _timeout: Duration,
+            ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
+                Ok(Vec::new())
+            }
+
+            fn variables(
+                &mut self,
+                _variables_reference: u64,
+                _timeout: Duration,
+            ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
+                Ok(Vec::new())
+            }
+
+            fn evaluate(
+                &mut self,
+                _frame_id: u64,
+                expression: &str,
+                _timeout: Duration,
+            ) -> Result<DebugVariable, DebugRuntimeError> {
+                Ok(DebugVariable {
+                    name: expression.to_owned(),
+                    value: "42".to_owned(),
+                    r#type: None,
+                    variables_reference: 0,
+                })
+            }
+
+            fn terminate(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+                Ok(())
+            }
+
+            fn disconnect(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+                Ok(())
+            }
+        }
+
+        fn stopped() -> DebugStop {
+            DebugStop {
+                state: DebugSessionState::Stopped,
+                reason: Some("breakpoint".to_owned()),
+                thread_id: Some(1),
+                top_frame: None,
+                hit_breakpoint_ids: Vec::new(),
+                timed_out: false,
+                exit_code: None,
+                output_since: Vec::new(),
+            }
+        }
+
+        let sessions = SessionManager::new(
+            DebugInitializeConfig {
+                languages: std::collections::BTreeMap::from([(
+                    "rust".to_owned(),
+                    DebugAdapterConfig {
+                        extensions: vec!["rs".to_owned()],
+                        command: "fake-debug-adapter".to_owned(),
+                        args: Vec::new(),
+                        adapter_type: "fake".to_owned(),
+                        launch: serde_json::Map::new(),
+                        default_timeout_secs: 1,
+                        idle_ttl_secs: 60,
+                    },
+                )]),
+                record: None,
+            },
+            Arc::new(LiveAdapterFactory),
+        );
+        let live = sessions
+            .launch(LaunchRequest {
+                language: "rust".to_owned(),
+                program: "target/debug/app".to_owned(),
+                cwd: None,
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                launch_overrides: serde_json::Map::new(),
+            })
+            .expect("live session launch should establish a session for dispatch rejection");
+
+        let result = dispatch_debug_tool(
+            "reverse_continue",
+            json!({ "session_id": live.session_id }),
+            &sessions,
+        )
+        .expect("reverse_continue handler should return a structured tool payload");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "reverse_unsupported");
+        assert_eq!(result["error"]["message"], "reverse_unsupported");
+    }
+
+    #[test]
+    fn main_dispatches_record_requests_through_rr_runtime_and_returns_record_payload() {
+        let mut rr_runtime = RrRuntime::with_parts(
+            Box::new(FakeRrPreflight::new(RrPreflightStatus::Unsupported {
+                reason: RrUnsupportedReason::UnsupportedCpu,
+                message: "CPU lacks required rr support".to_owned(),
+            })),
+            Box::new(FakeRrRecorder::new(RrRecordResult {
+                recordable: true,
+                reason: None,
+                trace_id: None,
+                trace: None,
+                exit_code: Some(0),
+                output: Vec::new(),
+                output_truncated: false,
+                error: None,
+            })),
+            TraceStore::new(TracePolicy {
+                trace_root: std::env::temp_dir().join("tower-record-dispatch-test"),
+                ttl_secs: Some(60),
+                max_traces: 20,
+                record_timeout_secs: 60,
+            }),
+        );
+
+        let result = dispatch_rr_tool(
+            "record",
+            json!({
+                "language": "rust",
+                "program": "target/debug/app",
+                "args": ["--case", "smoke"],
+                "cwd": null,
+                "env": {},
+                "timeout_ms": 250
+            }),
+            None,
+            &mut rr_runtime,
+        )
+        .expect("record dispatch returns a structured result");
+
+        assert_eq!(result["recordable"], false);
+        assert_eq!(result["reason"], RR_UNSUPPORTED);
+        assert_eq!(result["error"]["code"], RR_UNSUPPORTED);
+        assert_eq!(
+            result["error"]["data"],
+            json!({ "unsupported_reason": "unsupported_cpu" })
+        );
+
+        let error = dispatch_rr_tool(
+            "record",
+            json!({
+                "language": "rust",
+                "program": "target/debug/app",
+                "launch_overrides": {}
+            }),
+            None,
+            &mut rr_runtime,
+        )
+        .expect_err("record dispatch must reject fields outside the public RecordParams contract");
+        assert_eq!(error.code, DebugToolErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn main_dispatches_rr_trace_and_origin_tools_through_public_handlers() {
+        let mut rr_runtime = RrRuntime::with_parts(
+            Box::new(FakeRrPreflight::new(RrPreflightStatus::Unsupported {
+                reason: RrUnsupportedReason::UnsupportedCpu,
+                message: "CPU lacks required rr support".to_owned(),
+            })),
+            Box::new(FakeRrRecorder::new(RrRecordResult {
+                recordable: true,
+                reason: None,
+                trace_id: None,
+                trace: None,
+                exit_code: Some(0),
+                output: Vec::new(),
+                output_truncated: false,
+                error: None,
+            })),
+            TraceStore::new(TracePolicy {
+                trace_root: std::env::temp_dir().join("tower-rr-tool-dispatch-test"),
+                ttl_secs: Some(60),
+                max_traces: 20,
+                record_timeout_secs: 60,
+            }),
+        );
+        let sessions = SessionManager::new(
+            DebugInitializeConfig {
+                languages: std::collections::BTreeMap::new(),
+                record: None,
+            },
+            Arc::new(DispatchNeverStartsFactory),
+        );
+
+        let traces = dispatch_rr_tool("traces", json!({}), Some(&sessions), &mut rr_runtime)
+            .expect("traces dispatch must route to TraceStore-backed handler");
+        let deleted = dispatch_rr_tool(
+            "delete_trace",
+            json!({ "trace_id": "missing-trace" }),
+            Some(&sessions),
+            &mut rr_runtime,
+        )
+        .expect("delete_trace dispatch must route to TraceStore-backed handler");
+        let origin = dispatch_rr_tool(
+            "find_origin",
+            json!({
+                "trace_id": "trace-origin",
+                "language": "rust",
+                "watch": "answer",
+                "at": { "kind": "crash" }
+            }),
+            Some(&sessions),
+            &mut rr_runtime,
+        )
+        .expect("find_origin dispatch must route to stable origin DTO handler");
+        let record_and_origin = dispatch_rr_tool(
+            "record_and_find_origin",
+            json!({
+                "record": {
+                    "language": "rust",
+                    "program": "target/debug/app",
+                    "args": [],
+                    "cwd": null,
+                    "env": {},
+                    "timeout_ms": 250
+                },
+                "origin": {
+                    "language": "rust",
+                    "watch": "answer",
+                    "at": { "kind": "end" },
+                    "timeout_secs": 1,
+                    "max_depth": 2,
+                    "max_children": 4
+                }
+            }),
+            Some(&sessions),
+            &mut rr_runtime,
+        )
+        .expect("record_and_find_origin dispatch must route to public combined handler");
+
+        assert_eq!(traces, json!({ "traces": [] }));
+        assert_eq!(deleted["deleted"], false);
+        assert_eq!(deleted["error"]["code"], "trace_not_found");
+        assert_eq!(origin["found"], false);
+        assert_eq!(origin["reason"], "trace_not_found");
+        assert_eq!(record_and_origin["record"]["recordable"], false);
+        assert_eq!(record_and_origin["origin"], Value::Null);
+    }
+
+    struct DispatchNeverStartsFactory;
+
+    impl DebugAdapterFactory for DispatchNeverStartsFactory {
+        fn start(
+            &self,
+            _request: &LaunchRequest,
+        ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+            panic!("rr trace/origin dispatch tests must not start a debug adapter")
         }
     }
 
@@ -1469,8 +1978,15 @@ mod tests {
     }
 
     #[test]
-    fn process_debug_adapter_session_resume_propagates_adapter_exited_after_continue_response() {
+    fn process_debug_adapter_session_resume_preserves_buffered_output_when_adapter_exits_after_continue_response()
+     {
         let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({
+                "seq": 9,
+                "type": "event",
+                "event": "output",
+                "body": { "category": "stdout", "output": "cleanup\n" }
+            }))),
             Ok(Some(json!({
                 "seq": 10,
                 "type": "response",
@@ -1483,11 +1999,14 @@ mod tests {
         ]);
         let mut session = process_session(transport);
 
-        let error = session
+        let stop = session
             .continue_session(Duration::from_millis(50))
-            .expect_err("adapter EOF must remain an adapter-exited error");
+            .expect("adapter EOF after response is a terminated stop");
 
-        assert!(matches!(error, DebugRuntimeError::AdapterExited(_)));
+        assert_eq!(stop.state, DebugSessionState::Terminated);
+        assert_eq!(stop.reason.as_deref(), Some("adapter_exited"));
+        assert_eq!(stop.output_since.len(), 1);
+        assert_eq!(stop.output_since[0].text, "cleanup\n");
     }
 
     fn process_session(transport: ScriptedTransport) -> ProcessDebugAdapterSession {
