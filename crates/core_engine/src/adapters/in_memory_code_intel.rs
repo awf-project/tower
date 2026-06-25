@@ -15,7 +15,10 @@ use std::collections::HashSet;
 
 use crate::domain::RelativePath;
 use crate::domain::code_intel::{Diagnostic, Hover, Location, Position, Range, Severity, Symbol};
-use crate::ports::{CodeIntelError, CodeIntelligencePort, NavigationPort};
+use crate::ports::{
+    CodeIntelError, CodeIntelligencePort, NavigationPort, PrepareRenameResult,
+    RenameNavigationError,
+};
 
 /// The marker the fake analyzer treats as an error.
 const ERROR_MARKER: &str = "//!ERR";
@@ -115,6 +118,21 @@ impl NavigationPort for InMemoryCodeIntel {
         }])
     }
 
+    fn implementations(
+        &self,
+        path: &RelativePath,
+        _text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, CodeIntelError> {
+        if !self.is_supported(path) {
+            return Err(CodeIntelError::Unsupported);
+        }
+        Ok(vec![Location {
+            path: path.clone(),
+            range: point(position),
+        }])
+    }
+
     /// Two synthetic, distinct reference sites (the queried line and the next).
     fn references(
         &self,
@@ -194,6 +212,57 @@ impl NavigationPort for InMemoryCodeIntel {
             }
         }
         Ok(symbols)
+    }
+
+    fn prepare_rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<PrepareRenameResult, RenameNavigationError> {
+        if !self.is_supported(path) {
+            return Err(RenameNavigationError::UnsupportedLanguage);
+        }
+        let line = text
+            .lines()
+            .nth(usize::try_from(position.line).unwrap_or(usize::MAX))
+            .or_else(|| text.lines().next())
+            .ok_or(RenameNavigationError::NotRenameable)?;
+        let character = usize::try_from(position.character)
+            .map_err(|_| RenameNavigationError::NotRenameable)?;
+        if character > line.len() || !line.is_char_boundary(character) {
+            return Err(RenameNavigationError::NotRenameable);
+        }
+
+        let bytes = line.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut start = character;
+        while start > 0 && is_ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = character;
+        while end < bytes.len() && is_ident(bytes[end]) {
+            end += 1;
+        }
+        if start == end {
+            return Err(RenameNavigationError::NotRenameable);
+        }
+
+        Ok(PrepareRenameResult {
+            range: Some(Range {
+                start: Position {
+                    line: position.line,
+                    character: u32::try_from(start)
+                        .map_err(|_| RenameNavigationError::NotRenameable)?,
+                },
+                end: Position {
+                    line: position.line,
+                    character: u32::try_from(end)
+                        .map_err(|_| RenameNavigationError::NotRenameable)?,
+                },
+            }),
+            placeholder: Some(line[start..end].to_owned()),
+        })
     }
 }
 

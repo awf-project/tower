@@ -1,8 +1,9 @@
 //! `lsp` sidecar extension (spec 27).
 //!
 //! Absorbs `adapters/lsp/*` logic into an out-of-process sidecar. Exposes the
-//! four LSP tools (`tower_lsp_diagnostics`, `tower_lsp_definition`,
-//! `tower_lsp_references`, `tower_lsp_hover`) over the extension protocol and
+//! LSP tools (`tower_lsp_diagnostics`, `tower_lsp_definition`,
+//! `tower_lsp_references`, `tower_lsp_hover`, `tower_lsp_implementations`,
+//! `tower_lsp_rename`) over the extension protocol and
 //! subscribes to `event/fileChanged` and `event/fileDeleted` for document sync.
 //!
 //! # Push path (spec 27 O1)
@@ -54,7 +55,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use extension_protocol::{
-    Capability, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response, ToolDecl,
+    Capability, InitParams, InitResult, PROTOCOL_VERSION, Response, ToolDecl,
 };
 use protocol::{HostCallIdAllocator, QueuedFrame};
 use serde_json::Value;
@@ -186,8 +187,8 @@ fn main() {
                     tools: vec![
                         ToolDecl {
                             name: "diagnostics".to_owned(),
-                            description: "Return diagnostics (errors, warnings) for a workspace-relative source file. Requires a configured language server for the file's extension.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"}},"required":["path"]}"#.to_owned(),
+                            description: "Run the configured language server over a file's current content and return compiler/linter diagnostics (errors and warnings). Use after editing a file to verify the change did not break it.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to analyze"}},"required":["path"]}"#.to_owned(),
                         },
                         ToolDecl {
                             name: "definition".to_owned(),
@@ -204,6 +205,16 @@ fn main() {
                             description: "Return hover information for the symbol at the given position in a workspace-relative source file.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
                         },
+                        ToolDecl {
+                            name: "implementations".to_owned(),
+                            description: "Find implementations for the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "rename".to_owned(),
+                            description: "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}"#.to_owned(),
+                        },
                     ],
                     events: vec![
                         "event/fileChanged".to_owned(),
@@ -213,6 +224,7 @@ fn main() {
                         Capability::ReadFile,
                         Capability::Notify,
                         Capability::Log,
+                        Capability::RequestApplyEdits,
                     ],
                 };
 
@@ -248,15 +260,7 @@ fn main() {
                         protocol::send_response(&stdout_lock, &id, &Response::ToolResult(value));
                     }
                     Err(err_msg) => {
-                        protocol::send_response(
-                            &stdout_lock,
-                            &id,
-                            &Response::Error(ProtocolError {
-                                code: -32000,
-                                message: err_msg,
-                                data: None,
-                            }),
-                        );
+                        protocol::send_error(&stdout_lock, &id, -32000, &err_msg);
                     }
                 }
             }

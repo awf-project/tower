@@ -6,11 +6,15 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use crate::lsp_adapter::{DiagnosticsEvent, SessionPool};
+use crate::lsp_adapter::decode::{WorkspaceEditDecodeError, decode_workspace_edit};
+use crate::lsp_adapter::{DiagnosticsEvent, RawWorkspaceEdit, SessionPool};
 use core_engine::adapters::config::lsp::LspConfig;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position};
-use core_engine::ports::{CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort};
+use core_engine::ports::{
+    CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, RenameNavigationError,
+};
+use extension_protocol::WorkspaceEditSpan;
 
 /// The sidecar extension's LSP session manager.
 ///
@@ -74,6 +78,15 @@ impl LspSessionPool {
         self.inner.references(path, text, position)
     }
 
+    pub fn implementations(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, CodeIntelError> {
+        self.inner.implementations(path, text, position)
+    }
+
     /// Hover information at `position` in `path`.
     pub fn hover(
         &self,
@@ -84,9 +97,31 @@ impl LspSessionPool {
         self.inner.hover(path, text, position)
     }
 
+    pub fn rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+        self.inner.rename(path, text, position, new_name)
+    }
+
     /// Whether this pool is configured to handle the given path.
     pub fn serves(&self, path: &RelativePath) -> bool {
         self.inner.serves(path)
+    }
+
+    #[allow(dead_code)]
+    pub fn decode_rename_workspace_edit<F>(
+        &self,
+        raw: RawWorkspaceEdit,
+        resolver: F,
+    ) -> Result<Vec<WorkspaceEditSpan>, WorkspaceEditDecodeError>
+    where
+        F: FnMut(&str) -> Result<String, WorkspaceEditDecodeError>,
+    {
+        decode_workspace_edit(raw, &self.workspace_root, resolver)
     }
 
     /// Called when `event/fileChanged` is received.
@@ -130,5 +165,66 @@ impl LspSessionPool {
     pub fn shutdown_all(&mut self) {
         // The `SessionPool` drops all sessions when it is dropped.
         // We take no explicit action here; on drop the pool kills its children.
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::mutable_key_type)]
+mod tests {
+    use super::*;
+    use core_engine::domain::mutation::compute_content_version;
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    use lsp_types::{Position as LspPosition, Range as LspRange, TextEdit, Uri, WorkspaceEdit};
+
+    fn uri(value: &str) -> Uri {
+        Uri::from_str(value).unwrap()
+    }
+
+    fn text_edit(l0: u32, c0: u32, l1: u32, c1: u32, replacement: &str) -> TextEdit {
+        TextEdit::new(
+            LspRange {
+                start: LspPosition {
+                    line: l0,
+                    character: c0,
+                },
+                end: LspPosition {
+                    line: l1,
+                    character: c1,
+                },
+            },
+            replacement.to_owned(),
+        )
+    }
+
+    #[test]
+    fn session_exposes_decoded_rename_edit_data_without_performing_hostcall() {
+        let workspace = tempfile::tempdir().unwrap();
+        let pool = LspSessionPool::new(LspConfig::default(), workspace.path().to_path_buf(), None);
+        let uri_path = workspace.path().join("src/main.rs");
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri(&format!("file://{}", uri_path.display())),
+            vec![text_edit(0, 4, 0, 12, "new_name")],
+        );
+
+        let spans = pool
+            .decode_rename_workspace_edit(WorkspaceEdit::new(changes), |path| {
+                assert_eq!(path, "src/main.rs");
+                Ok("let old_name = 1;\n".to_owned())
+            })
+            .unwrap();
+
+        assert_eq!(
+            spans,
+            vec![WorkspaceEditSpan {
+                path: "src/main.rs".to_owned(),
+                start_byte: 4,
+                end_byte: 12,
+                replacement: "new_name".to_owned(),
+                base_hash: Some(compute_content_version(b"let old_name = 1;\n")),
+            }]
+        );
     }
 }

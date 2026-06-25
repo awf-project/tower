@@ -1,6 +1,7 @@
 #![allow(clippy::pedantic)]
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,9 @@ use core_engine::adapters::{InMemoryAstIndex, RealFs};
 use core_engine::domain::mutation::compute_content_version;
 use core_engine::domain::{DomainError, RelativePath};
 use core_engine::ports::inbound::{
-    ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, TextEdit,
+    ApplyEditsRequest, PerFileEditResult, TextEdit, WorkspaceApplyEditsError,
+    WorkspaceApplyEditsErrorCode, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
+    WorkspaceEditSpan,
 };
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
 use extension_protocol::{ExtensionManifest, ToolDecl};
@@ -278,47 +281,98 @@ impl FixtureApplyEditsHost {
 }
 
 impl ApplyEditsHostPort for FixtureApplyEditsHost {
-    fn apply_edits_cas(
+    fn apply_batch_edits(
         &self,
-        request: ApplyEditsRequest,
-    ) -> Result<ApplyEditsFileResult, DomainError> {
-        let content = self.plan(&request)?;
-        let new_version = compute_content_version(content.as_bytes());
-        let mut fs = self
-            .fs
-            .lock()
-            .map_err(|e| DomainError::IoError(format!("fs mutex poisoned: {e}")))?;
-        core_engine::ports::FileSystemPort::write(
-            &mut *fs,
-            request.path.clone(),
-            content.into_bytes(),
-        )
-        .map_err(|e| DomainError::IoError(e.to_string()))?;
-        Ok(ApplyEditsFileResult {
-            path: request.path,
-            applied: request.edits,
-            skipped: Vec::new(),
-            new_version: Some(new_version),
-            preview: None,
-        })
-    }
+        request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        if request.edits.is_empty() {
+            return Ok(WorkspaceApplyEditsResult {
+                files_changed: 0,
+                per_file: vec![PerFileEditResult {
+                    path: RelativePath::new(""),
+                    applied: false,
+                    edits_applied: 0,
+                    edits_skipped: 0,
+                    new_version: None,
+                    preview: None,
+                    error: Some(WorkspaceApplyEditsError {
+                        code: WorkspaceApplyEditsErrorCode::EmptyEdits,
+                        message: "workspace/applyEdits requires at least one edit".to_owned(),
+                        path: None,
+                    }),
+                }],
+            });
+        }
 
-    fn apply_edits_dry_run(
-        &self,
-        request: ApplyEditsRequest,
-    ) -> Result<ApplyEditsFileResult, DomainError> {
-        let content = self.plan(&request)?;
-        Ok(ApplyEditsFileResult {
-            path: request.path.clone(),
-            applied: request.edits.clone(),
-            skipped: Vec::new(),
-            new_version: None,
-            preview: Some(ApplyEditsPreview {
-                path: request.path,
-                edits: request.edits,
-                skipped: Vec::new(),
-                preview_content: content,
-            }),
+        let dry_run = request.dry_run.unwrap_or(false);
+        let mut groups: BTreeMap<RelativePath, Vec<WorkspaceEditSpan>> = BTreeMap::new();
+        for edit in request.edits {
+            groups.entry(edit.path.clone()).or_default().push(edit);
+        }
+
+        let mut files_changed = 0;
+        let mut per_file = Vec::new();
+        for (path, spans) in groups {
+            let expected_version = match spans.iter().find_map(|span| span.base_hash.clone()) {
+                Some(hash) => hash,
+                None => {
+                    let bytes = self
+                        .fs
+                        .read_file(path.as_str())
+                        .map_err(DomainError::IoError)?;
+                    compute_content_version(&bytes)
+                }
+            };
+            let edits = spans
+                .iter()
+                .map(|span| TextEdit {
+                    start_byte: span.start_byte,
+                    end_byte: span.end_byte,
+                    replacement: span.replacement.clone(),
+                })
+                .collect::<Vec<_>>();
+            let single = ApplyEditsRequest {
+                path: path.clone(),
+                expected_version,
+                edits,
+            };
+            let content = self.plan(&single)?;
+
+            if dry_run {
+                per_file.push(PerFileEditResult {
+                    path,
+                    applied: true,
+                    edits_applied: single.edits.len(),
+                    edits_skipped: 0,
+                    new_version: None,
+                    preview: Some(content),
+                    error: None,
+                });
+                continue;
+            }
+
+            let new_version = compute_content_version(content.as_bytes());
+            let mut fs = self
+                .fs
+                .lock()
+                .map_err(|e| DomainError::IoError(format!("fs mutex poisoned: {e}")))?;
+            core_engine::ports::FileSystemPort::write(&mut *fs, path.clone(), content.into_bytes())
+                .map_err(|e| DomainError::IoError(e.to_string()))?;
+            files_changed += 1;
+            per_file.push(PerFileEditResult {
+                path,
+                applied: true,
+                edits_applied: single.edits.len(),
+                edits_skipped: 0,
+                new_version: Some(new_version),
+                preview: None,
+                error: None,
+            });
+        }
+
+        Ok(WorkspaceApplyEditsResult {
+            files_changed,
+            per_file,
         })
     }
 }

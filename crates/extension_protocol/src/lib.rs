@@ -10,7 +10,7 @@
 //! newline-delimited JSON object conforming to the JSON-RPC 2.0 envelope:
 //!
 //! ```json
-//! {"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}
+//! {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 //! ```
 //!
 //! When `id` is present the message is a request; when absent it is a
@@ -49,7 +49,14 @@ pub mod messages;
 
 pub use fault::{ExtensionFault, ProtocolError};
 pub use manifest::{Activation, Capability, EventKind, ExtensionManifest, ToolDecl};
-pub use messages::{Event, HostCall, InitParams, InitResult, Request, Response};
+pub use messages::{
+    AnchoredSymbolEditError, AnchoredSymbolEditErrorCode, AnchoredSymbolEditRequest,
+    AnchoredSymbolEditResult, ApplyEditsHostCallTextEdit, Event, HostCall, InitParams, InitResult,
+    Location, LspImplementationRequest, LspImplementationResult, PerFileEditResult, RenameError,
+    RenameErrorCode, RenamePreview, RenameRequest, RenameResult, Request, Response,
+    SymbolCandidate, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
+    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
+};
 
 /// The current protocol version carried in every [`InitParams`].
 ///

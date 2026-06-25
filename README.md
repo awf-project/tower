@@ -20,8 +20,8 @@ See [`project-brief.md`](project-brief.md) for the full vision.
 | **Mass refactoring** | Parallel global find-and-replace with per-file atomic rewrites and a `TxReport` |
 | **MCP server** | JSON-RPC 2.0 over stdin/stdout; native `tower_*` tools plus any extension tools, served from one surface |
 | **Native extension host** | Out-of-process native sidecar extensions over a JSON-RPC 2.0 protocol on stdio; OS-process isolation, per-call timeouts, restart/backoff, and quarantine |
-| **AST analysis** | `ast` extension — Tree-sitter outline and symbol search for Rust, Go, PHP |
-| **Code intelligence** | `lsp` extension — diagnostics, definition, references, hover via a language-server bridge |
+| **AST analysis and symbol edits** | `ast` extension — Tree-sitter outline, symbol search, and anchored symbol edits for Rust, Go, PHP |
+| **Code intelligence and refactors** | `lsp` extension — diagnostics, definition, references, hover, implementation lookup, and rename via a language-server bridge |
 | **Standalone linting and fixes** | `lint` extension — on-demand diagnostics and structured fixes from configured external linters, using the same diagnostic shape as LSP |
 | **Debugging** | `debug` extension — opt-in Debug Adapter Protocol sessions, one-shot `tower_debug_eval_at` probes, and rr-backed record/replay reverse debugging |
 | **Single static binary** | No WASM, WASI SDK, JVM, Node, or container required at runtime |
@@ -163,7 +163,7 @@ extensions/               Native sidecar extensions (separate binaries)
 ├── ast/                  Reference Tree-sitter AST extension (eager)
 ├── debug/                Debug Adapter Protocol bridge extension (lazy, opt-in)
 ├── hello/                Minimal example extension (lazy)
-├── lsp/                  Language-server bridge extension (lazy)
+├── lsp/                  Language-server bridge extension (eager)
 ├── lint/                 Standalone linter extension (lazy)
 └── fixtures/             Test-only fault-isolation fixtures (not shipped)
 ```
@@ -180,9 +180,10 @@ tests can locate sidecars under `target/debug/`. There is no WASM build step and
 |---|---|
 | [`docs/getting-started.md`](docs/getting-started.md) | Prerequisites, build, quality gate, first MCP session |
 | [`docs/architecture.md`](docs/architecture.md) | Hexagonal boundary, crate layout, ports, data flow, design decisions |
-| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools including lint fix, interactive debug sessions, rr record/replay reverse debugging, and error codes |
+| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools including semantic edits, lint fix, interactive debug sessions, rr record/replay reverse debugging, and error codes |
 | [`docs/user-guide/debug-sessions.md`](docs/user-guide/debug-sessions.md) | How to configure and drive interactive Debug Adapter Protocol sessions, one-shot `tower_debug_eval_at` probes, and rr-backed reverse-debug workflows |
 | [`docs/user-guide/lint-fixes.md`](docs/user-guide/lint-fixes.md) | How to preview and apply structured linter fixes safely with `tower_lint_fix` |
+| [`docs/user-guide/semantic-edits.md`](docs/user-guide/semantic-edits.md) | How to dry-run and apply LSP rename and AST symbol edits safely through host-owned workspace edits |
 | [`docs/extensions.md`](docs/extensions.md) | Extension authoring guide — native sidecars, the JSON-RPC protocol, capabilities, manifest, fault model |
 | [`docs/development.md`](docs/development.md) | Contributing, TDD workflow, CI pipeline, test conventions |
 | [`docs/ADR/`](docs/ADR/) | Architecture Decision Records |

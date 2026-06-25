@@ -39,11 +39,9 @@
 //! **Cancellation / cap (OP1) — shared `AtomicUsize`**
 //!
 //! A `cap: Option<usize>` parameter bounds the result count. Each parallel
-//! closure checks an `AtomicUsize` counter with `Ordering::Relaxed` (no
-//! synchronisation needed — a few extra matches beyond the cap are harmless; what
-//! matters is that memory stays bounded and the search exits promptly). When the
-//! counter exceeds the cap the closure returns an empty `Vec`, which costs nothing
-//! and terminates the work item without a panic.
+//! closure reserves result slots with an `AtomicUsize` counter. When the counter
+//! reaches the cap the closure returns an empty `Vec`, which costs nothing and
+//! terminates the work item without a panic.
 //!
 //! **Rayon inside domain**
 //!
@@ -186,7 +184,14 @@ impl<'a> TextSearch<'a> {
                         break;
                     }
                     if line.contains(pattern) {
-                        counter.fetch_add(1, Ordering::Relaxed);
+                        if counter
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                (current < effective_cap).then_some(current + 1)
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                         // Saturate at u32::MAX rather than panicking in a Rayon
                         // worker thread (UN2 / panic-free contract). A file with
                         // 4 billion lines is pathological; saturating is correct
@@ -375,7 +380,7 @@ mod tests {
 
     /// AC4 — binary (non-UTF-8) file does not cause a panic.
     #[test]
-    fn ac4_binary_file_does_not_panic() {
+    fn ac4_binary_file_does_not_unwind() {
         let mut ws = ProjectWorkspace::new();
         let mut fs = InMemoryFs::new();
 

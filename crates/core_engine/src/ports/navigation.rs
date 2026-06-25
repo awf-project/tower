@@ -19,8 +19,21 @@
 //! the adapter can sync the document before querying (mirroring `check`).
 
 use crate::domain::RelativePath;
-use crate::domain::code_intel::{Hover, Location, Position, Symbol};
+use crate::domain::code_intel::{Hover, Location, Position, Range, Symbol};
 use crate::ports::CodeIntelError;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareRenameResult {
+    pub range: Option<Range>,
+    pub placeholder: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenameNavigationError {
+    NotRenameable,
+    UnsupportedLanguage,
+    Backend(String),
+}
 
 /// Semantic navigation over file content.
 ///
@@ -37,6 +50,13 @@ pub trait NavigationPort: Send + Sync {
     /// - [`CodeIntelError::Unsupported`] — no backend for this extension.
     /// - [`CodeIntelError::Backend`] — the backend errored.
     fn definition(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, CodeIntelError>;
+
+    fn implementations(
         &self,
         path: &RelativePath,
         text: &str,
@@ -76,4 +96,11 @@ pub trait NavigationPort: Send + Sync {
         path: &RelativePath,
         text: &str,
     ) -> Result<Vec<Symbol>, CodeIntelError>;
+
+    fn prepare_rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<PrepareRenameResult, RenameNavigationError>;
 }

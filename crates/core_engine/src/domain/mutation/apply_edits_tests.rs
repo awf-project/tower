@@ -7,8 +7,9 @@ use crate::domain::mutation::{FileMutationService, compute_content_version};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::inbound::{
-    ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, FileMutationUseCase, SkippedEdit,
-    SkippedEditReason, TextEdit,
+    ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, FileMutationUseCase,
+    PerFileEditResult, SkippedEdit, SkippedEditReason, TextEdit, WorkspaceApplyEditsErrorCode,
+    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
 };
 use crate::ports::{ExtensionHostPort, FileSystemPort, NoOpExtensionHost};
 use std::sync::Mutex;
@@ -18,6 +19,37 @@ fn assert_file_mutation_use_case_apply_edits_contract<T: FileMutationUseCase + ?
         T::apply_edits_cas;
     let _: fn(&T, ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError> =
         T::apply_edits_dry_run;
+    let _: fn(
+        &mut T,
+        WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> = T::apply_batch_edits;
+}
+
+fn workspace_span(
+    path: &RelativePath,
+    start_byte: usize,
+    end_byte: usize,
+    replacement: &str,
+    base_hash: Option<String>,
+) -> WorkspaceEditSpan {
+    WorkspaceEditSpan {
+        path: path.clone(),
+        start_byte,
+        end_byte,
+        replacement: replacement.to_owned(),
+        base_hash,
+    }
+}
+
+fn per_file<'a>(
+    result: &'a WorkspaceApplyEditsResult,
+    path: &RelativePath,
+) -> &'a PerFileEditResult {
+    result
+        .per_file
+        .iter()
+        .find(|file| file.path == *path)
+        .unwrap_or_else(|| panic!("missing result for {}", path.as_str()))
 }
 
 fn make_state_with_file(
@@ -39,6 +71,12 @@ fn make_state_with_file(
         service.create_file(path.clone(), content.to_vec()).unwrap();
     }
     (fs, workspace, index, storage)
+}
+
+fn make_fs_only_file(path: &RelativePath, content: &[u8]) -> InMemoryFs {
+    let mut fs = InMemoryFs::new();
+    fs.write(path.clone(), content.to_vec()).unwrap();
+    fs
 }
 
 #[derive(Default)]
@@ -201,6 +239,46 @@ fn safe_non_overlapping_edits_commit_once() {
         ["src/main.rs"],
         "apply_edits_cas must commit through the single indexed-write path once"
     );
+}
+
+#[test]
+fn apply_batch_edits_dry_run_allows_readable_file_missing_from_workspace_index() {
+    let path = RelativePath::new("extensions/hello/src/main.rs");
+    let original = b"fn send_response() {}\n";
+    let mut fs = make_fs_only_file(&path, original);
+    let mut workspace = ProjectWorkspace::new();
+    let mut index = InvertedIndex::new();
+    let mut storage = InMemoryStorage::new();
+    let host = RecordingHost::default();
+    let expected_version = compute_content_version(original);
+
+    let mut service =
+        FileMutationService::new(&mut fs, &mut workspace, &mut index, &mut storage, &host);
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![workspace_span(
+                &path,
+                0,
+                0,
+                "// preview\n",
+                Some(expected_version),
+            )],
+            dry_run: Some(true),
+        })
+        .unwrap();
+
+    let file = per_file(&result, &path);
+    assert!(!file.applied);
+    assert_eq!(file.edits_applied, 1);
+    assert_eq!(file.edits_skipped, 0);
+    assert_eq!(file.error, None);
+    assert_eq!(
+        file.preview.as_deref(),
+        Some("// preview\nfn send_response() {}\n")
+    );
+    assert_eq!(fs.read(&path).unwrap(), original);
+    assert!(workspace.get_by_path(&path).is_none());
+    assert!(host.changed.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -480,4 +558,491 @@ fn invalid_utf8_boundary_rejects_without_writing() {
         "invalid UTF-8 boundary must return InvalidRange; got {error:?}"
     );
     assert_eq!(fs.read(&path).unwrap(), original);
+}
+
+#[test]
+fn apply_batch_edits_returns_files_changed_equal_to_files_actually_committed() {
+    let path_a = RelativePath::new("src/a.rs");
+    let path_b = RelativePath::new("src/b.rs");
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path_a, b"alpha");
+    {
+        let mut service = FileMutationService::new(
+            &mut fs,
+            &mut workspace,
+            &mut index,
+            &mut storage,
+            &NoOpExtensionHost,
+        );
+        service
+            .create_file(path_b.clone(), b"beta".to_vec())
+            .unwrap();
+    }
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(
+                    &path_a,
+                    0,
+                    5,
+                    "ALPHA",
+                    Some(compute_content_version(b"alpha")),
+                ),
+                workspace_span(&path_b, 0, 4, "BETA", Some("stale".to_owned())),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 1);
+    assert_eq!(fs.read(&path_a).unwrap(), b"ALPHA");
+    assert_eq!(fs.read(&path_b).unwrap(), b"beta");
+    assert!(per_file(&result, &path_a).applied);
+    assert_eq!(per_file(&result, &path_a).edits_applied, 1);
+    assert!(!per_file(&result, &path_b).applied);
+    assert_eq!(
+        per_file(&result, &path_b)
+            .error
+            .as_ref()
+            .map(|err| &err.code),
+        Some(&WorkspaceApplyEditsErrorCode::Conflict)
+    );
+}
+
+#[test]
+fn apply_batch_edits_rejects_an_empty_edits_list_with_empty_edits_and_commits_no_files() {
+    let path = RelativePath::new("src/empty.rs");
+    let original = b"unchanged";
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path, original);
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 0);
+    assert_eq!(fs.read(&path).unwrap(), original);
+    assert_eq!(result.per_file.len(), 1);
+    let file = &result.per_file[0];
+    assert_eq!(file.path, RelativePath::new(""));
+    assert!(!file.applied);
+    assert_eq!(file.edits_applied, 0);
+    assert_eq!(file.edits_skipped, 0);
+    assert_eq!(
+        file.error.as_ref().map(|error| &error.code),
+        Some(&WorkspaceApplyEditsErrorCode::EmptyEdits)
+    );
+}
+
+#[test]
+fn apply_batch_edits_groups_spans_by_path_and_preserves_best_effort_cross_file_behavior() {
+    let path_a = RelativePath::new("src/group_a.rs");
+    let path_b = RelativePath::new("src/group_b.rs");
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path_a, b"one two");
+    {
+        let mut service = FileMutationService::new(
+            &mut fs,
+            &mut workspace,
+            &mut index,
+            &mut storage,
+            &NoOpExtensionHost,
+        );
+        service
+            .create_file(path_b.clone(), b"three four".to_vec())
+            .unwrap();
+    }
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(
+                    &path_a,
+                    0,
+                    3,
+                    "ONE",
+                    Some(compute_content_version(b"one two")),
+                ),
+                workspace_span(&path_b, 0, 5, "THREE", Some("stale".to_owned())),
+                workspace_span(
+                    &path_a,
+                    4,
+                    7,
+                    "TWO",
+                    Some(compute_content_version(b"one two")),
+                ),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 1);
+    assert_eq!(fs.read(&path_a).unwrap(), b"ONE TWO");
+    assert_eq!(fs.read(&path_b).unwrap(), b"three four");
+    assert_eq!(per_file(&result, &path_a).edits_applied, 2);
+    assert!(!per_file(&result, &path_b).applied);
+    assert_eq!(
+        per_file(&result, &path_b)
+            .error
+            .as_ref()
+            .map(|err| &err.code),
+        Some(&WorkspaceApplyEditsErrorCode::Conflict)
+    );
+}
+
+#[test]
+fn apply_batch_edits_sorts_multiple_spans_in_one_file_by_descending_start_byte() {
+    let path = RelativePath::new("src/descending.rs");
+    let original = b"abc def ghi";
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path, original);
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(&path, 0, 3, "ABC", Some(compute_content_version(original))),
+                workspace_span(&path, 8, 11, "GHI", Some(compute_content_version(original))),
+                workspace_span(&path, 4, 7, "DEF", Some(compute_content_version(original))),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 1);
+    assert_eq!(fs.read(&path).unwrap(), b"ABC DEF GHI");
+    assert_eq!(per_file(&result, &path).edits_applied, 3);
+    assert_eq!(per_file(&result, &path).edits_skipped, 0);
+}
+
+#[test]
+fn apply_batch_edits_marks_one_file_as_not_applied_for_overlapping_spans_and_does_not_mutate_it() {
+    let path = RelativePath::new("src/overlap.rs");
+    let original = b"0123456789";
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path, original);
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(&path, 1, 5, "AAAA", Some(compute_content_version(original))),
+                workspace_span(&path, 3, 7, "BBBB", Some(compute_content_version(original))),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    let file = per_file(&result, &path);
+    assert_eq!(result.files_changed, 0);
+    assert!(!file.applied);
+    assert_eq!(file.edits_applied, 0);
+    assert_eq!(
+        file.error.as_ref().map(|err| &err.code),
+        Some(&WorkspaceApplyEditsErrorCode::OverlappingSpans)
+    );
+    assert_eq!(fs.read(&path).unwrap(), original);
+}
+
+#[test]
+fn apply_batch_edits_marks_stale_base_hash_as_conflict_and_reports_non_conflicting_outcomes() {
+    let stale_path = RelativePath::new("src/stale_batch.rs");
+    let ok_path = RelativePath::new("src/ok_batch.rs");
+    let (mut fs, mut workspace, mut index, mut storage) =
+        make_state_with_file(&stale_path, b"current");
+    {
+        let mut service = FileMutationService::new(
+            &mut fs,
+            &mut workspace,
+            &mut index,
+            &mut storage,
+            &NoOpExtensionHost,
+        );
+        service
+            .create_file(ok_path.clone(), b"fresh".to_vec())
+            .unwrap();
+    }
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(&stale_path, 0, 7, "changed", Some("stale".to_owned())),
+                workspace_span(
+                    &ok_path,
+                    0,
+                    5,
+                    "FRESH",
+                    Some(compute_content_version(b"fresh")),
+                ),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 1);
+    assert_eq!(fs.read(&stale_path).unwrap(), b"current");
+    assert_eq!(fs.read(&ok_path).unwrap(), b"FRESH");
+    assert!(per_file(&result, &ok_path).applied);
+    assert_eq!(
+        per_file(&result, &stale_path)
+            .error
+            .as_ref()
+            .map(|err| &err.code),
+        Some(&WorkspaceApplyEditsErrorCode::Conflict)
+    );
+}
+
+#[test]
+fn apply_batch_edits_checks_every_base_hash_in_a_file_group_before_mutating() {
+    let path = RelativePath::new("src/mixed_hashes.rs");
+    let original = b"alpha beta";
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path, original);
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(
+                    &path,
+                    0,
+                    5,
+                    "ALPHA",
+                    Some(compute_content_version(original)),
+                ),
+                workspace_span(&path, 6, 10, "BETA", Some("stale".to_owned())),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 0);
+    assert_eq!(fs.read(&path).unwrap(), original);
+    let file = per_file(&result, &path);
+    assert!(!file.applied);
+    assert_eq!(file.edits_applied, 0);
+    assert_eq!(file.edits_skipped, 2);
+    assert_eq!(
+        file.error.as_ref().map(|error| &error.code),
+        Some(&WorkspaceApplyEditsErrorCode::Conflict)
+    );
+}
+
+#[test]
+fn apply_batch_edits_requires_every_mutating_edit_to_supply_base_hash() {
+    let path = RelativePath::new("src/missing_hash.rs");
+    let original = b"alpha beta";
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path, original);
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(
+                    &path,
+                    0,
+                    5,
+                    "ALPHA",
+                    Some(compute_content_version(original)),
+                ),
+                workspace_span(&path, 6, 10, "BETA", None),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 0);
+    assert_eq!(fs.read(&path).unwrap(), original);
+    let file = per_file(&result, &path);
+    assert!(!file.applied);
+    assert_eq!(file.edits_applied, 0);
+    assert_eq!(file.edits_skipped, 2);
+    assert_eq!(
+        file.error.as_ref().map(|error| &error.code),
+        Some(&WorkspaceApplyEditsErrorCode::Conflict)
+    );
+}
+
+#[test]
+fn apply_batch_edits_reports_invalid_range_for_the_affected_file_and_leaves_it_unchanged() {
+    let invalid_path = RelativePath::new("src/invalid_batch.rs");
+    let ordering_path = RelativePath::new("src/invalid_order_batch.rs");
+    let ok_path = RelativePath::new("src/valid_batch.rs");
+    let invalid_original = "héllo".as_bytes();
+    let ordering_original = b"order";
+    let (mut fs, mut workspace, mut index, mut storage) =
+        make_state_with_file(&invalid_path, invalid_original);
+    {
+        let mut service = FileMutationService::new(
+            &mut fs,
+            &mut workspace,
+            &mut index,
+            &mut storage,
+            &NoOpExtensionHost,
+        );
+        service
+            .create_file(ok_path.clone(), b"plain".to_vec())
+            .unwrap();
+        service
+            .create_file(ordering_path.clone(), ordering_original.to_vec())
+            .unwrap();
+    }
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![
+                workspace_span(
+                    &invalid_path,
+                    2,
+                    3,
+                    "e",
+                    Some(compute_content_version(invalid_original)),
+                ),
+                workspace_span(
+                    &ordering_path,
+                    4,
+                    2,
+                    "x",
+                    Some(compute_content_version(ordering_original)),
+                ),
+                workspace_span(
+                    &ok_path,
+                    0,
+                    5,
+                    "PLAIN",
+                    Some(compute_content_version(b"plain")),
+                ),
+            ],
+            dry_run: None,
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 1);
+    assert_eq!(fs.read(&invalid_path).unwrap(), invalid_original);
+    assert_eq!(fs.read(&ordering_path).unwrap(), ordering_original);
+    assert_eq!(fs.read(&ok_path).unwrap(), b"PLAIN");
+    assert_eq!(
+        per_file(&result, &invalid_path)
+            .error
+            .as_ref()
+            .map(|err| &err.code),
+        Some(&WorkspaceApplyEditsErrorCode::InvalidRange)
+    );
+    assert_eq!(
+        per_file(&result, &ordering_path)
+            .error
+            .as_ref()
+            .map(|err| &err.code),
+        Some(&WorkspaceApplyEditsErrorCode::InvalidRange)
+    );
+}
+
+#[test]
+fn apply_batch_edits_with_dry_run_returns_preview_data_and_changes_no_contents_indexes_or_versions()
+{
+    use crate::domain::index::FileSearch;
+    use crate::ports::inbound::SearchUseCase as _;
+
+    let path = RelativePath::new("src/dry_batch.rs");
+    let original = b"fn old() {}\n";
+    let (mut fs, mut workspace, mut index, mut storage) = make_state_with_file(&path, original);
+    let original_version = compute_content_version(original);
+
+    let mut service = FileMutationService::new(
+        &mut fs,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    );
+    let result = service
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![workspace_span(
+                &path,
+                3,
+                6,
+                "new",
+                Some(original_version.clone()),
+            )],
+            dry_run: Some(true),
+        })
+        .unwrap();
+
+    assert_eq!(result.files_changed, 0);
+    assert_eq!(fs.read(&path).unwrap(), original);
+    assert_eq!(
+        compute_content_version(&fs.read(&path).unwrap()),
+        original_version
+    );
+
+    let file = per_file(&result, &path);
+    assert!(!file.applied);
+    assert_eq!(file.edits_applied, 1);
+    assert_eq!(file.new_version, None);
+    assert_eq!(file.preview.as_deref(), Some("fn new() {}\n"));
+
+    let results = FileSearch::new(&index, &workspace)
+        .search_text("new")
+        .unwrap();
+    assert!(
+        results.is_empty(),
+        "dry-run preview content must not update the text index"
+    );
 }

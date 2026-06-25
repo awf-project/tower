@@ -23,6 +23,10 @@ pub struct SymbolEntry {
     pub start_col: usize,
     pub end_row: usize,
     pub end_col: usize,
+    #[serde(default)]
+    pub body_start_byte: Option<usize>,
+    #[serde(default)]
+    pub body_end_byte: Option<usize>,
 }
 
 impl SymbolEntry {
@@ -103,6 +107,8 @@ fn entry_from_item(path: &str, item: &OutlineItem) -> SymbolEntry {
         start_col: item.span.start_col,
         end_row: item.span.end_row,
         end_col: item.span.end_col,
+        body_start_byte: item.body_span.as_ref().map(|span| span.start_byte),
+        body_end_byte: item.body_span.as_ref().map(|span| span.end_byte),
     }
 }
 
@@ -135,6 +141,7 @@ mod tests {
                             end_row: 0,
                             end_col: 10,
                         },
+                        body_span: None,
                     }
                 })
                 .collect(),

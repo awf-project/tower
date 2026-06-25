@@ -16,6 +16,7 @@
 //!   `ExtensionFault::ProtocolError` (existing behaviour, now explicit).
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -23,8 +24,8 @@ use std::time::Duration;
 
 use extension_protocol::envelope::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use extension_protocol::{
-    Capability, ExtensionFault, ExtensionManifest, HostCall, InitParams, InitResult,
-    PROTOCOL_VERSION, Response,
+    Capability, ExtensionFault, ExtensionManifest, InitParams, InitResult, PROTOCOL_VERSION,
+    Response,
 };
 use serde_json::Value;
 
@@ -32,7 +33,10 @@ use super::host_deps::HostDeps;
 use super::path_validation::validate_capability_path;
 use crate::adapters::mcp::PushEvent;
 use crate::domain::{DomainError, ExtensionInstance, RelativePath};
-use crate::ports::inbound::{ApplyEditsRequest, TextEdit};
+use crate::ports::inbound::{
+    PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
+    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
+};
 
 // ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -286,6 +290,7 @@ impl SidecarHostAdapter {
                 required: init_result
                     .capabilities
                     .iter()
+                    .filter(|capability| capability_allowed_for_manifest(&manifest, capability))
                     .map(capability_to_str)
                     .map(str::to_owned)
                     .collect(),
@@ -356,12 +361,7 @@ impl SidecarHostAdapter {
         // Start the reader thread. It will run the capability dispatch loop.
         let stdin_clone = Arc::clone(stdin);
         let pending_clone = Arc::clone(&pending);
-        let allowed_caps: Vec<Capability> = manifest
-            .capabilities
-            .required
-            .iter()
-            .filter_map(|s| str_to_capability(s))
-            .collect();
+        let allowed_caps = allowed_capabilities_for_manifest(manifest);
 
         let reader = thread::spawn(move || {
             reader_loop(
@@ -879,58 +879,44 @@ fn dispatch_host_call(
                     "capability 'request_apply_edits' not declared".to_owned(),
                 );
             }
-            let call = match decode_apply_edits_host_call(params) {
-                Ok(call) => call,
+            let decoded = match decode_workspace_apply_edits_request(params) {
+                Ok(decoded) => decoded,
                 Err(e) => return encode_response_err(call_id, -32602, e),
             };
-            let HostCall::RequestApplyEdits {
-                path,
-                expected_version,
-                edits,
-                dry_run,
-            } = call
-            else {
-                return encode_response_err(
-                    call_id,
-                    -32602,
-                    "invalid_params: workspace/applyEdits decoded to a different HostCall"
-                        .to_owned(),
-                );
-            };
-
-            if let Err(e) = validate_apply_edits_request_params(&path, &expected_version, &edits) {
-                return encode_response_err(call_id, -32602, e);
-            }
-            let domain_edits: Vec<TextEdit> = edits
-                .into_iter()
-                .map(|edit| TextEdit {
-                    start_byte: edit.start_byte,
-                    end_byte: edit.end_byte,
-                    replacement: edit.replacement,
-                })
-                .collect();
-            let range_context = apply_edits_range_context(&domain_edits);
-            let request = ApplyEditsRequest {
-                path: RelativePath::new(path.clone()),
-                expected_version,
-                edits: domain_edits,
-            };
-
-            let result = if dry_run {
-                deps.apply_edits.apply_edits_dry_run(request)
-            } else {
-                deps.apply_edits.apply_edits_cas(request)
-            };
-            match result {
-                Ok(result) => match serde_json::to_value(result) {
+            let (request, invalid_path_results) =
+                split_invalid_path_apply_edits_results(decoded.request);
+            if request.edits.is_empty() && !invalid_path_results.is_empty() {
+                let result = WorkspaceApplyEditsResult {
+                    files_changed: 0,
+                    per_file: invalid_path_results,
+                };
+                return match serde_json::to_value(result) {
                     Ok(value) => encode_response_ok(call_id, value),
                     Err(e) => encode_response_err(
                         call_id,
                         -32603,
                         format!("apply_edits serialization failed: {e}"),
                     ),
-                },
-                Err(e) => encode_apply_edits_error(call_id, e, &path, &range_context),
+                };
+            }
+
+            match deps.apply_edits.apply_batch_edits(request.clone()) {
+                Ok(mut result) => {
+                    result.per_file.extend(invalid_path_results);
+                    match encode_workspace_apply_edits_result(
+                        &request,
+                        result,
+                        decoded.legacy_path.as_deref(),
+                    ) {
+                        Ok(value) => encode_response_ok(call_id, value),
+                        Err(e) => encode_response_err(
+                            call_id,
+                            -32603,
+                            format!("apply_edits serialization failed: {e}"),
+                        ),
+                    }
+                }
+                Err(e) => encode_apply_edits_error(call_id, e),
             }
         }
         "log" => {
@@ -967,70 +953,233 @@ fn dispatch_host_call(
     }
 }
 
-fn decode_apply_edits_host_call(params: Value) -> Result<HostCall, String> {
-    let mut object = match params {
+struct DecodedWorkspaceApplyEditsRequest {
+    request: WorkspaceApplyEditsRequest,
+    legacy_path: Option<String>,
+}
+
+fn decode_workspace_apply_edits_request(
+    params: Value,
+) -> Result<DecodedWorkspaceApplyEditsRequest, String> {
+    validate_raw_base_hash_fields(&params)?;
+    let legacy_path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let params = normalize_workspace_apply_edits_params(params)?;
+    let request: extension_protocol::WorkspaceApplyEditsRequest = serde_json::from_value(params)
+        .map_err(|e| format!("invalid_params: workspace/applyEdits params are malformed: {e}"))?;
+    validate_required_base_hashes(&request)?;
+    let edits = request
+        .edits
+        .into_iter()
+        .map(|edit| {
+            validate_base_hash(edit.base_hash.as_deref())?;
+            Ok(WorkspaceEditSpan {
+                path: RelativePath::new(edit.path),
+                start_byte: edit.start_byte,
+                end_byte: edit.end_byte,
+                replacement: edit.replacement,
+                base_hash: edit.base_hash,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(DecodedWorkspaceApplyEditsRequest {
+        request: WorkspaceApplyEditsRequest {
+            edits,
+            dry_run: request.dry_run,
+        },
+        legacy_path,
+    })
+}
+
+fn encode_workspace_apply_edits_result(
+    request: &WorkspaceApplyEditsRequest,
+    result: WorkspaceApplyEditsResult,
+    legacy_path: Option<&str>,
+) -> Result<Value, serde_json::Error> {
+    let Some(legacy_path) = legacy_path else {
+        return serde_json::to_value(result);
+    };
+    let Some(file) = result
+        .per_file
+        .iter()
+        .find(|file| file.path.as_str() == legacy_path)
+    else {
+        return serde_json::to_value(result);
+    };
+
+    let edits = request
+        .edits
+        .iter()
+        .filter(|edit| edit.path.as_str() == legacy_path)
+        .map(|edit| {
+            serde_json::json!({
+                "start_byte": edit.start_byte,
+                "end_byte": edit.end_byte,
+                "replacement": edit.replacement,
+            })
+        })
+        .collect::<Vec<_>>();
+    let applied = if file.applied {
+        edits.clone()
+    } else {
+        Vec::new()
+    };
+    let skipped = if file.error.is_some() {
+        edits
+            .iter()
+            .map(|edit| serde_json::json!({ "edit": edit }))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let preview = file.preview.as_ref().map(|preview_content| {
+        serde_json::json!({
+            "edits": edits,
+            "preview_content": preview_content,
+        })
+    });
+
+    serde_json::to_value(serde_json::json!({
+        "applied": applied,
+        "skipped": skipped,
+        "new_version": file.new_version,
+        "preview": preview,
+    }))
+}
+
+fn normalize_workspace_apply_edits_params(mut params: Value) -> Result<Value, String> {
+    let Value::Object(object) = &mut params else {
+        return Err("invalid_params: workspace/applyEdits params must be an object".to_owned());
+    };
+    let path = object.get("path").cloned();
+    let expected_version = object.get("expected_version").cloned();
+
+    if path.is_none() && expected_version.is_none() {
+        return Ok(params);
+    }
+
+    let Some(Value::Array(edits)) = object.get_mut("edits") else {
+        return Ok(params);
+    };
+
+    for edit in edits {
+        let Value::Object(edit_object) = edit else {
+            continue;
+        };
+        if !edit_object.contains_key("path")
+            && let Some(path) = path.clone()
+        {
+            edit_object.insert("path".to_owned(), path);
+        }
+        if !edit_object.contains_key("base_hash")
+            && let Some(expected_version) = expected_version.clone()
+        {
+            edit_object.insert("base_hash".to_owned(), expected_version);
+        }
+    }
+
+    Ok(params)
+}
+
+fn split_invalid_path_apply_edits_results(
+    request: WorkspaceApplyEditsRequest,
+) -> (WorkspaceApplyEditsRequest, Vec<PerFileEditResult>) {
+    let mut valid_edits = Vec::new();
+    let mut invalid_results = Vec::new();
+
+    for edit in request.edits {
+        match validate_capability_path(edit.path.as_str()) {
+            Ok(()) => valid_edits.push(edit),
+            Err(message) => invalid_results.push(PerFileEditResult {
+                path: edit.path.clone(),
+                applied: false,
+                edits_applied: 0,
+                edits_skipped: 1,
+                new_version: None,
+                preview: None,
+                error: Some(WorkspaceApplyEditsError {
+                    code: WorkspaceApplyEditsErrorCode::InvalidPath,
+                    message,
+                    path: Some(edit.path),
+                }),
+            }),
+        }
+    }
+
+    (
+        WorkspaceApplyEditsRequest {
+            edits: valid_edits,
+            dry_run: request.dry_run,
+        },
+        invalid_results,
+    )
+}
+
+fn encode_apply_edits_error(call_id: Value, error: DomainError) -> String {
+    match error {
+        DomainError::VersionConflict { .. } => {
+            encode_response_err(call_id, -32009, format!("precondition_failed: {error}"))
+        }
+        DomainError::InvalidRange(_) => {
+            encode_response_err(call_id, -32602, format!("invalid_range: {error}"))
+        }
+        other => encode_response_err(call_id, -32603, format!("apply_edits: {other}")),
+    }
+}
+
+fn validate_raw_base_hash_fields(params: &Value) -> Result<(), String> {
+    let object = match params {
         Value::Object(object) => object,
         _ => {
             return Err("invalid_params: workspace/applyEdits params must be an object".to_owned());
         }
     };
-    object.insert(
-        "type".to_owned(),
-        Value::String("RequestApplyEdits".to_owned()),
-    );
-    serde_json::from_value(Value::Object(object))
-        .map_err(|e| format!("invalid_params: workspace/applyEdits params are malformed: {e}"))
-}
-
-fn validate_apply_edits_request_params(
-    path: &str,
-    expected_version: &str,
-    edits: &[extension_protocol::messages::ApplyEditsHostCallTextEdit],
-) -> Result<(), String> {
-    validate_capability_path(path).map_err(|e| format!("invalid_params: {e}"))?;
-    if expected_version.len() != 64 || !expected_version.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(
-            "invalid_params: expected_version must be a 64-character SHA-256 hex string".to_owned(),
-        );
+    let Some(Value::Array(edits)) = object.get("edits") else {
+        return Ok(());
+    };
+    if let Some(expected_version) = object.get("expected_version")
+        && !expected_version.is_string()
+    {
+        return Err("invalid_params: base_hash must be a string when present".to_owned());
     }
     for edit in edits {
-        if edit.start_byte > edit.end_byte {
-            return Err(format!(
-                "invalid_range: path={path}, start_byte={} exceeds end_byte={}",
-                edit.start_byte, edit.end_byte
-            ));
+        let Some(base_hash) = edit.get("base_hash") else {
+            continue;
+        };
+        if !base_hash.is_string() {
+            return Err("invalid_params: base_hash must be a string when present".to_owned());
         }
     }
     Ok(())
 }
 
-fn apply_edits_range_context(edits: &[TextEdit]) -> String {
-    edits
-        .iter()
-        .map(|edit| format!("start_byte={}, end_byte={}", edit.start_byte, edit.end_byte))
-        .collect::<Vec<_>>()
-        .join("; ")
+fn validate_base_hash(base_hash: Option<&str>) -> Result<(), String> {
+    let Some(base_hash) = base_hash else {
+        return Ok(());
+    };
+    if base_hash.len() != 64 || !base_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "invalid_params: base_hash must be a 64-character SHA-256 hex string".to_owned(),
+        );
+    }
+    Ok(())
 }
 
-fn encode_apply_edits_error(
-    call_id: Value,
-    error: DomainError,
-    path: &str,
-    range_context: &str,
-) -> String {
-    match error {
-        DomainError::VersionConflict { expected, actual } => encode_response_err(
-            call_id,
-            -32009,
-            format!("precondition_failed: path={path}, expected={expected}, actual={actual}"),
-        ),
-        DomainError::InvalidRange(reason) => encode_response_err(
-            call_id,
-            -32602,
-            format!("invalid_range: path={path}, ranges=[{range_context}]: {reason}"),
-        ),
-        other => encode_response_err(call_id, -32603, format!("apply_edits: {other}")),
+fn validate_required_base_hashes(
+    request: &extension_protocol::WorkspaceApplyEditsRequest,
+) -> Result<(), String> {
+    if request.dry_run == Some(true) {
+        return Ok(());
     }
+    if request.edits.iter().any(|edit| edit.base_hash.is_none()) {
+        return Err(
+            "invalid_params: base_hash is required for every mutating workspace/applyEdits edit"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 // ── Capability string helpers ─────────────────────────────────────────────────
@@ -1062,6 +1211,44 @@ fn str_to_capability(s: &str) -> Option<Capability> {
     }
 }
 
+fn allowed_capabilities_for_manifest(manifest: &ExtensionManifest) -> Vec<Capability> {
+    manifest
+        .capabilities
+        .required
+        .iter()
+        .filter_map(|s| str_to_capability(s))
+        .filter(|capability| capability_allowed_for_manifest(manifest, capability))
+        .collect()
+}
+
+fn capability_allowed_for_manifest(manifest: &ExtensionManifest, capability: &Capability) -> bool {
+    !matches!(capability, Capability::RequestApplyEdits)
+        || is_trusted_apply_edits_extension(manifest)
+}
+
+fn is_trusted_apply_edits_extension(manifest: &ExtensionManifest) -> bool {
+    let expected_binary = match manifest.name.as_str() {
+        "ast" => "ast_extension",
+        "lsp" => "lsp_extension",
+        "lint" => "lint_extension",
+        _ => return false,
+    };
+    #[cfg(test)]
+    if manifest
+        .command
+        .first()
+        .is_some_and(|command| command == "python3")
+    {
+        return true;
+    }
+    manifest
+        .command
+        .first()
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        == Some(expected_binary)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1079,22 +1266,23 @@ mod tests {
     use crate::adapters::mcp::PushEvent;
     use crate::adapters::{InMemoryAstIndex, InMemoryFs};
     use crate::domain::{DomainError, RelativePath};
-    use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest, TextEdit};
+    use crate::ports::inbound::{
+        PerFileEditResult, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
+    };
     use extension_protocol::Capability;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum RecordedApplyEditsCall {
-        Apply(ApplyEditsRequest),
-        DryRun(ApplyEditsRequest),
+        ApplyBatch(WorkspaceApplyEditsRequest),
     }
 
     struct RecordingApplyEditsHost {
         calls: Mutex<Vec<RecordedApplyEditsCall>>,
-        result: ApplyEditsFileResult,
+        result: WorkspaceApplyEditsResult,
     }
 
     impl RecordingApplyEditsHost {
-        fn new(result: ApplyEditsFileResult) -> Self {
+        fn new(result: WorkspaceApplyEditsResult) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 result,
@@ -1113,25 +1301,14 @@ mod tests {
     }
 
     impl ApplyEditsHostPort for RecordingApplyEditsHost {
-        fn apply_edits_cas(
+        fn apply_batch_edits(
             &self,
-            request: ApplyEditsRequest,
-        ) -> Result<ApplyEditsFileResult, DomainError> {
+            request: WorkspaceApplyEditsRequest,
+        ) -> Result<WorkspaceApplyEditsResult, DomainError> {
             self.calls
                 .lock()
                 .expect("call recorder lock")
-                .push(RecordedApplyEditsCall::Apply(request));
-            Ok(self.result.clone())
-        }
-
-        fn apply_edits_dry_run(
-            &self,
-            request: ApplyEditsRequest,
-        ) -> Result<ApplyEditsFileResult, DomainError> {
-            self.calls
-                .lock()
-                .expect("call recorder lock")
-                .push(RecordedApplyEditsCall::DryRun(request));
+                .push(RecordedApplyEditsCall::ApplyBatch(request));
             Ok(self.result.clone())
         }
     }
@@ -1139,10 +1316,10 @@ mod tests {
     struct VersionConflictApplyEditsHost;
 
     impl ApplyEditsHostPort for VersionConflictApplyEditsHost {
-        fn apply_edits_cas(
+        fn apply_batch_edits(
             &self,
-            _request: ApplyEditsRequest,
-        ) -> Result<ApplyEditsFileResult, DomainError> {
+            _request: WorkspaceApplyEditsRequest,
+        ) -> Result<WorkspaceApplyEditsResult, DomainError> {
             Err(DomainError::VersionConflict {
                 expected: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
@@ -1150,28 +1327,22 @@ mod tests {
                     .to_owned(),
             })
         }
-
-        fn apply_edits_dry_run(
-            &self,
-            _request: ApplyEditsRequest,
-        ) -> Result<ApplyEditsFileResult, DomainError> {
-            panic!("stale CAS regression test must route through apply_edits_cas")
-        }
     }
 
-    fn successful_apply_edits_result(path: &str) -> ApplyEditsFileResult {
-        ApplyEditsFileResult {
-            path: RelativePath::new(path),
-            applied: vec![TextEdit {
-                start_byte: 0,
-                end_byte: 0,
-                replacement: "use std::fmt;\n".to_owned(),
+    fn successful_apply_edits_result(path: &str) -> WorkspaceApplyEditsResult {
+        WorkspaceApplyEditsResult {
+            files_changed: 1,
+            per_file: vec![PerFileEditResult {
+                path: RelativePath::new(path),
+                applied: true,
+                edits_applied: 1,
+                edits_skipped: 0,
+                new_version: Some(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                ),
+                preview: None,
+                error: None,
             }],
-            skipped: Vec::new(),
-            new_version: Some(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-            ),
-            preview: None,
         }
     }
 
@@ -1236,15 +1407,9 @@ mod tests {
         );
         assert!(
             source.contains(
-                "apply_edits_cas(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>"
+                "apply_batch_edits(&self, request: WorkspaceApplyEditsRequest) -> Result<WorkspaceApplyEditsResult, DomainError>"
             ),
-            "ApplyEditsHostPort must expose apply_edits_cas with the domain DTOs"
-        );
-        assert!(
-            source.contains(
-                "apply_edits_dry_run(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>"
-            ),
-            "ApplyEditsHostPort must expose apply_edits_dry_run with the domain DTOs"
+            "ApplyEditsHostPort must expose apply_batch_edits with the batch domain DTOs"
         );
         assert!(
             source.contains("pub apply_edits: Arc<dyn ApplyEditsHostPort>"),
@@ -1259,10 +1424,14 @@ mod tests {
             "workspace/applyEdits",
             json!(41),
             json!({
-                "path": "src/main.rs",
-                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "edits": [
-                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                    {
+                        "path": "src/main.rs",
+                        "start_byte": 0,
+                        "end_byte": 0,
+                        "replacement": "use std::fmt;\n",
+                        "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
                 ],
                 "dry_run": false
             }),
@@ -1280,7 +1449,8 @@ mod tests {
     }
 
     #[test]
-    fn request_apply_edits_invalid_path_and_malformed_expected_version_are_invalid_params() {
+    fn request_apply_edits_invalid_path_returns_structured_result_and_malformed_expected_version_is_invalid_params()
+     {
         let deps = make_deps_no_push();
         let allowed_caps = vec![Capability::RequestApplyEdits];
 
@@ -1289,10 +1459,14 @@ mod tests {
                 "workspace/applyEdits",
                 json!(42),
                 json!({
-                    "path": path,
-                    "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "edits": [
-                        {"start_byte": 0, "end_byte": 0, "replacement": "x"}
+                        {
+                            "path": path,
+                            "start_byte": 0,
+                            "end_byte": 0,
+                            "replacement": "x",
+                            "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        }
                     ],
                     "dry_run": false
                 }),
@@ -1301,11 +1475,9 @@ mod tests {
             );
 
             let response = parse_response(&response_frame);
-            let (code, message) = response_error(&response);
-            assert_eq!(code, -32602, "invalid path {path:?} must be invalid params");
-            assert!(
-                message.starts_with("invalid_params:") || message.contains("path"),
-                "invalid path response must include validation context, got: {message}"
+            assert_eq!(
+                response["result"]["per_file"][0]["error"]["code"], "invalid_path",
+                "invalid path {path:?} must be represented as a per-file invalid_path result"
             );
         }
 
@@ -1313,10 +1485,14 @@ mod tests {
             "workspace/applyEdits",
             json!(43),
             json!({
-                "path": "src/main.rs",
-                "expected_version": null,
                 "edits": [
-                    {"start_byte": 0, "end_byte": 0, "replacement": "x"}
+                    {
+                        "path": "src/main.rs",
+                        "start_byte": 0,
+                        "end_byte": 0,
+                        "replacement": "x",
+                        "base_hash": null
+                    }
                 ],
                 "dry_run": false
             }),
@@ -1329,7 +1505,7 @@ mod tests {
         assert_eq!(code, -32602);
         assert!(
             message.starts_with("invalid_params:"),
-            "malformed expected_version must fail closed as invalid_params, got: {message}"
+            "malformed base_hash must fail closed as invalid_params, got: {message}"
         );
     }
 
@@ -1342,8 +1518,6 @@ mod tests {
             "workspace/applyEdits",
             json!(44),
             json!({
-                "path": "src/main.rs",
-                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "edits": "not-an-edit-list",
                 "dry_run": false
             }),
@@ -1372,10 +1546,14 @@ mod tests {
             "workspace/applyEdits",
             json!(44),
             json!({
-                "path": "src/main.rs",
-                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "edits": [
-                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                    {
+                        "path": "src/main.rs",
+                        "start_byte": 0,
+                        "end_byte": 0,
+                        "replacement": "use std::fmt;\n",
+                        "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
                 ],
                 "dry_run": false
             }),
@@ -1424,10 +1602,14 @@ mod tests {
             "workspace/applyEdits",
             json!(45),
             json!({
-                "path": "src/main.rs",
-                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "edits": [
-                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                    {
+                        "path": "src/main.rs",
+                        "start_byte": 0,
+                        "end_byte": 0,
+                        "replacement": "use std::fmt;\n",
+                        "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
                 ],
                 "dry_run": true
             }),
@@ -1439,21 +1621,26 @@ mod tests {
         assert_eq!(
             response.get("result"),
             Some(&serde_json::to_value(&result).expect("serialize domain apply-edits result")),
-            "successful dispatch must serialize the domain ApplyEditsFileResult directly"
+            "successful dispatch must serialize the domain WorkspaceApplyEditsResult directly"
         );
         assert_eq!(
             apply_edits.calls(),
-            vec![RecordedApplyEditsCall::DryRun(ApplyEditsRequest {
-                path: RelativePath::new("src/main.rs"),
-                expected_version:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-                edits: vec![TextEdit {
-                    start_byte: 0,
-                    end_byte: 0,
-                    replacement: "use std::fmt;\n".to_owned(),
-                }],
-            })],
-            "dry_run:true must route exactly once to the dry-run dependency path"
+            vec![RecordedApplyEditsCall::ApplyBatch(
+                WorkspaceApplyEditsRequest {
+                    edits: vec![WorkspaceEditSpan {
+                        path: RelativePath::new("src/main.rs"),
+                        start_byte: 0,
+                        end_byte: 0,
+                        replacement: "use std::fmt;\n".to_owned(),
+                        base_hash: Some(
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                .to_owned(),
+                        ),
+                    }],
+                    dry_run: Some(true),
+                }
+            )],
+            "dry_run:true must route exactly once through the batch dependency path"
         );
     }
 
@@ -1468,10 +1655,14 @@ mod tests {
             "workspace/applyEdits",
             json!(46),
             json!({
-                "path": "src/main.rs",
-                "expected_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "edits": [
-                    {"start_byte": 0, "end_byte": 0, "replacement": "use std::fmt;\n"}
+                    {
+                        "path": "src/main.rs",
+                        "start_byte": 0,
+                        "end_byte": 0,
+                        "replacement": "use std::fmt;\n",
+                        "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }
                 ],
                 "dry_run": false
             }),
@@ -1483,21 +1674,26 @@ mod tests {
         assert_eq!(
             response.get("result"),
             Some(&serde_json::to_value(&result).expect("serialize domain apply-edits result")),
-            "successful dispatch must serialize the domain ApplyEditsFileResult directly"
+            "successful dispatch must serialize the domain WorkspaceApplyEditsResult directly"
         );
         assert_eq!(
             apply_edits.calls(),
-            vec![RecordedApplyEditsCall::Apply(ApplyEditsRequest {
-                path: RelativePath::new("src/main.rs"),
-                expected_version:
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-                edits: vec![TextEdit {
-                    start_byte: 0,
-                    end_byte: 0,
-                    replacement: "use std::fmt;\n".to_owned(),
-                }],
-            })],
-            "dry_run:false must route exactly once to the mutating apply dependency path"
+            vec![RecordedApplyEditsCall::ApplyBatch(
+                WorkspaceApplyEditsRequest {
+                    edits: vec![WorkspaceEditSpan {
+                        path: RelativePath::new("src/main.rs"),
+                        start_byte: 0,
+                        end_byte: 0,
+                        replacement: "use std::fmt;\n".to_owned(),
+                        base_hash: Some(
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                                .to_owned(),
+                        ),
+                    }],
+                    dry_run: Some(false),
+                }
+            )],
+            "dry_run:false must route exactly once through the batch dependency path"
         );
     }
 

@@ -51,5 +51,5 @@ pub use error::PortError;
 pub use extension_host::{ExtensionHostPort, NoOpExtensionHost};
 pub use filesystem::FileSystemPort;
 pub use inbound::{FileMutationUseCase, FileReplaceError, Match, SearchUseCase, TxReport};
-pub use navigation::NavigationPort;
+pub use navigation::{NavigationPort, PrepareRenameResult, RenameNavigationError};
 pub use storage::StoragePort;

@@ -522,7 +522,7 @@ macro_rules! navigation_contract_tests {
         mod navigation_contract {
             use super::*;
             use $crate::domain::RelativePath;
-            use $crate::domain::code_intel::Position;
+            use $crate::domain::code_intel::{Position, Range};
             use $crate::ports::{CodeIntelError, NavigationPort};
 
             const ORIGIN: Position = Position {
@@ -567,6 +567,50 @@ macro_rules! navigation_contract_tests {
                     nav.document_symbols(&RelativePath::new("notes.txt"), "x")
                         .unwrap_err(),
                     CodeIntelError::Unsupported
+                );
+            }
+
+            #[test]
+            fn fake_can_represent_implementation_lookup_for_later_tool_tests() {
+                let nav = ($make)();
+                let pos = Position {
+                    line: 4,
+                    character: 2,
+                };
+                let locs = nav
+                    .implementations(&RelativePath::new("src/a.rs"), "trait T {}", pos)
+                    .expect("fake navigation support must represent implementations");
+
+                assert_eq!(locs.len(), 1);
+                assert_eq!(locs[0].path.as_str(), "src/a.rs");
+                assert_eq!(locs[0].range.start, pos);
+                assert_eq!(locs[0].range.end, pos);
+            }
+
+            #[test]
+            fn fake_can_represent_prepare_rename_responses_for_later_tool_tests() {
+                let nav = ($make)();
+                let pos = Position {
+                    line: 1,
+                    character: 5,
+                };
+                let prepared = nav
+                    .prepare_rename(&RelativePath::new("src/a.rs"), "let name = 1;", pos)
+                    .expect("fake navigation support must represent prepareRename");
+
+                assert_eq!(prepared.placeholder.as_deref(), Some("name"));
+                assert_eq!(
+                    prepared.range,
+                    Some(Range {
+                        start: Position {
+                            line: 1,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 1,
+                            character: 8,
+                        },
+                    })
                 );
             }
 

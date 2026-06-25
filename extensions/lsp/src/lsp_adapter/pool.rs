@@ -31,11 +31,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::lsp_adapter::{DiagnosticsSender, SharedState};
+use crate::lsp_adapter::{DiagnosticsSender, RawWorkspaceEdit, SharedState};
 use core_engine::adapters::config::lsp::{LspConfig, LspServerConfig};
 use core_engine::domain::RelativePath;
-use core_engine::domain::code_intel::Diagnostic;
-use core_engine::ports::{CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort};
+use core_engine::domain::code_intel::{Diagnostic, Position};
+use core_engine::ports::{
+    CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
+    RenameNavigationError,
+};
 
 // ── PooledSession trait ───────────────────────────────────────────────────────
 
@@ -66,6 +69,15 @@ pub trait PooledSession:
     /// Called by `SessionPool::diagnostics_for` to serve `resources/read` (AC6 pull).
     #[allow(dead_code)]
     fn diagnostics_for(&self, uri: &str) -> Vec<Diagnostic>;
+
+    #[allow(dead_code)]
+    fn rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, RenameNavigationError>;
 
     /// Test/`testing`-only: force this session into the "dead" state.
     ///
@@ -354,6 +366,20 @@ impl NavigationPort for SessionPool {
         session.definition(path, text, position)
     }
 
+    fn implementations(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: core_engine::domain::code_intel::Position,
+    ) -> Result<Vec<core_engine::domain::code_intel::Location>, CodeIntelError> {
+        let lang = self
+            .lang_for_path(path)
+            .ok_or(CodeIntelError::Unsupported)?
+            .to_owned();
+        let session = self.get_or_spawn(&lang)?;
+        session.implementations(path, text, position)
+    }
+
     fn references(
         &self,
         path: &RelativePath,
@@ -393,6 +419,49 @@ impl NavigationPort for SessionPool {
             .to_owned();
         let session = self.get_or_spawn(&lang)?;
         session.document_symbols(path, text)
+    }
+
+    fn prepare_rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: core_engine::domain::code_intel::Position,
+    ) -> Result<PrepareRenameResult, RenameNavigationError> {
+        let lang = self
+            .lang_for_path(path)
+            .ok_or(RenameNavigationError::UnsupportedLanguage)?
+            .to_owned();
+        let session = self
+            .get_or_spawn(&lang)
+            .map_err(code_intel_to_rename_error)?;
+        session.prepare_rename(path, text, position)
+    }
+}
+
+impl SessionPool {
+    #[allow(dead_code)]
+    pub fn rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+        let lang = self
+            .lang_for_path(path)
+            .ok_or(RenameNavigationError::UnsupportedLanguage)?
+            .to_owned();
+        let session = self
+            .get_or_spawn(&lang)
+            .map_err(code_intel_to_rename_error)?;
+        session.rename(path, text, position, new_name)
+    }
+}
+
+fn code_intel_to_rename_error(error: CodeIntelError) -> RenameNavigationError {
+    match error {
+        CodeIntelError::Unsupported => RenameNavigationError::UnsupportedLanguage,
+        CodeIntelError::Backend(message) => RenameNavigationError::Backend(message),
     }
 }
 
@@ -449,7 +518,13 @@ mod tests {
     struct FakeSession {
         dead: AtomicBool,
         check_calls: AtomicUsize,
+        implementation_calls: AtomicUsize,
+        prepare_rename_calls: AtomicUsize,
+        rename_calls: AtomicUsize,
         canned_diags: Vec<Diagnostic>,
+        canned_implementations: Mutex<Vec<core_engine::domain::code_intel::Location>>,
+        canned_prepare_rename: Mutex<Result<PrepareRenameResult, RenameNavigationError>>,
+        canned_rename: Mutex<Result<RawWorkspaceEdit, RenameNavigationError>>,
     }
 
     impl FakeSession {
@@ -457,7 +532,43 @@ mod tests {
             Arc::new(Self {
                 dead: AtomicBool::new(false),
                 check_calls: AtomicUsize::new(0),
+                implementation_calls: AtomicUsize::new(0),
+                prepare_rename_calls: AtomicUsize::new(0),
+                rename_calls: AtomicUsize::new(0),
                 canned_diags: vec![],
+                canned_implementations: Mutex::new(vec![
+                    core_engine::domain::code_intel::Location {
+                        path: RelativePath::new("src/impl.rs"),
+                        range: core_engine::domain::code_intel::Range {
+                            start: Position {
+                                line: 3,
+                                character: 1,
+                            },
+                            end: Position {
+                                line: 3,
+                                character: 5,
+                            },
+                        },
+                    },
+                ]),
+                canned_prepare_rename: Mutex::new(Ok(PrepareRenameResult {
+                    range: Some(core_engine::domain::code_intel::Range {
+                        start: Position {
+                            line: 0,
+                            character: 4,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 8,
+                        },
+                    }),
+                    placeholder: Some("name".to_owned()),
+                })),
+                canned_rename: Mutex::new(Ok(RawWorkspaceEdit {
+                    changes: Some(std::collections::HashMap::new()),
+                    document_changes: None,
+                    change_annotations: None,
+                })),
             })
         }
 
@@ -467,6 +578,18 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.check_calls.load(Ordering::Relaxed)
+        }
+
+        fn implementation_calls(&self) -> usize {
+            self.implementation_calls.load(Ordering::Relaxed)
+        }
+
+        fn prepare_rename_calls(&self) -> usize {
+            self.prepare_rename_calls.load(Ordering::Relaxed)
+        }
+
+        fn rename_calls(&self) -> usize {
+            self.rename_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -484,6 +607,17 @@ mod tests {
 
         fn diagnostics_for(&self, _uri: &str) -> Vec<Diagnostic> {
             self.canned_diags.clone()
+        }
+
+        fn rename(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+            _: &str,
+        ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+            self.rename_calls.fetch_add(1, Ordering::Relaxed);
+            self.canned_rename.lock().unwrap().clone()
         }
 
         fn kill_for_test(&self) {
@@ -512,6 +646,16 @@ mod tests {
             Err(CodeIntelError::Unsupported)
         }
 
+        fn implementations(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: core_engine::domain::code_intel::Position,
+        ) -> Result<Vec<core_engine::domain::code_intel::Location>, CodeIntelError> {
+            self.implementation_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.canned_implementations.lock().unwrap().clone())
+        }
+
         fn references(
             &self,
             _: &RelativePath,
@@ -536,6 +680,16 @@ mod tests {
             _: &str,
         ) -> Result<Vec<core_engine::domain::code_intel::Symbol>, CodeIntelError> {
             Err(CodeIntelError::Unsupported)
+        }
+
+        fn prepare_rename(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: core_engine::domain::code_intel::Position,
+        ) -> Result<PrepareRenameResult, RenameNavigationError> {
+            self.prepare_rename_calls.fetch_add(1, Ordering::Relaxed);
+            self.canned_prepare_rename.lock().unwrap().clone()
         }
     }
 
@@ -893,5 +1047,131 @@ mod tests {
             0,
             "spawner must NOT be called for unconfigured ext"
         );
+    }
+
+    #[test]
+    fn session_pool_routes_implementation_prepare_rename_and_rename_through_get_or_spawn() {
+        let spawner = FakeSpawner::new();
+        let session = FakeSession::new();
+        spawner.register("rust", Arc::clone(&session));
+        let pool = pool_with_spawner(
+            rust_config(),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+        );
+        let rel = RelativePath::new("src/main.rs");
+        let pos = Position {
+            line: 0,
+            character: 5,
+        };
+
+        let implementations = pool.implementations(&rel, "trait Example {}", pos).unwrap();
+        let prepared = pool.prepare_rename(&rel, "let name = 1;", pos).unwrap();
+        let edit = pool.rename(&rel, "let name = 1;", pos, "new_name").unwrap();
+
+        assert_eq!(spawner.spawn_count("rust"), 1);
+        assert_eq!(session.implementation_calls(), 1);
+        assert_eq!(session.prepare_rename_calls(), 1);
+        assert_eq!(session.rename_calls(), 1);
+        assert_eq!(implementations[0].path.as_str(), "src/impl.rs");
+        assert_eq!(prepared.placeholder.as_deref(), Some("name"));
+        assert!(edit.changes.is_some());
+    }
+
+    #[test]
+    fn session_pool_restarts_dead_session_for_implementation_prepare_rename_and_rename() {
+        use std::collections::VecDeque;
+
+        struct QueueSpawner {
+            queue: Mutex<VecDeque<Arc<FakeSession>>>,
+            count: AtomicUsize,
+        }
+
+        impl QueueSpawner {
+            fn new(sessions: Vec<Arc<FakeSession>>) -> Arc<Self> {
+                Arc::new(Self {
+                    queue: Mutex::new(sessions.into_iter().collect()),
+                    count: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        impl SessionSpawner for QueueSpawner {
+            fn spawn(
+                &self,
+                _: &LspServerConfig,
+                _: &str,
+                _: PathBuf,
+                _: Option<DiagnosticsSender>,
+            ) -> Result<Arc<dyn PooledSession>, CodeIntelError> {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map(|s| s as Arc<dyn PooledSession>)
+                    .ok_or_else(|| CodeIntelError::Backend("queue empty".into()))
+            }
+        }
+
+        let first = FakeSession::new();
+        let second = FakeSession::new();
+        let third = FakeSession::new();
+        let fourth = FakeSession::new();
+        let spawner = QueueSpawner::new(vec![
+            Arc::clone(&first),
+            Arc::clone(&second),
+            Arc::clone(&third),
+            Arc::clone(&fourth),
+        ]);
+        let pool = SessionPool::with_spawner(
+            rust_config(),
+            PathBuf::from("/workspace"),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+            None,
+        );
+        let rel = RelativePath::new("src/main.rs");
+        let pos = Position {
+            line: 0,
+            character: 0,
+        };
+
+        pool.implementations(&rel, "", pos).unwrap();
+        first.set_dead();
+        pool.implementations(&rel, "", pos).unwrap();
+
+        second.set_dead();
+        pool.prepare_rename(&rel, "let name = 1;", pos).unwrap();
+
+        third.set_dead();
+        pool.rename(&rel, "let name = 1;", pos, "new_name").unwrap();
+
+        assert_eq!(spawner.count.load(Ordering::Relaxed), 4);
+        assert_eq!(second.implementation_calls(), 1);
+        assert_eq!(third.prepare_rename_calls(), 1);
+        assert_eq!(fourth.rename_calls(), 1);
+    }
+
+    #[test]
+    fn session_pool_returns_unsupported_language_for_rename_on_unconfigured_extension() {
+        let spawner = FakeSpawner::new();
+        let pool = pool_with_spawner(
+            rust_config(),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+        );
+
+        let err = pool
+            .rename(
+                &RelativePath::new("index.js"),
+                "",
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+                "renamed",
+            )
+            .unwrap_err();
+
+        assert_eq!(err, RenameNavigationError::UnsupportedLanguage);
+        assert_eq!(spawner.spawn_count("rust"), 0);
     }
 }

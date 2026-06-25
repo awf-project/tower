@@ -28,12 +28,24 @@ use std::time::Duration;
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
 use extension_protocol::{Event, ExtensionManifest};
 
+use core_engine::adapters::extension::host_deps::ApplyEditsHostPort;
 use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
 use core_engine::adapters::extension::{HostDeps, SidecarHostAdapter};
 use core_engine::adapters::formatter::NoOpFormatQueue;
-use core_engine::adapters::{InMemoryAstIndex, InMemoryFs};
+use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::native_tools::EngineState;
+use core_engine::adapters::mcp::registry::ToolRegistry;
+use core_engine::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage};
 use core_engine::domain::extension_host::ExtensionRegistry;
+use core_engine::domain::index::InvertedIndex;
+use core_engine::domain::mutation::compute_content_version;
+use core_engine::domain::workspace::ProjectWorkspace;
+use core_engine::domain::{DomainError, RelativePath};
 use core_engine::ports::FileSystemPort;
+use core_engine::ports::inbound::{
+    PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
+    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
+};
 
 /// Default timeout: long enough for cooperative extensions in CI.
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -83,6 +95,127 @@ fn make_deps(fs: InMemoryFs) -> HostDeps {
     }
 }
 
+fn empty_engine_state() -> Arc<std::sync::RwLock<EngineState>> {
+    Arc::new(std::sync::RwLock::new(EngineState::new(
+        ProjectWorkspace::new(),
+        InvertedIndex::new(),
+        Box::new(InMemoryStorage::new()),
+        Box::new(InMemoryFs::new()),
+    )))
+}
+
+fn make_deps_with_apply_edits(fs: Arc<Mutex<InMemoryFs>>) -> HostDeps {
+    HostDeps {
+        fs: fs.clone(),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(InMemoryApplyEditsHost { fs }),
+        push_tx: None,
+    }
+}
+
+struct InMemoryApplyEditsHost {
+    fs: Arc<Mutex<InMemoryFs>>,
+}
+
+impl ApplyEditsHostPort for InMemoryApplyEditsHost {
+    fn apply_batch_edits(
+        &self,
+        request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        let dry_run = request.dry_run.unwrap_or(false);
+        let mut files_changed = 0;
+        let mut per_file = Vec::new();
+
+        for span in request.edits {
+            let mut fs = self
+                .fs
+                .lock()
+                .map_err(|error| DomainError::IoError(format!("fs mutex poisoned: {error}")))?;
+            let bytes = fs.read(&span.path).map_err(|error| {
+                DomainError::IoError(format!("read {} failed: {error}", span.path.as_str()))
+            })?;
+            let actual_hash = compute_content_version(&bytes);
+            if span.base_hash.as_deref() != Some(actual_hash.as_str()) {
+                per_file.push(PerFileEditResult {
+                    path: span.path,
+                    applied: false,
+                    edits_applied: 0,
+                    edits_skipped: 1,
+                    new_version: None,
+                    preview: None,
+                    error: Some(WorkspaceApplyEditsError {
+                        code: WorkspaceApplyEditsErrorCode::Conflict,
+                        message: "base_hash did not match file version".to_owned(),
+                        path: None,
+                    }),
+                });
+                continue;
+            }
+
+            let mut content = String::from_utf8(bytes).map_err(|error| {
+                DomainError::InvalidRange(format!(
+                    "{} is not UTF-8 text: {error}",
+                    span.path.as_str()
+                ))
+            })?;
+            if span.start_byte > span.end_byte || span.end_byte > content.len() {
+                per_file.push(PerFileEditResult {
+                    path: span.path,
+                    applied: false,
+                    edits_applied: 0,
+                    edits_skipped: 1,
+                    new_version: None,
+                    preview: None,
+                    error: Some(WorkspaceApplyEditsError {
+                        code: WorkspaceApplyEditsErrorCode::InvalidRange,
+                        message: "edit range is outside file bounds".to_owned(),
+                        path: None,
+                    }),
+                });
+                continue;
+            }
+
+            content.replace_range(span.start_byte..span.end_byte, &span.replacement);
+            let new_version = compute_content_version(content.as_bytes());
+            if dry_run {
+                per_file.push(PerFileEditResult {
+                    path: span.path,
+                    applied: false,
+                    edits_applied: 0,
+                    edits_skipped: 0,
+                    new_version: None,
+                    preview: Some(content),
+                    error: None,
+                });
+            } else {
+                fs.write(span.path.clone(), content.into_bytes())
+                    .map_err(|error| {
+                        DomainError::IoError(format!(
+                            "write {} failed: {error}",
+                            span.path.as_str()
+                        ))
+                    })?;
+                files_changed += 1;
+                per_file.push(PerFileEditResult {
+                    path: span.path,
+                    applied: true,
+                    edits_applied: 1,
+                    edits_skipped: 0,
+                    new_version: Some(new_version),
+                    preview: None,
+                    error: None,
+                });
+            }
+        }
+
+        Ok(WorkspaceApplyEditsResult {
+            files_changed,
+            per_file,
+        })
+    }
+}
+
 #[allow(dead_code)]
 fn make_deps_with_index(fs: InMemoryFs, index: InMemoryAstIndex) -> HostDeps {
     HostDeps {
@@ -115,6 +248,7 @@ fn ast_manifest(bin: &str) -> ExtensionManifest {
                 "list_files".to_owned(),
                 "index_get".to_owned(),
                 "index_put".to_owned(),
+                "request_apply_edits".to_owned(),
                 "log".to_owned(),
             ],
         },
@@ -200,6 +334,295 @@ interface MyInterface {
 
 function topLevelFn() {}
 "#;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F007/T016: AST anchored symbol edit tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn t016_runtime_init_advertises_bare_ast_write_tools_and_request_apply_edits() {
+    let bin = ast_extension_bin();
+    let manifest = ast_manifest(&bin);
+    let deps = make_deps(InMemoryFs::new());
+    let manifest_toml =
+        std::fs::read_to_string(workspace_root().join("extensions/ast/extension.toml"))
+            .expect("ast extension manifest must be readable");
+    let static_manifest: ExtensionManifest =
+        toml::from_str(&manifest_toml).expect("manifest must parse");
+
+    let mut adapter =
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
+
+    let initialized = adapter.manifest();
+    let mut runtime_tools = initialized.tools.clone();
+    runtime_tools.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut manifest_tools = static_manifest.tools;
+    manifest_tools.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        runtime_tools, manifest_tools,
+        "InitResult tool metadata must match extension.toml"
+    );
+    let tool_names: Vec<&str> = runtime_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    for expected in [
+        "replace_symbol_body",
+        "insert_before_symbol",
+        "insert_after_symbol",
+        "delete_symbol",
+    ] {
+        assert!(
+            tool_names.contains(&expected),
+            "InitResult must advertise {expected}, got {tool_names:?}"
+        );
+    }
+    assert!(
+        initialized
+            .capabilities
+            .required
+            .contains(&"request_apply_edits".to_owned()),
+        "InitResult must request request_apply_edits, got {:?}",
+        initialized.capabilities.required
+    );
+    adapter.shutdown();
+}
+
+#[test]
+fn t016_mcp_tool_discovery_exposes_prefixed_ast_write_tools_through_merge_layer() {
+    let bin = ast_extension_bin();
+    let manifest = ast_manifest(&bin);
+    let deps = make_deps(InMemoryFs::new());
+
+    let adapter =
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
+    let ext_registry = Arc::new(std::sync::RwLock::new(ExtensionRegistry::new()));
+    ext_registry
+        .write()
+        .expect("extension registry lock")
+        .register(adapter)
+        .expect("register ast extension");
+
+    let merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
+    let names = merged
+        .list()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+
+    for expected in [
+        "tower_ast_replace_symbol_body",
+        "tower_ast_insert_before_symbol",
+        "tower_ast_insert_after_symbol",
+        "tower_ast_delete_symbol",
+    ] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "tools/list must expose {expected} through the merge layer; got {names:?}"
+        );
+    }
+}
+
+#[test]
+fn t016_extension_toml_declares_same_four_bare_ast_write_tools_and_request_apply_edits() {
+    let toml = std::fs::read_to_string(workspace_root().join("extensions/ast/extension.toml"))
+        .expect("ast extension manifest must be readable");
+    let manifest: ExtensionManifest = toml::from_str(&toml).expect("manifest must parse");
+    let tool_names: Vec<&str> = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+
+    for expected in [
+        "replace_symbol_body",
+        "insert_before_symbol",
+        "insert_after_symbol",
+        "delete_symbol",
+    ] {
+        assert!(
+            tool_names.contains(&expected),
+            "extension.toml must declare {expected}, got {tool_names:?}"
+        );
+    }
+    assert!(
+        manifest
+            .capabilities
+            .required
+            .contains(&"request_apply_edits".to_owned()),
+        "extension.toml must declare request_apply_edits, got {:?}",
+        manifest.capabilities.required
+    );
+}
+
+#[test]
+fn t016_real_ast_sidecar_applies_each_anchored_edit_and_refreshes_symbol_index_after_file_changed()
+{
+    let mut initial_fs = InMemoryFs::new();
+    initial_fs
+        .write(
+            RelativePath::new("src/lib.rs"),
+            b"pub fn remove_me() {}\n\npub fn target() -> u8 {\n    1\n}\n".to_vec(),
+        )
+        .expect("write must succeed");
+    let fs = Arc::new(Mutex::new(initial_fs));
+
+    let bin = ast_extension_bin();
+    let manifest = ast_manifest(&bin);
+    let deps = make_deps_with_apply_edits(fs.clone());
+
+    let mut adapter =
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
+    adapter
+        .deliver_event(Event::FileIndexed {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileIndexed must seed AST index");
+
+    let replace = adapter
+        .call_tool(
+            "replace_symbol_body",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": "target",
+                "kind": "function",
+                "replacement": "\n    2\n"
+            }),
+        )
+        .expect("replace_symbol_body must succeed");
+    assert_eq!(replace["applied"], true);
+    adapter
+        .deliver_event(Event::FileChanged {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileChanged after replace must refresh AST index");
+
+    let insert_before = adapter
+        .call_tool(
+            "insert_before_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": "target",
+                "kind": "function",
+                "replacement": "#[allow(dead_code)]\n"
+            }),
+        )
+        .expect("insert_before_symbol must succeed");
+    assert_eq!(insert_before["applied"], true);
+    adapter
+        .deliver_event(Event::FileChanged {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileChanged after insert-before must refresh AST index");
+
+    let insert_after = adapter
+        .call_tool(
+            "insert_after_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": "target",
+                "kind": "function",
+                "replacement": "\n\npub fn added_after() -> u8 { 3 }\n"
+            }),
+        )
+        .expect("insert_after_symbol must succeed");
+    assert_eq!(insert_after["applied"], true);
+    adapter
+        .deliver_event(Event::FileChanged {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileChanged after insert-after must refresh AST index");
+
+    let delete = adapter
+        .call_tool(
+            "delete_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": "remove_me",
+                "kind": "function"
+            }),
+        )
+        .expect("delete_symbol must succeed");
+    assert_eq!(delete["applied"], true);
+
+    let edited = {
+        let fs = fs.lock().expect("fs lock");
+        String::from_utf8(
+            fs.read(&RelativePath::new("src/lib.rs"))
+                .expect("read edited file"),
+        )
+        .expect("edited file must be UTF-8")
+    };
+    assert!(!edited.contains("remove_me"));
+    assert!(edited.contains("#[allow(dead_code)]\npub fn target() -> u8 {\n    2\n}"));
+    assert!(edited.contains("pub fn added_after() -> u8 { 3 }"));
+
+    adapter
+        .deliver_event(Event::FileChanged {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileChanged must refresh AST index");
+    let search = adapter
+        .call_tool("search_symbols", serde_json::json!({"name": "added_after"}))
+        .expect("search_symbols must succeed after fileChanged");
+    assert!(
+        search.to_string().contains("added_after"),
+        "symbol index must include post-edit symbol, got {search}"
+    );
+    adapter.shutdown();
+}
+
+#[test]
+fn t016_dry_run_returns_preview_without_changing_file() {
+    let original = b"pub fn target() {}\n".to_vec();
+    let mut initial_fs = InMemoryFs::new();
+    initial_fs
+        .write(RelativePath::new("src/lib.rs"), original.clone())
+        .expect("write must succeed");
+    let fs = Arc::new(Mutex::new(initial_fs));
+
+    let bin = ast_extension_bin();
+    let manifest = ast_manifest(&bin);
+    let deps = make_deps_with_apply_edits(fs.clone());
+
+    let mut adapter =
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
+    adapter
+        .deliver_event(Event::FileIndexed {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileIndexed must seed AST index");
+
+    let result = adapter
+        .call_tool(
+            "insert_before_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": "target",
+                "kind": "function",
+                "replacement": "// preview\n",
+                "dry_run": true
+            }),
+        )
+        .expect("dry-run insert_before_symbol must succeed");
+
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["files_changed"], 0);
+    assert_eq!(result["preview"], "// preview\npub fn target() {}\n");
+    let after = fs
+        .lock()
+        .expect("fs lock")
+        .read(&RelativePath::new("src/lib.rs"))
+        .expect("read file after dry-run");
+    assert_eq!(after, original);
+    adapter.shutdown();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AC1 / U1: ast_extension declares all five tools

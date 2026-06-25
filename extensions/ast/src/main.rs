@@ -7,7 +7,9 @@
 //!
 //! ```text
 //! host ──initialize──► ast_extension
-//!      ◄──Initialized── (tools: find_symbols, search_symbols, get_outline, read_symbol, reindex)
+//!      ◄──Initialized── (tools: find_symbols, search_symbols, get_outline, read_symbol, reindex,
+//!                        replace_symbol_body, insert_before_symbol, insert_after_symbol,
+//!                        delete_symbol)
 //!                       (events: event/fileIndexed, event/fileChanged)
 //!      ──invokeTool───► (tool_name, params)
 //!      ◄──ToolResult──
@@ -30,7 +32,8 @@
 //!
 //! # Host capabilities used
 //!
-//! `workspace/readFile`, `workspace/listFiles`, `index/get`, `index/put`, `log`.
+//! `workspace/readFile`, `workspace/listFiles`, `workspace/applyEdits`,
+//! `index/get`, `index/put`, `log`.
 //! All capability calls follow the host-call → host-response interleave pattern:
 //! the extension sends a JSON-RPC request (with `id`) to stdout, then reads
 //! the response from stdin before continuing.
@@ -121,50 +124,48 @@ fn main() {
                     tools: vec![
                         ToolDecl {
                             name: "get_outline".to_owned(),
-                            description: "Return a structural outline (functions, structs, \
-                                          methods, traits, enums, impl blocks) for a \
-                                          workspace-relative source file. Supports Rust (.rs), \
-                                          Go (.go), and PHP (.php). Returns an \
-                                          unsupported-language result for other file types."
-                                .to_owned(),
+                            description: "Return a structural outline (functions, structs, methods, traits, enums, impl blocks) for a workspace-relative source file. Supports Rust (.rs), Go (.go), and PHP (.php). Returns an unsupported-language result for other file types.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"}},"required":["path"]}"#.to_owned(),
                         },
                         ToolDecl {
                             name: "find_symbols".to_owned(),
-                            description: "Find precise definition locations for a named symbol \
-                                          of a given kind in a workspace-relative source file. \
-                                          Uses the error-tolerant syntax tree to exclude false \
-                                          positives in comments and string literals. Supports \
-                                          Rust (.rs), Go (.go), and PHP (.php)."
-                                .to_owned(),
+                            description: "Find precise definition locations for a named symbol of a given kind in a workspace-relative source file. Uses the error-tolerant syntax tree to exclude false positives in comments and string literals. Supports Rust (.rs), Go (.go), and PHP (.php).".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to search for"},"kind":{"type":"string","description":"Symbol kind: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["path","symbol_name","kind"]}"#.to_owned(),
                         },
                         ToolDecl {
                             name: "search_symbols".to_owned(),
-                            description: "Search the in-memory cross-file symbol index for \
-                                          symbols matching a given name and optional kind. The \
-                                          index is built incrementally via fileIndexed/fileChanged \
-                                          events and updated by reindex."
-                                .to_owned(),
+                            description: "Search the in-memory cross-file symbol index for symbols matching a given name and optional kind. The index is built incrementally as files are indexed (event-driven) and updated via fileIndexed/fileChanged events.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"name":{"type":"string","description":"Exact symbol name to search for"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["name"]}"#.to_owned(),
                         },
                         ToolDecl {
                             name: "reindex".to_owned(),
-                            description: "Rebuild the whole-project symbol index by enumerating \
-                                          all workspace files and parsing each. Forces a full \
-                                          reindex; use after large external changes or on a cold \
-                                          cache."
-                                .to_owned(),
+                            description: "Rebuild the whole-project symbol index by enumerating all workspace files and parsing each. Forces a full reindex; use after large external changes or on a cold cache.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{},"additionalProperties":false}"#.to_owned(),
                         },
                         ToolDecl {
                             name: "read_symbol".to_owned(),
-                            description: "Read only a named symbol source span from a file — not \
-                                          the whole file. Returns the exact byte slice \
-                                          [start_byte, end_byte) plus kind and start/end rows for \
-                                          each match, ordered by start_byte."
-                                .to_owned(),
+                            description: "Read only a named symbol source span from a file — not the whole file. Returns the exact byte slice [start_byte, end_byte) plus kind and start/end rows for each match, ordered by start_byte. Supports optional kind filter to disambiguate same-named symbols of different kinds.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to read"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"}},"required":["path","symbol_name"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "replace_symbol_body".to_owned(),
+                            description: "Replace the body span of one uniquely resolved symbol through host-applied workspace edits.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to edit"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"},"replacement":{"type":"string","description":"Replacement text for the resolved symbol body"},"dry_run":{"type":"boolean","description":"Preview the edit without modifying files"}},"required":["path","symbol_name","replacement"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "insert_before_symbol".to_owned(),
+                            description: "Insert text immediately before one uniquely resolved symbol through host-applied workspace edits.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to edit"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"},"replacement":{"type":"string","description":"Text to insert before the resolved symbol"},"dry_run":{"type":"boolean","description":"Preview the edit without modifying files"}},"required":["path","symbol_name","replacement"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "insert_after_symbol".to_owned(),
+                            description: "Insert text immediately after one uniquely resolved symbol through host-applied workspace edits.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to edit"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"},"replacement":{"type":"string","description":"Text to insert after the resolved symbol"},"dry_run":{"type":"boolean","description":"Preview the edit without modifying files"}},"required":["path","symbol_name","replacement"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "delete_symbol".to_owned(),
+                            description: "Delete the declaration span of one uniquely resolved symbol through host-applied workspace edits.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to delete"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"},"dry_run":{"type":"boolean","description":"Preview the edit without modifying files"}},"required":["path","symbol_name"]}"#.to_owned(),
                         },
                     ],
                     events: vec![
@@ -176,6 +177,7 @@ fn main() {
                         Capability::ListFiles,
                         Capability::IndexGet,
                         Capability::IndexPut,
+                        Capability::RequestApplyEdits,
                         Capability::Log,
                     ],
                 };
@@ -303,9 +305,9 @@ fn main() {
 ///
 /// The host sends params as either:
 /// - A `Request::DeliverEvent(Event)` adjacently-tagged value:
-///   `{"type":"DeliverEvent","data":{"type":"FileIndexed","file_id":1,"path":"..."}}`
+///   `{"type":"DeliverEvent","data":{"type":"FileIndexed","file_id":1,"path":"src/lib.rs"}}`
 /// - Or just the Event directly:
-///   `{"type":"FileIndexed","file_id":1,"path":"..."}`
+///   `{"type":"FileIndexed","file_id":1,"path":"src/lib.rs"}`
 ///
 /// We try both shapes.
 fn extract_event_path(params: &serde_json::Value) -> Option<String> {

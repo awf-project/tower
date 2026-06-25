@@ -301,7 +301,6 @@ fn visit_rust_node(
         (SymbolKind::Function, "function_item")
         | (SymbolKind::Struct, "struct_item")
         | (SymbolKind::Enum, "enum_item")
-        | (SymbolKind::Trait, "trait_item")
         | (SymbolKind::TypeAlias, "type_item")
         | (SymbolKind::Const, "const_item")
         | (SymbolKind::Static, "static_item")
@@ -309,6 +308,15 @@ fn visit_rust_node(
             if let Some(m) = match_named_item(child, source, symbol_name, kind) {
                 matches.push(m);
             }
+        }
+        (SymbolKind::Trait, "trait_item") => {
+            if let Some(m) = match_named_item(child, source, symbol_name, kind) {
+                matches.push(m);
+            }
+            walk_rust_trait_body(child, source, symbol_name, kind, matches);
+        }
+        (SymbolKind::Method, "trait_item") => {
+            walk_rust_trait_body(child, source, symbol_name, kind, matches);
         }
         (SymbolKind::Module, "mod_item") => {
             if let Some(m) = match_named_item(child, source, symbol_name, kind) {
@@ -362,6 +370,33 @@ fn walk_rust_mod_body(
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         visit_rust_node(child, source, symbol_name, kind, matches);
+    }
+}
+
+fn walk_rust_trait_body(
+    trait_node: Node<'_>,
+    source: &[u8],
+    symbol_name: &str,
+    kind: SymbolKind,
+    matches: &mut Vec<SymbolMatch>,
+) {
+    let body = trait_node
+        .children(&mut trait_node.walk())
+        .find(|n| n.kind() == "declaration_list");
+
+    let Some(body) = body else { return };
+
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "function_signature_item" {
+            if matches!(kind, SymbolKind::Method)
+                && let Some(m) = match_named_item(child, source, symbol_name, SymbolKind::Method)
+            {
+                matches.push(m);
+            }
+        } else {
+            visit_rust_node(child, source, symbol_name, kind, matches);
+        }
     }
 }
 
