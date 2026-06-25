@@ -27,10 +27,9 @@ The contract for merging any spec:
 > **Every spec must leave the tree in a stable state** — all quality gates green
 > before moving to the next spec.
 
-Specs are not versioned in the repository. The source of intent is
-`project-brief.md`. If you need to understand why a decision was made, check the
-ADR directory at `docs/ADR/` and the decision comments embedded in the relevant
-source files.
+Specs are not versioned in the repository. If you need to understand why a decision was made, check
+[architecture.md](architecture.md), the ADR directory at `docs/ADR/`, and the decision comments
+embedded in the relevant source files.
 
 ---
 
@@ -292,6 +291,5 @@ plugin host with the out-of-process native extension model described in
 ## Related docs
 
 - [docs/ADR/](ADR/) — architectural decision records
-- [project-brief.md](../project-brief.md) — the original product intent
 - [AGENTS.md](../AGENTS.md) — crate layout, port/adapter names, invariants (the authoritative quick-reference for contributors)
 - [.github/workflows/ci.yml](../.github/workflows/ci.yml) — canonical CI definition

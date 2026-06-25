@@ -13,6 +13,5 @@
 | [development.md](development.md) | Spec-driven workflow, CI pipeline, testing conventions, hexagonal boundary rules, invariants |
 | [ADR/](ADR/) | Architecture Decision Records (none yet; template and numbering convention in `ADR/README.md`) |
 
-Related root-level files: [`project-brief.md`](../project-brief.md) (vision + functional scope),
-[`AGENTS.md`](../AGENTS.md) (project guide for automated agents),
+Related root-level files: [`AGENTS.md`](../AGENTS.md) (project guide for automated agents),
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (canonical CI definition).

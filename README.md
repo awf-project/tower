@@ -1,195 +1,176 @@
 # Tower
 
-Tower is a core engine for a high-performance productivity tool: a virtual file system with a persistent
-inverted index, parallel content search, safe mass text refactoring, and an out-of-process **native
-extension** architecture — all exposed over a JSON-RPC 2.0 stdio interface following the
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io).
+Tower is a Rust core engine that gives MCP clients a fast, shared view of a workspace:
+indexed files, content search, safe edits, semantic tools, lint fixes, and debug workflows.
 
-Architecture: **Domain-Driven Design + Hexagonal (Ports & Adapters) + Microkernel**.
-See [`project-brief.md`](project-brief.md) for the full vision.
+It runs as one daemon per workspace. Each MCP session launched through Tower's stdio entrypoint
+connects to that daemon, so multiple agents can inspect and edit the same project through the same
+persisted index.
 
----
+Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 
-## Features
+## Why Tower
 
-| Capability | Description |
+| Capability | What it gives clients |
 |---|---|
-| **Virtual file system** | Workspace-scoped VFS with a persistent `sled` inverted index; sub-millisecond file lookup |
-| **Parallel content search** | Rayon-backed grep across all indexed files |
-| **Safe file mutations** | Shadow-file pattern (`<path>.tmp_write` → flush → atomic `fs::rename`); crash-safe |
-| **Mass refactoring** | Parallel global find-and-replace with per-file atomic rewrites and a `TxReport` |
-| **MCP server** | JSON-RPC 2.0 over stdin/stdout; native `tower_*` tools plus any extension tools, served from one surface |
-| **Native extension host** | Out-of-process native sidecar extensions over a JSON-RPC 2.0 protocol on stdio; OS-process isolation, per-call timeouts, restart/backoff, and quarantine |
-| **AST analysis and symbol edits** | `ast` extension — Tree-sitter outline, symbol search, and anchored symbol edits for Rust, Go, PHP |
-| **Code intelligence and refactors** | `lsp` extension — diagnostics, definition, references, hover, implementation lookup, and rename via a language-server bridge |
-| **Standalone linting and fixes** | `lint` extension — on-demand diagnostics and structured fixes from configured external linters, using the same diagnostic shape as LSP |
-| **Debugging** | `debug` extension — opt-in Debug Adapter Protocol sessions, one-shot `tower_debug_eval_at` probes, and rr-backed record/replay reverse debugging |
-| **Single static binary** | No WASM, WASI SDK, JVM, Node, or container required at runtime |
+| **Persistent workspace index** | Fast file lookup and directory listing from a `sled`-backed VFS. |
+| **Parallel text search** | Rayon-backed grep across indexed file contents. |
+| **Safe mutations** | Atomic writes and CAS-style `expected_version` checks for agent-safe edits. |
+| **Shared daemon** | One watcher, index, and extension registry per workspace; many MCP clients. |
+| **Native sidecar extensions** | Out-of-process extension binaries that contribute `tower_<ext>_*` MCP tools. |
+| **Semantic workflows** | AST outline/symbol tools, LSP diagnostics/navigation, lint fixes, and opt-in DAP debugging. |
+| **No runtime VM** | Native binaries only; no JVM, Node, WASM runtime, or container required at runtime. |
 
----
+## Quick Start
 
-## 60-second quick start
+### Install
 
-### Install (prebuilt binary)
-
-No toolchain required — download a prebuilt binary from GitHub Releases:
+Download a prebuilt binary from GitHub Releases:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh | sh
 ```
 
-Installs the latest stable release to `$HOME/.local/bin/tower`. Override via environment:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `TOWER_VERSION` | `latest` | `latest`/`stable`, `dev` (rolling prerelease), or a tag like `v0.1.0` |
-| `TOWER_INSTALL_DIR` | `$HOME/.local/bin` | Where the binary is installed |
-| `TOWER_TARGET` | auto-detected | Force a target triple instead of auto-detecting |
+The installer writes `tower` to `$HOME/.local/bin` by default. You can override the release or
+install directory:
 
 ```bash
-curl -fsSL .../install.sh | TOWER_VERSION=dev sh      # rolling dev build
-curl -fsSL .../install.sh | TOWER_VERSION=v0.1.0 sh   # pinned version
+curl -fsSL https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh \
+  | TOWER_VERSION=dev TOWER_INSTALL_DIR="$HOME/bin" sh
 ```
 
-The installer verifies the published `.sha256` checksum when present. To build from source instead, follow the steps below.
-
-### Prerequisites
-
-- Rust toolchain — pinned by `rust-toolchain.toml`; `rustup` installs it automatically:
-
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  ```
-
-- `cargo-deny` for the license/advisory gate:
-
-  ```bash
-  cargo install cargo-deny --locked
-  ```
-
-### Build
+To build from source instead:
 
 ```bash
 git clone <repository-url> tower
 cd tower
-cargo build -p core_engine        # produces target/debug/tower
-```
-
-### Run the MCP server
-
-```bash
-# Workspace root = current directory (or set --workspace-dir / $TOWER_WORKSPACE)
-cargo run -p core_engine
-# stderr: tower: initial scan complete — N files indexed
-```
-
-### Drive it over a pipe
-
-```bash
-# Handshake
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | cargo run -p core_engine -q
-
-# List tools (native tower_* tools, plus tower_<ext>_<tool> for any loaded extension)
-echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | cargo run -p core_engine -q
-
-# Find a file
-echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find_file","arguments":{"query":"main.rs"}}}' \
-  | cargo run -p core_engine -q
-
-# List indexed directory entries
-echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_list_dir","arguments":{"path":"src","recursive":true,"max_depth":1}}}' \
-  | cargo run -p core_engine -q
-
-# Run configured standalone linters for all supported indexed files
-echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{}}}' \
-  | cargo run -p core_engine -q
-
-# Preview structured lint fixes without writing files
-echo '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_lint_fix","arguments":{"path":"src/main.rs","dry_run":true}}}' \
-  | cargo run -p core_engine -q
-```
-
-Each request is a single newline-delimited JSON object on stdin; responses arrive on stdout.
-No `Content-Length` header — unlike LSP.
-
-### Install an extension
-
-Extensions are out-of-process **native sidecar** binaries described by an `extension.toml` manifest.
-`tower` discovers them at startup (resolved from `--extensions-dir`, then `$TOWER_EXTENSIONS_DIR`,
-then the global XDG dir and `<workspace>/.tower/extensions/`). Drop a binary + manifest into a scope,
-restart, and its tools appear in `tools/list` — no host recompile:
-
-```bash
-mkdir -p .tower/extensions/ast
-cp target/debug/ast_extension     .tower/extensions/ast/
-cp extensions/ast/extension.toml  .tower/extensions/ast/
-cargo run -p core_engine -q     # tools/list now also exposes tower_ast_get_outline, tower_ast_find_symbols, …
-```
-
-No extensions serves the native tools; an extension that fails to spawn is skipped with a
-stderr warning and never aborts startup. See [`docs/extensions.md`](docs/extensions.md) for details.
-
----
-
-## Quality gate
-
-Run these checks in order before every merge (mirrors CI):
-
-```bash
-cargo fmt --all --check                                   # make fmt-check
-cargo clippy --workspace --all-targets -- -D warnings     # make clippy
-
-# Build native extension binaries first so host integration tests can locate
-# them under target/debug/. No WASM, no WASI SDK.
 cargo build --workspace --bins
-cargo test --workspace                                    # make test
-
-cargo deny check                                          # make deny
 ```
 
-Or run the whole sequence with `make gate`.
+The main binary is `target/debug/tower`.
 
----
+### Initialize a Workspace
 
-## Workspace layout
+Run this once at the project root you want Tower to index:
 
-```
-crates/                   Engine + shared protocol (host-side)
-├── core_engine/          Host binary (tower) + lib; domain / ports / adapters
-└── extension_protocol/   Shared host ↔ extension wire contract (types + serde only)
-
-extensions/               Native sidecar extensions (separate binaries)
-├── ast/                  Reference Tree-sitter AST extension (eager)
-├── debug/                Debug Adapter Protocol bridge extension (lazy, opt-in)
-├── hello/                Minimal example extension (lazy)
-├── lsp/                  Language-server bridge extension (eager)
-├── lint/                 Standalone linter extension (lazy)
-└── fixtures/             Test-only fault-isolation fixtures (not shipped)
+```bash
+tower init
 ```
 
-The reference extensions are ordinary native binaries. Build them with
-`cargo build --workspace --bins` before `cargo test --workspace` so host integration
-tests can locate sidecars under `target/debug/`. There is no WASM build step and no WASI SDK.
+This creates:
 
----
+| File | Purpose |
+|---|---|
+| `.towerignore` | Authoritative ignore rules for the Tower index, independent of `.gitignore`. |
+| `.tower/config.toml` | Local Tower configuration, including formatter/linter/debug settings. |
+
+Secrets and generated output should be excluded in `.towerignore` before exposing a workspace to an
+agent. If `.towerignore` is missing, Tower warns and indexes all non-hidden files except `.git/`.
+
+### Connect an MCP Client
+
+Tower's MCP entrypoint is the `mcp` subcommand:
+
+```bash
+tower mcp
+```
+
+Most MCP clients do not store that as one shell string. Configure the executable and arguments in the
+shape your client expects. In JSON-like configs, that usually means:
+
+```json
+{
+  "command": "tower",
+  "args": ["mcp"]
+}
+```
+
+If the client provides a CLI for registering MCP servers, pass `tower` as the command and `mcp` as
+its argument using that client's syntax.
+
+The `mcp` subcommand connects to the workspace daemon, spawning it if needed. The daemon owns the
+index, watcher, storage, and loaded extensions, then exits after its configured idle timeout when no
+clients remain.
+
+Useful local checks:
+
+```bash
+tower status
+tower shutdown
+```
+
+Workspace resolution is consistent across commands:
+
+| Priority | Mechanism |
+|---|---|
+| 1 | `--workspace-dir <path>` |
+| 2 | `TOWER_WORKSPACE=/path/to/project` |
+| 3 | current working directory |
+
+## Core Concepts
+
+**The index is Tower-owned.** Tower persists workspace metadata under `.tower/db/`, watches file
+changes, and serves file/search tools from the current index.
+
+**`.towerignore` is the source of truth.** Tower does not inherit `.gitignore`. This keeps the agent
+visibility policy explicit and project-local.
+
+**Edits are CAS-aware.** Mutating tools can use an `expected_version` token returned by
+`tower_read_file` to reject writes when a file changed since it was read.
+
+**Extensions are native sidecars.** Extension binaries are discovered at startup, supervised by the
+host, and exposed as namespaced MCP tools such as `tower_ast_get_outline` or
+`tower_lint_check`. A failed extension is skipped or quarantined without taking down the daemon.
+
+## Tool Surface
+
+Native tools are always available. Extension tools appear when their sidecars are installed and
+enabled.
+
+| Area | Examples |
+|---|---|
+| Files and search | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text` |
+| Safe mutations | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file` |
+| AST | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol` |
+| LSP | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover` |
+| Lint | `tower_lint_check`, `tower_lint_fix` |
+| Debug | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin` |
+
+See [docs/mcp-tools.md](docs/mcp-tools.md) for the full wire protocol, tool schemas, responses, and
+stable error codes.
 
 ## Documentation
 
 | Page | Contents |
 |---|---|
-| [`docs/getting-started.md`](docs/getting-started.md) | Prerequisites, build, quality gate, first MCP session |
-| [`docs/architecture.md`](docs/architecture.md) | Hexagonal boundary, crate layout, ports, data flow, design decisions |
-| [`docs/mcp-tools.md`](docs/mcp-tools.md) | Full MCP tool reference — wire protocol, the native tools, extension tools including semantic edits, lint fix, interactive debug sessions, rr record/replay reverse debugging, and error codes |
-| [`docs/user-guide/debug-sessions.md`](docs/user-guide/debug-sessions.md) | How to configure and drive interactive Debug Adapter Protocol sessions, one-shot `tower_debug_eval_at` probes, and rr-backed reverse-debug workflows |
-| [`docs/user-guide/lint-fixes.md`](docs/user-guide/lint-fixes.md) | How to preview and apply structured linter fixes safely with `tower_lint_fix` |
-| [`docs/user-guide/semantic-edits.md`](docs/user-guide/semantic-edits.md) | How to dry-run and apply LSP rename and AST symbol edits safely through host-owned workspace edits |
-| [`docs/extensions.md`](docs/extensions.md) | Extension authoring guide — native sidecars, the JSON-RPC protocol, capabilities, manifest, fault model |
-| [`docs/development.md`](docs/development.md) | Contributing, TDD workflow, CI pipeline, test conventions |
-| [`docs/ADR/`](docs/ADR/) | Architecture Decision Records |
-| [`project-brief.md`](project-brief.md) | Vision, objectives, functional scope |
+| [docs/getting-started.md](docs/getting-started.md) | Build, first MCP session, quality gate, and copy-paste examples. |
+| [docs/towerignore.md](docs/towerignore.md) | `.towerignore` behavior, defaults, migration notes, and watcher limits. |
+| [docs/architecture.md](docs/architecture.md) | Hexagonal boundary, ports/adapters, daemon flow, and invariants. |
+| [docs/extensions.md](docs/extensions.md) | Native sidecar extension protocol, manifests, capabilities, and supervision. |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | Complete MCP tool reference and JSON-RPC details. |
+| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Safe AST and LSP edit workflows. |
+| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md) | Previewing and applying structured linter fixes. |
+| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md) | Interactive DAP sessions and rr-backed reverse-debug workflows. |
+| [docs/development.md](docs/development.md) | Contribution workflow, CI checks, tests, and project conventions. |
 
----
+## Development
+
+The merge gate is:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --bins
+cargo test --workspace
+cargo deny check
+```
+
+Or run the project wrapper:
+
+```bash
+make gate
+```
 
 ## License
 
