@@ -28,7 +28,15 @@ Numbers are never reused. If a decision is reversed, the original ADR is marked 
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| — | No ADRs yet | — |
+| [0001](0001-domain-hexagon-boundary.md) | Keep the Domain Behind Hexagonal Ports | Proposed |
+| [0002](0002-sled-vfs-index-source.md) | Use Sled as the Persisted VFS Index Source | Proposed |
+| [0003](0003-cas-shadow-file-mutations.md) | Use CAS-Guarded Shadow-File Mutations | Proposed |
+| [0004](0004-workspace-daemon-mcp-clients.md) | Use One Shared Workspace Daemon for MCP Clients | Proposed |
+| [0005](0005-native-sidecar-extensions.md) | Use Native Out-of-Process Sidecar Extensions | Proposed |
+| [0006](0006-extension-registry-read-paths.md) | Keep Extension Registry Writes Out of MCP Serving Paths | Proposed |
+| [0007](0007-sidecar-multiplexed-frame-queue.md) | Queue Inbound Sidecar Frames During HostCalls | Proposed |
+| [0008](0008-mcp-mutations-real-extension-host.md) | Notify the Real Extension Host After MCP Mutations | Proposed |
+| [0009](0009-defer-apply-edits-extension-callbacks.md) | Defer Extension Callbacks After Workspace Apply-Edits | Proposed |
 
 <!--
   Update this table as ADRs are added. Format:
