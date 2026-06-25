@@ -88,7 +88,13 @@ use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{
     Diagnostic, Hover, Location, Position, Range, Severity, Symbol,
 };
-use core_engine::ports::{CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort};
+use core_engine::ports::{
+    CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
+    RenameNavigationError,
+};
+
+#[allow(dead_code)]
+pub type RawWorkspaceEdit = lsp_types::WorkspaceEdit;
 
 /// A push event carrying updated diagnostics for one URI.
 ///
@@ -136,7 +142,58 @@ enum RequestOutcome {
     /// A transient `ContentModified` (-32801) — retryable.
     ContentModified,
     /// A non-retryable error (already formatted) or a timeout.
-    Error(String),
+    Error(RequestFailure),
+}
+
+/// Non-retryable LSP request failure.
+enum RequestFailure {
+    Response {
+        code: Option<i64>,
+        message: Option<String>,
+        raw: Value,
+    },
+    Message(String),
+}
+
+impl RequestFailure {
+    fn format(&self, method: &str) -> String {
+        match self {
+            RequestFailure::Response { raw, .. } => format!("{method} error: {raw}"),
+            RequestFailure::Message(message) => message.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameCapability {
+    UnknownAssumePrepare,
+    Unavailable,
+    RenameOnly,
+    RenameWithPrepare,
+}
+
+impl RenameCapability {
+    fn from_initialize_result(result: &Value) -> Self {
+        match result
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("renameProvider"))
+        {
+            Some(Value::Bool(true)) => Self::RenameOnly,
+            Some(Value::Bool(false)) | None => Self::Unavailable,
+            Some(Value::Object(provider)) => {
+                if provider
+                    .get("prepareProvider")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    Self::RenameWithPrepare
+                } else {
+                    Self::RenameOnly
+                }
+            }
+            Some(_) => Self::Unavailable,
+        }
+    }
 }
 
 /// Provisional cross-file settle delay used before a workspace query
@@ -472,6 +529,8 @@ pub struct LspClientAdapter {
     state: SharedState,
     /// Responses to navigation requests, keyed by request id.
     responses: ResponseCache,
+    /// Rename capability shape reported by the initialized language server.
+    rename_capability: Mutex<RenameCapability>,
     /// Root `.towerignore` policy applied to navigation results.
     ignore: Gitignore,
     next_id: AtomicI64,
@@ -492,7 +551,7 @@ struct Session {
 }
 
 impl LspClientAdapter {
-    /// Spawn `command args...` rooted at `workspace_root`, perform the LSP
+    /// Spawn `command` with `args` rooted at `workspace_root`, perform the LSP
     /// handshake, and start the reader thread.
     ///
     /// `language_id` is the LSP language identifier sent on `didOpen` (e.g.
@@ -564,6 +623,7 @@ impl LspClientAdapter {
             writer,
             state,
             responses,
+            rename_capability: Mutex::new(RenameCapability::UnknownAssumePrepare),
             ignore,
             next_id: AtomicI64::new(1),
             dead_flag,
@@ -581,35 +641,30 @@ impl LspClientAdapter {
 
     fn handshake(&self) -> Result<(), CodeIntelError> {
         let root_uri = path_to_uri(&self.workspace_root);
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "initialize",
-            "params": {
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                "capabilities": {
-                    "textDocument": { "publishDiagnostics": {} },
-                    "window": { "workDoneProgress": true },
-                    // rust-analyzer reads serverStatus capability at
-                    // params.capabilities.experimental.serverStatusNotification,
-                    // NOT as a sibling of capabilities.
-                    "experimental": { "serverStatusNotification": true }
-                },
-                "initializationOptions": {}
-            }
+        let initialize_params = json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {
+                "textDocument": { "publishDiagnostics": {} },
+                "window": { "workDoneProgress": true },
+                // rust-analyzer reads serverStatus capability at
+                // params.capabilities.experimental.serverStatusNotification,
+                // NOT as a sibling of capabilities.
+                "experimental": { "serverStatusNotification": true }
+            },
+            "initializationOptions": {}
         });
         let initialized = json!({
             "jsonrpc": "2.0",
             "method": "initialized",
             "params": {}
         });
-        write_framed(&self.writer, &initialize)
-            .map_err(|e| CodeIntelError::Backend(format!("initialize write failed: {e}")))?;
-        // Note: we do not block on the initialize *response* here; rust-analyzer
-        // accepts `initialized` immediately and the reader thread drains the
-        // response. This is sufficient for the MVP diagnostics flow.
+        let initialize_result = self.send_request("initialize", initialize_params)?;
+        *self
+            .rename_capability
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            RenameCapability::from_initialize_result(&initialize_result);
         write_framed(&self.writer, &initialized)
             .map_err(|e| CodeIntelError::Backend(format!("initialized write failed: {e}")))?;
         Ok(())
@@ -656,21 +711,24 @@ impl LspClientAdapter {
     /// query) is **retried** a bounded number of times, per the LSP spec which
     /// defines it as a transient "re-request" signal rather than a real failure.
     fn send_request(&self, method: &str, params: Value) -> Result<Value, CodeIntelError> {
-        for attempt in 0..=CONTENT_MODIFIED_RETRIES {
+        let mut attempt = 0;
+        loop {
             match self.send_request_once(method, params.clone())? {
                 RequestOutcome::Ok(value) => return Ok(value),
                 RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
                     std::thread::sleep(CONTENT_MODIFIED_BACKOFF);
+                    attempt += 1;
                 }
                 RequestOutcome::ContentModified => {
                     return Err(CodeIntelError::Backend(format!(
                         "{method} still content-modified after {CONTENT_MODIFIED_RETRIES} retries"
                     )));
                 }
-                RequestOutcome::Error(msg) => return Err(CodeIntelError::Backend(msg)),
+                RequestOutcome::Error(failure) => {
+                    return Err(CodeIntelError::Backend(failure.format(method)));
+                }
             }
         }
-        unreachable!("loop returns on the final attempt")
     }
 
     /// Send one request and await its response, classifying the outcome so
@@ -695,7 +753,14 @@ impl LspClientAdapter {
                     if err.get("code").and_then(Value::as_i64) == Some(CONTENT_MODIFIED) {
                         return Ok(RequestOutcome::ContentModified);
                     }
-                    return Ok(RequestOutcome::Error(format!("{method} error: {err}")));
+                    return Ok(RequestOutcome::Error(RequestFailure::Response {
+                        code: err.get("code").and_then(Value::as_i64),
+                        message: err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        raw: err.clone(),
+                    }));
                 }
                 return Ok(RequestOutcome::Ok(
                     msg.get("result").cloned().unwrap_or(Value::Null),
@@ -703,7 +768,9 @@ impl LspClientAdapter {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Ok(RequestOutcome::Error(format!("{method} timed out")));
+                return Ok(RequestOutcome::Error(RequestFailure::Message(format!(
+                    "{method} timed out"
+                ))));
             }
             let (next, _) = cvar
                 .wait_timeout(map, deadline - now)
@@ -759,6 +826,90 @@ impl LspClientAdapter {
             &self.ignore,
         ))
     }
+
+    fn prepare_rename_query(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<PrepareRenameResult, RenameNavigationError> {
+        let value = self.prepare_rename_value(path, text, position)?;
+        decode_prepare_rename(value)
+    }
+
+    fn prepare_rename_value(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Value, RenameNavigationError> {
+        if !self.supports(path) {
+            return Err(RenameNavigationError::UnsupportedLanguage);
+        }
+        let uri = self.uri_for(path);
+        self.acquire_doc(&uri, text)
+            .map_err(code_intel_to_rename_error)?;
+        let result = self.send_prepare_rename_request(json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": position.line, "character": position.character }
+        }));
+        self.release_doc(&uri);
+        result
+    }
+
+    fn send_prepare_rename_request(&self, params: Value) -> Result<Value, RenameNavigationError> {
+        let method = "textDocument/prepareRename";
+        let mut attempt = 0;
+        loop {
+            match self
+                .send_request_once(method, params.clone())
+                .map_err(code_intel_to_rename_error)?
+            {
+                RequestOutcome::Ok(value) => return Ok(value),
+                RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
+                    std::thread::sleep(CONTENT_MODIFIED_BACKOFF);
+                    attempt += 1;
+                }
+                RequestOutcome::ContentModified => {
+                    return Err(RenameNavigationError::Backend(format!(
+                        "{method} still content-modified after {CONTENT_MODIFIED_RETRIES} retries"
+                    )));
+                }
+                RequestOutcome::Error(failure) if is_prepare_rename_rejection(&failure) => {
+                    return Err(RenameNavigationError::NotRenameable);
+                }
+                RequestOutcome::Error(failure) if is_method_not_found(&failure) => {
+                    return Ok(json!({ "defaultBehavior": true }));
+                }
+                RequestOutcome::Error(failure) => {
+                    return Err(RenameNavigationError::Backend(failure.format(method)));
+                }
+            }
+        }
+    }
+}
+
+fn is_prepare_rename_rejection(failure: &RequestFailure) -> bool {
+    match failure {
+        RequestFailure::Response {
+            code: Some(-32602),
+            message: Some(message),
+            ..
+        } => message
+            .to_ascii_lowercase()
+            .contains("not valid rename target"),
+        _ => false,
+    }
+}
+
+fn is_method_not_found(failure: &RequestFailure) -> bool {
+    matches!(
+        failure,
+        RequestFailure::Response {
+            code: Some(-32601),
+            ..
+        }
+    )
 }
 
 impl NavigationPort for LspClientAdapter {
@@ -773,6 +924,24 @@ impl NavigationPort for LspClientAdapter {
             path,
             text,
             "textDocument/definition",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character }
+            }),
+        )
+    }
+
+    fn implementations(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, CodeIntelError> {
+        let uri = self.uri_for(path);
+        self.location_query(
+            path,
+            text,
+            "textDocument/implementation",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": position.line, "character": position.character }
@@ -855,6 +1024,79 @@ impl NavigationPort for LspClientAdapter {
         );
         self.release_doc(&uri);
         Ok(decode::decode_document_symbols(&result?))
+    }
+
+    fn prepare_rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<PrepareRenameResult, RenameNavigationError> {
+        match *self
+            .rename_capability
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            RenameCapability::Unavailable => {
+                return Err(RenameNavigationError::UnsupportedLanguage);
+            }
+            RenameCapability::RenameOnly => {
+                return Ok(PrepareRenameResult {
+                    range: None,
+                    placeholder: None,
+                });
+            }
+            RenameCapability::UnknownAssumePrepare | RenameCapability::RenameWithPrepare => {}
+        }
+        self.prepare_rename_query(path, text, position)
+    }
+}
+
+impl LspClientAdapter {
+    #[allow(dead_code)]
+    pub fn rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+        if !self.supports(path) {
+            return Err(RenameNavigationError::UnsupportedLanguage);
+        }
+        match *self
+            .rename_capability
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+        {
+            RenameCapability::Unavailable => {
+                return Err(RenameNavigationError::UnsupportedLanguage);
+            }
+            RenameCapability::UnknownAssumePrepare | RenameCapability::RenameWithPrepare => {
+                let prepared = self.prepare_rename_value(path, text, position)?;
+                if let Err(error) = decode_prepare_rename(prepared.clone()) {
+                    if looks_like_workspace_edit(&prepared) {
+                        return decode_workspace_edit(prepared);
+                    }
+                    return Err(error);
+                }
+            }
+            RenameCapability::RenameOnly => {}
+        }
+        let uri = self.uri_for(path);
+        self.acquire_doc(&uri, text)
+            .map_err(code_intel_to_rename_error)?;
+        let result = self.send_request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character },
+                "newName": new_name
+            }),
+        );
+        self.release_doc(&uri);
+        let value = result.map_err(code_intel_to_rename_error)?;
+        decode_workspace_edit(value)
     }
 }
 
@@ -963,6 +1205,16 @@ impl pool::PooledSession for LspClientAdapter {
             .get(uri)
             .map(|e| e.diags.clone())
             .unwrap_or_default()
+    }
+
+    fn rename(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+        Self::rename(self, path, text, position, new_name)
     }
 
     /// Kill the real OS process to simulate a crash in e2e tests.
@@ -1170,20 +1422,95 @@ fn workspace_locations(raws: Vec<RawLocation>, root: &Path, ignore: &Gitignore) 
         .collect()
 }
 
+fn decode_prepare_rename(value: Value) -> Result<PrepareRenameResult, RenameNavigationError> {
+    if value.is_null() {
+        return Err(RenameNavigationError::NotRenameable);
+    }
+    let response: lsp_types::PrepareRenameResponse = serde_json::from_value(value)
+        .map_err(|e| RenameNavigationError::Backend(format!("decode prepareRename failed: {e}")))?;
+    match response {
+        lsp_types::PrepareRenameResponse::Range(range) => Ok(PrepareRenameResult {
+            range: Some(domain_range(range)),
+            placeholder: None,
+        }),
+        lsp_types::PrepareRenameResponse::RangeWithPlaceholder { range, placeholder } => {
+            Ok(PrepareRenameResult {
+                range: Some(domain_range(range)),
+                placeholder: Some(placeholder),
+            })
+        }
+        lsp_types::PrepareRenameResponse::DefaultBehavior { default_behavior } => {
+            if default_behavior {
+                Ok(PrepareRenameResult {
+                    range: None,
+                    placeholder: None,
+                })
+            } else {
+                Err(RenameNavigationError::NotRenameable)
+            }
+        }
+    }
+}
+
+fn domain_range(range: lsp_types::Range) -> Range {
+    Range {
+        start: Position {
+            line: range.start.line,
+            character: range.start.character,
+        },
+        end: Position {
+            line: range.end.line,
+            character: range.end.character,
+        },
+    }
+}
+
+fn decode_workspace_edit(value: Value) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+    if value.is_null() {
+        return Ok(RawWorkspaceEdit {
+            changes: None,
+            document_changes: None,
+            change_annotations: None,
+        });
+    }
+    serde_json::from_value(value)
+        .map_err(|e| RenameNavigationError::Backend(format!("decode WorkspaceEdit failed: {e}")))
+}
+
+fn looks_like_workspace_edit(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("changes") || object.contains_key("documentChanges")
+    })
+}
+
+fn code_intel_to_rename_error(error: CodeIntelError) -> RenameNavigationError {
+    match error {
+        CodeIntelError::Unsupported => RenameNavigationError::UnsupportedLanguage,
+        CodeIntelError::Backend(message) => RenameNavigationError::Backend(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::BufReader;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicI64};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        CHECK_TIMEOUT, DiagnosticsEvent, RawLocation, ResponseCache, SharedState, Writer,
+        CHECK_TIMEOUT, DiagnosticsEvent, LspClientAdapter, RawLocation, RawWorkspaceEdit,
+        RenameCapability, RenameNavigationError, ResponseCache, Session, SharedState, Writer,
         build_dispatcher, current_generation, mark_ready, parse_publish_diagnostics, path_to_uri,
         progress_kind, record_diagnostics, server_status_is_quiescent, uri_to_path,
         wait_for_settled, workspace_locations,
     };
+    use crate::lsp_adapter::documents::DocumentTracker;
+    use core_engine::domain::RelativePath;
     use core_engine::domain::code_intel::{Diagnostic, Position, Range, Severity};
+    use core_engine::ports::{CodeIntelError, NavigationPort};
 
     fn new_state() -> SharedState {
         Arc::new((
@@ -1417,6 +1744,387 @@ mod tests {
         let sink = SharedSink::default();
         let writer: Writer = Arc::new(Mutex::new(Box::new(sink.clone())));
         (writer, sink)
+    }
+
+    fn test_adapter() -> (LspClientAdapter, SharedSink, ResponseCache) {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (writer, sink) = test_writer();
+        let responses: ResponseCache =
+            Arc::new((Mutex::new(std::collections::HashMap::new()), Condvar::new()));
+        let adapter = LspClientAdapter {
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            extensions: vec!["rs".to_owned()],
+            language_id: "rust".to_owned(),
+            inner: Mutex::new(Session {
+                child,
+                docs: DocumentTracker::new(),
+            }),
+            writer,
+            state: new_state(),
+            responses: Arc::clone(&responses),
+            rename_capability: Mutex::new(RenameCapability::UnknownAssumePrepare),
+            ignore: empty_ignore(),
+            next_id: AtomicI64::new(1),
+            dead_flag: Arc::new(AtomicBool::new(false)),
+        };
+        (adapter, sink, responses)
+    }
+
+    fn complete_response(responses: ResponseCache, response: serde_json::Value) {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let (lock, cvar) = &*responses;
+            lock.lock().unwrap().insert(1, response);
+            cvar.notify_all();
+        });
+    }
+
+    fn complete_responses(responses: ResponseCache, responses_by_id: Vec<serde_json::Value>) {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let (lock, cvar) = &*responses;
+            let mut cache = lock.lock().unwrap();
+            for response in responses_by_id {
+                let id = response["id"].as_i64().expect("test response has id");
+                cache.insert(id, response);
+            }
+            cvar.notify_all();
+        });
+    }
+
+    fn written_messages(sink: &SharedSink) -> Vec<serde_json::Value> {
+        let bytes = sink.0.lock().unwrap().clone();
+        let mut reader = BufReader::new(bytes.as_slice());
+        let mut out = Vec::new();
+        while let Some(msg) = super::jsonrpc::read_message(&mut reader).unwrap() {
+            out.push(msg);
+        }
+        out
+    }
+
+    fn request_with_method(messages: &[serde_json::Value], method: &str) -> serde_json::Value {
+        messages
+            .iter()
+            .find(|msg| msg.get("method").and_then(serde_json::Value::as_str) == Some(method))
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn lsp_client_adapter_sends_text_document_implementation_with_zero_based_utf16_position() {
+        let (adapter, sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "result": [{
+                    "uri": "file:///workspace/src/impl.rs",
+                    "range": {
+                        "start": { "line": 7, "character": 3 },
+                        "end": { "line": 7, "character": 9 }
+                    }
+                }]
+            }),
+        );
+
+        let locations = adapter
+            .implementations(
+                &RelativePath::new("src/main.rs"),
+                "trait Example {}",
+                Position {
+                    line: 2,
+                    character: 11,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path.as_str(), "src/impl.rs");
+        let request = request_with_method(&written_messages(&sink), "textDocument/implementation");
+        assert_eq!(request["params"]["position"]["line"], 2);
+        assert_eq!(request["params"]["position"]["character"], 11);
+    }
+
+    #[test]
+    fn unsupported_implementation_lookup_returns_code_intel_unsupported() {
+        let (adapter, _sink, _responses) = test_adapter();
+
+        let err = adapter
+            .implementations(
+                &RelativePath::new("README.txt"),
+                "not rust",
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(err, CodeIntelError::Unsupported);
+    }
+
+    #[test]
+    fn prepare_rename_returns_range_and_placeholder_from_lsp_result() {
+        let (adapter, sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "result": {
+                    "range": {
+                        "start": { "line": 1, "character": 4 },
+                        "end": { "line": 1, "character": 8 }
+                    },
+                    "placeholder": "name"
+                }
+            }),
+        );
+
+        let prepared = adapter
+            .prepare_rename(
+                &RelativePath::new("src/main.rs"),
+                "let name = 1;",
+                Position {
+                    line: 1,
+                    character: 5,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(prepared.placeholder.as_deref(), Some("name"));
+        assert_eq!(
+            prepared.range.unwrap(),
+            Range {
+                start: Position {
+                    line: 1,
+                    character: 4,
+                },
+                end: Position {
+                    line: 1,
+                    character: 8,
+                },
+            }
+        );
+        request_with_method(&written_messages(&sink), "textDocument/prepareRename");
+    }
+
+    #[test]
+    fn prepare_rename_rejection_maps_to_not_renameable() {
+        let (adapter, _sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "error": {
+                    "code": -32602,
+                    "message": "not valid rename target"
+                }
+            }),
+        );
+
+        let err = adapter
+            .prepare_rename(
+                &RelativePath::new("src/main.rs"),
+                "let name = 1;",
+                Position {
+                    line: 1,
+                    character: 0,
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(err, RenameNavigationError::NotRenameable);
+    }
+
+    #[test]
+    fn prepare_rename_backend_error_stays_backend() {
+        let (adapter, _sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "error": {
+                    "code": -32603,
+                    "message": "internal error"
+                }
+            }),
+        );
+
+        let err = adapter
+            .prepare_rename(
+                &RelativePath::new("src/main.rs"),
+                "let name = 1;",
+                Position {
+                    line: 1,
+                    character: 0,
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RenameNavigationError::Backend(message) if message.contains("internal error"))
+        );
+    }
+
+    #[test]
+    fn rename_sends_new_name_exactly_sourced_from_caller() {
+        let (adapter, sink, responses) = test_adapter();
+        complete_responses(
+            responses,
+            vec![
+                json!({
+                    "id": 1,
+                    "result": {
+                        "range": {
+                            "start": { "line": 0, "character": 4 },
+                            "end": { "line": 0, "character": 8 }
+                        },
+                        "placeholder": "name"
+                    }
+                }),
+                json!({
+                    "id": 2,
+                    "result": {
+                        "changes": {
+                            "file:///workspace/src/main.rs": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 4 },
+                                    "end": { "line": 0, "character": 8 }
+                                },
+                                "newText": "renamedSymbol"
+                            }]
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let _ = adapter
+            .rename(
+                &RelativePath::new("src/main.rs"),
+                "let name = 1;",
+                Position {
+                    line: 0,
+                    character: 5,
+                },
+                "renamedSymbol",
+            )
+            .unwrap();
+
+        let messages = written_messages(&sink);
+        let prepare_idx = messages
+            .iter()
+            .position(|msg| {
+                msg.get("method").and_then(serde_json::Value::as_str)
+                    == Some("textDocument/prepareRename")
+            })
+            .expect("rename must prepareRename before issuing rename");
+        let rename_idx = messages
+            .iter()
+            .position(|msg| {
+                msg.get("method").and_then(serde_json::Value::as_str) == Some("textDocument/rename")
+            })
+            .expect("rename request must be sent after successful prepareRename");
+        assert!(
+            prepare_idx < rename_idx,
+            "prepareRename must be sent before rename; messages={messages:?}"
+        );
+        assert_eq!(messages[rename_idx]["params"]["newName"], "renamedSymbol");
+    }
+
+    #[test]
+    fn raw_workspace_edit_forwards_changes_document_changes_versions_and_resource_ops() {
+        let (adapter, _sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "result": {
+                    "changes": {
+                        "file:///workspace/src/main.rs": [{
+                            "range": {
+                                "start": { "line": 0, "character": 4 },
+                                "end": { "line": 0, "character": 8 }
+                            },
+                            "newText": "new_name"
+                        }]
+                    },
+                    "documentChanges": [{
+                        "textDocument": {
+                            "uri": "file:///workspace/src/lib.rs",
+                            "version": 7
+                        },
+                        "edits": [{
+                            "range": {
+                                "start": { "line": 2, "character": 0 },
+                                "end": { "line": 2, "character": 3 }
+                            },
+                            "newText": "new_name"
+                        }]
+                    }, {
+                        "kind": "rename",
+                        "oldUri": "file:///workspace/src/old.rs",
+                        "newUri": "file:///workspace/src/new.rs",
+                        "options": { "overwrite": true, "ignoreIfExists": false }
+                    }]
+                }
+            }),
+        );
+
+        let edit: RawWorkspaceEdit = adapter
+            .rename(
+                &RelativePath::new("src/main.rs"),
+                "let name = 1;",
+                Position {
+                    line: 0,
+                    character: 5,
+                },
+                "new_name",
+            )
+            .unwrap();
+
+        assert!(
+            edit.changes
+                .as_ref()
+                .is_some_and(|changes| !changes.is_empty())
+        );
+        assert!(edit.document_changes.is_some());
+        let forwarded = serde_json::to_value(&edit).unwrap();
+        assert_eq!(
+            forwarded["documentChanges"][1]["kind"], "rename",
+            "unsupported resource operations must remain in RawWorkspaceEdit for T014 rejection"
+        );
+        assert_eq!(
+            forwarded["documentChanges"][1]["oldUri"],
+            "file:///workspace/src/old.rs"
+        );
+        assert_eq!(
+            forwarded["documentChanges"][1]["newUri"],
+            "file:///workspace/src/new.rs"
+        );
+    }
+
+    #[test]
+    fn rename_navigation_error_has_stable_public_variants() {
+        assert!(matches!(
+            RenameNavigationError::NotRenameable,
+            RenameNavigationError::NotRenameable
+        ));
+        assert!(matches!(
+            RenameNavigationError::UnsupportedLanguage,
+            RenameNavigationError::UnsupportedLanguage
+        ));
+        assert!(matches!(
+            RenameNavigationError::Backend("backend".to_owned()),
+            RenameNavigationError::Backend(_)
+        ));
     }
 
     #[test]

@@ -207,6 +207,193 @@ pub struct ApplyEditsHostCallTextEdit {
     pub replacement: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApplyEditsRequest {
+    pub edits: Vec<WorkspaceEditSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEditSpan {
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub replacement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApplyEditsResult {
+    pub files_changed: usize,
+    pub per_file: Vec<PerFileEditResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerFileEditResult {
+    pub path: String,
+    pub applied: bool,
+    pub edits_applied: usize,
+    pub edits_skipped: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WorkspaceApplyEditsError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApplyEditsError {
+    pub code: WorkspaceApplyEditsErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceApplyEditsErrorCode {
+    CapabilityDenied,
+    InvalidPath,
+    #[serde(rename = "empty_edit_list")]
+    EmptyEdits,
+    #[serde(rename = "overlapping_edits")]
+    OverlappingSpans,
+    InvalidRange,
+    #[serde(rename = "cas_conflict")]
+    Conflict,
+    #[serde(rename = "unsupported_operation")]
+    Unsupported,
+    #[serde(rename = "backend_error")]
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+    #[serde(rename = "endLine")]
+    pub end_line: u32,
+    #[serde(rename = "endCharacter")]
+    pub end_character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspImplementationRequest {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspImplementationResult {
+    pub supported: bool,
+    pub locations: Vec<Location>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameRequest {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+    pub new_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameResult {
+    pub applied: bool,
+    pub files_changed: usize,
+    pub spans: Vec<WorkspaceEditSpan>,
+    pub preview: Option<String>,
+    pub per_file: Vec<PerFileEditResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenamePreview {
+    pub spans: Vec<WorkspaceEditSpan>,
+    pub preview: String,
+    pub per_file: Vec<PerFileEditResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameError {
+    pub code: RenameErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenameErrorCode {
+    NotRenameable,
+    UnsupportedWorkspaceEdit,
+    UnsupportedLanguage,
+    InvalidRange,
+    #[serde(rename = "backend_error")]
+    BackendError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchoredSymbolEditRequest {
+    pub path: String,
+    pub symbol_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchoredSymbolEditResult {
+    pub applied: bool,
+    pub files_changed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<WorkspaceEditSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    pub per_file: Vec<PerFileEditResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchoredSymbolEditError {
+    pub code: AnchoredSymbolEditErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<SymbolCandidate>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchoredSymbolEditErrorCode {
+    NotFound,
+    AmbiguousSymbol,
+    UnsupportedLanguage,
+    InvalidRange,
+    #[serde(rename = "backend_error")]
+    BackendError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolCandidate {
+    pub path: String,
+    pub kind: String,
+    pub name: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_row: usize,
+    pub end_row: usize,
+}
+
 /// Requests an extension may make back to the host (capability callbacks).
 ///
 /// The sidecar adapter (spec 23) routes each variant to the appropriate

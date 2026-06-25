@@ -45,6 +45,31 @@ where
         .map_err(harness_error_message)
 }
 
+pub fn host_call_value<R>(
+    out: &Arc<Mutex<impl Write>>,
+    lines: &mut R,
+    ids: &mut HostCallIdAllocator,
+    method: &str,
+    params: Value,
+    queued: &mut std::collections::VecDeque<QueuedFrame>,
+) -> Result<Value, String>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let id = ids.next_id();
+    extension_sidecar_harness::write_envelope(
+        out,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }),
+    )
+    .map_err(harness_error_message)?;
+    extension_sidecar_harness::read_host_response(lines, id, queued).map_err(harness_error_message)
+}
+
 /// Send a `notify/resourceUpdated` HostCall from the push thread.
 ///
 /// This variant takes a plain `impl Write` because the push thread owns the

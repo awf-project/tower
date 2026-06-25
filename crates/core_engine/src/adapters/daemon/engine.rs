@@ -31,7 +31,9 @@ use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::FileMutationService;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{FileId, RelativePath};
-use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest, FileMutationUseCase};
+use crate::ports::inbound::{
+    FileMutationUseCase, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
+};
 use crate::ports::{AstIndexPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
 use extension_protocol::ExtensionManifest;
 
@@ -145,18 +147,11 @@ impl EngineApplyEditsHost {
 }
 
 impl ApplyEditsHostPort for EngineApplyEditsHost {
-    fn apply_edits_cas(
+    fn apply_batch_edits(
         &self,
-        request: ApplyEditsRequest,
-    ) -> Result<ApplyEditsFileResult, DomainError> {
-        self.with_mutation_service(|svc| svc.apply_edits_cas(request))
-    }
-
-    fn apply_edits_dry_run(
-        &self,
-        request: ApplyEditsRequest,
-    ) -> Result<ApplyEditsFileResult, DomainError> {
-        self.with_mutation_service(|svc| svc.apply_edits_dry_run(request))
+        request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        self.with_mutation_service(|svc| svc.apply_batch_edits(request))
     }
 }
 

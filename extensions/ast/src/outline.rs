@@ -65,6 +65,7 @@ pub struct OutlineItem {
     pub kind: OutlineKind,
     pub name: String,
     pub span: Span,
+    pub body_span: Option<Span>,
 }
 
 /// The full outline of a source file.
@@ -156,6 +157,7 @@ fn walk_top_level(node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>) {
                 if let Some(item) = extract_named_item(child, source, OutlineKind::Trait) {
                     items.push(item);
                 }
+                walk_trait_body(child, source, items);
             }
             "impl_item" => {
                 let impl_item = extract_impl_item(child, source);
@@ -217,6 +219,22 @@ fn walk_impl_body(impl_node: Node<'_>, source: &[u8], items: &mut Vec<OutlineIte
     }
 }
 
+fn walk_trait_body(trait_node: Node<'_>, source: &[u8], items: &mut Vec<OutlineItem>) {
+    let body = trait_node
+        .children(&mut trait_node.walk())
+        .find(|n| n.kind() == "declaration_list");
+    let Some(body) = body else { return };
+
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if matches!(child.kind(), "function_item" | "function_signature_item")
+            && let Some(item) = extract_named_item(child, source, OutlineKind::Method)
+        {
+            items.push(item);
+        }
+    }
+}
+
 fn extract_named_item(node: Node<'_>, source: &[u8], kind: OutlineKind) -> Option<OutlineItem> {
     if node.is_error() {
         return None;
@@ -229,6 +247,7 @@ fn extract_named_item(node: Node<'_>, source: &[u8], kind: OutlineKind) -> Optio
         kind,
         name,
         span: node_span(node),
+        body_span: node_body_span(node, source),
     })
 }
 
@@ -260,6 +279,7 @@ fn extract_impl_item(node: Node<'_>, source: &[u8]) -> OutlineItem {
         kind: OutlineKind::Impl,
         name,
         span: node_span(node),
+        body_span: node_body_span(node, source),
     }
 }
 
@@ -274,6 +294,67 @@ fn node_span(node: Node<'_>) -> Span {
         end_row: end.row,
         end_col: end.column,
     }
+}
+
+fn node_body_span(node: Node<'_>, source: &[u8]) -> Option<Span> {
+    let body = node
+        .child_by_field_name("body")
+        .or_else(|| body_child_by_kind(node))?;
+    delimited_body_inner_span(source, body)
+}
+
+fn body_child_by_kind(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "block"
+                | "declaration_list"
+                | "field_declaration_list"
+                | "enumerator_list"
+                | "compound_statement"
+                | "class_declaration_body"
+        )
+    })
+}
+
+fn delimited_body_inner_span(source: &[u8], body: Node<'_>) -> Option<Span> {
+    let bytes = source.get(body.start_byte()..body.end_byte())?;
+    let open = bytes.iter().position(|byte| *byte == b'{')?;
+    let close = bytes.iter().rposition(|byte| *byte == b'}')?;
+    if open >= close {
+        return None;
+    }
+    let start_byte = body.start_byte() + open + 1;
+    let end_byte = body.start_byte() + close;
+    Some(byte_range_span(source, start_byte, end_byte))
+}
+
+fn byte_range_span(source: &[u8], start_byte: usize, end_byte: usize) -> Span {
+    let (start_row, start_col) = row_col_for_byte(source, start_byte);
+    let (end_row, end_col) = row_col_for_byte(source, end_byte);
+    Span {
+        start_byte,
+        end_byte,
+        start_row,
+        start_col,
+        end_row,
+        end_col,
+    }
+}
+
+fn row_col_for_byte(source: &[u8], byte_offset: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for byte in source.iter().take(byte_offset) {
+        if *byte == b'\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
 }
 
 // ── Go walker ─────────────────────────────────────────────────────────────────

@@ -14,6 +14,8 @@
 
 use core_engine::domain::code_intel::Position;
 
+use crate::lsp_adapter::decode::WorkspaceEditDecodeError;
+
 /// Bidirectional byte ↔ (line, UTF-16) converter over a borrowed UTF-8 document.
 #[allow(dead_code)]
 pub struct PositionMap<'a> {
@@ -105,14 +107,99 @@ impl<'a> PositionMap<'a> {
         }
         Some(byte)
     }
+
+    pub fn lsp_range_to_byte_range(
+        &self,
+        path: &str,
+        range: lsp_types::Range,
+    ) -> Result<std::ops::Range<usize>, WorkspaceEditDecodeError> {
+        let start = self.exact_position_to_byte(range.start).ok_or_else(|| {
+            WorkspaceEditDecodeError::InvalidRange {
+                path: path.to_owned(),
+                message: format!(
+                    "invalid LSP range start {}:{}",
+                    range.start.line, range.start.character
+                ),
+            }
+        })?;
+        let end = self.exact_position_to_byte(range.end).ok_or_else(|| {
+            WorkspaceEditDecodeError::InvalidRange {
+                path: path.to_owned(),
+                message: format!(
+                    "invalid LSP range end {}:{}",
+                    range.end.line, range.end.character
+                ),
+            }
+        })?;
+        if start > end {
+            return Err(WorkspaceEditDecodeError::InvalidRange {
+                path: path.to_owned(),
+                message: "range start is after range end".to_owned(),
+            });
+        }
+        Ok(start..end)
+    }
+
+    fn exact_position_to_byte(&self, pos: lsp_types::Position) -> Option<usize> {
+        let mut line_start = 0usize;
+        if pos.line > 0 {
+            let mut seen = 0u32;
+            let mut found = false;
+            for (i, b) in self.text.bytes().enumerate() {
+                if b == b'\n' {
+                    seen += 1;
+                    if seen == pos.line {
+                        line_start = i + 1;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                return None;
+            }
+        }
+
+        let mut utf16 = 0u32;
+        let mut byte = line_start;
+        for c in self.text[line_start..].chars() {
+            if c == '\n' {
+                break;
+            }
+            if utf16 == pos.character {
+                return Some(byte);
+            }
+            let next_utf16 = utf16 + c.len_utf16() as u32;
+            if pos.character < next_utf16 {
+                return None;
+            }
+            utf16 = next_utf16;
+            byte += c.len_utf8();
+        }
+        (utf16 == pos.character).then_some(byte)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::{Position as LspPosition, Range as LspRange};
 
     fn pos(line: u32, character: u32) -> Position {
         Position { line, character }
+    }
+
+    fn lsp_range(l0: u32, c0: u32, l1: u32, c1: u32) -> LspRange {
+        LspRange {
+            start: LspPosition {
+                line: l0,
+                character: c0,
+            },
+            end: LspPosition {
+                line: l1,
+                character: c1,
+            },
+        }
     }
 
     #[test]
@@ -171,5 +258,41 @@ mod tests {
         let map = PositionMap::new("ab\ncd");
         // Column 99 on line 0 clamps to byte 2 (just before '\n').
         assert_eq!(map.position_to_byte(pos(0, 99)), Some(2));
+    }
+
+    #[test]
+    fn lsp_range_to_byte_range_converts_utf16_positions_for_ascii_accented_and_surrogate_pairs() {
+        let text = "alpha\nlet café = \"😀\";\n";
+        let map = PositionMap::new(text);
+
+        assert_eq!(
+            map.lsp_range_to_byte_range("src/main.rs", lsp_range(0, 0, 0, 5))
+                .unwrap(),
+            0..5
+        );
+        assert_eq!(
+            map.lsp_range_to_byte_range("src/main.rs", lsp_range(1, 4, 1, 8))
+                .unwrap(),
+            10..15
+        );
+        assert_eq!(
+            map.lsp_range_to_byte_range("src/main.rs", lsp_range(1, 12, 1, 14))
+                .unwrap(),
+            19..23
+        );
+    }
+
+    #[test]
+    fn lsp_range_to_byte_range_invalid_utf16_position_returns_invalid_range_safely() {
+        let map = PositionMap::new("let café = 1;");
+
+        let error = map
+            .lsp_range_to_byte_range("src/main.rs", lsp_range(7, 0, 7, 1))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceEditDecodeError::InvalidRange { path, .. } if path == "src/main.rs"
+        ));
     }
 }

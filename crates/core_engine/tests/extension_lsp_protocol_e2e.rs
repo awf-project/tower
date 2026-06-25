@@ -11,9 +11,15 @@
 //! the actual `lsp_extension` binary (which requires a language server).
 //! Real rust-analyzer e2e tests live in `lsp_rust_analyzer_e2e.rs`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
+use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::native_tools::EngineState;
+use core_engine::adapters::mcp::registry::ToolRegistry;
+use core_engine::adapters::{InMemoryFs, InMemoryStorage};
 use core_engine::domain::extension_host::{ExtensionId, ExtensionRegistry};
+use core_engine::domain::index::InvertedIndex;
+use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::domain::{FileId, RelativePath};
 use core_engine::ports::ExtensionHostPort;
 use extension_protocol::manifest::{CapabilitiesSection, EventsSection};
@@ -30,6 +36,14 @@ struct RecordingExtension {
 
 impl RecordingExtension {
     fn new(name: &str, subscriptions: Vec<&str>) -> (Self, Arc<Mutex<Vec<Event>>>) {
+        Self::with_tools(name, subscriptions, vec![])
+    }
+
+    fn with_tools(
+        name: &str,
+        subscriptions: Vec<&str>,
+        tools: Vec<ToolDecl>,
+    ) -> (Self, Arc<Mutex<Vec<Event>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let ext = Self {
             manifest: ExtensionManifest {
@@ -37,7 +51,7 @@ impl RecordingExtension {
                 version: "0.1.0".to_owned(),
                 command: vec!["./fake".to_owned()],
                 activation: extension_protocol::Activation::Lazy,
-                tools: vec![],
+                tools,
                 events: EventsSection {
                     subscribe: subscriptions.into_iter().map(str::to_owned).collect(),
                 },
@@ -46,6 +60,33 @@ impl RecordingExtension {
             events: Arc::clone(&events),
         };
         (ext, events)
+    }
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::path::Path::new(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn empty_engine_state() -> Arc<RwLock<EngineState>> {
+    Arc::new(RwLock::new(EngineState::new(
+        ProjectWorkspace::new(),
+        InvertedIndex::new(),
+        Box::new(InMemoryStorage::new()),
+        Box::new(InMemoryFs::new()),
+    )))
+}
+
+fn lsp_tool(name: &str) -> ToolDecl {
+    ToolDecl {
+        name: name.to_owned(),
+        description: format!("LSP {name}"),
+        schema_json: "{}".to_owned(),
     }
 }
 
@@ -217,105 +258,22 @@ fn spec27_notify_resource_updated_reaches_push_channel() {
 
 // ── TDD step 3: diagnostics tool parity (protocol shape) ─────────────────────
 
-/// Spec 27 U1: The LSP extension declares the four standard tools in its
-/// `InitResult`, matching the MCP contract from spec 14a/14b.
+/// `extensions/lsp/extension.toml` declares bare tool names `implementations`
+/// and `rename`, plus privileged capability `request_apply_edits`.
 #[test]
-fn spec27_lsp_extension_declares_four_tools() {
-    use extension_protocol::InitResult;
-
-    // Simulate the InitResult the extension would send.
-    let init_result = InitResult {
-        tools: vec![
-            ToolDecl {
-                name: "diagnostics".to_owned(),
-                description: "Run diagnostics".to_owned(),
-                schema_json: "{}".to_owned(),
-            },
-            ToolDecl {
-                name: "definition".to_owned(),
-                description: "Go to definition".to_owned(),
-                schema_json: "{}".to_owned(),
-            },
-            ToolDecl {
-                name: "references".to_owned(),
-                description: "Find references".to_owned(),
-                schema_json: "{}".to_owned(),
-            },
-            ToolDecl {
-                name: "hover".to_owned(),
-                description: "Hover info".to_owned(),
-                schema_json: "{}".to_owned(),
-            },
-        ],
-        events: vec![
-            "event/fileChanged".to_owned(),
-            "event/fileDeleted".to_owned(),
-        ],
-        capabilities: vec![Capability::ReadFile, Capability::Notify, Capability::Log],
-    };
-
-    assert_eq!(init_result.tools.len(), 4, "must declare exactly 4 tools");
-    let names: Vec<&str> = init_result.tools.iter().map(|t| t.name.as_str()).collect();
-    assert!(names.contains(&"diagnostics"), "must declare 'diagnostics'");
-    assert!(names.contains(&"definition"), "must declare 'definition'");
-    assert!(names.contains(&"references"), "must declare 'references'");
-    assert!(names.contains(&"hover"), "must declare 'hover'");
-
-    assert!(
-        init_result.events.contains(&"event/fileChanged".to_owned()),
-        "must subscribe to fileChanged"
-    );
-    assert!(
-        init_result.events.contains(&"event/fileDeleted".to_owned()),
-        "must subscribe to fileDeleted"
-    );
-
-    assert!(
-        init_result.capabilities.contains(&Capability::Notify),
-        "must declare Notify capability"
-    );
-}
-
-/// Spec 27: The `ExtensionManifest` from `extension.toml` parses correctly for
-/// the LSP extension.
-#[test]
-fn spec27_lsp_extension_toml_parses_correctly() {
-    let toml = r#"
-        name    = "lsp"
-        version = "0.1.0"
-        command    = ["lsp_extension"]
-        activation = "lazy"
-
-        [events]
-        subscribe = ["event/fileChanged", "event/fileDeleted"]
-
-        [capabilities]
-        required = ["read_file", "notify", "log"]
-
-        [[tools]]
-        name        = "diagnostics"
-        description = "Run diagnostics"
-        schema_json = "{}"
-
-        [[tools]]
-        name        = "definition"
-        description = "Go to definition"
-        schema_json = "{}"
-
-        [[tools]]
-        name        = "references"
-        description = "Find references"
-        schema_json = "{}"
-
-        [[tools]]
-        name        = "hover"
-        description = "Hover info"
-        schema_json = "{}"
-    "#;
-
-    let manifest: ExtensionManifest = toml::from_str(toml).expect("manifest must parse");
+fn f007_t015_extension_toml_declares_bare_tool_names_implementations_rename_and_request_apply_edits()
+ {
+    let manifest_path = workspace_root().join("extensions/lsp/extension.toml");
+    let toml = std::fs::read_to_string(&manifest_path).expect("read lsp extension.toml");
+    let manifest: ExtensionManifest = toml::from_str(&toml).expect("manifest must parse");
     assert_eq!(manifest.name, "lsp");
-    assert_eq!(manifest.tools.len(), 4);
+    let names = manifest
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"implementations"));
+    assert!(names.contains(&"rename"));
     assert!(
         manifest
             .events
@@ -327,12 +285,53 @@ fn spec27_lsp_extension_toml_parses_correctly() {
         manifest
             .capabilities
             .required
-            .contains(&"notify".to_owned()),
-        "manifest must require notify capability"
+            .contains(&"request_apply_edits".to_owned()),
+        "manifest must require request_apply_edits capability"
     );
     assert!(
-        matches!(manifest.activation, extension_protocol::Activation::Lazy),
-        "activation must be lazy"
+        matches!(manifest.activation, extension_protocol::Activation::Eager),
+        "activation must stay eager for event subscribers"
+    );
+}
+
+/// E2E/protocol tests assert tool discovery parity between `extension.toml` and
+/// runtime `InitResult` bare names, and public MCP discovery of the
+/// merge-layer-prefixed names.
+#[test]
+fn f007_t015_mcp_tool_discovery_exposes_tower_lsp_implementations_and_tower_lsp_rename() {
+    let (lsp_ext, _) = RecordingExtension::with_tools(
+        "lsp",
+        vec!["event/fileChanged", "event/fileDeleted"],
+        vec![
+            lsp_tool("diagnostics"),
+            lsp_tool("definition"),
+            lsp_tool("references"),
+            lsp_tool("hover"),
+            lsp_tool("implementations"),
+            lsp_tool("rename"),
+        ],
+    );
+    let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
+    ext_registry
+        .write()
+        .unwrap()
+        .register(Box::new(lsp_ext))
+        .expect("register lsp");
+
+    let merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
+    let names = merged
+        .list()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+
+    assert!(
+        names.iter().any(|name| name == "tower_lsp_implementations"),
+        "tools/list must expose tower_lsp_implementations; got {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "tower_lsp_rename"),
+        "tools/list must expose tower_lsp_rename; got {names:?}"
     );
 }
 

@@ -24,7 +24,7 @@ use core_engine::domain::mutation::compute_content_version;
 use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::domain::{DomainError, RelativePath};
 use core_engine::ports::FileSystemPort;
-use core_engine::ports::inbound::{ApplyEditsRequest, TextEdit};
+use core_engine::ports::inbound::{WorkspaceApplyEditsRequest, WorkspaceEditSpan};
 use extension_protocol::{ExtensionManifest, PROTOCOL_VERSION};
 use extension_sidecar_harness::{HostCallIdAllocator, QueuedFrame, read_host_response};
 use lint_support::{
@@ -81,9 +81,9 @@ fn write_apply_edits_extension(workspace: &TestWorkspace, expected_version: &str
     fs::write(
         ext_dir.join("extension.toml"),
         r#"
-name = "apply"
+name = "lint"
 version = "0.1.0"
-command = ["./apply_host.sh"]
+command = ["./lint_extension"]
 activation = "lazy"
 
 [[tools]]
@@ -109,7 +109,7 @@ IFS= read -r _shutdown
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"type":"Ack"}}}}'
 "#
     );
-    let script_path = ext_dir.join("apply_host.sh");
+    let script_path = ext_dir.join("lint_extension");
     fs::write(&script_path, script).expect("write apply extension script");
 
     #[cfg(unix)]
@@ -130,9 +130,9 @@ fn write_subscribed_apply_edits_extension(workspace: &TestWorkspace, expected_ve
     fs::write(
         ext_dir.join("extension.toml"),
         r#"
-name = "apply_subscribed"
+name = "lint"
 version = "0.1.0"
-command = ["./apply_host.sh"]
+command = ["./lint_extension"]
 activation = "eager"
 
 [[tools]]
@@ -163,7 +163,7 @@ IFS= read -r _shutdown
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"type":"Ack"}}}}'
 "#
     );
-    let script_path = ext_dir.join("apply_host.sh");
+    let script_path = ext_dir.join("lint_extension");
     fs::write(&script_path, script).expect("write subscribed apply extension script");
 
     #[cfg(unix)]
@@ -189,9 +189,9 @@ fn write_reentrant_file_changed_apply_edits_extension(
     fs::write(
         ext_dir.join("extension.toml"),
         r#"
-name = "apply_reentrant"
+name = "lint"
 version = "0.1.0"
-command = ["./apply_host.sh"]
+command = ["./lint_extension"]
 activation = "eager"
 
 [[tools]]
@@ -224,7 +224,7 @@ IFS= read -r _shutdown
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"type":"Ack"}}}}'
 "#
     );
-    let script_path = ext_dir.join("apply_host.sh");
+    let script_path = ext_dir.join("lint_extension");
     fs::write(&script_path, script).expect("write reentrant apply extension script");
 
     #[cfg(unix)]
@@ -281,9 +281,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"type":"Ack"}}'
     fs::write(
         apply_dir.join("extension.toml"),
         r#"
-name = "apply"
+name = "lint"
 version = "0.1.0"
-command = ["./apply_init.sh"]
+command = ["./lint_extension"]
 activation = "eager"
 
 [capabilities]
@@ -301,7 +301,7 @@ IFS= read -r _shutdown
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"type":"Ack"}}}}'
 "#
     );
-    let apply_script_path = apply_dir.join("apply_init.sh");
+    let apply_script_path = apply_dir.join("lint_extension");
     fs::write(&apply_script_path, apply_script).expect("write eager apply script");
 
     #[cfg(unix)]
@@ -480,16 +480,20 @@ fn lint_support_rs_can_build_lint_extension_fixtures_with_the_new_apply_edits_de
     let workspace = TestWorkspace::new();
     let deps = host_deps(workspace.real_fs());
 
-    let result = deps.apply_edits.apply_edits_dry_run(ApplyEditsRequest {
-        path: RelativePath::new("src/main.txt"),
-        expected_version: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            .to_owned(),
-        edits: vec![TextEdit {
-            start_byte: 0,
-            end_byte: 0,
-            replacement: "fixed".to_owned(),
-        }],
-    });
+    let result = deps
+        .apply_edits
+        .apply_batch_edits(WorkspaceApplyEditsRequest {
+            edits: vec![WorkspaceEditSpan {
+                path: RelativePath::new("src/main.txt"),
+                start_byte: 0,
+                end_byte: 0,
+                replacement: "fixed".to_owned(),
+                base_hash: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                ),
+            }],
+            dry_run: Some(true),
+        });
 
     assert!(
         !matches!(result, Err(DomainError::UnsupportedOperation(_))),
@@ -536,7 +540,7 @@ fn runtime_test_proves_apply_edits_writes_are_visible_through_an_indexed_read_se
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_apply_replace", json!({}))
+        .call("tower_lint_replace", json!({}))
         .expect("apply extension must request workspace/applyEdits successfully");
 
     let read = registry
@@ -577,7 +581,7 @@ fn apply_edits_from_file_changed_subscriber_does_not_deadlock_its_own_tool_call(
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_apply_subscribed_replace", json!({}))
+        .call("tower_lint_replace", json!({}))
         .expect("subscribed apply extension must not deadlock its own apply-edits HostCall");
 
     let read = registry
@@ -611,7 +615,7 @@ fn apply_edits_from_file_changed_handler_does_not_deadlock_original_apply() {
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_apply_reentrant_replace", json!({}))
+        .call("tower_lint_replace", json!({}))
         .expect("fileChanged apply-edits HostCall must not deadlock the original apply");
 
     let read = registry

@@ -154,6 +154,69 @@ pub struct ApplyEditsFileResult {
     pub preview: Option<ApplyEditsPreview>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApplyEditsRequest {
+    pub edits: Vec<WorkspaceEditSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEditSpan {
+    pub path: RelativePath,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub replacement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApplyEditsResult {
+    pub files_changed: usize,
+    pub per_file: Vec<PerFileEditResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerFileEditResult {
+    pub path: RelativePath,
+    pub applied: bool,
+    pub edits_applied: usize,
+    pub edits_skipped: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WorkspaceApplyEditsError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApplyEditsError {
+    pub code: WorkspaceApplyEditsErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<RelativePath>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceApplyEditsErrorCode {
+    CapabilityDenied,
+    InvalidPath,
+    #[serde(rename = "empty_edit_list")]
+    EmptyEdits,
+    #[serde(rename = "overlapping_edits")]
+    OverlappingSpans,
+    InvalidRange,
+    #[serde(rename = "cas_conflict")]
+    Conflict,
+    #[serde(rename = "unsupported_operation")]
+    Unsupported,
+    #[serde(rename = "backend_error")]
+    Internal,
+}
+
 // ── Inbound port traits ──────────────────────────────────────────────────────
 
 /// Read-only search over the workspace.
@@ -386,6 +449,11 @@ pub trait FileMutationUseCase {
         &self,
         request: ApplyEditsRequest,
     ) -> Result<ApplyEditsFileResult, DomainError>;
+
+    fn apply_batch_edits(
+        &mut self,
+        request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError>;
 
     /// Global find-and-replace with per-file optimistic concurrency guards
     /// (spec 18, AC6).

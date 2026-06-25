@@ -96,3 +96,33 @@
 {"ts":1782309990,"op":"assert","clause":"arch_convention('conv_eval_at_probe_outcomes', 'extensions/debug/tools', 'expected probe outcomes such as timeout, unsupported breakpoint conditions, expression errors, and no-hit exits should serialize as successful JSON payloads rather than protocol errors', 'feature_f005_debug_eval_at_stateless_evidence_probe')"}
 {"ts":1782309990,"op":"retractall","clause":"arch_convention('conv_debug_no_workspace_mutation', _, _, _)"}
 {"ts":1782309990,"op":"assert","clause":"arch_convention('conv_debug_no_workspace_mutation', 'extensions/debug', 'debug extension protocol additions must continue to request no workspace mutation capabilities', 'feature_f005_debug_eval_at_stateless_evidence_probe')"}
+{"ts":1782335373,"op":"retractall","clause":"arch_component(_,_,_,'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335373,"op":"retractall","clause":"arch_port(_,_,'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335373,"op":"retractall","clause":"arch_decision(_,_,_,_,'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335373,"op":"retractall","clause":"arch_convention(_,_,_,'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335374,"op":"retractall","clause":"arch_adr(_,_,'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335374,"op":"retractall","clause":"arch_feature('feature_f006_debug_rr_reverse_time_travel_debuggin',_,_)"}
+{"ts":1782335374,"op":"retractall","clause":"arch_component('config', _, _, _)"}
+{"ts":1782335374,"op":"assert","clause":"arch_component('config', infrastructure, '', 'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335374,"op":"retractall","clause":"arch_component('daemon', _, _, _)"}
+{"ts":1782335374,"op":"assert","clause":"arch_component('daemon', infrastructure, '', 'feature_f006_debug_rr_reverse_time_travel_debuggin')"}
+{"ts":1782335375,"op":"retractall","clause":"arch_decision('dec_rr_sidecar_boundary', _, _, _, _, _, _, _)"}
+{"ts":1782335375,"op":"assert","clause":"arch_decision('dec_rr_sidecar_boundary', 'reverse debugging placement', 'implement rr record/replay inside the existing debug sidecar while the host only validates and forwards debug.record config', 'preserves the core domain boundary and keeps DAP process lifecycle, rr preflight, trace storage, and cleanup in the fault-isolated debug extension', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335375,"op":"retractall","clause":"arch_decision('dec_rr_opt_in_discovery', _, _, _, _)"}
+{"ts":1782335375,"op":"assert","clause":"arch_decision('dec_rr_opt_in_discovery', 'record/replay capability exposure', 'expose rr tools only when debug.record.backend is rr', 'rr traces are sensitive host execution data and unsupported environments must degrade without changing normal debug tool discovery', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335375,"op":"retractall","clause":"arch_decision('dec_replay_reuses_sessions', _, _, _, _, _, _, _, _)"}
+{"ts":1782335375,"op":"assert","clause":"arch_decision('dec_replay_reuses_sessions', 'replay lifecycle', 'model replay as a SessionManager-owned debug session by extending DebugAdapterSession instead of creating a parallel replay stack', 'reuses existing launch, timeout, stop-state, cleanup, and fake-adapter testing behavior for live and replay debugging', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335375,"op":"retractall","clause":"arch_decision('dec_rr_structured_outcomes', _, _, _, _, _, _, _, _, _, _)"}
+{"ts":1782335375,"op":"assert","clause":"arch_decision('dec_rr_structured_outcomes', 'runtime failure contract', 'represent expected rr and reverse-debug outcomes as structured tool payloads such as recordable false, rr_unsupported, reverse_unsupported, and found false', 'missing rr support, live-session reverse requests, and no prior write are operational evidence for agents, not JSON-RPC transport failures', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335376,"op":"retractall","clause":"arch_decision('dec_trace_retention_safety', _, _, _, _, _, _, _, _, _, _, _)"}
+{"ts":1782335376,"op":"assert","clause":"arch_decision('dec_trace_retention_safety', 'trace lifecycle', 'store traces in a workspace-local contained trace root with list, delete, TTL pruning, and max trace retention', 'rr traces can be large and sensitive, so retention must be explicit, bounded, inspectable, and protected from path escape deletion hazards', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335376,"op":"retractall","clause":"arch_convention('conv_debug_record_config', _, _, _, _, _, _)"}
+{"ts":1782335376,"op":"assert","clause":"arch_convention('conv_debug_record_config', 'debug config', 'debug.record config must be parsed by the host, serialized through extension_config, validated again by the sidecar, and rejected for unknown fields or non-rr backends', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335376,"op":"retractall","clause":"arch_convention('conv_reverse_replay_only', _, _, _, _, _)"}
+{"ts":1782335376,"op":"assert","clause":"arch_convention('conv_reverse_replay_only', 'extensions/debug/session', 'reverse_continue, step_back, and watchpoint operations are valid only for replay sessions; live sessions and default adapters return reverse_unsupported', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335376,"op":"retractall","clause":"arch_convention('conv_origin_cleanup', _, _, _, _, _)"}
+{"ts":1782335376,"op":"assert","clause":"arch_convention('conv_origin_cleanup', 'extensions/debug/origin', 'one-shot origin recipes must open replay, seek/watch/reverse/capture, then terminate the replay session on every path while preserving the primary failure reason', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335376,"op":"retractall","clause":"arch_convention('conv_rr_bounded_capture', _, _, _)"}
+{"ts":1782335376,"op":"assert","clause":"arch_convention('conv_rr_bounded_capture', 'extensions/debug', 'rr output and origin evidence must be bounded with explicit truncation markers using output byte limits and max_depth/max_children capture limits', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1782335377,"op":"retractall","clause":"arch_convention('conv_rr_test_gating', _, _, _)"}
+{"ts":1782335377,"op":"assert","clause":"arch_convention('conv_rr_test_gating', 'debug reverse tests', 'ordinary tests must use fake rr/replay adapters and fixture scenarios; real rr coverage is host-gated and reverse-debug sidecar behavior must include 20-way parallel stress coverage', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}

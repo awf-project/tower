@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::adapters::formatter::FormatQueuePort;
 use crate::adapters::mcp::PushEvent;
 use crate::domain::DomainError;
-use crate::ports::inbound::{ApplyEditsFileResult, ApplyEditsRequest};
+use crate::ports::inbound::{WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult};
 use crate::ports::{AstIndexPort, FileSystemPort};
 
 /// Capability dependencies required by [`SidecarHostAdapter`].
@@ -68,31 +68,19 @@ pub struct HostDeps {
 /// Apply-edits dependency required by `workspace/applyEdits`.
 #[rustfmt::skip]
 pub trait ApplyEditsHostPort: Send + Sync {
-    fn apply_edits_cas(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>;
-    fn apply_edits_dry_run(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>;
+    fn apply_batch_edits(&self, request: WorkspaceApplyEditsRequest) -> Result<WorkspaceApplyEditsResult, DomainError>;
 }
 
 pub struct UnsupportedApplyEditsHost;
 
 impl ApplyEditsHostPort for UnsupportedApplyEditsHost {
-    fn apply_edits_cas(
+    fn apply_batch_edits(
         &self,
-        request: ApplyEditsRequest,
-    ) -> Result<ApplyEditsFileResult, DomainError> {
-        Err(DomainError::UnsupportedOperation(format!(
-            "workspace/applyEdits is not wired for {}",
-            request.path.as_str()
-        )))
-    }
-
-    fn apply_edits_dry_run(
-        &self,
-        request: ApplyEditsRequest,
-    ) -> Result<ApplyEditsFileResult, DomainError> {
-        Err(DomainError::UnsupportedOperation(format!(
-            "workspace/applyEdits dry-run is not wired for {}",
-            request.path.as_str()
-        )))
+        _request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        Err(DomainError::UnsupportedOperation(
+            "workspace/applyEdits is not wired".to_owned(),
+        ))
     }
 }
 

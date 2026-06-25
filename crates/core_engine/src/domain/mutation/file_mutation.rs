@@ -12,7 +12,9 @@ use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::inbound::{
     ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, FileMutationUseCase,
-    FileReplaceError, SkippedEdit, SkippedEditReason, TextEdit, TxReport,
+    FileReplaceError, PerFileEditResult, SkippedEdit, SkippedEditReason, TextEdit, TxReport,
+    WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode, WorkspaceApplyEditsRequest,
+    WorkspaceApplyEditsResult, WorkspaceEditSpan,
 };
 use crate::ports::{ExtensionHostPort, FileSystemPort, PortError, StoragePort};
 
@@ -571,9 +573,6 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         &self,
         request: ApplyEditsRequest,
     ) -> Result<ApplyEditsFileResult, DomainError> {
-        if self.workspace.get_by_path(&request.path).is_none() {
-            return Err(DomainError::NotFound);
-        }
         let bytes = self.fs.read(&request.path).map_err(port_err_to_domain)?;
         let actual = compute_content_version(&bytes);
         if actual != request.expected_version {
@@ -597,6 +596,43 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
             skipped: preview.skipped.clone(),
             new_version: None,
             preview: Some(preview),
+        })
+    }
+
+    fn apply_batch_edits(
+        &mut self,
+        request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        if request.edits.is_empty() {
+            return Ok(WorkspaceApplyEditsResult {
+                files_changed: 0,
+                per_file: vec![batch_file_error(
+                    RelativePath::new(""),
+                    0,
+                    WorkspaceApplyEditsError {
+                        code: WorkspaceApplyEditsErrorCode::EmptyEdits,
+                        message: "empty edit list".to_owned(),
+                        path: None,
+                    },
+                )],
+            });
+        }
+
+        let dry_run = request.dry_run.unwrap_or(false);
+        let mut files_changed = 0;
+        let mut per_file = Vec::new();
+
+        for group in group_workspace_edit_spans(request.edits) {
+            let file_result = self.apply_batch_edit_group(group, dry_run);
+            if !dry_run && file_result.applied {
+                files_changed += 1;
+            }
+            per_file.push(file_result);
+        }
+
+        Ok(WorkspaceApplyEditsResult {
+            files_changed,
+            per_file,
         })
     }
 
@@ -657,6 +693,101 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+impl<'ws> FileMutationService<'ws> {
+    fn apply_batch_edit_group(
+        &mut self,
+        group: WorkspaceEditGroup,
+        dry_run: bool,
+    ) -> PerFileEditResult {
+        let path = group.path;
+        let mut edits = group.edits;
+        edits.sort_by(|left, right| {
+            right
+                .start_byte
+                .cmp(&left.start_byte)
+                .then_with(|| right.end_byte.cmp(&left.end_byte))
+        });
+
+        let bytes = match self.fs.read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return batch_file_error(
+                    path,
+                    edits.len(),
+                    domain_error_to_batch_error(port_err_to_domain(error)),
+                );
+            }
+        };
+
+        let actual = compute_content_version(&bytes);
+        if !dry_run && group.base_hashes.len() != edits.len() {
+            return batch_file_error(
+                path.clone(),
+                edits.len(),
+                WorkspaceApplyEditsError {
+                    code: WorkspaceApplyEditsErrorCode::Conflict,
+                    message: "version conflict: base_hash is required for every mutating edit"
+                        .to_owned(),
+                    path: Some(path),
+                },
+            );
+        }
+        if group
+            .base_hashes
+            .iter()
+            .any(|base_hash| base_hash != &actual)
+        {
+            return batch_file_error(
+                path.clone(),
+                edits.len(),
+                WorkspaceApplyEditsError {
+                    code: WorkspaceApplyEditsErrorCode::Conflict,
+                    message: format!(
+                        "version conflict: one or more supplied base_hash values did not match actual {actual}"
+                    ),
+                    path: Some(path),
+                },
+            );
+        }
+        let expected_version = actual;
+
+        if let Err(error) = validate_apply_edits(&path, &bytes, &edits) {
+            return batch_file_error(path, edits.len(), domain_error_to_batch_error(error));
+        }
+
+        if has_overlapping_text_edits(&edits) {
+            return batch_file_error(
+                path.clone(),
+                edits.len(),
+                WorkspaceApplyEditsError {
+                    code: WorkspaceApplyEditsErrorCode::OverlappingSpans,
+                    message: "overlapping spans in one file are rejected by batch apply-edits"
+                        .to_owned(),
+                    path: Some(path),
+                },
+            );
+        }
+
+        let request = ApplyEditsRequest {
+            path: path.clone(),
+            expected_version,
+            edits,
+        };
+        let file_result = if dry_run {
+            self.apply_edits_dry_run(request)
+        } else {
+            self.apply_edits_cas(request)
+        };
+
+        match file_result {
+            Ok(result) => batch_file_success(result, dry_run),
+            Err(error) => {
+                batch_file_error(path, group.edit_count, domain_error_to_batch_error(error))
+            }
+        }
+    }
+}
+
 /// Map a [`PortError`] to a [`DomainError`].
 ///
 /// The domain layer must not expose infrastructure error types in its return
@@ -667,6 +798,107 @@ fn port_err_to_domain(err: PortError) -> DomainError {
         PortError::WriteFailed(reason)
         | PortError::ReadFailed(reason)
         | PortError::InvalidArgs(reason) => DomainError::IoError(reason),
+    }
+}
+
+struct WorkspaceEditGroup {
+    path: RelativePath,
+    base_hashes: Vec<String>,
+    edits: Vec<TextEdit>,
+    edit_count: usize,
+}
+
+fn group_workspace_edit_spans(spans: Vec<WorkspaceEditSpan>) -> Vec<WorkspaceEditGroup> {
+    let mut groups: Vec<WorkspaceEditGroup> = Vec::new();
+
+    for span in spans {
+        let edit = TextEdit {
+            start_byte: span.start_byte,
+            end_byte: span.end_byte,
+            replacement: span.replacement,
+        };
+
+        if let Some(group) = groups.iter_mut().find(|group| group.path == span.path) {
+            if let Some(base_hash) = span.base_hash {
+                group.base_hashes.push(base_hash);
+            }
+            group.edits.push(edit);
+            group.edit_count += 1;
+        } else {
+            let base_hashes = span.base_hash.into_iter().collect();
+            groups.push(WorkspaceEditGroup {
+                path: span.path,
+                base_hashes,
+                edits: vec![edit],
+                edit_count: 1,
+            });
+        }
+    }
+
+    groups
+}
+
+fn has_overlapping_text_edits(edits: &[TextEdit]) -> bool {
+    for (index, left) in edits.iter().enumerate() {
+        if edits
+            .iter()
+            .skip(index + 1)
+            .any(|right| text_edits_conflict(left, right))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn batch_file_success(result: ApplyEditsFileResult, dry_run: bool) -> PerFileEditResult {
+    let preview = result.preview.map(|preview| preview.preview_content);
+    let applied = !dry_run && result.new_version.is_some();
+    PerFileEditResult {
+        path: result.path,
+        applied,
+        edits_applied: result.applied.len(),
+        edits_skipped: result.skipped.len(),
+        new_version: result.new_version,
+        preview,
+        error: None,
+    }
+}
+
+fn batch_file_error(
+    path: RelativePath,
+    edit_count: usize,
+    error: WorkspaceApplyEditsError,
+) -> PerFileEditResult {
+    PerFileEditResult {
+        path,
+        applied: false,
+        edits_applied: 0,
+        edits_skipped: edit_count,
+        new_version: None,
+        preview: None,
+        error: Some(error),
+    }
+}
+
+fn domain_error_to_batch_error(error: DomainError) -> WorkspaceApplyEditsError {
+    let code = match error {
+        DomainError::InvalidRange(_) => WorkspaceApplyEditsErrorCode::InvalidRange,
+        DomainError::VersionConflict { .. } => WorkspaceApplyEditsErrorCode::Conflict,
+        DomainError::NotFound | DomainError::NotADirectory(_) => {
+            WorkspaceApplyEditsErrorCode::InvalidPath
+        }
+        DomainError::UnsupportedOperation(_) => WorkspaceApplyEditsErrorCode::Unsupported,
+        DomainError::StaleHandle | DomainError::DuplicatePath | DomainError::IoError(_) => {
+            WorkspaceApplyEditsErrorCode::Internal
+        }
+    };
+
+    WorkspaceApplyEditsError {
+        code,
+        message: error.to_string(),
+        path: None,
     }
 }
 

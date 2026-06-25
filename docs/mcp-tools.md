@@ -667,7 +667,7 @@ formatting.
 
 ## Code-intelligence tools (LSP)
 
-Four `tower_lsp_*` tools surface language-server intelligence over the same
+Six `tower_lsp_*` tools surface language-server intelligence over the same
 `tools/call` interface. They are contributed by the `lsp` extension (manifest
 `name = "lsp"`) and appear in `tools/list` whenever that extension is discovered.
 When there is no backend, or when the file's language is not supported by the
@@ -757,6 +757,112 @@ Get hover information (type/doc) for the symbol at a position. Same arguments as
 The range fields are present only when the server reports one. No symbol under the
 cursor → `{"supported": true, "hover": null}`. No backend / unsupported →
 `{"supported": false, "hover": null}`.
+
+### tower_lsp_implementations
+
+Find implementation sites for the symbol at a position. Same arguments as
+`tower_lsp_definition`.
+
+**Returns**
+
+```json
+{
+  "supported": true,
+  "locations": [
+    { "path": "src/lib.rs", "line": 10, "character": 7, "endLine": 10, "endCharacter": 13 },
+    { "path": "src/impls.rs", "line": 4, "character": 6, "endLine": 4, "endCharacter": 18 }
+  ]
+}
+```
+
+If the configured server or language does not support implementation lookup, the
+tool returns `{"supported": false, "locations": []}`.
+
+### tower_lsp_rename
+
+Rename the symbol at a position through the configured language server, decode
+the resulting text edits into byte spans, and apply them through the privileged
+`workspace/applyEdits` host capability. The `lsp` sidecar never writes workspace
+files directly. Both `changes` and text-only `documentChanges` WorkspaceEdit
+payloads are accepted, including versioned `TextDocumentEdit` entries; file
+create, rename, and delete resource operations are rejected before any file is
+changed.
+
+| Field       | Type    | Required | Description                                   |
+|-------------|---------|----------|-----------------------------------------------|
+| `path`      | string  | yes      | Workspace-relative path of the file           |
+| `line`      | integer | yes      | Zero-based line number                        |
+| `character` | integer | yes      | Zero-based UTF-16 code-unit column            |
+| `new_name`  | string  | yes      | Replacement symbol name                       |
+| `dry_run`   | boolean | no       | Return preview data without mutating files    |
+
+Before issuing the rename, Tower uses `prepareRename` when the server supports
+it. A non-renameable position returns a structured tool payload instead of
+partially editing files.
+
+**Returns (applied rename)**
+
+```json
+{
+  "applied": true,
+  "files_changed": 1,
+  "spans": [
+    {
+      "path": "src/lib.rs",
+      "start_byte": 3,
+      "end_byte": 11,
+      "replacement": "new_name",
+      "base_hash": "..."
+    }
+  ],
+  "preview": null,
+  "per_file": [
+    {
+      "path": "src/lib.rs",
+      "applied": true,
+      "edits_applied": 1,
+      "edits_skipped": 0,
+      "new_version": "..."
+    }
+  ]
+}
+```
+
+**Returns (`dry_run:true`)**
+
+```json
+{
+  "spans": [
+    {
+      "path": "src/lib.rs",
+      "start_byte": 3,
+      "end_byte": 11,
+      "replacement": "new_name",
+      "base_hash": "..."
+    }
+  ],
+  "preview": "fn new_name() {}\n",
+  "per_file": [
+    {
+      "path": "src/lib.rs",
+      "applied": false,
+      "edits_applied": 1,
+      "edits_skipped": 0,
+      "preview": "fn new_name() {}\n"
+    }
+  ]
+}
+```
+
+**Structured error results**
+
+```json
+{ "code": "not_renameable", "message": "the symbol at this position cannot be renamed" }
+```
+
+Other stable `code` values are `unsupported_workspace_edit`,
+`unsupported_language`, `invalid_range`, and `backend_error`. Host-side apply
+failures surface inside `per_file[*].error`, for example `cas_conflict`.
 
 ---
 
@@ -1451,8 +1557,10 @@ to an in-process sandbox; they are now out-of-process native sidecars — see
 ## AST extension tools
 
 The `ast` extension (manifest `name = "ast"`) provides Tree-sitter-based
-structural analysis for Rust, Go, and PHP. Its native sidecar binary must be
-discovered from an extension scope for the tools to appear.
+structural analysis for Rust, Go, and PHP. It also contributes AST-anchored write
+tools that resolve exactly one symbol and request host-applied edits through
+`workspace/applyEdits`. Its native sidecar binary must be discovered from an
+extension scope for the tools to appear.
 
 Supported languages (detected by file extension or language ID):
 
@@ -1735,6 +1843,97 @@ MCP name: `"tower_ast_read_symbol"`
 
 A missing file, an unknown symbol (the error names the symbol), or a stale span
 maps to `-32603`. An unrecognised `kind` returns `-32602 InvalidParams`.
+
+### tower_ast_replace_symbol_body
+
+Replace the body of one uniquely resolved symbol. Tower resolves the symbol span
+through the AST index, computes the body-only edit span, and submits one
+host-owned `workspace/applyEdits` request.
+
+| Field         | Type   | Required | Description                                              |
+|---------------|--------|----------|----------------------------------------------------------|
+| `path`        | string | yes      | Workspace-relative path to the source file               |
+| `symbol_name` | string | yes      | Name of the symbol to edit                               |
+| `kind`        | string | no       | Optional kind filter                                     |
+| `replacement` | string | yes      | Replacement text for the symbol body                     |
+| `dry_run`     | bool   | no       | Return preview data without mutating files               |
+
+**Returns**
+
+```json
+{
+  "applied": true,
+  "files_changed": 1,
+  "span": {
+    "path": "src/lib.rs",
+    "start_byte": 22,
+    "end_byte": 27,
+    "replacement": "\n    2\n",
+    "base_hash": "..."
+  },
+  "per_file": [
+    {
+      "path": "src/lib.rs",
+      "applied": true,
+      "edits_applied": 1,
+      "edits_skipped": 0,
+      "new_version": "..."
+    }
+  ]
+}
+```
+
+For `dry_run:true`, the same shape is returned with `applied:false`,
+`files_changed:0`, and `preview` / `per_file[*].preview` populated.
+
+### tower_ast_insert_before_symbol
+
+Insert text immediately before one uniquely resolved symbol.
+
+Arguments are the same as `tower_ast_replace_symbol_body`.
+
+### tower_ast_insert_after_symbol
+
+Insert text immediately after one uniquely resolved symbol.
+
+Arguments are the same as `tower_ast_replace_symbol_body`.
+
+### tower_ast_delete_symbol
+
+Delete one uniquely resolved declaration span. When the symbol owns a trailing
+newline, Tower removes that newline too, but it does not chase references or call
+sites elsewhere in the workspace.
+
+| Field         | Type   | Required | Description                                |
+|---------------|--------|----------|--------------------------------------------|
+| `path`        | string | yes      | Workspace-relative path to the source file |
+| `symbol_name` | string | yes      | Name of the symbol to delete               |
+| `kind`        | string | no       | Optional kind filter                       |
+| `dry_run`     | bool   | no       | Return preview data without mutating files |
+
+All four AST write tools return the same `AnchoredSymbolEditResult` shape on
+success and stable structured error payloads on resolution failures:
+
+```json
+{
+  "code": "ambiguous_symbol",
+  "message": "symbol name matched multiple candidates",
+  "candidates": [
+    {
+      "path": "src/lib.rs",
+      "kind": "function",
+      "name": "duplicate",
+      "start_byte": 8,
+      "end_byte": 28,
+      "start_row": 0,
+      "end_row": 0
+    }
+  ]
+}
+```
+
+Other stable `code` values are `not_found`, `unsupported_language`,
+`invalid_range`, and `backend_error`.
 
 ---
 

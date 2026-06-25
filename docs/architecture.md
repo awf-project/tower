@@ -99,11 +99,14 @@ crates/
 extensions/                Native sidecar extensions (separate binaries)
 ├── ast/                   Reference Tree-sitter AST extension (eager)
 │                          Tools: get_outline, find_symbols, search_symbols,
-│                                 reindex, read_symbol
+│                                 reindex, read_symbol, replace_symbol_body,
+│                                 insert_before_symbol, insert_after_symbol,
+│                                 delete_symbol
 │                          Languages: Rust (.rs), Go (.go), PHP (.php)
 ├── hello/                 Minimal example extension (lazy; greet tool)
-├── lsp/                   Language-server bridge extension (lazy)
-│                          Tools: diagnostics, definition, references, hover
+├── lsp/                   Language-server bridge extension (eager)
+│                          Tools: diagnostics, definition, references, hover,
+│                                 implementations, rename
 ├── lint/                  Standalone linter extension (lazy)
 │                          Tools: check, fix; runs configured external linters
 │                                 read-only and applies structured fixes through
@@ -139,6 +142,9 @@ pub trait FileMutationUseCase {
     fn delete_file(&mut self, path: &RelativePath) -> Result<(), DomainError>;
     fn global_replace(&mut self, target: &str, replacement: &str) -> Result<TxReport, DomainError>;
     fn global_replace_dry_run(&mut self, target: &str, replacement: &str) -> Result<TxReport, DomainError>;
+    fn apply_edits_cas(&mut self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>;
+    fn apply_edits_dry_run(&self, request: ApplyEditsRequest) -> Result<ApplyEditsFileResult, DomainError>;
+    fn apply_batch_edits(&mut self, request: WorkspaceApplyEditsRequest) -> Result<WorkspaceApplyEditsResult, DomainError>;
 }
 ```
 
@@ -203,7 +209,7 @@ stdin (newline-delimited JSON-RPC 2.0)
   │    NativeToolRegistry::call(name, args)
   │      acquires RwLock::write (mutations) or RwLock::read (reads)
   │      delegates to SearchUseCase / FileMutationUseCase
-  │        FileMutationService: write → <path>.tmp_write → flush → fs::rename
+  │        FileMutationService: write/applyEdits → <path>.tmp_write → flush → fs::rename
   │        GlobalReplaceService: parallel (Rayon) per-file rewrite → TxReport
   │        SearchService: inverted index lookup (find_file) or parallel grep (search_text)
   │      StoragePort::put / put_batch → sled

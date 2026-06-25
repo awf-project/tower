@@ -77,6 +77,30 @@ where
     read_host_response(lines, &id_val)
 }
 
+pub fn host_call_value(
+    out: &mut impl Write,
+    lines: &mut impl Iterator<Item = Result<String, std::io::Error>>,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let id = *next_id;
+    *next_id += 1;
+    let id_val = serde_json::json!(id);
+
+    let envelope = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id_val,
+        "method": method,
+        "params": params,
+    });
+    let s = serde_json::to_string(&envelope).expect("serialize host call");
+    writeln!(out, "{s}").unwrap();
+    out.flush().map_err(|e| format!("flush error: {e}"))?;
+
+    read_host_response(lines, &id_val)
+}
+
 /// Read a single host response frame matching `expected_id`.
 fn read_host_response<R>(
     lines: &mut impl Iterator<Item = Result<String, std::io::Error>>,

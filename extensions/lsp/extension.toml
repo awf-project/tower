@@ -13,7 +13,7 @@ activation = "eager"
 subscribe = ["event/fileChanged", "event/fileDeleted"]
 
 [capabilities]
-required = ["read_file", "notify", "log"]
+required = ["read_file", "notify", "log", "request_apply_edits"]
 
 # Tools contributed to the MCP registry under the tower_lsp_* namespace.
 [[tools]]
@@ -35,3 +35,13 @@ schema_json = '{"type":"object","properties":{"path":{"type":"string","descripti
 name        = "hover"
 description = "Return hover information for the symbol at the given position in a workspace-relative source file."
 schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}'
+
+[[tools]]
+name        = "implementations"
+description = "Find implementations for the symbol at the given position in a workspace-relative source file."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}'
+
+[[tools]]
+name        = "rename"
+description = "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}'
