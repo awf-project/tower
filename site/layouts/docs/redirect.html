@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  {{ $target := .GetPage .Params.redirect_to }}
+  {{ if not $target }}
+    {{ errorf "Redirect page %s: target %q does not exist" .Path .Params.redirect_to }}
+  {{ end }}
+  {{ with $target }}
+  <meta http-equiv="refresh" content="0; url={{ .RelPermalink }}">
+  <link rel="canonical" href="{{ .Permalink }}">
+  {{ end }}
+  <title>Redirecting&hellip;</title>
+</head>
+<body>
+  {{ with $target }}
+  <p>Redirecting to <a href="{{ .RelPermalink }}">{{ .Title }}</a>&hellip;</p>
+  {{ end }}
+</body>
+</html>

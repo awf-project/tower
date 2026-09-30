@@ -1,3 +1,10 @@
+---
+title: "Getting Started"
+description: "Build Tower, configure native extensions, and connect your first MCP client to search and safely edit your workspace."
+slug: installation
+weight: 1
+---
+
 # Getting Started
 
 This guide covers prerequisites, building the project, running the quality gate, and operating the
