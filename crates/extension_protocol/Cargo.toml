@@ -10,6 +10,10 @@ description = "Tower extension protocol — wire contract (JSON-RPC 2.0 types, m
 name = "extension_protocol"
 path = "src/lib.rs"
 
+[[test]]
+name = "lsp_outcome_contracts"
+path = "tests/lsp_outcome_contracts.rs"
+
 [dependencies]
 # Decision: serde + serde_json as the wire format for the JSON-RPC 2.0 protocol.
 # Why: The sidecar extension protocol uses JSON-RPC 2.0 over stdio; JSON is the

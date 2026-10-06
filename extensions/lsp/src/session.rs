@@ -7,13 +7,11 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crate::lsp_adapter::decode::{WorkspaceEditDecodeError, decode_workspace_edit};
-use crate::lsp_adapter::{DiagnosticsEvent, RawWorkspaceEdit, SessionPool};
+use crate::lsp_adapter::{DiagnosticsEvent, LspSessionError, RawWorkspaceEdit, SessionPool};
 use core_engine::adapters::config::lsp::LspConfig;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position};
-use core_engine::ports::{
-    CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, RenameNavigationError,
-};
+use core_engine::ports::DocumentSyncPort;
 use extension_protocol::WorkspaceEditSpan;
 
 /// The sidecar extension's LSP session manager.
@@ -54,8 +52,8 @@ impl LspSessionPool {
         &self,
         path: &RelativePath,
         text: &str,
-    ) -> Result<Vec<Diagnostic>, CodeIntelError> {
-        self.inner.check(path, text)
+    ) -> Result<Vec<Diagnostic>, LspSessionError> {
+        self.inner.check_lsp(path, text)
     }
 
     /// Go to definition at `position` in `path`.
@@ -64,8 +62,8 @@ impl LspSessionPool {
         path: &RelativePath,
         text: &str,
         position: Position,
-    ) -> Result<Vec<Location>, CodeIntelError> {
-        self.inner.definition(path, text, position)
+    ) -> Result<Vec<Location>, LspSessionError> {
+        self.inner.definition_lsp(path, text, position)
     }
 
     /// Find references at `position` in `path`.
@@ -74,8 +72,8 @@ impl LspSessionPool {
         path: &RelativePath,
         text: &str,
         position: Position,
-    ) -> Result<Vec<Location>, CodeIntelError> {
-        self.inner.references(path, text, position)
+    ) -> Result<Vec<Location>, LspSessionError> {
+        self.inner.references_lsp(path, text, position)
     }
 
     pub fn implementations(
@@ -83,8 +81,8 @@ impl LspSessionPool {
         path: &RelativePath,
         text: &str,
         position: Position,
-    ) -> Result<Vec<Location>, CodeIntelError> {
-        self.inner.implementations(path, text, position)
+    ) -> Result<Vec<Location>, LspSessionError> {
+        self.inner.implementations_lsp(path, text, position)
     }
 
     /// Hover information at `position` in `path`.
@@ -93,8 +91,8 @@ impl LspSessionPool {
         path: &RelativePath,
         text: &str,
         position: Position,
-    ) -> Result<Option<Hover>, CodeIntelError> {
-        self.inner.hover(path, text, position)
+    ) -> Result<Option<Hover>, LspSessionError> {
+        self.inner.hover_lsp(path, text, position)
     }
 
     pub fn rename(
@@ -103,13 +101,17 @@ impl LspSessionPool {
         text: &str,
         position: Position,
         new_name: &str,
-    ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
-        self.inner.rename(path, text, position, new_name)
+    ) -> Result<RawWorkspaceEdit, LspSessionError> {
+        self.inner.rename_lsp(path, text, position, new_name)
     }
 
     /// Whether this pool is configured to handle the given path.
     pub fn serves(&self, path: &RelativePath) -> bool {
         self.inner.serves(path)
+    }
+
+    pub fn binding_for(&self, path: &RelativePath) -> Option<(&str, &str)> {
+        self.inner.binding_for(path)
     }
 
     #[allow(dead_code)]

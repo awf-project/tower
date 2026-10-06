@@ -42,7 +42,6 @@
 
 #![forbid(unsafe_code)]
 
-mod config;
 mod lsp_adapter;
 mod protocol;
 mod push;
@@ -54,13 +53,30 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use core_engine::adapters::config::lsp::{LspInitializeError, decode_lsp_initialize_config};
 use extension_protocol::{
-    Capability, InitParams, InitResult, PROTOCOL_VERSION, Response, ToolDecl,
+    Capability, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response, ToolDecl,
 };
 use protocol::{HostCallIdAllocator, QueuedFrame};
 use serde_json::Value;
 
 use session::LspSessionPool;
+
+fn invalid_lsp_initialize_error(error: LspInitializeError) -> ProtocolError {
+    let reason = match error {
+        LspInitializeError::MissingConfiguration => "missing_configuration",
+        LspInitializeError::InvalidConfiguration => "invalid_configuration",
+    };
+
+    ProtocolError {
+        code: -32602,
+        message: "invalid LSP initialization configuration".to_owned(),
+        data: Some(serde_json::json!({
+            "kind": "invalid_lsp_initialize_config",
+            "reason": reason,
+        })),
+    }
+}
 
 fn main() {
     // Wrap Stdout in a Mutex so it is Send + 'static and can be shared with the
@@ -129,6 +145,9 @@ fn main() {
 
         match method.as_str() {
             "initialize" => {
+                // Preserve field presence because `Option<Value>` deserializes both
+                // an absent field and an explicit JSON null as `None`.
+                let extension_config = params_val.get("extension_config").cloned();
                 let init_params: InitParams = match serde_json::from_value(params_val) {
                     Ok(p) => p,
                     Err(e) => {
@@ -155,15 +174,24 @@ fn main() {
                     continue;
                 }
 
+                let lsp_config = match decode_lsp_initialize_config(extension_config.as_ref()) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        protocol::send_protocol_error(
+                            &stdout_lock,
+                            &id,
+                            &invalid_lsp_initialize_error(error),
+                        );
+                        continue;
+                    }
+                };
+
                 // Read workspace root from environment or default to CWD.
                 workspace_root = std::env::var("TOWER_WORKSPACE")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                     });
-
-                // Load LSP config from .tower/config.toml.
-                let lsp_config = config::load_lsp_config(&workspace_root);
 
                 // Build the push channel: LSP adapter sends DiagnosticsEvent → we
                 // forward as `notify/resourceUpdated` HostCall.
@@ -252,15 +280,20 @@ fn main() {
                         &mut deferred,
                     )
                 } else {
-                    Err("LSP extension not initialized".to_owned())
+                    Err(tools::ToolDispatchError::Legacy(
+                        "LSP extension not initialized".to_owned(),
+                    ))
                 };
 
                 match result {
                     Ok(value) => {
                         protocol::send_response(&stdout_lock, &id, &Response::ToolResult(value));
                     }
-                    Err(err_msg) => {
+                    Err(tools::ToolDispatchError::Legacy(err_msg)) => {
                         protocol::send_error(&stdout_lock, &id, -32000, &err_msg);
+                    }
+                    Err(tools::ToolDispatchError::ReadOnlyOutcome(outcome)) => {
+                        protocol::send_read_only_outcome_error(&stdout_lock, &id, outcome);
                     }
                 }
             }

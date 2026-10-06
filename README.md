@@ -11,15 +11,15 @@ Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 
 ## Why Tower
 
-| Capability | What it gives clients |
-|---|---|
-| **Persistent workspace index** | Fast file lookup and directory listing from a `sled`-backed VFS. |
-| **Parallel text search** | Rayon-backed grep across indexed file contents. |
-| **Safe mutations** | Atomic writes and CAS-style `expected_version` checks for agent-safe edits. |
-| **Shared daemon** | One watcher, index, and extension registry per workspace; many MCP clients. |
-| **Native sidecar extensions** | Out-of-process extension binaries that contribute `tower_<ext>_*` MCP tools. |
-| **Semantic workflows** | AST outline/symbol tools, LSP diagnostics/navigation, lint fixes, and opt-in DAP debugging. |
-| **No runtime VM** | Native binaries only; no JVM, Node, WASM runtime, or container required at runtime. |
+| Capability                     | What it gives clients                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------- |
+| **Persistent workspace index** | Fast file lookup and directory listing from a `sled`-backed VFS.                            |
+| **Parallel text search**       | Rayon-backed grep across indexed file contents.                                             |
+| **Safe mutations**             | Atomic writes and CAS-style `expected_version` checks for agent-safe edits.                 |
+| **Shared daemon**              | One watcher, index, and extension registry per workspace; many MCP clients.                 |
+| **Native sidecar extensions**  | Out-of-process extension binaries that contribute `tower_<ext>_*` MCP tools.                |
+| **Semantic workflows**         | AST outline/symbol tools, LSP diagnostics/navigation, lint fixes, and opt-in DAP debugging. |
+| **No runtime VM**              | Native binaries only; no JVM, Node, WASM runtime, or container required at runtime.         |
 
 ## Quick Start
 
@@ -60,10 +60,10 @@ tower init
 
 This creates:
 
-| File | Purpose |
-|---|---|
-| `.towerignore` | Authoritative ignore rules for the Tower index, independent of `.gitignore`. |
-| `.tower/config.toml` | Local Tower configuration, including formatter/linter/debug settings. |
+| File                 | Purpose                                                                      |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `.towerignore`       | Authoritative ignore rules for the Tower index, independent of `.gitignore`. |
+| `.tower/config.toml` | Local Tower configuration, including formatter/linter/debug settings.        |
 
 Secrets and generated output should be excluded in `.towerignore` before exposing a workspace to an
 agent. If `.towerignore` is missing, Tower warns and indexes all non-hidden files except `.git/`.
@@ -102,11 +102,11 @@ tower shutdown
 
 Workspace resolution is consistent across commands:
 
-| Priority | Mechanism |
-|---|---|
-| 1 | `--workspace-dir <path>` |
-| 2 | `TOWER_WORKSPACE=/path/to/project` |
-| 3 | current working directory |
+| Priority | Mechanism                          |
+| -------- | ---------------------------------- |
+| 1        | `--workspace-dir <path>`           |
+| 2        | `TOWER_WORKSPACE=/path/to/project` |
+| 3        | current working directory          |
 
 ## Core Concepts
 
@@ -128,31 +128,31 @@ host, and exposed as namespaced MCP tools such as `tower_ast_get_outline` or
 Native tools are always available. Extension tools appear when their sidecars are installed and
 enabled.
 
-| Area | Examples |
-|---|---|
-| Files and search | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text` |
-| Safe mutations | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file` |
-| AST | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol` |
-| LSP | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover` |
-| Lint | `tower_lint_check`, `tower_lint_fix` |
-| Debug | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin` |
+| Area             | Examples                                                                                   |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| Files and search | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text`                |
+| Safe mutations   | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`       |
+| AST              | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol`                 |
+| LSP              | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover` |
+| Lint             | `tower_lint_check`, `tower_lint_fix`                                                       |
+| Debug            | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin`          |
 
 See [docs/mcp-tools.md](docs/mcp-tools.md) for the full wire protocol, tool schemas, responses, and
 stable error codes.
 
 ## Documentation
 
-| Page | Contents |
-|---|---|
-| [docs/getting-started.md](docs/getting-started.md) | Build, first MCP session, quality gate, and copy-paste examples. |
-| [docs/towerignore.md](docs/towerignore.md) | `.towerignore` behavior, defaults, migration notes, and watcher limits. |
-| [docs/architecture.md](docs/architecture.md) | Hexagonal boundary, ports/adapters, daemon flow, and invariants. |
-| [docs/extensions.md](docs/extensions.md) | Native sidecar extension protocol, manifests, capabilities, and supervision. |
-| [docs/mcp-tools.md](docs/mcp-tools.md) | Complete MCP tool reference and JSON-RPC details. |
-| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Safe AST and LSP edit workflows. |
-| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md) | Previewing and applying structured linter fixes. |
-| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md) | Interactive DAP sessions and rr-backed reverse-debug workflows. |
-| [docs/development.md](docs/development.md) | Contribution workflow, CI checks, tests, and project conventions. |
+| Page                                                                   | Contents                                                                     |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| [docs/getting-started.md](docs/getting-started.md)                     | Build, first MCP session, quality gate, and copy-paste examples.             |
+| [docs/towerignore.md](docs/towerignore.md)                             | `.towerignore` behavior, defaults, migration notes, and watcher limits.      |
+| [docs/architecture.md](docs/architecture.md)                           | Hexagonal boundary, ports/adapters, daemon flow, and invariants.             |
+| [docs/extensions.md](docs/extensions.md)                               | Native sidecar extension protocol, manifests, capabilities, and supervision. |
+| [docs/mcp-tools.md](docs/mcp-tools.md)                                 | Complete MCP tool reference and JSON-RPC details.                            |
+| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Safe AST and LSP edit workflows.                                             |
+| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)         | Previewing and applying structured linter fixes.                             |
+| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md) | Interactive DAP sessions and rr-backed reverse-debug workflows.              |
+| [docs/development.md](docs/development.md)                             | Contribution workflow, CI checks, tests, and project conventions.            |
 
 ## Development
 

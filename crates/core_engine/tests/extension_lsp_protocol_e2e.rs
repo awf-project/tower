@@ -17,7 +17,7 @@ use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegist
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use core_engine::adapters::{InMemoryFs, InMemoryStorage};
-use core_engine::domain::extension_host::{ExtensionId, ExtensionRegistry};
+use core_engine::domain::extension_host::{ExtensionCallError, ExtensionId, ExtensionRegistry};
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::domain::{FileId, RelativePath};
@@ -95,7 +95,7 @@ impl core_engine::domain::ExtensionInstance for RecordingExtension {
         &self.manifest
     }
 
-    fn call_tool(&mut self, _name: &str, params: Value) -> Result<Value, ExtensionFault> {
+    fn call_tool(&mut self, _name: &str, params: Value) -> Result<Value, ExtensionCallError> {
         Ok(params)
     }
 

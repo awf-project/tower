@@ -20,15 +20,15 @@
 //! # Ready gate and generation-numbered diagnostics
 //!
 //! [`SessionState`] holds both the readiness flag and diagnostics keyed by URI
-//! and generation. `check` waits on a single predicate: the server is ready
-//! **and** a diagnostics generation newer than the one captured before the sync
-//! has landed for the requested URI. This eliminates the fixed settle budget and
-//! the `Instant`-stamp double-publish heuristic: diagnostics are authoritative
-//! only once the server signals it has finished analysis.
+//! and generation. After emitting a document sync, `check` waits until the server
+//! is ready **and** a newer diagnostics generation has landed for the requested
+//! URI. When identical content emits no sync, an already-settled URI entry is
+//! authoritative and can be reused immediately. This eliminates the fixed settle
+//! budget and the `Instant`-stamp double-publish heuristic.
 //!
 //! The cap [`CHECK_TIMEOUT`] exists as a safety net for servers that never signal
-//! (e.g. a crashed rust-analyzer). After the cap elapses, `check` returns the
-//! latest known diagnostics (best-effort).
+//! (e.g. a crashed rust-analyzer). After the cap elapses, `check` returns a typed
+//! server-timeout failure.
 //!
 //! # Lock discipline
 //!
@@ -72,7 +72,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -95,6 +95,28 @@ use core_engine::ports::{
 
 #[allow(dead_code)]
 pub type RawWorkspaceEdit = lsp_types::WorkspaceEdit;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LspSessionError {
+    Unconfigured,
+    CapabilityUnavailable,
+    NotRenameable,
+    Backend(extension_protocol::LspOutcomeCode),
+}
+
+impl core::fmt::Display for LspSessionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let description = match self {
+            Self::Unconfigured => "language is not configured",
+            Self::CapabilityUnavailable => "language server capability is unavailable",
+            Self::NotRenameable => "symbol is not renameable",
+            Self::Backend(_) => "language server request failed",
+        };
+        f.write_str(description)
+    }
+}
+
+impl core::error::Error for LspSessionError {}
 
 /// A push event carrying updated diagnostics for one URI.
 ///
@@ -150,49 +172,122 @@ enum RequestFailure {
     Response {
         code: Option<i64>,
         message: Option<String>,
-        raw: Value,
     },
-    Message(String),
+    Timeout,
 }
 
-impl RequestFailure {
-    fn format(&self, method: &str) -> String {
-        match self {
-            RequestFailure::Response { raw, .. } => format!("{method} error: {raw}"),
-            RequestFailure::Message(message) => message.clone(),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum ReaderExit {
+    Crashed = 0,
+    Transport = 1,
+    Malformed = 2,
+}
+
+impl ReaderExit {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Transport,
+            2 => Self::Malformed,
+            _ => Self::Crashed,
         }
+    }
+}
+
+fn classify_reader_error(error: &std::io::Error) -> ReaderExit {
+    match error.kind() {
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+            ReaderExit::Malformed
+        }
+        _ => ReaderExit::Transport,
+    }
+}
+
+fn session_to_code_intel_error(error: LspSessionError) -> CodeIntelError {
+    match error {
+        LspSessionError::Unconfigured | LspSessionError::CapabilityUnavailable => {
+            CodeIntelError::Unsupported
+        }
+        LspSessionError::NotRenameable | LspSessionError::Backend(_) => {
+            CodeIntelError::Backend(error.to_string())
+        }
+    }
+}
+
+fn session_to_rename_error(error: LspSessionError) -> RenameNavigationError {
+    match error {
+        LspSessionError::Unconfigured | LspSessionError::CapabilityUnavailable => {
+            RenameNavigationError::UnsupportedLanguage
+        }
+        LspSessionError::NotRenameable => RenameNavigationError::NotRenameable,
+        LspSessionError::Backend(_) => RenameNavigationError::Backend(error.to_string()),
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenameCapability {
-    UnknownAssumePrepare,
     Unavailable,
     RenameOnly,
     RenameWithPrepare,
 }
 
-impl RenameCapability {
-    fn from_initialize_result(result: &Value) -> Self {
-        match result
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderCapability {
+    Unavailable,
+    Available,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SemanticCapabilities {
+    definition: ProviderCapability,
+    references: ProviderCapability,
+    hover: ProviderCapability,
+    implementation: ProviderCapability,
+    rename: RenameCapability,
+}
+
+#[allow(dead_code)]
+impl SemanticCapabilities {
+    fn from_initialize_result(result: &Value) -> Result<Self, LspSessionError> {
+        let capabilities = result
             .get("capabilities")
-            .and_then(|capabilities| capabilities.get("renameProvider"))
-        {
-            Some(Value::Bool(true)) => Self::RenameOnly,
-            Some(Value::Bool(false)) | None => Self::Unavailable,
-            Some(Value::Object(provider)) => {
-                if provider
-                    .get("prepareProvider")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    Self::RenameWithPrepare
-                } else {
-                    Self::RenameOnly
-                }
-            }
-            Some(_) => Self::Unavailable,
-        }
+            .and_then(Value::as_object)
+            .ok_or_else(malformed_capabilities)?;
+
+        Ok(Self {
+            definition: parse_provider(capabilities.get("definitionProvider"))?,
+            references: parse_provider(capabilities.get("referencesProvider"))?,
+            hover: parse_provider(capabilities.get("hoverProvider"))?,
+            implementation: parse_provider(capabilities.get("implementationProvider"))?,
+            rename: parse_rename_provider(capabilities.get("renameProvider"))?,
+        })
+    }
+}
+
+fn malformed_capabilities() -> LspSessionError {
+    LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerMalformedResponse)
+}
+
+fn parse_provider(value: Option<&Value>) -> Result<ProviderCapability, LspSessionError> {
+    match value {
+        None | Some(Value::Bool(false)) => Ok(ProviderCapability::Unavailable),
+        Some(Value::Bool(true) | Value::Object(_)) => Ok(ProviderCapability::Available),
+        Some(_) => Err(malformed_capabilities()),
+    }
+}
+
+fn parse_rename_provider(value: Option<&Value>) -> Result<RenameCapability, LspSessionError> {
+    match value {
+        None | Some(Value::Bool(false)) => Ok(RenameCapability::Unavailable),
+        Some(Value::Bool(true)) => Ok(RenameCapability::RenameOnly),
+        Some(Value::Object(options)) => match options.get("prepareProvider") {
+            None | Some(Value::Bool(false)) => Ok(RenameCapability::RenameOnly),
+            Some(Value::Bool(true)) => Ok(RenameCapability::RenameWithPrepare),
+            Some(_) => Err(malformed_capabilities()),
+        },
+        Some(_) => Err(malformed_capabilities()),
     }
 }
 
@@ -486,6 +581,7 @@ fn current_ready_gen(state: &SharedState) -> u64 {
 /// The `$/progress` end fallback may also call `mark_ready` for servers without
 /// `serverStatus`; the two-part predicate (quiescent AND fresh diagnostics)
 /// ensures the gate does not fire on a stale quiescent from a prior cycle.
+#[cfg(test)]
 fn wait_for_settled(
     state: &SharedState,
     uri: &str,
@@ -529,8 +625,8 @@ pub struct LspClientAdapter {
     state: SharedState,
     /// Responses to navigation requests, keyed by request id.
     responses: ResponseCache,
-    /// Rename capability shape reported by the initialized language server.
-    rename_capability: Mutex<RenameCapability>,
+    /// Semantic provider capabilities reported by the initialized server.
+    semantic_capabilities: Mutex<SemanticCapabilities>,
     /// Root `.towerignore` policy applied to navigation results.
     ignore: Gitignore,
     next_id: AtomicI64,
@@ -540,6 +636,8 @@ pub struct LspClientAdapter {
     /// writer, gets `CodeIntelError::Backend`, and detects `true` on the next
     /// request — matching UN1 semantics exactly.
     pub dead_flag: Arc<AtomicBool>,
+    /// Cause published by the reader before `dead_flag` becomes observable.
+    reader_exit: Arc<AtomicU8>,
 }
 
 struct Session {
@@ -548,6 +646,58 @@ struct Session {
     /// `check`, navigation, and the watcher document-sync path so a document is
     /// never opened twice.
     docs: DocumentTracker,
+}
+
+fn classify_spawn_error(error: std::io::Error, executable: &Path, root: &Path) -> LspSessionError {
+    use extension_protocol::LspOutcomeCode;
+
+    let code = if !root.is_dir() {
+        LspOutcomeCode::ServerLaunchFailed
+    } else if matches!(std::fs::metadata(executable), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        LspOutcomeCode::ServerMissing
+    } else {
+        match error.kind() {
+            std::io::ErrorKind::PermissionDenied if executable_is_non_executable(executable) => {
+                LspOutcomeCode::ServerNotExecutable
+            }
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::Unsupported => {
+                LspOutcomeCode::ServerNotExecutable
+            }
+            _ if is_bad_executable_format(&error) => LspOutcomeCode::ServerNotExecutable,
+            _ => LspOutcomeCode::ServerLaunchFailed,
+        }
+    };
+    LspSessionError::Backend(code)
+}
+
+#[cfg(unix)]
+fn executable_is_non_executable(executable: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(executable).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 == 0)
+}
+
+#[cfg(not(unix))]
+fn executable_is_non_executable(_executable: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_bad_executable_format(error: &std::io::Error) -> bool {
+    // POSIX ENOEXEC: the file exists but its format is not executable.
+    error.raw_os_error() == Some(8)
+}
+
+#[cfg(windows)]
+fn is_bad_executable_format(error: &std::io::Error) -> bool {
+    // Win32 ERROR_BAD_EXE_FORMAT.
+    error.raw_os_error() == Some(193)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_bad_executable_format(_error: &std::io::Error) -> bool {
+    false
 }
 
 impl LspClientAdapter {
@@ -562,6 +712,7 @@ impl LspClientAdapter {
     ///
     /// Returns `CodeIntelError::Backend` if the server cannot be spawned or the
     /// handshake fails.
+    #[allow(dead_code)]
     pub fn spawn(
         command: &str,
         args: &[String],
@@ -570,29 +721,53 @@ impl LspClientAdapter {
         workspace_root: std::path::PathBuf,
         push_tx: Option<DiagnosticsSender>,
     ) -> Result<Self, CodeIntelError> {
-        let mut child = Command::new(command)
+        Self::spawn_resolved(
+            Path::new(command),
+            args,
+            extensions,
+            language_id,
+            workspace_root,
+            push_tx,
+        )
+        .map_err(session_to_code_intel_error)
+    }
+
+    pub(crate) fn spawn_resolved(
+        executable: &Path,
+        args: &[String],
+        extensions: Vec<String>,
+        language_id: String,
+        root: PathBuf,
+        push_tx: Option<DiagnosticsSender>,
+    ) -> Result<Self, LspSessionError> {
+        if !root.is_dir() {
+            return Err(LspSessionError::Backend(
+                extension_protocol::LspOutcomeCode::ServerLaunchFailed,
+            ));
+        }
+
+        let mut child = Command::new(executable)
             .args(args)
-            .current_dir(&workspace_root)
+            .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| CodeIntelError::Backend(format!("spawn {command} failed: {e}")))?;
+            .map_err(|error| classify_spawn_error(error, executable, &root))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| CodeIntelError::Backend("no stdin pipe".to_owned()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CodeIntelError::Backend("no stdout pipe".to_owned()))?;
+        let stdin = child.stdin.take().ok_or(LspSessionError::Backend(
+            extension_protocol::LspOutcomeCode::ServerLaunchFailed,
+        ))?;
+        let stdout = child.stdout.take().ok_or(LspSessionError::Backend(
+            extension_protocol::LspOutcomeCode::ServerLaunchFailed,
+        ))?;
 
         let writer: Writer = Arc::new(Mutex::new(Box::new(stdin)));
         let state: SharedState =
             Arc::new((Mutex::new(SessionStateInner::default()), Condvar::new()));
         let responses: ResponseCache = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
         let dead_flag = Arc::new(AtomicBool::new(false));
+        let reader_exit = Arc::new(AtomicU8::new(ReaderExit::Crashed as u8));
 
         let dispatcher = build_dispatcher(
             Arc::clone(&state),
@@ -601,19 +776,32 @@ impl LspClientAdapter {
             push_tx,
         );
         let dead_flag_clone = Arc::clone(&dead_flag);
+        let reader_exit_clone = Arc::clone(&reader_exit);
+        let state_clone = Arc::clone(&state);
+        let responses_clone = Arc::clone(&responses);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
-            while let Ok(Some(msg)) = jsonrpc::read_message(&mut reader) {
-                dispatcher.dispatch(&msg);
+            loop {
+                match jsonrpc::read_message(&mut reader) {
+                    Ok(Some(msg)) => dispatcher.dispatch(&msg),
+                    Ok(None) => break,
+                    Err(error) => {
+                        reader_exit_clone
+                            .store(classify_reader_error(&error) as u8, Ordering::Relaxed);
+                        break;
+                    }
+                }
             }
             // Reader thread exits on EOF (server died, crashed, or was killed).
-            // Signal the pool so the next request triggers a restart.
-            dead_flag_clone.store(true, Ordering::Relaxed);
+            // Release publishes the exit cause before waking every waiter.
+            dead_flag_clone.store(true, Ordering::Release);
+            state_clone.1.notify_all();
+            responses_clone.1.notify_all();
         });
 
-        let ignore = build_ignore_matcher(&workspace_root);
+        let ignore = build_ignore_matcher(&root);
         let adapter = Self {
-            workspace_root,
+            workspace_root: root,
             extensions,
             language_id,
             inner: Mutex::new(Session {
@@ -623,10 +811,17 @@ impl LspClientAdapter {
             writer,
             state,
             responses,
-            rename_capability: Mutex::new(RenameCapability::UnknownAssumePrepare),
+            semantic_capabilities: Mutex::new(SemanticCapabilities {
+                definition: ProviderCapability::Unavailable,
+                references: ProviderCapability::Unavailable,
+                hover: ProviderCapability::Unavailable,
+                implementation: ProviderCapability::Unavailable,
+                rename: RenameCapability::Unavailable,
+            }),
             ignore,
             next_id: AtomicI64::new(1),
             dead_flag,
+            reader_exit,
         };
         adapter.handshake()?;
         Ok(adapter)
@@ -639,7 +834,7 @@ impl LspClientAdapter {
         Arc::clone(&self.state)
     }
 
-    fn handshake(&self) -> Result<(), CodeIntelError> {
+    fn handshake(&self) -> Result<(), LspSessionError> {
         let root_uri = path_to_uri(&self.workspace_root);
         let initialize_params = json!({
             "processId": std::process::id(),
@@ -660,13 +855,14 @@ impl LspClientAdapter {
             "params": {}
         });
         let initialize_result = self.send_request("initialize", initialize_params)?;
+        let capabilities = SemanticCapabilities::from_initialize_result(&initialize_result)?;
         *self
-            .rename_capability
+            .semantic_capabilities
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) =
-            RenameCapability::from_initialize_result(&initialize_result);
-        write_framed(&self.writer, &initialized)
-            .map_err(|e| CodeIntelError::Backend(format!("initialized write failed: {e}")))?;
+            .unwrap_or_else(|p| p.into_inner()) = capabilities;
+        write_framed(&self.writer, &initialized).map_err(|_| {
+            LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTransportError)
+        })?;
         Ok(())
     }
 
@@ -683,11 +879,10 @@ impl LspClientAdapter {
 
     /// Acquire a scoped hold on `uri` (a navigation request) and emit the
     /// resulting `didOpen`/`didChange`. Pair with [`release_doc`](Self::release_doc).
-    fn acquire_doc(&self, uri: &str, text: &str) -> Result<(), CodeIntelError> {
+    fn acquire_doc(&self, uri: &str, text: &str) -> Result<(), LspSessionError> {
         let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(sync) = session.docs.acquire(uri, &self.language_id, text) {
-            write_doc_sync(&self.writer, uri, &sync)
-                .map_err(|e| CodeIntelError::Backend(format!("doc sync write failed: {e}")))?;
+            write_doc_sync(&self.writer, uri, &sync).map_err(|_| self.transport_failure())?;
         }
         Ok(())
     }
@@ -710,7 +905,7 @@ impl LspClientAdapter {
     /// the request was in flight — common when document open/close churn races a
     /// query) is **retried** a bounded number of times, per the LSP spec which
     /// defines it as a transient "re-request" signal rather than a real failure.
-    fn send_request(&self, method: &str, params: Value) -> Result<Value, CodeIntelError> {
+    fn send_request(&self, method: &str, params: Value) -> Result<Value, LspSessionError> {
         let mut attempt = 0;
         loop {
             match self.send_request_once(method, params.clone())? {
@@ -720,12 +915,12 @@ impl LspClientAdapter {
                     attempt += 1;
                 }
                 RequestOutcome::ContentModified => {
-                    return Err(CodeIntelError::Backend(format!(
-                        "{method} still content-modified after {CONTENT_MODIFIED_RETRIES} retries"
-                    )));
+                    return Err(LspSessionError::Backend(
+                        extension_protocol::LspOutcomeCode::ServerError,
+                    ));
                 }
                 RequestOutcome::Error(failure) => {
-                    return Err(CodeIntelError::Backend(failure.format(method)));
+                    return Err(self.classify_request_failure(&failure));
                 }
             }
         }
@@ -737,19 +932,34 @@ impl LspClientAdapter {
         &self,
         method: &str,
         params: Value,
-    ) -> Result<RequestOutcome, CodeIntelError> {
+    ) -> Result<RequestOutcome, LspSessionError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if self.dead_flag.load(Ordering::Acquire) {
+            return Err(self.reader_failure());
+        }
         let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         // The request does not touch `docs`, so we write directly without holding `inner`.
-        write_framed(&self.writer, &request)
-            .map_err(|e| CodeIntelError::Backend(format!("{method} write failed: {e}")))?;
+        write_framed(&self.writer, &request).map_err(|_| self.transport_failure())?;
 
         let (lock, cvar) = &*self.responses;
         let mut map = lock.lock().unwrap_or_else(|p| p.into_inner());
         let deadline = Instant::now() + REQUEST_BUDGET;
         loop {
             if let Some(msg) = map.remove(&id) {
+                let has_result = msg.get("result").is_some();
+                let has_error = msg.get("error").is_some();
+                if has_result == has_error {
+                    return Err(malformed_response());
+                }
                 if let Some(err) = msg.get("error") {
+                    if !err.is_object()
+                        || err.get("code").and_then(Value::as_i64).is_none()
+                        || err
+                            .get("message")
+                            .is_some_and(|message| !message.is_string())
+                    {
+                        return Err(malformed_response());
+                    }
                     if err.get("code").and_then(Value::as_i64) == Some(CONTENT_MODIFIED) {
                         return Ok(RequestOutcome::ContentModified);
                     }
@@ -759,23 +969,96 @@ impl LspClientAdapter {
                             .get("message")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
-                        raw: err.clone(),
                     }));
                 }
-                return Ok(RequestOutcome::Ok(
-                    msg.get("result").cloned().unwrap_or(Value::Null),
-                ));
+                return Ok(RequestOutcome::Ok(msg["result"].clone()));
             }
             let now = Instant::now();
             if now >= deadline {
-                return Ok(RequestOutcome::Error(RequestFailure::Message(format!(
-                    "{method} timed out"
-                ))));
+                if self.dead_flag.load(Ordering::Acquire) {
+                    return Err(self.reader_failure());
+                }
+                return Ok(RequestOutcome::Error(RequestFailure::Timeout));
             }
             let (next, _) = cvar
                 .wait_timeout(map, deadline - now)
                 .unwrap_or_else(|p| p.into_inner());
             map = next;
+        }
+    }
+
+    fn transport_failure(&self) -> LspSessionError {
+        if self.dead_flag.load(Ordering::Acquire) {
+            self.reader_failure()
+        } else {
+            LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTransportError)
+        }
+    }
+
+    fn reader_failure(&self) -> LspSessionError {
+        let code = match ReaderExit::from_u8(self.reader_exit.load(Ordering::Relaxed)) {
+            ReaderExit::Crashed => extension_protocol::LspOutcomeCode::ServerCrashed,
+            ReaderExit::Transport => extension_protocol::LspOutcomeCode::ServerTransportError,
+            ReaderExit::Malformed => extension_protocol::LspOutcomeCode::ServerMalformedResponse,
+        };
+        LspSessionError::Backend(code)
+    }
+
+    fn wait_for_settled_or_failure(
+        &self,
+        uri: &str,
+        sync_gen: u64,
+        pre_sync_ready_gen: u64,
+        emitted_sync: bool,
+        timeout: Duration,
+    ) -> Result<Vec<Diagnostic>, LspSessionError> {
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.dead_flag.load(Ordering::Acquire) {
+                return Err(self.reader_failure());
+            }
+            let fresh = state
+                .by_uri
+                .get(uri)
+                .is_some_and(|entry| entry.generation > sync_gen);
+            let quiescent = state.ready_gen > pre_sync_ready_gen;
+            let settled_cache = !emitted_sync && state.ready && state.by_uri.contains_key(uri);
+            let now = Instant::now();
+            if (quiescent && fresh) || settled_cache {
+                return Ok(state
+                    .by_uri
+                    .get(uri)
+                    .map(|entry| entry.diags.clone())
+                    .unwrap_or_default());
+            }
+            if now >= deadline {
+                return Err(LspSessionError::Backend(
+                    extension_protocol::LspOutcomeCode::ServerTimeout,
+                ));
+            }
+            let (next, _) = cvar
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
+    }
+
+    fn classify_request_failure(&self, failure: &RequestFailure) -> LspSessionError {
+        if self.dead_flag.load(Ordering::Acquire) {
+            return self.reader_failure();
+        }
+        match failure {
+            RequestFailure::Response {
+                code: Some(-32601), ..
+            } => LspSessionError::CapabilityUnavailable,
+            RequestFailure::Response { .. } => {
+                LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerError)
+            }
+            RequestFailure::Timeout => {
+                LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+            }
         }
     }
 
@@ -811,15 +1094,15 @@ impl LspClientAdapter {
         text: &str,
         method: &str,
         params: Value,
-    ) -> Result<Vec<Location>, CodeIntelError> {
+    ) -> Result<Vec<Location>, LspSessionError> {
         if !self.supports(path) {
-            return Err(CodeIntelError::Unsupported);
+            return Err(LspSessionError::CapabilityUnavailable);
         }
         let uri = self.uri_for(path);
         self.acquire_doc(&uri, text)?;
         let result = self.send_request(method, params);
         self.release_doc(&uri);
-        let raws = decode::decode_locations(&result?);
+        let raws = decode_locations_typed(&result?)?;
         Ok(workspace_locations(
             raws,
             &self.workspace_root,
@@ -832,9 +1115,9 @@ impl LspClientAdapter {
         path: &RelativePath,
         text: &str,
         position: Position,
-    ) -> Result<PrepareRenameResult, RenameNavigationError> {
+    ) -> Result<PrepareRenameResult, LspSessionError> {
         let value = self.prepare_rename_value(path, text, position)?;
-        decode_prepare_rename(value)
+        decode_prepare_rename_typed(value)
     }
 
     fn prepare_rename_value(
@@ -842,13 +1125,12 @@ impl LspClientAdapter {
         path: &RelativePath,
         text: &str,
         position: Position,
-    ) -> Result<Value, RenameNavigationError> {
+    ) -> Result<Value, LspSessionError> {
         if !self.supports(path) {
-            return Err(RenameNavigationError::UnsupportedLanguage);
+            return Err(LspSessionError::CapabilityUnavailable);
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)
-            .map_err(code_intel_to_rename_error)?;
+        self.acquire_doc(&uri, text)?;
         let result = self.send_prepare_rename_request(json!({
             "textDocument": { "uri": uri },
             "position": { "line": position.line, "character": position.character }
@@ -857,32 +1139,26 @@ impl LspClientAdapter {
         result
     }
 
-    fn send_prepare_rename_request(&self, params: Value) -> Result<Value, RenameNavigationError> {
+    fn send_prepare_rename_request(&self, params: Value) -> Result<Value, LspSessionError> {
         let method = "textDocument/prepareRename";
         let mut attempt = 0;
         loop {
-            match self
-                .send_request_once(method, params.clone())
-                .map_err(code_intel_to_rename_error)?
-            {
+            match self.send_request_once(method, params.clone())? {
                 RequestOutcome::Ok(value) => return Ok(value),
                 RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
                     std::thread::sleep(CONTENT_MODIFIED_BACKOFF);
                     attempt += 1;
                 }
                 RequestOutcome::ContentModified => {
-                    return Err(RenameNavigationError::Backend(format!(
-                        "{method} still content-modified after {CONTENT_MODIFIED_RETRIES} retries"
-                    )));
+                    return Err(LspSessionError::Backend(
+                        extension_protocol::LspOutcomeCode::ServerError,
+                    ));
                 }
                 RequestOutcome::Error(failure) if is_prepare_rename_rejection(&failure) => {
-                    return Err(RenameNavigationError::NotRenameable);
-                }
-                RequestOutcome::Error(failure) if is_method_not_found(&failure) => {
-                    return Ok(json!({ "defaultBehavior": true }));
+                    return Err(LspSessionError::NotRenameable);
                 }
                 RequestOutcome::Error(failure) => {
-                    return Err(RenameNavigationError::Backend(failure.format(method)));
+                    return Err(self.classify_request_failure(&failure));
                 }
             }
         }
@@ -902,16 +1178,6 @@ fn is_prepare_rename_rejection(failure: &RequestFailure) -> bool {
     }
 }
 
-fn is_method_not_found(failure: &RequestFailure) -> bool {
-    matches!(
-        failure,
-        RequestFailure::Response {
-            code: Some(-32601),
-            ..
-        }
-    )
-}
-
 impl NavigationPort for LspClientAdapter {
     fn definition(
         &self,
@@ -919,16 +1185,8 @@ impl NavigationPort for LspClientAdapter {
         text: &str,
         position: Position,
     ) -> Result<Vec<Location>, CodeIntelError> {
-        let uri = self.uri_for(path);
-        self.location_query(
-            path,
-            text,
-            "textDocument/definition",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": position.line, "character": position.character }
-            }),
-        )
+        pool::PooledSession::definition_lsp(self, path, text, position)
+            .map_err(session_to_code_intel_error)
     }
 
     fn implementations(
@@ -937,16 +1195,8 @@ impl NavigationPort for LspClientAdapter {
         text: &str,
         position: Position,
     ) -> Result<Vec<Location>, CodeIntelError> {
-        let uri = self.uri_for(path);
-        self.location_query(
-            path,
-            text,
-            "textDocument/implementation",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": position.line, "character": position.character }
-            }),
-        )
+        pool::PooledSession::implementations_lsp(self, path, text, position)
+            .map_err(session_to_code_intel_error)
     }
 
     fn references(
@@ -955,35 +1205,8 @@ impl NavigationPort for LspClientAdapter {
         text: &str,
         position: Position,
     ) -> Result<Vec<Location>, CodeIntelError> {
-        if !self.supports(path) {
-            return Err(CodeIntelError::Unsupported);
-        }
-        let uri = self.uri_for(path);
-
-        // EV3: capture ready_gen BEFORE opening the document so we can wait
-        // for a fresh quiescent signal that arrived after the didOpen/didChange,
-        // not a stale one from a prior analysis cycle.
-        let pre_open_ready_gen = current_ready_gen(&self.state);
-        self.acquire_doc(&uri, text)?;
-        // Block until the server signals it has settled the index for the
-        // newly opened document (or the fallback cap elapses).
-        self.await_index_settled(pre_open_ready_gen);
-
-        let result = self.send_request(
-            "textDocument/references",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": position.line, "character": position.character },
-                "context": { "includeDeclaration": true }
-            }),
-        );
-        self.release_doc(&uri);
-        let raws = decode::decode_locations(&result?);
-        Ok(workspace_locations(
-            raws,
-            &self.workspace_root,
-            &self.ignore,
-        ))
+        pool::PooledSession::references_lsp(self, path, text, position)
+            .map_err(session_to_code_intel_error)
     }
 
     fn hover(
@@ -992,20 +1215,8 @@ impl NavigationPort for LspClientAdapter {
         text: &str,
         position: Position,
     ) -> Result<Option<Hover>, CodeIntelError> {
-        if !self.supports(path) {
-            return Err(CodeIntelError::Unsupported);
-        }
-        let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)?;
-        let result = self.send_request(
-            "textDocument/hover",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": position.line, "character": position.character }
-            }),
-        );
-        self.release_doc(&uri);
-        Ok(decode::decode_hover(&result?))
+        pool::PooledSession::hover_lsp(self, path, text, position)
+            .map_err(session_to_code_intel_error)
     }
 
     fn document_symbols(
@@ -1017,13 +1228,16 @@ impl NavigationPort for LspClientAdapter {
             return Err(CodeIntelError::Unsupported);
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)?;
+        self.acquire_doc(&uri, text)
+            .map_err(session_to_code_intel_error)?;
         let result = self.send_request(
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": uri } }),
         );
         self.release_doc(&uri);
-        Ok(decode::decode_document_symbols(&result?))
+        Ok(decode::decode_document_symbols(
+            &result.map_err(session_to_code_intel_error)?,
+        ))
     }
 
     fn prepare_rename(
@@ -1032,23 +1246,8 @@ impl NavigationPort for LspClientAdapter {
         text: &str,
         position: Position,
     ) -> Result<PrepareRenameResult, RenameNavigationError> {
-        match *self
-            .rename_capability
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-        {
-            RenameCapability::Unavailable => {
-                return Err(RenameNavigationError::UnsupportedLanguage);
-            }
-            RenameCapability::RenameOnly => {
-                return Ok(PrepareRenameResult {
-                    range: None,
-                    placeholder: None,
-                });
-            }
-            RenameCapability::UnknownAssumePrepare | RenameCapability::RenameWithPrepare => {}
-        }
-        self.prepare_rename_query(path, text, position)
+        pool::PooledSession::prepare_rename_lsp(self, path, text, position)
+            .map_err(session_to_rename_error)
     }
 }
 
@@ -1061,22 +1260,34 @@ impl LspClientAdapter {
         position: Position,
         new_name: &str,
     ) -> Result<RawWorkspaceEdit, RenameNavigationError> {
+        pool::PooledSession::rename_lsp(self, path, text, position, new_name)
+            .map_err(session_to_rename_error)
+    }
+
+    fn rename_query(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, LspSessionError> {
         if !self.supports(path) {
-            return Err(RenameNavigationError::UnsupportedLanguage);
+            return Err(LspSessionError::CapabilityUnavailable);
         }
-        match *self
-            .rename_capability
+        match self
+            .semantic_capabilities
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .rename
         {
             RenameCapability::Unavailable => {
-                return Err(RenameNavigationError::UnsupportedLanguage);
+                return Err(LspSessionError::CapabilityUnavailable);
             }
-            RenameCapability::UnknownAssumePrepare | RenameCapability::RenameWithPrepare => {
+            RenameCapability::RenameWithPrepare => {
                 let prepared = self.prepare_rename_value(path, text, position)?;
-                if let Err(error) = decode_prepare_rename(prepared.clone()) {
+                if let Err(error) = decode_prepare_rename_typed(prepared.clone()) {
                     if looks_like_workspace_edit(&prepared) {
-                        return decode_workspace_edit(prepared);
+                        return decode_workspace_edit_typed(prepared);
                     }
                     return Err(error);
                 }
@@ -1084,8 +1295,7 @@ impl LspClientAdapter {
             RenameCapability::RenameOnly => {}
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)
-            .map_err(code_intel_to_rename_error)?;
+        self.acquire_doc(&uri, text)?;
         let result = self.send_request(
             "textDocument/rename",
             json!({
@@ -1095,8 +1305,7 @@ impl LspClientAdapter {
             }),
         );
         self.release_doc(&uri);
-        let value = result.map_err(code_intel_to_rename_error)?;
-        decode_workspace_edit(value)
+        decode_workspace_edit_typed(result?)
     }
 }
 
@@ -1141,39 +1350,7 @@ impl DocumentSyncPort for LspClientAdapter {
 
 impl CodeIntelligencePort for LspClientAdapter {
     fn check(&self, path: &RelativePath, text: &str) -> Result<Vec<Diagnostic>, CodeIntelError> {
-        if !self.supports(path) {
-            return Err(CodeIntelError::Unsupported);
-        }
-        let uri = self.uri_for(path);
-
-        // Capture BOTH generations before syncing so the gate can require a
-        // fresh quiescent signal AND a fresh diagnostic publish, both produced
-        // after this didOpen/didChange — never satisfied by stale values from a
-        // prior analysis cycle.
-        let sync_gen = current_generation(&self.state);
-        let pre_sync_ready_gen = current_ready_gen(&self.state);
-
-        {
-            let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let sync = if session.docs.is_open(&uri) {
-                session.docs.sync(&uri, text)
-            } else {
-                session.docs.acquire(&uri, &self.language_id, text)
-            };
-            if let Some(sync) = sync {
-                write_doc_sync(&self.writer, &uri, &sync)
-                    .map_err(|e| CodeIntelError::Backend(format!("doc sync write failed: {e}")))?;
-            }
-        }
-        // `inner` lock released here — reader thread can now safely lock `state`.
-
-        Ok(wait_for_settled(
-            &self.state,
-            &uri,
-            sync_gen,
-            pre_sync_ready_gen,
-            CHECK_TIMEOUT,
-        ))
+        pool::PooledSession::check_lsp(self, path, text).map_err(session_to_code_intel_error)
     }
 }
 
@@ -1189,8 +1366,195 @@ impl Drop for LspClientAdapter {
 }
 
 impl pool::PooledSession for LspClientAdapter {
+    fn check_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+    ) -> Result<Vec<Diagnostic>, LspSessionError> {
+        if !self.supports(path) {
+            return Err(LspSessionError::CapabilityUnavailable);
+        }
+        if self.dead_flag.load(Ordering::Acquire) {
+            return Err(self.reader_failure());
+        }
+        let uri = self.uri_for(path);
+        let sync_gen = current_generation(&self.state);
+        let pre_sync_ready_gen = current_ready_gen(&self.state);
+        let emitted_sync = {
+            let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let sync = if session.docs.is_open(&uri) {
+                session.docs.sync(&uri, text)
+            } else {
+                session.docs.acquire(&uri, &self.language_id, text)
+            };
+            let emitted_sync = sync.is_some();
+            if let Some(sync) = sync {
+                write_doc_sync(&self.writer, &uri, &sync).map_err(|_| self.transport_failure())?;
+            }
+            emitted_sync
+        };
+        self.wait_for_settled_or_failure(
+            &uri,
+            sync_gen,
+            pre_sync_ready_gen,
+            emitted_sync,
+            CHECK_TIMEOUT,
+        )
+    }
+
+    fn definition_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, LspSessionError> {
+        if self
+            .semantic_capabilities
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .definition
+            == ProviderCapability::Unavailable
+        {
+            return Err(LspSessionError::CapabilityUnavailable);
+        }
+        let uri = self.uri_for(path);
+        self.location_query(
+            path,
+            text,
+            "textDocument/definition",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character }
+            }),
+        )
+    }
+
+    fn references_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, LspSessionError> {
+        if !self.supports(path)
+            || self
+                .semantic_capabilities
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .references
+                == ProviderCapability::Unavailable
+        {
+            return Err(LspSessionError::CapabilityUnavailable);
+        }
+        let uri = self.uri_for(path);
+        let pre_open_ready_gen = current_ready_gen(&self.state);
+        self.acquire_doc(&uri, text)?;
+        self.await_index_settled(pre_open_ready_gen);
+        let result = self.send_request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character },
+                "context": { "includeDeclaration": true }
+            }),
+        );
+        self.release_doc(&uri);
+        let raws = decode_locations_typed(&result?)?;
+        Ok(workspace_locations(
+            raws,
+            &self.workspace_root,
+            &self.ignore,
+        ))
+    }
+
+    fn implementations_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Vec<Location>, LspSessionError> {
+        if self
+            .semantic_capabilities
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .implementation
+            == ProviderCapability::Unavailable
+        {
+            return Err(LspSessionError::CapabilityUnavailable);
+        }
+        let uri = self.uri_for(path);
+        self.location_query(
+            path,
+            text,
+            "textDocument/implementation",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character }
+            }),
+        )
+    }
+
+    fn hover_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<Option<Hover>, LspSessionError> {
+        if !self.supports(path)
+            || self
+                .semantic_capabilities
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .hover
+                == ProviderCapability::Unavailable
+        {
+            return Err(LspSessionError::CapabilityUnavailable);
+        }
+        let uri = self.uri_for(path);
+        self.acquire_doc(&uri, text)?;
+        let result = self.send_request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character }
+            }),
+        );
+        self.release_doc(&uri);
+        decode_hover_typed(&result?)
+    }
+
+    fn prepare_rename_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+    ) -> Result<PrepareRenameResult, LspSessionError> {
+        match self
+            .semantic_capabilities
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rename
+        {
+            RenameCapability::Unavailable => Err(LspSessionError::CapabilityUnavailable),
+            RenameCapability::RenameOnly => Ok(PrepareRenameResult {
+                range: None,
+                placeholder: None,
+            }),
+            RenameCapability::RenameWithPrepare => self.prepare_rename_query(path, text, position),
+        }
+    }
+
+    fn rename_lsp(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<RawWorkspaceEdit, LspSessionError> {
+        self.rename_query(path, text, position, new_name)
+    }
+
     fn is_dead(&self) -> bool {
-        self.dead_flag.load(Ordering::Relaxed)
+        self.dead_flag.load(Ordering::Acquire)
     }
 
     fn shared_state(&self) -> SharedState {
@@ -1422,6 +1786,47 @@ fn workspace_locations(raws: Vec<RawLocation>, root: &Path, ignore: &Gitignore) 
         .collect()
 }
 
+fn malformed_response() -> LspSessionError {
+    LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerMalformedResponse)
+}
+
+fn decode_locations_typed(value: &Value) -> Result<Vec<RawLocation>, LspSessionError> {
+    let decoded = decode::decode_locations(value);
+    match value {
+        Value::Null => Ok(decoded),
+        Value::Object(_) if decoded.len() == 1 => Ok(decoded),
+        Value::Array(items) if decoded.len() == items.len() => Ok(decoded),
+        _ => Err(malformed_response()),
+    }
+}
+
+fn decode_hover_typed(value: &Value) -> Result<Option<Hover>, LspSessionError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let hover = decode::decode_hover(value);
+    if hover.is_some() {
+        Ok(hover)
+    } else {
+        Err(malformed_response())
+    }
+}
+
+fn decode_prepare_rename_typed(value: Value) -> Result<PrepareRenameResult, LspSessionError> {
+    if value.is_null() {
+        return Err(LspSessionError::NotRenameable);
+    }
+    decode_prepare_rename(value).map_err(|error| match error {
+        RenameNavigationError::NotRenameable => LspSessionError::NotRenameable,
+        RenameNavigationError::UnsupportedLanguage => LspSessionError::CapabilityUnavailable,
+        RenameNavigationError::Backend(_) => malformed_response(),
+    })
+}
+
+fn decode_workspace_edit_typed(value: Value) -> Result<RawWorkspaceEdit, LspSessionError> {
+    decode_workspace_edit(value).map_err(|_| malformed_response())
+}
+
 fn decode_prepare_rename(value: Value) -> Result<PrepareRenameResult, RenameNavigationError> {
     if value.is_null() {
         return Err(RenameNavigationError::NotRenameable);
@@ -1483,34 +1888,30 @@ fn looks_like_workspace_edit(value: &Value) -> bool {
     })
 }
 
-fn code_intel_to_rename_error(error: CodeIntelError) -> RenameNavigationError {
-    match error {
-        CodeIntelError::Unsupported => RenameNavigationError::UnsupportedLanguage,
-        CodeIntelError::Backend(message) => RenameNavigationError::Backend(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
+    use std::io::{BufReader, Error, ErrorKind, Write};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, AtomicI64};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        CHECK_TIMEOUT, DiagnosticsEvent, LspClientAdapter, RawLocation, RawWorkspaceEdit,
-        RenameCapability, RenameNavigationError, ResponseCache, Session, SharedState, Writer,
-        build_dispatcher, current_generation, mark_ready, parse_publish_diagnostics, path_to_uri,
-        progress_kind, record_diagnostics, server_status_is_quiescent, uri_to_path,
+        CHECK_TIMEOUT, DiagnosticsEvent, LspClientAdapter, ProviderCapability, RawLocation,
+        RawWorkspaceEdit, ReaderExit, RenameCapability, RenameNavigationError, ResponseCache,
+        SemanticCapabilities, Session, SharedState, Writer, build_dispatcher,
+        classify_reader_error, current_generation, mark_ready, parse_publish_diagnostics,
+        path_to_uri, progress_kind, record_diagnostics, server_status_is_quiescent, uri_to_path,
         wait_for_settled, workspace_locations,
     };
     use crate::lsp_adapter::documents::DocumentTracker;
+    use crate::lsp_adapter::pool::PooledSession;
     use core_engine::domain::RelativePath;
-    use core_engine::domain::code_intel::{Diagnostic, Position, Range, Severity};
+    use core_engine::domain::code_intel::{Diagnostic, Location, Position, Range, Severity};
     use core_engine::ports::{CodeIntelError, NavigationPort};
+    use extension_protocol::LspOutcomeCode;
 
     fn new_state() -> SharedState {
         Arc::new((
@@ -1769,10 +2170,17 @@ mod tests {
             writer,
             state: new_state(),
             responses: Arc::clone(&responses),
-            rename_capability: Mutex::new(RenameCapability::UnknownAssumePrepare),
+            semantic_capabilities: Mutex::new(SemanticCapabilities {
+                definition: ProviderCapability::Available,
+                references: ProviderCapability::Available,
+                hover: ProviderCapability::Available,
+                implementation: ProviderCapability::Available,
+                rename: RenameCapability::RenameWithPrepare,
+            }),
             ignore: empty_ignore(),
             next_id: AtomicI64::new(1),
             dead_flag: Arc::new(AtomicBool::new(false)),
+            reader_exit: Arc::new(AtomicU8::new(ReaderExit::Crashed as u8)),
         };
         (adapter, sink, responses)
     }
@@ -1799,6 +2207,33 @@ mod tests {
         });
     }
 
+    fn adapter_with_malformed_server_output(output: &str) -> LspClientAdapter {
+        let initialize =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"definitionProvider":true}}}"#;
+        let script = format!(
+            "initialize='{initialize}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${{#initialize}}\" \"$initialize\"; printf '%b' '{output}'; sleep 60"
+        );
+        LspClientAdapter::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), script],
+            vec!["rs".to_owned()],
+            "rust".to_owned(),
+            std::env::current_dir().expect("test process has a current directory"),
+            None,
+        )
+        .expect("the valid initialize response must allow the session to start")
+    }
+
+    fn wait_until_reader_exits(adapter: &LspClientAdapter) {
+        for _ in 0..100 {
+            if adapter.dead_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("malformed server output must terminate the reader");
+    }
+
     fn written_messages(sink: &SharedSink) -> Vec<serde_json::Value> {
         let bytes = sink.0.lock().unwrap().clone();
         let mut reader = BufReader::new(bytes.as_slice());
@@ -1815,6 +2250,773 @@ mod tests {
             .find(|msg| msg.get("method").and_then(serde_json::Value::as_str) == Some(method))
             .cloned()
             .unwrap()
+    }
+
+    #[test]
+    fn f008_failure_classification_preserves_typed_failure_information_through_sidecar_seams() {
+        let (adapter, _sink, _responses) = test_adapter();
+
+        let error = PooledSession::definition_lsp(
+            &adapter,
+            &RelativePath::new("README.txt"),
+            "not rust",
+            Position {
+                line: 0,
+                character: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, super::LspSessionError::CapabilityUnavailable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f008_spawn_resolved_classifies_post_resolution_executable_changes() {
+        use extension_protocol::LspOutcomeCode;
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let executable = workspace.path().join("language-server");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        std::fs::remove_file(&executable).unwrap();
+        let missing = match LspClientAdapter::spawn_resolved(
+            &executable,
+            &[],
+            vec!["rs".to_owned()],
+            "rust".to_owned(),
+            workspace.path().to_path_buf(),
+            None,
+        ) {
+            Ok(_) => panic!("removed executable must not spawn"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerMissing)
+        );
+
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let not_executable = match LspClientAdapter::spawn_resolved(
+            &executable,
+            &[],
+            vec!["rs".to_owned()],
+            "rust".to_owned(),
+            workspace.path().to_path_buf(),
+            None,
+        ) {
+            Ok(_) => panic!("non-executable file must not spawn"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            not_executable,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerNotExecutable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f008_spawn_resolved_does_not_misclassify_working_directory_failure() {
+        use extension_protocol::LspOutcomeCode;
+
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let removed_root = workspace.path().join("removed-root");
+        std::fs::create_dir(&removed_root).unwrap();
+        std::fs::remove_dir(&removed_root).unwrap();
+
+        let error = match LspClientAdapter::spawn_resolved(
+            std::path::Path::new("/bin/true"),
+            &[],
+            vec!["rs".to_owned()],
+            "rust".to_owned(),
+            removed_root,
+            None,
+        ) {
+            Ok(_) => panic!("removed working directory must not permit spawn"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerLaunchFailed)
+        );
+
+        let ambiguous_permission_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            super::classify_spawn_error(
+                ambiguous_permission_error,
+                std::path::Path::new("/bin/true"),
+                workspace.path(),
+            ),
+            super::LspSessionError::Backend(LspOutcomeCode::ServerLaunchFailed),
+            "a valid executable must not absorb a working-directory permission failure"
+        );
+    }
+
+    #[test]
+    fn f008_failure_classification_preserves_successful_definition_payload_for_typed_and_legacy_ports()
+     {
+        let (adapter, _sink, responses) = test_adapter();
+        let expected = vec![Location {
+            path: RelativePath::new("src/lib.rs"),
+            range: Range {
+                start: Position {
+                    line: 2,
+                    character: 4,
+                },
+                end: Position {
+                    line: 2,
+                    character: 8,
+                },
+            },
+        }];
+        let result = json!([{
+            "uri": "file:///workspace/src/lib.rs",
+            "range": {
+                "start": { "line": 2, "character": 4 },
+                "end": { "line": 2, "character": 8 }
+            }
+        }]);
+        complete_responses(
+            responses,
+            vec![
+                json!({"id": 1, "result": result}),
+                json!({"id": 2, "result": result}),
+            ],
+        );
+        let path = RelativePath::new("src/main.rs");
+        let position = Position {
+            line: 2,
+            character: 5,
+        };
+
+        let typed = PooledSession::definition_lsp(&adapter, &path, "fn main() {}", position)
+            .expect("typed query keeps its established successful payload");
+        let legacy = NavigationPort::definition(&adapter, &path, "fn main() {}", position)
+            .expect("legacy wrapper delegates to the same successful typed query");
+
+        assert_eq!(typed, expected);
+        assert_eq!(legacy, expected);
+    }
+
+    #[test]
+    fn f008_failure_classification_uses_injected_responses_for_precedence_and_sanitized_codes() {
+        let cases = [
+            (
+                json!({"id": 1, "error": {"code": -32601, "message": "secret method detail"}}),
+                super::LspSessionError::CapabilityUnavailable,
+                "language server capability is unavailable",
+            ),
+            (
+                json!({"id": 1, "error": {"code": -32603, "message": "secret backend detail"}}),
+                super::LspSessionError::Backend(LspOutcomeCode::ServerError),
+                "language server request failed",
+            ),
+            (
+                json!({"id": 1, "result": {"unexpected": "secret schema detail"}}),
+                super::LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse),
+                "language server request failed",
+            ),
+        ];
+
+        for (response, expected, sanitized_message) in cases {
+            let (adapter, _sink, responses) = test_adapter();
+            complete_response(responses, response);
+
+            let error = PooledSession::definition_lsp(
+                &adapter,
+                &RelativePath::new("src/main.rs"),
+                "fn main() {}",
+                Position {
+                    line: 0,
+                    character: 3,
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(error, expected);
+            assert_eq!(error.to_string(), sanitized_message);
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn f008_failure_classification_classifies_known_server_exit_as_server_crashed() {
+        let (adapter, _sink, responses) = test_adapter();
+        adapter
+            .dead_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        complete_response(
+            responses,
+            json!({"id": 1, "error": {"code": -32603, "message": "internal error"}}),
+        );
+
+        let error = PooledSession::definition_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "fn main() {}",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerCrashed)
+        );
+    }
+
+    #[test]
+    fn f008_failure_classification_classifies_live_server_io_failure_as_transport_error() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "private transport detail",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (adapter, _sink, _responses) = test_adapter();
+        *adapter.writer.lock().unwrap() = Box::new(FailingWriter);
+
+        let error = PooledSession::definition_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "fn main() {}",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerTransportError)
+        );
+
+        let legacy_error = NavigationPort::definition(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "fn main() {}",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            legacy_error,
+            CodeIntelError::Backend("language server request failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn f008_failure_classification_classifies_invalid_framing_as_malformed_response() {
+        let adapter = adapter_with_malformed_server_output("Content-Length: nope\\r\\n\\r\\n");
+        wait_until_reader_exits(&adapter);
+
+        let error = PooledSession::definition_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "fn main() {}",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse)
+        );
+        assert_eq!(error.to_string(), "language server request failed");
+    }
+
+    #[test]
+    fn f008_failure_classification_classifies_invalid_json_as_malformed_response() {
+        let adapter = adapter_with_malformed_server_output("Content-Length: 1\\r\\n\\r\\n{");
+        wait_until_reader_exits(&adapter);
+
+        let error = PooledSession::definition_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "fn main() {}",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse)
+        );
+        assert_eq!(error.to_string(), "language server request failed");
+    }
+
+    #[test]
+    fn f008_failure_classification_classifies_deadline_expiry_as_server_timeout() {
+        let (adapter, _sink, _responses) = test_adapter();
+
+        let error = PooledSession::definition_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "fn main() {}",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerTimeout)
+        );
+    }
+
+    #[test]
+    fn f008_failure_classification_preserves_explicit_rename_target_rejection() {
+        let (adapter, _sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "error": {"code": -32602, "message": "not valid rename target"}
+            }),
+        );
+
+        let error = PooledSession::prepare_rename_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "let name = 1;",
+            Position {
+                line: 0,
+                character: 4,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, super::LspSessionError::NotRenameable);
+    }
+
+    #[test]
+    fn f008_failure_classification_prepare_rename_method_not_found_is_capability_unavailable() {
+        let (adapter, _sink, responses) = test_adapter();
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "error": {"code": -32601, "message": "method not found"}
+            }),
+        );
+
+        let error = PooledSession::prepare_rename_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "let name = 1;",
+            Position {
+                line: 0,
+                character: 4,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, super::LspSessionError::CapabilityUnavailable);
+    }
+
+    #[test]
+    fn f008_failure_classification_rejects_missing_or_ambiguous_response_payloads() {
+        for response in [
+            json!({"jsonrpc": "2.0", "id": 1}),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": null,
+                "error": {"code": -32603, "message": "internal error"}
+            }),
+        ] {
+            let (adapter, _sink, responses) = test_adapter();
+            complete_response(responses, response);
+
+            let error = PooledSession::definition_lsp(
+                &adapter,
+                &RelativePath::new("src/main.rs"),
+                "fn main() {}",
+                Position {
+                    line: 0,
+                    character: 3,
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error,
+                super::LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse)
+            );
+        }
+    }
+
+    #[test]
+    fn f008_failure_classification_check_reports_known_dead_server_without_waiting() {
+        let (adapter, _sink, _responses) = test_adapter();
+        adapter
+            .dead_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let error =
+            PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}")
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            super::LspSessionError::Backend(LspOutcomeCode::ServerCrashed)
+        );
+    }
+
+    #[test]
+    fn f008_failure_classification_reader_io_error_is_transport_error() {
+        assert_eq!(
+            classify_reader_error(&Error::new(
+                ErrorKind::BrokenPipe,
+                "private transport detail"
+            )),
+            ReaderExit::Transport
+        );
+    }
+
+    #[test]
+    fn f008_capability_captures_provider_shapes_and_classifies_missing_false_and_malformed_values()
+    {
+        let valid_cases = [
+            (
+                json!({
+                    "capabilities": {
+                        "definitionProvider": true,
+                        "referencesProvider": true,
+                        "hoverProvider": true,
+                        "implementationProvider": true,
+                        "renameProvider": true
+                    }
+                }),
+                SemanticCapabilities {
+                    definition: ProviderCapability::Available,
+                    references: ProviderCapability::Available,
+                    hover: ProviderCapability::Available,
+                    implementation: ProviderCapability::Available,
+                    rename: RenameCapability::RenameOnly,
+                },
+            ),
+            (
+                json!({
+                    "capabilities": {
+                        "definitionProvider": {},
+                        "referencesProvider": {"workDoneProgress": true},
+                        "hoverProvider": {},
+                        "implementationProvider": {},
+                        "renameProvider": {"prepareProvider": true}
+                    }
+                }),
+                SemanticCapabilities {
+                    definition: ProviderCapability::Available,
+                    references: ProviderCapability::Available,
+                    hover: ProviderCapability::Available,
+                    implementation: ProviderCapability::Available,
+                    rename: RenameCapability::RenameWithPrepare,
+                },
+            ),
+            (
+                json!({
+                    "capabilities": {
+                        "definitionProvider": false,
+                        "referencesProvider": false,
+                        "hoverProvider": false,
+                        "implementationProvider": false,
+                        "renameProvider": false
+                    }
+                }),
+                SemanticCapabilities {
+                    definition: ProviderCapability::Unavailable,
+                    references: ProviderCapability::Unavailable,
+                    hover: ProviderCapability::Unavailable,
+                    implementation: ProviderCapability::Unavailable,
+                    rename: RenameCapability::Unavailable,
+                },
+            ),
+            (
+                json!({"capabilities": {}}),
+                SemanticCapabilities {
+                    definition: ProviderCapability::Unavailable,
+                    references: ProviderCapability::Unavailable,
+                    hover: ProviderCapability::Unavailable,
+                    implementation: ProviderCapability::Unavailable,
+                    rename: RenameCapability::Unavailable,
+                },
+            ),
+        ];
+
+        for (response, expected) in valid_cases {
+            assert_eq!(
+                SemanticCapabilities::from_initialize_result(&response),
+                Ok(expected)
+            );
+        }
+
+        for (provider, malformed) in [
+            ("definitionProvider", json!("yes")),
+            ("referencesProvider", json!(1)),
+            ("hoverProvider", json!([])),
+            ("implementationProvider", json!(null)),
+            ("renameProvider", json!("supported")),
+            ("renameProvider", json!({"prepareProvider": "yes"})),
+        ] {
+            let mut capabilities = serde_json::Map::new();
+            capabilities.insert(provider.to_owned(), malformed);
+            let response = json!({"capabilities": capabilities});
+
+            assert_eq!(
+                SemanticCapabilities::from_initialize_result(&response),
+                Err(super::LspSessionError::Backend(
+                    LspOutcomeCode::ServerMalformedResponse
+                )),
+                "provider {provider} must reject malformed capability values"
+            );
+        }
+    }
+
+    #[test]
+    fn f008_capability_table_gates_unavailable_methods_without_gating_published_diagnostics() {
+        let capabilities = SemanticCapabilities::from_initialize_result(&json!({
+            "capabilities": {
+                "definitionProvider": false,
+                "referencesProvider": false,
+                "hoverProvider": false,
+                "implementationProvider": false,
+                "renameProvider": false,
+                "diagnosticProvider": "malformed-but-irrelevant-to-push-diagnostics"
+            }
+        }))
+        .expect("diagnosticProvider must not participate in semantic capability parsing");
+        assert_eq!(capabilities.definition, ProviderCapability::Unavailable);
+        assert_eq!(capabilities.references, ProviderCapability::Unavailable);
+        assert_eq!(capabilities.hover, ProviderCapability::Unavailable);
+        assert_eq!(capabilities.implementation, ProviderCapability::Unavailable);
+        assert_eq!(capabilities.rename, RenameCapability::Unavailable);
+
+        // Inject method-not-found replies only to make an incorrectly dispatched
+        // request return promptly. A correctly gated operation must not consume
+        // these replies or write any of the semantic LSP requests.
+        let (adapter, sink, responses) = test_adapter();
+        *adapter.semantic_capabilities.lock().unwrap() = capabilities;
+        complete_responses(
+            responses,
+            vec![
+                json!({"id": 1, "error": {"code": -32601, "message": "method not found"}}),
+                json!({"id": 2, "error": {"code": -32601, "message": "method not found"}}),
+                json!({"id": 3, "error": {"code": -32601, "message": "method not found"}}),
+                json!({"id": 4, "error": {"code": -32601, "message": "method not found"}}),
+                json!({"id": 5, "error": {"code": -32601, "message": "method not found"}}),
+            ],
+        );
+        let path = RelativePath::new("src/main.rs");
+        let text = "let name = 1;";
+        let position = Position {
+            line: 0,
+            character: 4,
+        };
+
+        for error in [
+            PooledSession::definition_lsp(&adapter, &path, text, position).unwrap_err(),
+            PooledSession::references_lsp(&adapter, &path, text, position).unwrap_err(),
+            PooledSession::hover_lsp(&adapter, &path, text, position).unwrap_err(),
+            PooledSession::implementations_lsp(&adapter, &path, text, position).unwrap_err(),
+            PooledSession::rename_lsp(&adapter, &path, text, position, "new_name").unwrap_err(),
+        ] {
+            assert_eq!(
+                error,
+                super::LspSessionError::CapabilityUnavailable,
+                "an operation without its advertised provider must return CapabilityUnavailable"
+            );
+        }
+
+        let messages = written_messages(&sink);
+        let methods: Vec<_> = messages
+            .iter()
+            .filter_map(|message| message.get("method").and_then(serde_json::Value::as_str))
+            .collect();
+        for method in [
+            "textDocument/definition",
+            "textDocument/references",
+            "textDocument/hover",
+            "textDocument/implementation",
+            "textDocument/prepareRename",
+            "textDocument/rename",
+        ] {
+            assert!(
+                !methods.contains(&method),
+                "unavailable capability must prevent sending {method}; sent methods: {methods:?}"
+            );
+        }
+
+        // Push diagnostics do not depend on diagnosticProvider. Exercise the
+        // real notification dispatcher and the public check path rather than
+        // treating the provider field's absence from parsing as proof.
+        let (adapter, _sink, responses) = test_adapter();
+        let dispatcher = build_dispatcher(
+            Arc::clone(&adapter.state),
+            responses,
+            Arc::clone(&adapter.writer),
+            None,
+        );
+        let publish_and_settle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            dispatcher.dispatch(&json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": "file:///workspace/src/main.rs",
+                    "diagnostics": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 4}
+                        },
+                        "severity": 1,
+                        "message": "published diagnostic"
+                    }]
+                }
+            }));
+            dispatcher.dispatch(&json!({
+                "jsonrpc": "2.0",
+                "method": "experimental/serverStatus",
+                "params": {"quiescent": true}
+            }));
+        });
+        let diagnostics = PooledSession::check_lsp(&adapter, &path, text)
+            .expect("published diagnostics must remain available without diagnosticProvider");
+        publish_and_settle.join().unwrap();
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the published diagnostic must reach check"
+        );
+        assert_eq!(diagnostics[0].message, "published diagnostic");
+    }
+
+    #[test]
+    fn repeated_identical_check_reuses_settled_cached_diagnostics() {
+        let (adapter, _sink, _responses) = test_adapter();
+        let path = RelativePath::new("src/main.rs");
+        let uri = "file:///workspace/src/main.rs";
+        let text = "fn main() {}";
+        adapter
+            .inner
+            .lock()
+            .unwrap()
+            .docs
+            .acquire(uri, "rust", text);
+        record_diagnostics(&adapter.state, uri.to_owned(), vec![diag("cached")]);
+        mark_ready(&adapter.state);
+
+        for _ in 0..2 {
+            let diagnostics = PooledSession::check_lsp(&adapter, &path, text)
+                .expect("an unchanged settled document must reuse cached diagnostics");
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].message, "cached");
+        }
+    }
+
+    #[test]
+    fn preopened_identical_document_reuses_settled_cached_diagnostics() {
+        let (adapter, _sink, _responses) = test_adapter();
+        let path = RelativePath::new("src/main.rs");
+        let uri = "file:///workspace/src/main.rs";
+        let text = "fn main() {}";
+        adapter
+            .inner
+            .lock()
+            .unwrap()
+            .docs
+            .acquire(uri, "rust", text);
+        record_diagnostics(&adapter.state, uri.to_owned(), Vec::new());
+        mark_ready(&adapter.state);
+
+        let diagnostics = PooledSession::check_lsp(&adapter, &path, text)
+            .expect("a watcher-preopened settled document must not await a new generation");
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn f008_capability_rename_without_prepare_stays_available_and_target_rejection_stays_not_renameable()
+     {
+        let (adapter, sink, responses) = test_adapter();
+        adapter.semantic_capabilities.lock().unwrap().rename = RenameCapability::RenameOnly;
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "result": {"changes": {}}
+            }),
+        );
+
+        PooledSession::rename_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "let name = 1;",
+            Position {
+                line: 0,
+                character: 4,
+            },
+            "new_name",
+        )
+        .expect("renameProvider without prepareProvider must remain available");
+        let messages = written_messages(&sink);
+        let methods: Vec<_> = messages
+            .iter()
+            .filter_map(|message| message.get("method").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(methods.contains(&"textDocument/rename"));
+        assert!(!methods.contains(&"textDocument/prepareRename"));
+
+        let (adapter, _sink, responses) = test_adapter();
+        adapter.semantic_capabilities.lock().unwrap().rename = RenameCapability::RenameWithPrepare;
+        complete_response(
+            responses,
+            json!({
+                "id": 1,
+                "error": {"code": -32602, "message": "not valid rename target"}
+            }),
+        );
+        let error = PooledSession::rename_lsp(
+            &adapter,
+            &RelativePath::new("src/main.rs"),
+            "let name = 1;",
+            Position {
+                line: 0,
+                character: 4,
+            },
+            "new_name",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, super::LspSessionError::NotRenameable);
     }
 
     #[test]
@@ -1968,8 +3170,9 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(
-            matches!(err, RenameNavigationError::Backend(message) if message.contains("internal error"))
+        assert_eq!(
+            err,
+            RenameNavigationError::Backend("language server request failed".to_owned())
         );
     }
 

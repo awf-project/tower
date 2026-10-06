@@ -110,11 +110,11 @@ cargo build --release -p core_engine
 
 The engine needs to know which directory to index. It resolves the workspace root in priority order:
 
-| Priority | Mechanism | Example |
-|----------|-----------|---------|
-| 1 (highest) | `--workspace-dir <path>` CLI flag | `tower --workspace-dir /home/user/myproject` |
-| 2 | `TOWER_WORKSPACE` environment variable | `TOWER_WORKSPACE=/home/user/myproject tower` |
-| 3 (fallback) | Current working directory | `cd /home/user/myproject && tower` |
+| Priority     | Mechanism                              | Example                                      |
+| ------------ | -------------------------------------- | -------------------------------------------- |
+| 1 (highest)  | `--workspace-dir <path>` CLI flag      | `tower --workspace-dir /home/user/myproject` |
+| 2            | `TOWER_WORKSPACE` environment variable | `TOWER_WORKSPACE=/home/user/myproject tower` |
+| 3 (fallback) | Current working directory              | `cd /home/user/myproject && tower`           |
 
 ### Sled database
 
@@ -159,19 +159,27 @@ In a second terminal (or pipe input to the process), send JSON-RPC messages.
 ### Handshake
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+{ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }
 ```
 
 Expected response:
 
 ```json
-{"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"tower","version":"0.1.0"}},"id":1}
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "capabilities": { "tools": {} },
+    "protocolVersion": "2024-11-05",
+    "serverInfo": { "name": "tower", "version": "0.1.0" }
+  },
+  "id": 1
+}
 ```
 
 ### List available tools
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }
 ```
 
 The response lists the native `tower_*` tools plus any tools contributed by discovered extensions
@@ -204,25 +212,54 @@ for the manifest schema, capabilities, activation, and the supervision/fault mod
 ### Find a file
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_find_file","arguments":{"query":"main.rs"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": { "name": "tower_find_file", "arguments": { "query": "main.rs" } }
+}
 ```
 
 ### List a directory
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tower_list_dir","arguments":{"path":"src","recursive":true,"max_depth":1}}}
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_list_dir",
+    "arguments": { "path": "src", "recursive": true, "max_depth": 1 }
+  }
+}
 ```
 
 ### Search for text
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tower_search_text","arguments":{"pattern":"fn main"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_search_text",
+    "arguments": { "pattern": "fn main" }
+  }
+}
 ```
 
 ### Read a file
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"src/main.rs"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_read_file",
+    "arguments": { "path": "src/main.rs" }
+  }
+}
 ```
 
 ### Run standalone linters
@@ -250,7 +287,15 @@ Call `tower_lint_check` with a path to lint one file, or with `{}` to lint every
 that has a matching lint configuration.
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{"path":"src/main.rs"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lint_check",
+    "arguments": { "path": "src/main.rs" }
+  }
+}
 ```
 
 Call `tower_lint_fix` to apply structured fixes emitted by `rustc-json` or `eslint-json` linters.
@@ -259,25 +304,60 @@ CAS-guarded atomic write path. Use `dry_run:true` to return previews without cha
 `unsafe:true` only when you want to apply fixes marked unsafe or unknown by the linter.
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tower_lint_fix","arguments":{"path":"src/main.rs","dry_run":true}}}
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lint_fix",
+    "arguments": { "path": "src/main.rs", "dry_run": true }
+  }
+}
 ```
 
 ### Create a file
 
 ```json
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"notes.txt","content":"hello world\n"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_create_file",
+    "arguments": { "path": "notes.txt", "content": "hello world\n" }
+  }
+}
 ```
 
 ### Mass find-and-replace
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tower_global_replace","arguments":{"target":"old_name","replacement":"new_name"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_global_replace",
+    "arguments": { "target": "old_name", "replacement": "new_name" }
+  }
+}
 ```
 
 Response shape (success):
 
 ```json
-{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"}]},"id":10}
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"
+      }
+    ]
+  },
+  "id": 10
+}
 ```
 
 All tool responses follow the same envelope: `result.content[0].text` is a JSON string containing
@@ -285,15 +365,15 @@ the tool-specific payload.
 
 ### Error codes reference
 
-| Code | Meaning |
-|------|---------|
-| -32700 | `ParseError` — malformed JSON or invalid UTF-8 |
-| -32600 | `InvalidRequest` — wrong `jsonrpc` version |
-| -32601 | `MethodNotFound` — unknown RPC method |
+| Code   | Meaning                                                    |
+| ------ | ---------------------------------------------------------- |
+| -32700 | `ParseError` — malformed JSON or invalid UTF-8             |
+| -32600 | `InvalidRequest` — wrong `jsonrpc` version                 |
+| -32601 | `MethodNotFound` — unknown RPC method                      |
 | -32602 | `InvalidParams` — missing required field in tool arguments |
-| -32603 | `InternalError` — tool execution failed |
-| -32001 | `ToolNotFound` — named tool not in the registry |
-| -32002 | `ResourceNotFound` — domain entity not found |
+| -32603 | `InternalError` — tool execution failed                    |
+| -32001 | `ToolNotFound` — named tool not in the registry            |
+| -32002 | `ResourceNotFound` — domain entity not found               |
 
 ---
 

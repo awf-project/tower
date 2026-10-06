@@ -31,6 +31,7 @@ use crate::adapters::formatter::NoOpFormatQueue;
 use crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::{InMemoryAstIndex, InMemoryFs};
+use crate::domain::extension_host::{ExtensionApplicationError, ExtensionCallError};
 use crate::domain::mutation::compute_content_version;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::FileSystemPort;
@@ -63,6 +64,21 @@ fn test_helper_bin() -> String {
         .join("debug")
         .join("test_helper_extension");
     bin.to_str().unwrap().to_owned()
+}
+
+fn fixture_bin(name: &str) -> String {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::path::Path::new(manifest_dir)
+        .parent()
+        .expect("core_engine must be under crates")
+        .parent()
+        .expect("crates must be under the workspace root")
+        .join("target")
+        .join("debug")
+        .join(name)
+        .to_str()
+        .expect("fixture path must be UTF-8")
+        .to_owned()
 }
 
 // ── HostDeps builders ─────────────────────────────────────────────────────────
@@ -219,6 +235,55 @@ fn make_manifest(bin: &str, caps: Vec<String>) -> ExtensionManifest {
         tools: vec![], // populated by initialize handshake
         events: EventsSection::default(),
         capabilities: CapabilitiesSection { required: caps },
+    }
+}
+
+fn scripted_invoke_response_manifest(response: &str) -> ExtensionManifest {
+    let script = format!(
+        r#"
+read -r initialize
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"type":"Initialized","data":{{"tools":[],"events":[],"capabilities":[]}}}}}}'
+read -r invoke
+printf '%s\n' '{response}'
+read -r shutdown
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"type":"Ack"}}}}'
+"#
+    );
+    ExtensionManifest {
+        name: "structured_error_fixture".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec!["sh".to_owned(), "-c".to_owned(), script],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    }
+}
+
+fn scripted_invoke_responses_manifest(responses: &[&str]) -> ExtensionManifest {
+    let responses = responses
+        .iter()
+        .map(|response| format!("printf '%s\\n' '{response}'"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let script = format!(
+        r#"
+read -r initialize
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"type":"Initialized","data":{{"tools":[],"events":[],"capabilities":[]}}}}}}'
+read -r invoke
+{responses}
+read -r shutdown
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"type":"Ack"}}}}'
+"#
+    );
+    ExtensionManifest {
+        name: "multi_response_fixture".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec!["sh".to_owned(), "-c".to_owned(), script],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
     }
 }
 
@@ -641,6 +706,144 @@ fn u3_call_tool_echo_round_trip() {
         .expect("echo must succeed");
 
     assert_eq!(result, params, "echo must return params unchanged");
+    instance.shutdown();
+}
+
+#[test]
+fn f008_application_maps_valid_json_rpc_error_with_code_message_and_data() {
+    let manifest = scripted_invoke_response_manifest(
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rename rejected","data":{"outcome":"not_renameable"}}}"#,
+    );
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), TEST_TIMEOUT, None)
+            .expect("structured error fixture must initialize");
+
+    let error = instance
+        .call_tool("rename", json!({}))
+        .expect_err("JSON-RPC errors must remain application errors");
+
+    assert_eq!(
+        error,
+        ExtensionCallError::Application(ExtensionApplicationError {
+            code: -32_000,
+            message: "rename rejected".to_owned(),
+            data: Some(json!({"outcome": "not_renameable"})),
+        })
+    );
+    instance.shutdown();
+}
+
+#[test]
+fn f008_application_maps_response_error_with_code_message_and_data() {
+    let manifest = scripted_invoke_response_manifest(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"type":"Error","data":{"code":-32000,"message":"rename rejected","data":{"outcome":"not_renameable"}}}}"#,
+    );
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), TEST_TIMEOUT, None)
+            .expect("structured error fixture must initialize");
+
+    let error = instance
+        .call_tool("rename", json!({}))
+        .expect_err("Response::Error must remain an application error");
+
+    assert_eq!(
+        error,
+        ExtensionCallError::Application(ExtensionApplicationError {
+            code: -32_000,
+            message: "rename rejected".to_owned(),
+            data: Some(json!({"outcome": "not_renameable"})),
+        })
+    );
+    instance.shutdown();
+}
+
+#[test]
+fn f008_application_malformed_frame_and_sidecar_exit_remain_faults() {
+    for fixture in ["fixture_garbage_frames", "fixture_exit_nonzero"] {
+        let manifest = make_manifest(&fixture_bin(fixture), vec![]);
+        let mut instance = SidecarHostAdapter::spawn(
+            manifest,
+            make_deps(InMemoryFs::new()),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{fixture} must initialize: {error:?}"));
+
+        let error = instance
+            .call_tool("run", json!({}))
+            .expect_err("transport failures must remain faults");
+
+        assert!(
+            matches!(error, ExtensionCallError::Fault(_)),
+            "{fixture} must return a transport fault, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn f008_application_rejects_malformed_or_mismatched_json_rpc_error_envelopes() {
+    let cases = [
+        (
+            "missing id",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"rejected"}}"#,
+        ),
+        (
+            "wrong id",
+            r#"{"jsonrpc":"2.0","id":999,"error":{"code":-32000,"message":"rejected"}}"#,
+        ),
+        (
+            "invalid jsonrpc version",
+            r#"{"jsonrpc":"1.0","id":1,"error":{"code":-32000,"message":"rejected"}}"#,
+        ),
+        (
+            "result and error",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"type":"ToolResult","data":{}},"error":{"code":-32000,"message":"rejected"}}"#,
+        ),
+    ];
+
+    for (case, response) in cases {
+        let manifest = scripted_invoke_response_manifest(response);
+        let mut instance =
+            SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), TEST_TIMEOUT, None)
+                .unwrap_or_else(|error| panic!("{case} fixture must initialize: {error:?}"));
+
+        let error = instance
+            .call_tool("rename", json!({}))
+            .expect_err("invalid JSON-RPC envelopes must remain transport faults");
+
+        assert!(
+            matches!(
+                error,
+                ExtensionCallError::Fault(ExtensionFault::ProtocolError { .. })
+            ),
+            "{case} must return ProtocolError, got {error:?}"
+        );
+        instance.shutdown();
+    }
+}
+
+#[test]
+fn f008_application_keeps_first_response_when_two_frames_arrive_rapidly() {
+    let manifest = scripted_invoke_responses_manifest(&[
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"first"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"result":{"type":"ToolResult","data":{"second":true}}}"#,
+    ]);
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), TEST_TIMEOUT, None)
+            .expect("rapid response fixture must initialize");
+
+    let error = instance
+        .call_tool("rename", json!({}))
+        .expect_err("the first matching response must complete the request");
+
+    assert_eq!(
+        error,
+        ExtensionCallError::Application(ExtensionApplicationError {
+            code: -32_000,
+            message: "first".to_owned(),
+            data: None,
+        })
+    );
     instance.shutdown();
 }
 

@@ -19,11 +19,76 @@
 //! - `{"type":"DeliverEvent","data":{"type":"FileIndexed","file_id":1,"path":"/x"}}`
 //! - `{"type":"Shutdown"}`  ← unit variant: no `data` key emitted
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::fault::ProtocolError;
 use crate::manifest::{Capability, ToolDecl};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspOutcome {
+    pub status: LspOutcomeStatus,
+    pub code: LspOutcomeCode,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub language: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub command: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub operation: Option<LspOperation>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub path: Option<String>,
+    pub phase: LspOutcomePhase,
+    pub message: String,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspOutcomeStatus {
+    Unsupported,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspOutcomeCode {
+    LanguageNotConfigured,
+    CapabilityUnavailable,
+    ServerMissing,
+    InvalidCommand,
+    ServerNotExecutable,
+    ServerLaunchFailed,
+    ServerCrashed,
+    ServerTimeout,
+    ServerTransportError,
+    ServerMalformedResponse,
+    ServerError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspOperation {
+    Diagnostics,
+    Definition,
+    References,
+    Hover,
+    Implementations,
+    Rename,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspOutcomePhase {
+    Startup,
+    Runtime,
+}
 
 // ── Lifecycle types ───────────────────────────────────────────────────────────
 
@@ -292,6 +357,8 @@ pub struct LspImplementationRequest {
 pub struct LspImplementationResult {
     pub supported: bool,
     pub locations: Vec<Location>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<LspOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +393,8 @@ pub struct RenameError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<LspOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

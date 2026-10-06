@@ -9,7 +9,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use extension_protocol::{HostCall, Response};
+use extension_protocol::{HostCall, ProtocolError, Response};
 use extension_sidecar_harness::jsonrpc::HarnessError;
 use serde_json::Value;
 
@@ -25,6 +25,35 @@ pub fn send_response(out: &Arc<Mutex<impl Write>>, id: &Option<Value>, resp: &Re
 /// Send a JSON-RPC error response to the host.
 pub fn send_error(out: &Arc<Mutex<impl Write>>, id: &Option<Value>, code: i32, msg: &str) {
     let _ = extension_sidecar_harness::send_error(out, id, code, msg);
+}
+
+/// Send a structured JSON-RPC error response to the host.
+pub fn send_protocol_error(
+    out: &Arc<Mutex<impl Write>>,
+    id: &Option<Value>,
+    error: &ProtocolError,
+) {
+    let mut envelope = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": error,
+    });
+    if let Some(id) = id {
+        envelope["id"] = id.clone();
+    }
+    let _ = extension_sidecar_harness::write_envelope(out, envelope);
+}
+
+pub(crate) fn send_read_only_outcome_error(
+    out: &Arc<Mutex<impl Write>>,
+    id: &Option<Value>,
+    outcome: extension_protocol::LspOutcome,
+) {
+    let error = ProtocolError {
+        code: -32000,
+        message: outcome.message.clone(),
+        data: Some(serde_json::json!({ "outcome": outcome })),
+    };
+    send_protocol_error(out, id, &error);
 }
 
 /// Perform a typed host capability call and wait for the response.

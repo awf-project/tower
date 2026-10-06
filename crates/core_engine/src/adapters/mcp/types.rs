@@ -52,6 +52,11 @@ pub enum ToolError {
     InvalidArgs(String),
     /// The tool executed but encountered a runtime error.
     ExecutionFailed(String),
+    Application {
+        code: i32,
+        message: String,
+        data: Option<Value>,
+    },
     /// The resource targeted by the tool does not exist (e.g. file not found).
     ///
     /// Distinct from [`ToolError::NotFound`] (which is for an unknown *tool*
@@ -68,6 +73,9 @@ impl core::fmt::Display for ToolError {
             Self::NotFound(name) => write!(f, "tool not found: {name}"),
             Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
             Self::ExecutionFailed(msg) => write!(f, "tool execution failed: {msg}"),
+            Self::Application { code, message, .. } => {
+                write!(f, "application error {code}: {message}")
+            }
             Self::ResourceNotFound(msg) => write!(f, "resource not found: {msg}"),
             Self::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
         }

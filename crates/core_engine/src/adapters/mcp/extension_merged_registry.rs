@@ -177,6 +177,11 @@ impl ToolRegistry for ExtensionMergedRegistry {
 fn invoke_error_to_tool_error(err: InvokeError) -> ToolError {
     match err {
         InvokeError::ToolNotFound(name) => ToolError::NotFound(name),
+        InvokeError::Application(error) => ToolError::Application {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        },
         InvokeError::Fault(fault) => {
             ToolError::ExecutionFailed(format!("extension fault: {fault:?}"))
         }
@@ -192,11 +197,13 @@ mod tests {
     use extension_protocol::{ExtensionFault, ExtensionManifest, ToolDecl};
     use serde_json::{Value as JsonValue, json};
 
-    use super::ExtensionMergedRegistry;
+    use super::{ExtensionMergedRegistry, invoke_error_to_tool_error};
     use crate::adapters::mcp::native_tools::{EXPECTED_NATIVE_TOOL_NAMES, EngineState};
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::{InMemoryFs, InMemoryStorage};
-    use crate::domain::extension_host::ExtensionRegistry;
+    use crate::domain::extension_host::{
+        ExtensionApplicationError, ExtensionCallError, ExtensionRegistry, InvokeError,
+    };
     use crate::domain::index::InvertedIndex;
     use crate::domain::workspace::ProjectWorkspace;
 
@@ -245,7 +252,7 @@ mod tests {
             &mut self,
             _name: &str,
             params: JsonValue,
-        ) -> Result<JsonValue, ExtensionFault> {
+        ) -> Result<JsonValue, ExtensionCallError> {
             Ok(params)
         }
 
@@ -280,7 +287,7 @@ mod tests {
             &mut self,
             _name: &str,
             _params: JsonValue,
-        ) -> Result<JsonValue, ExtensionFault> {
+        ) -> Result<JsonValue, ExtensionCallError> {
             Ok(JsonValue::String(self.manifest.name.clone()))
         }
 
@@ -316,8 +323,8 @@ mod tests {
             &mut self,
             _name: &str,
             _params: JsonValue,
-        ) -> Result<JsonValue, ExtensionFault> {
-            Err(ExtensionFault::Crashed { code: Some(1) })
+        ) -> Result<JsonValue, ExtensionCallError> {
+            Err(ExtensionFault::Crashed { code: Some(1) }.into())
         }
 
         fn deliver_event(
@@ -356,6 +363,61 @@ mod tests {
             )))
             .expect("register");
         ExtensionMergedRegistry::new(empty_engine_state(), ext_registry)
+    }
+
+    #[test]
+    fn f008_application_maps_some_data_field_for_field() {
+        let data = json!({"outcome": "not_renameable", "detail": "reserved symbol"});
+
+        let mapped =
+            invoke_error_to_tool_error(InvokeError::Application(ExtensionApplicationError {
+                code: -32_042,
+                message: "symbol cannot be renamed".to_owned(),
+                data: Some(data.clone()),
+            }));
+
+        match mapped {
+            crate::adapters::mcp::types::ToolError::Application {
+                code,
+                message,
+                data: actual_data,
+            } => {
+                assert_eq!(code, -32_042);
+                assert_eq!(message, "symbol cannot be renamed");
+                assert_eq!(actual_data, Some(data));
+            }
+            other => panic!("expected application error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f008_application_maps_none_data_without_synthesizing_a_value() {
+        let mapped =
+            invoke_error_to_tool_error(InvokeError::Application(ExtensionApplicationError {
+                code: 7,
+                message: "operation rejected".to_owned(),
+                data: None,
+            }));
+
+        assert!(matches!(
+            mapped,
+            crate::adapters::mcp::types::ToolError::Application {
+                code: 7,
+                ref message,
+                data: None,
+            } if message == "operation rejected"
+        ));
+    }
+
+    #[test]
+    fn f008_application_keeps_genuine_fault_mapping_unchanged() {
+        let mapped = invoke_error_to_tool_error(InvokeError::Fault(ExtensionFault::Timeout));
+
+        assert!(matches!(
+            mapped,
+            crate::adapters::mcp::types::ToolError::ExecutionFailed(ref message)
+                if message.contains("Timeout")
+        ));
     }
 
     // ── EV1: extension tool appears in tools/list beside native tools ──────────
