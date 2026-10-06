@@ -1,7 +1,7 @@
 ---
-title: "Tower — Code Intelligence for AI Agents"
-description: "A native Rust MCP server for workspace search, code navigation, safe edits, linting, and debugging through isolated extensions."
-lead: "Give your AI coding agent the tools to search, understand, and safely edit your codebase through MCP."
+title: 'Tower — Code Intelligence for AI Agents'
+description: 'A native Rust MCP server for workspace search, code navigation, safe edits, linting, and debugging through isolated extensions.'
+lead: 'Give your AI coding agent the tools to search, understand, and safely edit your codebase through MCP.'
 date: 2026-03-14
 draft: false
 ---
