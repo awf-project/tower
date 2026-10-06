@@ -1,7 +1,7 @@
 ---
-title: "Development"
-description: "Architecture, testing, and contribution guides."
+title: 'Development'
+description: 'Architecture, testing, and contribution guides.'
 weight: 4
 cascade:
-  - type: "docs"
+    - type: 'docs'
 ---
