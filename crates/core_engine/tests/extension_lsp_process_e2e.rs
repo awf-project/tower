@@ -104,6 +104,7 @@ struct RawLspChild {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    initialize_config: serde_json::Value,
 }
 
 impl RawLspChild {
@@ -112,6 +113,11 @@ impl RawLspChild {
     }
 
     fn spawn_with_workspace(workspace: Option<&std::path::Path>) -> Self {
+        let initialize_config = workspace
+            .and_then(|root| fs::read_to_string(root.join(".tower/config.toml")).ok())
+            .and_then(|source| core_engine::adapters::config::lsp::parse_lsp_config(&source).ok())
+            .map(|config| core_engine::adapters::config::lsp::lsp_initialize_payload(&config))
+            .unwrap_or_else(empty_lsp_initialize_payload);
         let mut command = Command::new(lsp_extension_bin());
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
@@ -128,14 +134,19 @@ impl RawLspChild {
             child,
             stdin,
             stdout,
+            initialize_config,
         }
     }
 
     fn write_frame(&mut self, frame: serde_json::Value) {
+        self.write_frame_for_drop(frame).expect("write frame");
+    }
+
+    fn write_frame_for_drop(&mut self, frame: serde_json::Value) -> std::io::Result<()> {
         let line = serde_json::to_string(&frame).expect("serialize frame");
-        self.stdin.write_all(line.as_bytes()).expect("write frame");
-        self.stdin.write_all(b"\n").expect("write newline");
-        self.stdin.flush().expect("flush frame");
+        self.stdin.write_all(line.as_bytes())?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()
     }
 
     fn read_frame(&mut self) -> serde_json::Value {
@@ -147,6 +158,10 @@ impl RawLspChild {
         );
         serde_json::from_str(line.trim()).expect("valid JSON frame")
     }
+}
+
+fn empty_lsp_initialize_payload() -> serde_json::Value {
+    serde_json::json!({"servers": {}, "idle_timeout_secs": null})
 }
 
 fn fake_lsp_workspace(mode: &str) -> tempfile::TempDir {
@@ -161,9 +176,16 @@ fn fake_lsp_workspace(mode: &str) -> tempfile::TempDir {
         &script,
         r#"#!/usr/bin/env python3
 import json
+import os
 import sys
+import time
 
 MODE = sys.argv[1]
+LOG = sys.argv[2]
+PID_LOG = sys.argv[3]
+
+with open(PID_LOG, "a", encoding="utf-8") as pid_log:
+    pid_log.write(str(os.getpid()) + "\n")
 
 def read_message():
     headers = {}
@@ -188,45 +210,91 @@ while True:
     message = read_message()
     method = message.get("method")
     request_id = message.get("id")
-    if request_id is None:
-        continue
+    with open(LOG, "a", encoding="utf-8") as log:
+        log.write(method + "\n")
     params = message.get("params") or {}
     text_document = params.get("textDocument") or {}
     uri = text_document.get("uri") or "file:///workspace/src/lib.rs"
 
     if method == "initialize":
+        provider = None if MODE == "provider_absent" else MODE != "provider_false"
+        capabilities = {"textDocumentSync": 1, "renameProvider": True if MODE == "no_prepare" else {"prepareProvider": True}}
+        if provider is not None:
+            capabilities.update({
+                "definitionProvider": provider,
+                "referencesProvider": provider,
+                "hoverProvider": provider,
+                "implementationProvider": provider,
+            })
         send_message({
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {
-                "capabilities": {
-                    "textDocumentSync": 1,
-                    "implementationProvider": True,
-                    "renameProvider": True if MODE == "no_prepare" else {"prepareProvider": True}
-                }
-            }
+            "result": {"capabilities": capabilities}
         })
-    elif method == "textDocument/implementation":
+        if MODE == "server_transport_error":
+            os.close(sys.stdin.fileno())
+            time.sleep(300)
+    elif method == "textDocument/didOpen":
+        if MODE == "diagnostics_ready":
+            send_message({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": []}})
+            send_message({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": True}})
+        elif MODE == "server_crashed":
+            sys.exit(71)
+        elif MODE == "server_malformed_response":
+            sys.stdout.buffer.write(b"Content-Length: nope\r\n\r\n")
+            sys.stdout.buffer.flush()
+            time.sleep(30)
+    elif request_id is None:
+        continue
+    elif method in ("textDocument/definition", "textDocument/references", "textDocument/implementation"):
         if MODE == "backend_error":
             send_message({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32099, "message": "implementation backend exploded"}
             })
+        elif MODE == "server_timeout":
+            time.sleep(30)
+        elif MODE == "method_not_found":
+            send_message({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "method not found"}})
         else:
+            locations = [] if MODE == "empty" else [{
+                "uri": uri,
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 11}
+                }
+            }]
             send_message({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": [{
-                    "uri": uri,
-                    "range": {
-                        "start": {"line": 0, "character": 3},
-                        "end": {"line": 0, "character": 11}
-                    }
-                }]
+                "result": locations
             })
+    elif method == "textDocument/hover":
+        if MODE == "method_not_found":
+            send_message({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "method not found"}})
+        else:
+            hover = None if MODE == "empty" else {"contents": {"kind": "plaintext", "value": "fn old_name()"}}
+            send_message({"jsonrpc": "2.0", "id": request_id, "result": hover})
     elif method == "textDocument/prepareRename":
-        if MODE == "no_prepare":
+        if MODE == "server_crashed":
+            sys.exit(71)
+        elif MODE == "server_transport_error":
+            os.close(sys.stdout.fileno())
+            time.sleep(30)
+        elif MODE == "server_malformed_response":
+            sys.stdout.buffer.write(b"Content-Length: 1\r\n\r\n{")
+            sys.stdout.buffer.flush()
+            time.sleep(30)
+        elif MODE == "server_timeout":
+            time.sleep(30)
+        elif MODE == "backend_error":
+            send_message({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "SENTINEL_PRIVATE_BACKEND_DETAIL"}
+            })
+        elif MODE == "no_prepare":
             send_message({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -243,12 +311,6 @@ while True:
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {"code": -32602, "message": "not valid rename target"}
-            })
-        elif MODE == "unsupported_edit":
-            send_message({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {"documentChanges": [{"kind": "create", "uri": uri}]}
             })
         else:
             send_message({
@@ -271,7 +333,16 @@ while True:
             },
             "newText": new_name
         }
-        if MODE == "versioned_document_changes":
+        if MODE == "invalid_range":
+            text_edit["range"]["start"]["character"] = 999
+            text_edit["range"]["end"]["character"] = 1000
+        if MODE == "unsupported_edit":
+            send_message({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"documentChanges": [{"kind": "create", "uri": uri}]}
+            })
+        elif MODE == "versioned_document_changes":
             send_message({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -302,11 +373,13 @@ while True:
         r#"
 [lsp.rust]
 command = "python3"
-args = ["{}", "{}"]
+args = ["{}", "{}", "{}", "{}"]
 extensions = ["rs"]
 "#,
         script.display(),
-        mode
+        mode,
+        workspace.path().join("fake_lsp.log").display(),
+        workspace.path().join("fake_lsp.pids").display()
     );
     fs::write(workspace.path().join(".tower/config.toml"), config).expect("write lsp config");
 
@@ -314,13 +387,15 @@ extensions = ["rs"]
 }
 
 fn initialize_raw_lsp_child(child: &mut RawLspChild) {
+    let extension_config = child.initialize_config.clone();
     child.write_frame(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
         "params": {
             "protocol_version": extension_protocol::PROTOCOL_VERSION,
-            "client_info": "lsp-e2e/0.1.0"
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": extension_config,
         }
     }));
     let initialized = child.read_frame();
@@ -330,14 +405,594 @@ fn initialize_raw_lsp_child(child: &mut RawLspChild) {
     );
 }
 
+fn invoke_configured_read_tool(
+    child: &mut RawLspChild,
+    id: u64,
+    name: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "invokeTool",
+        "params": {"name": name, "params": params},
+    }));
+    let read_file = child.read_frame();
+    assert_eq!(
+        read_file["method"], "workspace/readFile",
+        "configured {name} must read the requested file; got {read_file}"
+    );
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"].clone(),
+        "result": "fn old_name() {}\n",
+    }));
+    loop {
+        let frame = child.read_frame();
+        if frame["method"] == "notify/resourceUpdated" {
+            child.write_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": frame["id"].clone(),
+                "result": null,
+            }));
+            continue;
+        }
+        return frame;
+    }
+}
+
+fn read_tool_params(name: &str, path: &str) -> serde_json::Value {
+    if name == "diagnostics" {
+        serde_json::json!({"path": path})
+    } else {
+        serde_json::json!({"path": path, "line": 0, "character": 3})
+    }
+}
+
+fn unsupported_read_envelope(
+    id: u64,
+    name: &str,
+    path: &str,
+    code: &str,
+    message: &str,
+) -> serde_json::Value {
+    let legacy = if name == "hover" {
+        serde_json::json!({"supported": false, "hover": null})
+    } else if name == "diagnostics" {
+        serde_json::json!({"supported": false, "diagnostics": []})
+    } else {
+        serde_json::json!({"supported": false, "locations": []})
+    };
+    let mut data = legacy.as_object().expect("legacy payload object").clone();
+    data.insert(
+        "outcome".to_owned(),
+        serde_json::json!({
+            "status": "unsupported",
+            "code": code,
+            "language": null,
+            "command": null,
+            "operation": name,
+            "path": path,
+            "phase": "runtime",
+            "message": message,
+        }),
+    );
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"type": "ToolResult", "data": data},
+    })
+}
+
+#[test]
+fn f008_bare_read_extends_the_existing_mode_driven_fixture_once_and_table_tests_the_five_read_only_operations_for_supported_results_valid_empty_null_results_and_unconfigured_language()
+ {
+    let location = serde_json::json!([{
+        "path": "src/lib.rs",
+        "line": 0,
+        "character": 3,
+        "endLine": 0,
+        "endCharacter": 11,
+    }]);
+    let cases = [
+        (
+            "diagnostics",
+            "diagnostics_ready",
+            serde_json::json!({"supported": true, "diagnostics": []}),
+        ),
+        (
+            "definition",
+            "normal",
+            serde_json::json!({"supported": true, "locations": location.clone()}),
+        ),
+        (
+            "references",
+            "normal",
+            serde_json::json!({"supported": true, "locations": location.clone()}),
+        ),
+        (
+            "hover",
+            "normal",
+            serde_json::json!({"supported": true, "hover": {"contents": "fn old_name()"}}),
+        ),
+        (
+            "implementations",
+            "normal",
+            serde_json::json!({"supported": true, "locations": location.clone()}),
+        ),
+        (
+            "definition",
+            "empty",
+            serde_json::json!({"supported": true, "locations": []}),
+        ),
+        (
+            "references",
+            "empty",
+            serde_json::json!({"supported": true, "locations": []}),
+        ),
+        (
+            "hover",
+            "empty",
+            serde_json::json!({"supported": true, "hover": null}),
+        ),
+        (
+            "implementations",
+            "empty",
+            serde_json::json!({"supported": true, "locations": []}),
+        ),
+    ];
+
+    for (id, (name, mode, expected_data)) in cases.into_iter().enumerate() {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child(&mut child);
+        let id = 100 + id as u64;
+        let response =
+            invoke_configured_read_tool(&mut child, id, name, read_tool_params(name, "src/lib.rs"));
+        assert_eq!(
+            response,
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"type": "ToolResult", "data": expected_data}}),
+            "{name} in {mode} mode must preserve its exact legacy success envelope"
+        );
+    }
+
+    let mut unconfigured = RawLspChild::spawn();
+    initialize_raw_lsp_child(&mut unconfigured);
+    for (offset, name) in [
+        "diagnostics",
+        "definition",
+        "references",
+        "hover",
+        "implementations",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 200 + offset as u64;
+        unconfigured.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "invokeTool",
+            "params": {"name": name, "params": read_tool_params(name, "src/file.unmapped")},
+        }));
+        assert_eq!(
+            unconfigured.read_frame(),
+            unsupported_read_envelope(
+                id,
+                name,
+                "src/file.unmapped",
+                "language_not_configured",
+                "No language server is configured for this file.",
+            ),
+            "unmapped {name} must respond directly without a HostCall"
+        );
+    }
+}
+
+#[test]
+fn f008_bare_read_checks_absent_false_and_method_not_found_semantic_providers_for_definition_references_hover_and_implementations()
+ {
+    for mode in ["provider_absent", "provider_false", "method_not_found"] {
+        for (offset, name) in ["definition", "references", "hover", "implementations"]
+            .into_iter()
+            .enumerate()
+        {
+            let workspace = fake_lsp_workspace(mode);
+            let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+            initialize_raw_lsp_child(&mut child);
+            let id = 300 + offset as u64;
+            let response = invoke_configured_read_tool(
+                &mut child,
+                id,
+                name,
+                read_tool_params(name, "src/lib.rs"),
+            );
+            assert_eq!(
+                response,
+                unsupported_read_envelope(
+                    id,
+                    name,
+                    "src/lib.rs",
+                    "capability_unavailable",
+                    "The configured language server does not provide this operation.",
+                ),
+                "{name} must report {mode} as capability_unavailable"
+            );
+            if mode != "method_not_found" {
+                let log = fs::read_to_string(workspace.path().join("fake_lsp.log"))
+                    .expect("read fake LSP method log");
+                let semantic_method = if name == "implementations" {
+                    "textDocument/implementation"
+                } else {
+                    match name {
+                        "definition" => "textDocument/definition",
+                        "references" => "textDocument/references",
+                        "hover" => "textDocument/hover",
+                        _ => unreachable!(),
+                    }
+                };
+                assert!(
+                    !log.lines().any(|method| method == semantic_method),
+                    "{mode} {name} provider must prevent the unavailable semantic request; log: {log}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn f008_bare_read_diagnostics_without_pull_provider_follows_published_readiness_with_timeout_on_unresolved_readiness()
+ {
+    let ready_workspace = fake_lsp_workspace("diagnostics_ready");
+    let mut ready = RawLspChild::spawn_with_workspace(Some(ready_workspace.path()));
+    initialize_raw_lsp_child(&mut ready);
+    assert_eq!(
+        invoke_configured_read_tool(
+            &mut ready,
+            401,
+            "diagnostics",
+            read_tool_params("diagnostics", "src/lib.rs"),
+        ),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 401,
+            "result": {"type": "ToolResult", "data": {"supported": true, "diagnostics": []}},
+        })
+    );
+
+    let timeout_workspace = fake_lsp_workspace("diagnostics_timeout");
+    let mut timeout = RawLspChild::spawn_with_workspace(Some(timeout_workspace.path()));
+    initialize_raw_lsp_child(&mut timeout);
+    assert_eq!(
+        invoke_configured_read_tool(
+            &mut timeout,
+            402,
+            "diagnostics",
+            read_tool_params("diagnostics", "src/lib.rs"),
+        ),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 402,
+            "error": {
+                "code": -32000,
+                "message": "language server request failed",
+                "data": {
+                    "outcome": {
+                        "status": "error",
+                        "code": "server_timeout",
+                        "language": "rust",
+                        "command": "python3",
+                        "operation": "diagnostics",
+                        "path": "src/lib.rs",
+                        "phase": "runtime",
+                        "message": "language server request failed",
+                    },
+                },
+            },
+        }),
+        "unresolved diagnostics readiness must preserve the complete typed timeout envelope"
+    );
+}
+
+fn invoke_bare_rename_without_apply_edits(child: &mut RawLspChild, id: u64) -> serde_json::Value {
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "invokeTool",
+        "params": {
+            "name": "rename",
+            "params": {
+                "path": "src/lib.rs",
+                "line": 0,
+                "character": 3,
+                "new_name": "new_name",
+            },
+        },
+    }));
+    let read_file = child.read_frame();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"].clone(),
+        "result": "fn old_name() {}\n",
+    }));
+    child.read_frame()
+}
+
+fn classified_runtime_failure_fixtures() -> [(&'static str, &'static str); 5] {
+    [
+        ("server_crashed", "server_crashed"),
+        ("server_timeout", "server_timeout"),
+        ("server_transport_error", "server_transport_error"),
+        ("server_malformed_response", "server_malformed_response"),
+        ("backend_error", "server_error"),
+    ]
+}
+
+fn expected_lsp_outcome(code: &str, command: Option<&str>, operation: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "code": code,
+        "language": command.map(|_| "rust"),
+        "command": command,
+        "operation": operation,
+        "path": "src/lib.rs",
+        "phase": "runtime",
+        "message": "language server request failed",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn assert_fixture_servers_stopped(workspace: &std::path::Path) {
+    let pids = fs::read_to_string(workspace.join("fake_lsp.pids"))
+        .expect("fixture server must record its pid");
+    for pid in pids.lines() {
+        let proc_entry = std::path::Path::new("/proc").join(pid);
+        assert!(
+            !proc_entry.exists(),
+            "fixture language-server process {pid} survived sidecar shutdown"
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn assert_fixture_servers_stopped(_workspace: &std::path::Path) {}
+
+fn classified_command_failure_workspace(code: &str) -> (tempfile::TempDir, String) {
+    let workspace = fake_lsp_workspace("normal");
+    let command = match code {
+        "invalid_command" => String::new(),
+        "server_missing" => "definitely-missing-f008-language-server".to_owned(),
+        "server_not_executable" => ".".to_owned(),
+        "server_launch_failed" => {
+            let executable = workspace.path().join("missing-interpreter-server");
+            fs::write(&executable, "#!/definitely/missing/f008-interpreter\n")
+                .expect("write launch fixture");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(&executable)
+                    .expect("read launch fixture metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&executable, permissions)
+                    .expect("make launch fixture executable");
+            }
+            "./missing-interpreter-server".to_owned()
+        }
+        _ => unreachable!("unknown classified command failure"),
+    };
+    let config = format!("[lsp.rust]\ncommand = {command:?}\nextensions = [\"rs\"]\nargs = []\n");
+    fs::write(workspace.path().join(".tower/config.toml"), config).expect("write failure config");
+    (workspace, command)
+}
+
+#[test]
+fn f008_bare_rename_failure_table_tests_success_preview_availability_and_preserved_domain_payloads()
+{
+    for (mode, dry_run) in [("normal", false), ("normal", true), ("no_prepare", false)] {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child(&mut child);
+        let response = invoke_supported_rename(&mut child, dry_run);
+        let data = &response["result"]["data"];
+        assert_eq!(data["spans"][0]["replacement"], "new_name");
+        assert_eq!(data.get("applied").is_none(), dry_run);
+    }
+
+    let mut unconfigured = RawLspChild::spawn();
+    initialize_raw_lsp_child(&mut unconfigured);
+    unconfigured.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 510,
+        "method": "invokeTool",
+        "params": {"name": "rename", "params": {"path": "src/file.unmapped", "line": 0, "character": 0, "new_name": "new_name"}},
+    }));
+    let unavailable = unconfigured.read_frame();
+    assert_eq!(
+        unavailable["result"]["data"]["code"],
+        "unsupported_language"
+    );
+    assert_eq!(unavailable["result"]["data"]["path"], "src/file.unmapped");
+    assert_eq!(
+        unavailable["result"]["data"]["outcome"]["code"],
+        "language_not_configured"
+    );
+    assert_eq!(
+        unavailable["result"]["data"]["message"],
+        unavailable["result"]["data"]["outcome"]["message"]
+    );
+    assert_eq!(
+        unavailable["result"]["data"]["path"],
+        unavailable["result"]["data"]["outcome"]["path"]
+    );
+
+    for (mode, expected_code, expected_path) in [
+        (
+            "prepare_method_not_found",
+            "unsupported_language",
+            Some("src/lib.rs"),
+        ),
+        ("reject", "not_renameable", Some("src/lib.rs")),
+        ("unsupported_edit", "unsupported_workspace_edit", None),
+        ("invalid_range", "invalid_range", Some("src/lib.rs")),
+    ] {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child(&mut child);
+        let response = invoke_bare_rename_without_apply_edits(&mut child, 511);
+        let data = &response["result"]["data"];
+        assert_eq!(
+            data["code"], expected_code,
+            "unexpected {mode} payload: {response}"
+        );
+        assert_eq!(data["path"].as_str(), expected_path);
+        if mode == "prepare_method_not_found" {
+            assert_eq!(data["outcome"]["code"], "capability_unavailable");
+            assert_eq!(data["message"], data["outcome"]["message"]);
+            assert_eq!(data["path"], data["outcome"]["path"]);
+        } else {
+            assert!(
+                data.get("outcome").is_none(),
+                "{mode} must retain its domain payload without reclassification: {response}"
+            );
+        }
+    }
+}
+
+#[test]
+fn f008_bare_rename_failure_table_preserves_read_only_and_rename_server_failure_envelopes() {
+    for (offset, (mode, code)) in classified_runtime_failure_fixtures()
+        .into_iter()
+        .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        let mut read_child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child(&mut read_child);
+        let operation = if mode == "backend_error" {
+            "definition"
+        } else {
+            "diagnostics"
+        };
+        let read_response = invoke_configured_read_tool(
+            &mut read_child,
+            520 + offset as u64,
+            operation,
+            read_tool_params(operation, "src/lib.rs"),
+        );
+        let read_outcome = &read_response["error"]["data"]["outcome"];
+        assert_eq!(
+            read_response["error"]["code"], -32000,
+            "unexpected {mode} read envelope: {read_response}"
+        );
+        assert_eq!(
+            read_outcome,
+            &expected_lsp_outcome(code, Some("python3"), operation)
+        );
+        assert!(
+            !read_response
+                .to_string()
+                .contains("SENTINEL_PRIVATE_BACKEND_DETAIL")
+        );
+
+        let mut rename_child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child(&mut rename_child);
+        let rename_response =
+            invoke_bare_rename_without_apply_edits(&mut rename_child, 530 + offset as u64);
+        let rename = &rename_response["result"]["data"];
+        assert_eq!(
+            rename["code"], "backend_error",
+            "unexpected {mode} rename envelope: {rename_response}"
+        );
+        assert_eq!(rename["message"], "language server request failed");
+        assert_eq!(rename["path"], "src/lib.rs");
+        assert_eq!(
+            rename["outcome"],
+            expected_lsp_outcome(code, None, "rename")
+        );
+        assert_eq!(rename["message"], rename["outcome"]["message"]);
+        assert_eq!(rename["path"], rename["outcome"]["path"]);
+        assert!(
+            !rename_response
+                .to_string()
+                .contains("SENTINEL_PRIVATE_BACKEND_DETAIL")
+        );
+        drop(read_child);
+        drop(rename_child);
+        assert_fixture_servers_stopped(workspace.path());
+    }
+
+    for (offset, code) in [
+        "invalid_command",
+        "server_missing",
+        "server_not_executable",
+        "server_launch_failed",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (read_workspace, command) = classified_command_failure_workspace(code);
+        let mut read_child = RawLspChild::spawn_with_workspace(Some(read_workspace.path()));
+        initialize_raw_lsp_child(&mut read_child);
+        let read_response = invoke_configured_read_tool(
+            &mut read_child,
+            550 + offset as u64,
+            "diagnostics",
+            read_tool_params("diagnostics", "src/lib.rs"),
+        );
+        let read_outcome = &read_response["error"]["data"]["outcome"];
+        assert_eq!(read_response["error"]["code"], -32000);
+        assert_eq!(
+            read_outcome,
+            &expected_lsp_outcome(code, Some(&command), "diagnostics")
+        );
+
+        let (rename_workspace, rename_command) = classified_command_failure_workspace(code);
+        let mut rename_child = RawLspChild::spawn_with_workspace(Some(rename_workspace.path()));
+        initialize_raw_lsp_child(&mut rename_child);
+        let rename_response =
+            invoke_bare_rename_without_apply_edits(&mut rename_child, 560 + offset as u64);
+        let rename = &rename_response["result"]["data"];
+        assert_eq!(rename["code"], "backend_error");
+        assert_eq!(rename["message"], rename["outcome"]["message"]);
+        assert_eq!(rename["path"], rename["outcome"]["path"]);
+        assert_eq!(
+            rename["outcome"],
+            expected_lsp_outcome(code, None, "rename")
+        );
+        assert_eq!(rename_command, command);
+    }
+}
+
+#[test]
+fn f008_bare_rename_failure_never_applies_edits_and_excludes_sentinel_secrets() {
+    let workspace = fake_lsp_workspace("backend_error");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child(&mut child);
+    let response = invoke_bare_rename_without_apply_edits(&mut child, 540);
+    let serialized = response.to_string();
+    assert_eq!(
+        response["result"]["data"]["message"],
+        "language server request failed"
+    );
+    assert_eq!(response["result"]["data"]["path"], "src/lib.rs");
+    assert!(!serialized.contains("SENTINEL_PRIVATE_BACKEND_DETAIL"));
+    assert!(
+        response.get("method").is_none(),
+        "backend failure must not issue workspace/applyEdits: {response}"
+    );
+}
+
 fn initialized_raw_lsp_child(child: &mut RawLspChild) -> serde_json::Value {
+    let extension_config = child.initialize_config.clone();
     child.write_frame(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
         "params": {
             "protocol_version": extension_protocol::PROTOCOL_VERSION,
-            "client_info": "lsp-e2e/0.1.0"
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": extension_config,
         }
     }));
     let initialized = child.read_frame();
@@ -348,14 +1003,356 @@ fn initialized_raw_lsp_child(child: &mut RawLspChild) -> serde_json::Value {
     initialized
 }
 
+/// T024: the public sidecar boundary must distinguish a typed read-only LSP
+/// failure from legacy dispatch errors, without changing successful tool-result
+/// envelopes for unsupported and rename requests.
+#[test]
+fn f008_error_envelope_preserves_typed_and_legacy_dispatch_outcomes() {
+    let workspace = fake_lsp_workspace("backend_error");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child(&mut child);
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 81,
+        "method": "invokeTool",
+        "params": {
+            "name": "implementations",
+            "params": {"path": "src/lib.rs", "line": 0, "character": 3},
+        },
+    }));
+    let read_file = child.read_frame();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"],
+        "result": "fn old_name() {}\n",
+    }));
+    let typed_failure = child.read_frame();
+    assert_eq!(
+        typed_failure,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "error": {
+                "code": -32000,
+                "message": "language server request failed",
+                "data": {
+                    "outcome": {
+                        "status": "error",
+                        "code": "server_error",
+                        "language": "rust",
+                        "command": "python3",
+                        "operation": "implementations",
+                        "path": "src/lib.rs",
+                        "phase": "runtime",
+                        "message": "language server request failed",
+                    },
+                },
+            },
+        }),
+        "a read-only server failure must cross the sidecar boundary as a typed JSON-RPC error"
+    );
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 82,
+        "method": "invokeTool",
+        "params": {"name": "implementations", "params": {"path": "src/lib.rs", "line": 0}},
+    }));
+    let malformed = child.read_frame();
+    assert_eq!(malformed["error"]["code"], -32000);
+    assert_eq!(
+        malformed["error"]["message"],
+        "bad LspImplementationRequest: missing field `character`"
+    );
+    assert!(malformed["error"].get("data").is_none());
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 83,
+        "method": "invokeTool",
+        "params": {"name": "implementations", "params": {"path": "src/lib.rs", "line": 0, "character": 3}},
+    }));
+    let read_file = child.read_frame();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"],
+        "error": {"code": -32001, "message": "workspace read denied"},
+    }));
+    let read_failure = child.read_frame();
+    assert_eq!(read_failure["error"]["code"], -32000);
+    assert_eq!(read_failure["error"]["message"], "workspace read denied");
+    assert!(read_failure["error"].get("data").is_none());
+
+    let mut unconfigured = RawLspChild::spawn();
+    initialize_raw_lsp_child(&mut unconfigured);
+    unconfigured.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 84,
+        "method": "invokeTool",
+        "params": {
+            "name": "rename",
+            "params": {"path": "src/lib.rs", "line": 0, "character": 3, "new_name": "new_name"},
+        },
+    }));
+    let rename = unconfigured.read_frame();
+    assert_eq!(rename["id"], 84);
+    assert_eq!(rename["result"]["type"], "ToolResult");
+    assert_eq!(rename["result"]["data"]["code"], "unsupported_language");
+    assert_eq!(
+        rename["result"]["data"]["outcome"]["code"],
+        "language_not_configured"
+    );
+    assert!(rename.get("error").is_none());
+
+    unconfigured.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 85,
+        "method": "invokeTool",
+        "params": {"name": "definition", "params": {"path": "src/lib.rs", "line": 0, "character": 3}},
+    }));
+    let unsupported = unconfigured.read_frame();
+    assert_eq!(unsupported["id"], 85);
+    assert_eq!(unsupported["result"]["type"], "ToolResult");
+    assert_eq!(unsupported["result"]["data"]["supported"], false);
+    assert_eq!(
+        unsupported["result"]["data"]["outcome"]["code"],
+        "language_not_configured"
+    );
+    assert!(unsupported.get("error").is_none());
+
+    let successful_workspace = fake_lsp_workspace("normal");
+    let mut successful = RawLspChild::spawn_with_workspace(Some(successful_workspace.path()));
+    initialize_raw_lsp_child(&mut successful);
+    successful.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 86,
+        "method": "invokeTool",
+        "params": {"name": "implementations", "params": {"path": "src/lib.rs", "line": 0, "character": 3}},
+    }));
+    let read_file = successful.read_frame();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    successful.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"],
+        "result": "fn old_name() {}\n",
+    }));
+    let success = successful.read_frame();
+    assert_eq!(success["id"], 86);
+    assert_eq!(success["result"]["type"], "ToolResult");
+    assert_eq!(success["result"]["data"]["supported"], true);
+    assert_eq!(
+        success["result"]["data"]["locations"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert!(success.get("error").is_none());
+}
+
 impl Drop for RawLspChild {
     fn drop(&mut self) {
+        let _ = self.write_frame_for_drop(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": u64::MAX,
+            "method": "shutdown",
+            "params": {},
+        }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
 // ── AC1/U1: spawn and initialize ─────────────────────────────────────────────
+
+#[test]
+fn f008_initialize_uses_exact_errors_without_fallback_or_partial_initialization() {
+    let mut child = RawLspChild::spawn();
+
+    for (id, extension_config, reason) in [
+        (41, None, "missing_configuration"),
+        (42, Some(serde_json::Value::Null), "invalid_configuration"),
+        (
+            43,
+            Some(serde_json::json!({"servers": {"rust": {"command": 7}}})),
+            "invalid_configuration",
+        ),
+    ] {
+        let mut params = serde_json::json!({
+            "protocol_version": extension_protocol::PROTOCOL_VERSION,
+            "client_info": "lsp-e2e/0.1.0",
+        });
+        if let Some(extension_config) = extension_config {
+            params["extension_config"] = extension_config;
+        }
+        child.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": params,
+        }));
+
+        assert_eq!(
+            child.read_frame(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "invalid LSP initialization configuration",
+                    "data": {
+                        "kind": "invalid_lsp_initialize_config",
+                        "reason": reason,
+                    },
+                },
+            })
+        );
+    }
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 44,
+        "method": "initialize",
+        "params": {
+            "protocol_version": extension_protocol::PROTOCOL_VERSION,
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": {"servers": {}, "idle_timeout_secs": null},
+        },
+    }));
+    let initialized = child.read_frame();
+    assert_eq!(initialized["id"], 44);
+    assert_eq!(initialized["result"]["type"], "Initialized");
+}
+
+#[test]
+fn f008_initialize_decodes_host_config_before_pool_creation_and_ignores_disk_config() {
+    let workspace = fake_lsp_workspace("backend_error");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 51,
+        "method": "initialize",
+        "params": {
+            "protocol_version": extension_protocol::PROTOCOL_VERSION,
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": {"servers": {}, "idle_timeout_secs": null},
+        },
+    }));
+    assert_eq!(child.read_frame()["result"]["type"], "Initialized");
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 52,
+        "method": "invokeTool",
+        "params": {
+            "name": "diagnostics",
+            "params": {"path": "src/lib.rs"},
+        },
+    }));
+    let response = child.read_frame();
+    assert_eq!(response["id"], 52);
+    assert_eq!(response["result"]["data"]["supported"], false);
+}
+
+#[test]
+fn f008_initialize_process_fixture_accepts_explicit_empty_and_valid_payloads_without_disk_config() {
+    for (id, extension_config) in [
+        (61, empty_lsp_initialize_payload()),
+        (
+            62,
+            serde_json::json!({
+                "servers": {
+                    "rust": {
+                        "command": "definitely-missing-tower-lsp-server",
+                        "extensions": ["rs"],
+                        "args": [],
+                    },
+                },
+                "idle_timeout_secs": null,
+            }),
+        ),
+    ] {
+        let mut child = RawLspChild::spawn();
+        child.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocol_version": extension_protocol::PROTOCOL_VERSION,
+                "client_info": "lsp-e2e/0.1.0",
+                "extension_config": extension_config,
+            },
+        }));
+
+        let initialized = child.read_frame();
+        assert_eq!(initialized["id"], id);
+        assert_eq!(initialized["result"]["type"], "Initialized");
+    }
+}
+
+/// Once initialization completes, the sidecar must already be back in its main
+/// read loop so the host's next request cannot be lost.
+#[test]
+fn f008_initialize_is_ready_for_the_next_request() {
+    let mut child = RawLspChild::spawn();
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 71,
+        "method": "initialize",
+        "params": {
+            "protocol_version": extension_protocol::PROTOCOL_VERSION,
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": {
+                "servers": {
+                    "rust": {
+                        "command": "definitely-missing-tower-lsp-server",
+                        "extensions": ["rs"],
+                        "args": [],
+                    },
+                },
+                "idle_timeout_secs": null,
+            },
+        },
+    }));
+
+    let initialized = child.read_frame();
+    assert_eq!(initialized["id"], 71);
+    assert_eq!(initialized["result"]["type"], "Initialized");
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 72,
+        "method": "invokeTool",
+        "params": {
+            "name": "diagnostics",
+            "params": {"path": "src/lib.rs"},
+        },
+    }));
+
+    let read_file = child.read_frame();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"],
+        "result": "",
+    }));
+
+    let response = child.read_frame();
+    assert_eq!(response["id"], 72);
+    assert!(
+        response.get("result").is_some() || response.get("error").is_some(),
+        "next request after initialize must receive a response; got: {response}"
+    );
+}
 
 /// Runtime `InitResult` advertises bare tool names `implementations` and
 /// `rename`; MCP tool discovery exposes them publicly as
@@ -367,8 +1364,13 @@ fn f007_t015_lsp_process_spawns_and_declares_implementations_and_rename_tools() 
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let m = adapter.manifest();
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
@@ -442,8 +1444,13 @@ fn lsp_process_subscribes_to_file_events() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let m = adapter.manifest();
     assert!(
@@ -468,8 +1475,13 @@ fn f007_t015_lsp_process_declares_request_apply_edits_capability() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let m = adapter.manifest();
     assert!(
@@ -499,13 +1511,15 @@ extensions = ["rs"]
     .expect("write lsp config");
 
     let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    let extension_config = child.initialize_config.clone();
     child.write_frame(serde_json::json!({
         "jsonrpc": "2.0",
         "id": 0,
         "method": "initialize",
         "params": {
             "protocol_version": extension_protocol::PROTOCOL_VERSION,
-            "client_info": "lsp-e2e/0.1.0"
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": extension_config,
         }
     }));
     let initialized = child.read_frame();
@@ -652,8 +1666,13 @@ fn lsp_process_diagnostics_unsupported_when_no_lsp_configured() {
         push_tx: None,
     };
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let result = adapter
         .call_tool("diagnostics", serde_json::json!({ "path": "src/lib.rs" }))
@@ -678,8 +1697,13 @@ fn f007_t015_tower_lsp_implementations_parses_lsp_implementation_request_fields(
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let result = adapter
         .call_tool(
@@ -710,8 +1734,13 @@ fn f007_t015_tower_lsp_implementations_returns_unsupported_result_for_unsupporte
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let result = adapter
         .call_tool(
@@ -770,13 +1799,9 @@ fn f007_t015_tower_lsp_implementations_surfaces_backend_failures_as_sidecar_tool
     let message = response["error"]["message"]
         .as_str()
         .expect("sidecar error must include a message");
-    assert!(
-        message.contains("textDocument/implementation error"),
-        "error message must name the failed LSP request; got {message:?}"
-    );
-    assert!(
-        message.contains("implementation backend exploded"),
-        "error message must preserve backend details; got {message:?}"
+    assert_eq!(
+        message, "language server request failed",
+        "typed backend errors must not expose provider details"
     );
 }
 
@@ -827,7 +1852,7 @@ fn f007_t015_tower_lsp_implementations_returns_supported_locations_in_existing_l
 
 /// `tower_lsp_rename(path, line, character, new_name, dry_run?)` parses
 /// `RenameRequest`, calls prepareRename when available, and returns
-/// `RenameError { code: RenameErrorCode::NotRenameable, ... }` serialized as
+/// `RenameError` with `RenameErrorCode::NotRenameable` serialized as
 /// `not_renameable` without HostCall when prepareRename rejects the position.
 #[test]
 fn f007_t015_tower_lsp_rename_returns_not_renameable_without_apply_edits_hostcall_when_prepare_rename_rejects()
@@ -872,7 +1897,7 @@ fn f007_t015_tower_lsp_rename_returns_not_renameable_without_apply_edits_hostcal
 }
 
 /// `tower_lsp_rename` rejects unsupported WorkspaceEdit operations with
-/// `RenameError { code: RenameErrorCode::UnsupportedWorkspaceEdit, ... }`
+/// `RenameError` with `RenameErrorCode::UnsupportedWorkspaceEdit`
 /// serialized as `unsupported_workspace_edit` before calling
 /// `workspace/applyEdits`.
 #[test]
@@ -1030,17 +2055,42 @@ fn f007_t015_tower_lsp_rename_skips_prepare_when_server_does_not_advertise_prepa
 }
 
 #[test]
-fn f007_t015_tower_lsp_rename_falls_back_to_rename_when_prepare_method_is_missing() {
+fn f008_t020_tower_lsp_rename_reports_unsupported_when_prepare_method_is_missing() {
     let workspace = fake_lsp_workspace("prepare_method_not_found");
     let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
     initialize_raw_lsp_child(&mut child);
 
-    let response = invoke_supported_rename(&mut child, false);
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "invokeTool",
+        "params": {
+            "name": "rename",
+            "params": {
+                "path": "src/lib.rs",
+                "line": 0,
+                "character": 3,
+                "new_name": "new_name",
+                "dry_run": false
+            }
+        }
+    }));
+
+    let read = child.read_frame();
+    assert_eq!(read["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read["id"].clone(),
+        "result": "fn old_name() {}\n"
+    }));
+
+    let response = child.read_frame();
 
     assert_eq!(response["id"], serde_json::json!(1));
-    assert_eq!(
-        response["result"]["data"]["spans"][0]["replacement"],
-        serde_json::json!("new_name")
+    assert_eq!(response["result"]["data"]["code"], "unsupported_language");
+    assert!(
+        response.get("method").is_none(),
+        "capability-unavailable rename must not request workspace edits: {response}"
     );
 }
 
@@ -1198,8 +2248,13 @@ fn lsp_process_file_changed_event_completes() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let event = Event::FileChanged {
         file_id: 1,
@@ -1219,8 +2274,13 @@ fn lsp_process_file_deleted_event_completes() {
     let manifest = lsp_manifest(&bin);
     let deps = make_deps();
 
-    let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-        .expect("lsp_extension must spawn");
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        TEST_TIMEOUT,
+        Some(empty_lsp_initialize_payload()),
+    )
+    .expect("lsp_extension must spawn");
 
     let event = Event::FileDeleted {
         path: "src/lib.rs".to_owned(),
@@ -1282,7 +2342,8 @@ fn lsp_process_push_response_frame_during_idle_is_discarded() {
             "method": "initialize",
             "params": {
                 "protocol_version": PROTOCOL_VERSION,
-                "client_info": "test-host/0.1.0"
+                "client_info": "test-host/0.1.0",
+                "extension_config": empty_lsp_initialize_payload(),
             }
         }),
     );
@@ -1415,8 +2476,13 @@ fn lsp_process_concurrent_spawn_stress_20_parallel() {
                 let manifest = lsp_manifest(&bin);
                 let deps = make_deps();
 
-                let mut adapter = SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None)
-                    .unwrap_or_else(|e| panic!("spawn #{i} failed: {e:?}"));
+                let mut adapter = SidecarHostAdapter::spawn(
+                    manifest,
+                    deps,
+                    TEST_TIMEOUT,
+                    Some(empty_lsp_initialize_payload()),
+                )
+                .unwrap_or_else(|e| panic!("spawn #{i} failed: {e:?}"));
 
                 // Call a tool that completes without a real LSP.
                 let result = adapter
@@ -1561,7 +2627,8 @@ fn lsp_process_concurrent_spawn_stress_20_with_push_response_injection() {
                         "method": "initialize",
                         "params": {
                             "protocol_version": PROTOCOL_VERSION,
-                            "client_info": "stress-test/0.1.0"
+                            "client_info": "stress-test/0.1.0",
+                            "extension_config": empty_lsp_initialize_payload(),
                         }
                     }),
                 );

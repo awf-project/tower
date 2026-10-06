@@ -5,7 +5,7 @@
 //! ```text
 //! trait ExtensionInstance {
 //!     manifest()                                     -> &ExtensionManifest
-//!     call_tool(name, params) -> Result<Value, ExtensionFault>
+//!     call_tool(name, params) -> Result<Value, ExtensionCallError>
 //!     deliver_event(Event)    -> Result<(), ExtensionFault>
 //!     shutdown()
 //! }
@@ -136,6 +136,44 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtensionApplicationError {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl std::fmt::Display for ExtensionApplicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExtensionApplicationError {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExtensionCallError {
+    Application(ExtensionApplicationError),
+    Fault(ExtensionFault),
+}
+
+impl std::fmt::Display for ExtensionCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Application(error) => error.fmt(f),
+            Self::Fault(fault) => fault.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ExtensionCallError {}
+
+impl From<ExtensionFault> for ExtensionCallError {
+    fn from(fault: ExtensionFault) -> Self {
+        Self::Fault(fault)
+    }
+}
+
 // ── InvokeError ───────────────────────────────────────────────────────────────
 
 /// Errors returned by [`ExtensionRegistry::invoke`].
@@ -143,6 +181,7 @@ impl std::error::Error for RegistrationError {}
 pub enum InvokeError {
     /// No registered extension owns the named tool.
     ToolNotFound(String),
+    Application(ExtensionApplicationError),
     /// The owning extension returned a fault.
     Fault(ExtensionFault),
 }
@@ -151,6 +190,7 @@ impl std::fmt::Display for InvokeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ToolNotFound(name) => write!(f, "no extension owns tool: {name}"),
+            Self::Application(error) => error.fmt(f),
             Self::Fault(fault) => write!(f, "extension fault: {fault}"),
         }
     }
@@ -187,8 +227,9 @@ pub trait ExtensionInstance: Send {
     ///
     /// # Errors
     ///
-    /// Returns an [`ExtensionFault`] on any runtime or protocol error.
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionFault>;
+    /// Returns an [`ExtensionCallError`] when the extension reports an
+    /// application error or encounters a runtime/protocol fault.
+    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError>;
 
     /// Deliver a workspace event to this extension instance.
     ///
@@ -217,16 +258,15 @@ struct ExtensionHandle {
     instance: Arc<Mutex<Box<dyn ExtensionInstance>>>,
     /// Consecutive-fault counter for quarantine policy (S1).
     ///
-    /// Kept outside the instance mutex so reads of `fault_count` (e.g., in
-    /// `declared_tools`) don't block on an in-flight sidecar RPC.
+    /// Kept outside the instance mutex so quarantine-only reads don't block on
+    /// an in-flight sidecar RPC. Any path that invokes the instance acquires
+    /// the instance lock first, then checks and updates this counter before
+    /// releasing that lock. This makes each invocation and its quarantine
+    /// transition one serialized state change.
     ///
     /// Decision: `Mutex<u32>` separate from `Mutex<Box<dyn ExtensionInstance>>`.
     /// Why: the instance lock can be held for the full duration of an RPC call
-    ///      (ms–s). Placing the counter inside would block `declared_tools`
-    ///      queries while a slow extension is being called. The counter is
-    ///      updated after releasing the instance lock (load-then-store), which is
-    ///      safe because `fan_out` and `invoke` are the only writers and they
-    ///      hold the handle ref from an immutable `Vec`.
+    ///      (ms–s), while quarantine-only reads should remain cheap.
     consecutive_faults: Arc<Mutex<u32>>,
 }
 
@@ -418,6 +458,7 @@ impl ExtensionRegistry {
     /// # Errors
     ///
     /// - [`InvokeError::ToolNotFound`] — no extension owns `tool_name`.
+    /// - [`InvokeError::Application`] — the extension rejected the tool call.
     /// - [`InvokeError::Fault`] — the owning extension returned a fault (or is
     ///   quarantined).
     pub fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError> {
@@ -463,22 +504,20 @@ impl ExtensionRegistry {
         tool_name: &str,
         params: Value,
     ) -> Result<Value, InvokeError> {
+        let mut instance = handle.instance.lock().unwrap_or_else(|p| p.into_inner());
         if handle.is_quarantined() {
             return Err(InvokeError::Fault(ExtensionFault::Quarantined));
         }
 
-        let result = handle
-            .instance
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .call_tool(tool_name, params);
+        let result = instance.call_tool(tool_name, params);
 
         match result {
             Ok(value) => {
                 handle.record_success();
                 Ok(value)
             }
-            Err(fault) => {
+            Err(ExtensionCallError::Application(error)) => Err(InvokeError::Application(error)),
+            Err(ExtensionCallError::Fault(fault)) => {
                 handle.record_fault();
                 Err(InvokeError::Fault(fault))
             }
@@ -513,9 +552,9 @@ impl ExtensionRegistry {
             }
 
             let event = make_event();
-            let result = match handle.instance.try_lock() {
-                Ok(mut instance) => instance.deliver_event(event),
-                Err(TryLockError::Poisoned(poison)) => poison.into_inner().deliver_event(event),
+            let mut instance = match handle.instance.try_lock() {
+                Ok(instance) => instance,
+                Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
                 Err(TryLockError::WouldBlock) => {
                     self.deferred_events
                         .lock()
@@ -527,6 +566,10 @@ impl ExtensionRegistry {
                     continue;
                 }
             };
+            if handle.is_quarantined() {
+                continue;
+            }
+            let result = instance.deliver_event(event);
 
             match result {
                 Ok(()) => {
@@ -568,16 +611,18 @@ impl ExtensionRegistry {
                 if handle.is_quarantined() {
                     continue;
                 }
-                let result = match handle.instance.try_lock() {
-                    Ok(mut instance) => instance.deliver_event(deferred.event),
-                    Err(TryLockError::Poisoned(poison)) => {
-                        poison.into_inner().deliver_event(deferred.event)
-                    }
+                let mut instance = match handle.instance.try_lock() {
+                    Ok(instance) => instance,
+                    Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
                     Err(TryLockError::WouldBlock) => {
                         still_busy.push(deferred);
                         continue;
                     }
                 };
+                if handle.is_quarantined() {
+                    continue;
+                }
+                let result = instance.deliver_event(deferred.event);
                 match result {
                     Ok(()) => handle.record_success(),
                     Err(fault) => {
@@ -678,8 +723,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ExtensionId, ExtensionInstance, ExtensionRegistry, InvokeError, MAX_CONSECUTIVE_FAILURES,
-        RegistrationError,
+        ExtensionApplicationError, ExtensionCallError, ExtensionId, ExtensionInstance,
+        ExtensionRegistry, InvokeError, MAX_CONSECUTIVE_FAILURES, RegistrationError,
     };
     use crate::domain::{FileId, RelativePath};
     use crate::ports::ExtensionHostPort;
@@ -717,6 +762,72 @@ mod tests {
         RelativePath::new(s)
     }
 
+    #[test]
+    fn f008_error_types_are_neutral_and_convert_faults() {
+        fn assert_error_traits<T: std::error::Error + Clone + PartialEq + std::fmt::Debug>() {}
+
+        assert_error_traits::<ExtensionApplicationError>();
+        assert_error_traits::<ExtensionCallError>();
+
+        let fault = ExtensionFault::Timeout;
+        let converted = ExtensionCallError::from(fault.clone());
+
+        assert_eq!(converted, ExtensionCallError::Fault(fault));
+        assert_eq!(converted.to_string(), ExtensionFault::Timeout.to_string());
+    }
+
+    #[test]
+    fn f008_error_types_retain_code_message_and_some_or_none_data_across_distinct_branches() {
+        let with_data = ExtensionApplicationError {
+            code: -32_001,
+            message: "rename rejected".to_owned(),
+            data: Some(serde_json::json!({"reason": "not renameable"})),
+        };
+        let without_data = ExtensionApplicationError {
+            code: 42,
+            message: "application failure".to_owned(),
+            data: None,
+        };
+
+        assert_eq!(with_data.code, -32_001);
+        assert_eq!(with_data.message, "rename rejected");
+        assert_eq!(
+            with_data.data,
+            Some(serde_json::json!({"reason": "not renameable"}))
+        );
+        assert_eq!(without_data.code, 42);
+        assert_eq!(without_data.message, "application failure");
+        assert_eq!(without_data.data, None);
+        assert_eq!(
+            ExtensionCallError::Application(with_data.clone()),
+            ExtensionCallError::Application(with_data)
+        );
+        assert_ne!(
+            ExtensionCallError::Application(without_data),
+            ExtensionCallError::Fault(ExtensionFault::Timeout)
+        );
+    }
+
+    #[test]
+    fn f008_error_types_expose_migrated_trait_and_retain_existing_invoke_variants() {
+        fn call_migrated_trait(
+            extension: &mut dyn ExtensionInstance,
+        ) -> Result<Value, ExtensionCallError> {
+            extension.call_tool("echo", Value::Bool(true))
+        }
+
+        let mut extension = RecordingExtension::new("existing", vec![], vec![]);
+        assert_eq!(call_migrated_trait(&mut extension), Ok(Value::Bool(true)));
+        assert_eq!(
+            InvokeError::Fault(ExtensionFault::Timeout),
+            InvokeError::Fault(ExtensionFault::Timeout)
+        );
+        assert_eq!(
+            InvokeError::ToolNotFound("missing".to_owned()),
+            InvokeError::ToolNotFound("missing".to_owned())
+        );
+    }
+
     // ── RecordingExtension: records every deliver_event call ──────────────
 
     /// A fake `ExtensionInstance` that records every `deliver_event` call and
@@ -740,7 +851,7 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, params: Value) -> Result<Value, ExtensionFault> {
+        fn call_tool(&mut self, _name: &str, params: Value) -> Result<Value, ExtensionCallError> {
             // Echo params back as the result.
             Ok(params)
         }
@@ -772,8 +883,8 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionFault> {
-            Err(ExtensionFault::Crashed { code: Some(1) })
+        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+            Err(ExtensionFault::Crashed { code: Some(1) }.into())
         }
 
         fn deliver_event(&mut self, _event: Event) -> Result<(), ExtensionFault> {
@@ -802,13 +913,14 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, name: &str, _params: Value) -> Result<Value, ExtensionFault> {
+        fn call_tool(&mut self, name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
             if self.manifest.tools.iter().any(|t| t.name == name) {
                 Ok(Value::String(self.manifest.name.clone()))
             } else {
                 Err(ExtensionFault::ProtocolError {
                     message: format!("tool not found: {name}"),
-                })
+                }
+                .into())
             }
         }
 
@@ -842,13 +954,55 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionFault> {
+        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
             if self.remaining_faults > 0 {
                 self.remaining_faults -= 1;
-                Err(ExtensionFault::Timeout)
+                Err(ExtensionFault::Timeout.into())
             } else {
                 Ok(Value::Bool(true))
             }
+        }
+
+        fn deliver_event(&mut self, _event: Event) -> Result<(), ExtensionFault> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    /// An in-memory extension with a fixed sequence of tool outcomes.
+    ///
+    /// This lets registry tests drive application errors, genuine faults, and
+    /// success through the public `invoke` APIs without inspecting counters.
+    struct SequencedExtension {
+        manifest: ExtensionManifest,
+        outcomes: Vec<Result<Value, ExtensionCallError>>,
+    }
+
+    impl SequencedExtension {
+        fn new(
+            name: &str,
+            tools: Vec<ToolDecl>,
+            outcomes: Vec<Result<Value, ExtensionCallError>>,
+        ) -> Self {
+            Self {
+                manifest: make_manifest(name, tools, vec![]),
+                outcomes,
+            }
+        }
+    }
+
+    impl ExtensionInstance for SequencedExtension {
+        fn manifest(&self) -> &ExtensionManifest {
+            &self.manifest
+        }
+
+        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+            assert!(
+                !self.outcomes.is_empty(),
+                "test invoked the extension more times than configured"
+            );
+            self.outcomes.remove(0)
         }
 
         fn deliver_event(&mut self, _event: Event) -> Result<(), ExtensionFault> {
@@ -1040,6 +1194,30 @@ mod tests {
         assert_eq!(result, Value::String("lint".to_owned()));
     }
 
+    #[test]
+    fn f008_application_error_propagates_unchanged_through_invoke_extension() {
+        let application = ExtensionApplicationError {
+            code: -32_042,
+            message: "rename rejected".to_owned(),
+            data: Some(serde_json::json!({"outcome": "not_renameable"})),
+        };
+        let extension = SequencedExtension::new(
+            "lsp",
+            vec![make_tool("rename")],
+            vec![Err(ExtensionCallError::Application(application.clone()))],
+        );
+        let mut registry = ExtensionRegistry::new();
+        registry
+            .register(Box::new(extension))
+            .expect("register lsp");
+
+        let error = registry
+            .invoke_extension(&ExtensionId::new("lsp"), "rename", Value::Null)
+            .expect_err("application errors must be returned to the caller");
+
+        assert_eq!(error, InvokeError::Application(application));
+    }
+
     /// Invoking a non-existent tool returns ToolNotFound.
     #[test]
     fn invoke_unknown_tool_returns_tool_not_found() {
@@ -1119,10 +1297,7 @@ mod tests {
             let err = registry
                 .invoke("run", Value::Null)
                 .expect_err(&format!("call {i} must fault"));
-            assert!(
-                !matches!(err, InvokeError::Fault(ExtensionFault::Quarantined)),
-                "call {i} must not be Quarantined yet: {err:?}"
-            );
+            assert_eq!(err, InvokeError::Fault(ExtensionFault::Timeout));
         }
 
         // The (MAX_CONSECUTIVE_FAILURES + 1)-th call must return Quarantined.
@@ -1135,48 +1310,199 @@ mod tests {
         );
     }
 
+    /// A call queued behind the fault that reaches the quarantine threshold
+    /// must observe that transition before it can enter the extension.
+    #[test]
+    fn concurrent_invoke_serializes_quarantine_transition_with_extension_call() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+        use std::thread;
+
+        struct BlockingThresholdExtension {
+            manifest: ExtensionManifest,
+            calls: Arc<AtomicU32>,
+            threshold_entered: mpsc::Sender<()>,
+            release_threshold: mpsc::Receiver<()>,
+        }
+
+        impl ExtensionInstance for BlockingThresholdExtension {
+            fn manifest(&self) -> &ExtensionManifest {
+                &self.manifest
+            }
+
+            fn call_tool(
+                &mut self,
+                _name: &str,
+                _params: Value,
+            ) -> Result<Value, ExtensionCallError> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == MAX_CONSECUTIVE_FAILURES {
+                    self.threshold_entered
+                        .send(())
+                        .expect("test must observe threshold call");
+                    self.release_threshold
+                        .recv()
+                        .expect("test must release threshold call");
+                }
+                Err(ExtensionFault::Timeout.into())
+            }
+
+            fn deliver_event(&mut self, _event: Event) -> Result<(), ExtensionFault> {
+                Ok(())
+            }
+
+            fn shutdown(&mut self) {}
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let (threshold_entered_tx, threshold_entered_rx) = mpsc::channel();
+        let (release_threshold_tx, release_threshold_rx) = mpsc::channel();
+        let extension = BlockingThresholdExtension {
+            manifest: make_manifest("blocking", vec![make_tool("run")], vec![]),
+            calls: Arc::clone(&calls),
+            threshold_entered: threshold_entered_tx,
+            release_threshold: release_threshold_rx,
+        };
+        let mut registry = ExtensionRegistry::new();
+        registry
+            .register(Box::new(extension))
+            .expect("register blocking extension");
+
+        for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
+            assert_eq!(
+                registry.invoke("run", Value::Null),
+                Err(InvokeError::Fault(ExtensionFault::Timeout))
+            );
+        }
+
+        let registry = Arc::new(registry);
+        let threshold_registry = Arc::clone(&registry);
+        let threshold_call = thread::spawn(move || threshold_registry.invoke("run", Value::Null));
+        threshold_entered_rx
+            .recv()
+            .expect("threshold call must enter extension");
+
+        let queued_registry = Arc::clone(&registry);
+        let queued_call = thread::spawn(move || queued_registry.invoke("run", Value::Null));
+        release_threshold_tx
+            .send(())
+            .expect("release threshold call");
+
+        assert_eq!(
+            threshold_call.join().expect("threshold thread must join"),
+            Err(InvokeError::Fault(ExtensionFault::Timeout))
+        );
+        assert_eq!(
+            queued_call.join().expect("queued thread must join"),
+            Err(InvokeError::Fault(ExtensionFault::Quarantined))
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_CONSECUTIVE_FAILURES,
+            "queued call must not enter a quarantined extension"
+        );
+    }
+
     /// AC5 part 2: A successful call before the limit resets the counter.
     ///
     /// Scenario: 2 faults, 1 success, 2 faults — the extension is NOT quarantined
     /// because the success reset the counter mid-sequence.
     #[test]
     fn successful_call_resets_consecutive_fault_counter() {
-        // Fault on calls 0 and 1, succeed on call 2, fault on calls 3 and 4.
-        // Pattern: F, F, OK, F, F → not quarantined after call 4
-        //          (counter is 2 after call 1, resets to 0 after call 2,
-        //           becomes 1 after call 3, becomes 2 after call 4)
-        let ext = CountingFaultExtension::new(
+        // F, F, OK, F, F, F must not quarantine until the final fault because
+        // the successful call resets the pre-existing count.
+        let ext = SequencedExtension::new(
             "flaky",
             vec![make_tool("run")],
-            2, // first 2 calls fault; 3rd succeeds; CountingFaultExtension then succeeds forever
+            vec![
+                Err(ExtensionFault::Timeout.into()),
+                Err(ExtensionFault::Timeout.into()),
+                Ok(Value::Bool(true)),
+                Err(ExtensionFault::Timeout.into()),
+                Err(ExtensionFault::Timeout.into()),
+                Err(ExtensionFault::Timeout.into()),
+            ],
         );
 
         let mut registry = ExtensionRegistry::new();
         registry.register(Box::new(ext)).expect("register");
 
-        // Calls 0 and 1: fault (counter → 1, → 2)
+        // Calls 0 and 1: genuine faults (counter → 1, → 2).
         for i in 0..2u32 {
             let err = registry
                 .invoke("run", Value::Null)
                 .expect_err(&format!("call {i} must fault"));
-            assert!(
-                !matches!(err, InvokeError::Fault(ExtensionFault::Quarantined)),
-                "call {i} must not be Quarantined: {err:?}"
-            );
+            assert_eq!(err, InvokeError::Fault(ExtensionFault::Timeout));
         }
 
         // Call 2: success — resets counter to 0.
-        registry
+        let success = registry
             .invoke("run", Value::Null)
-            .expect("call 2 must succeed after reset");
+            .expect("call 2 must succeed and reset the counter");
+        assert_eq!(success, Value::Bool(true));
 
-        // Calls 3 and 4: succeed (CountingFaultExtension is done faulting).
-        // Counter should remain at 0 — well under the quarantine threshold.
-        for i in 3..5u32 {
+        // Calls 3 through 5 are genuine faults, not a premature quarantine.
+        // The next call confirms the third post-success fault reached the limit.
+        for i in 3..6u32 {
+            let error = registry
+                .invoke("run", Value::Null)
+                .expect_err(&format!("call {i} must be a genuine fault"));
+            assert_eq!(error, InvokeError::Fault(ExtensionFault::Timeout));
+        }
+        assert_eq!(
             registry
                 .invoke("run", Value::Null)
-                .unwrap_or_else(|e| panic!("call {i} must succeed after reset: {e}"));
+                .expect_err("call after three post-success faults must quarantine"),
+            InvokeError::Fault(ExtensionFault::Quarantined)
+        );
+    }
+
+    #[test]
+    fn f008_application_error_preserves_an_existing_fault_count() {
+        let application = ExtensionApplicationError {
+            code: -32_043,
+            message: "server declined request".to_owned(),
+            data: None,
+        };
+        let ext = SequencedExtension::new(
+            "lsp",
+            vec![make_tool("references")],
+            vec![
+                Err(ExtensionFault::Timeout.into()),
+                Err(ExtensionCallError::Application(application.clone())),
+                Err(ExtensionFault::Timeout.into()),
+                Err(ExtensionFault::Timeout.into()),
+            ],
+        );
+        let mut registry = ExtensionRegistry::new();
+        registry.register(Box::new(ext)).expect("register lsp");
+
+        assert_eq!(
+            registry
+                .invoke("references", Value::Null)
+                .expect_err("first call must be a genuine fault"),
+            InvokeError::Fault(ExtensionFault::Timeout)
+        );
+        assert_eq!(
+            registry
+                .invoke("references", Value::Null)
+                .expect_err("application error must be propagated"),
+            InvokeError::Application(application)
+        );
+        for call in 3..=4 {
+            assert_eq!(
+                registry
+                    .invoke("references", Value::Null)
+                    .expect_err(&format!("call {call} must be a genuine fault")),
+                InvokeError::Fault(ExtensionFault::Timeout)
+            );
         }
+        assert_eq!(
+            registry
+                .invoke("references", Value::Null)
+                .expect_err("three genuine faults around an application error must quarantine"),
+            InvokeError::Fault(ExtensionFault::Quarantined)
+        );
     }
 
     /// AC5 part 3: Event delivery also increments the quarantine counter.
@@ -1316,7 +1642,7 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionFault> {
+        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
             Ok(Value::Null)
         }
 

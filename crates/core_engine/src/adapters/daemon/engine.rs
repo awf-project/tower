@@ -13,6 +13,7 @@ use crate::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
 use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_workspace_root};
+use crate::adapters::config::lsp::{lsp_initialize_payload, validate_lsp_commands};
 use crate::adapters::config::{TowerConfig, legacy_plugins_dir_fallback};
 use crate::adapters::extension::host_deps::ApplyEditsHostPort;
 use crate::adapters::extension::{
@@ -335,10 +336,7 @@ fn load_extension_registry(
         push_tx: Some(push_tx),
     };
 
-    let mut init_configs = ExtensionInitConfigMap::new();
-    if let Some(debug_config) = tower_config.debug.for_extension_initialize() {
-        init_configs.insert("debug".to_owned(), debug_config);
-    }
+    let init_configs = extension_init_configs(tower_config);
 
     load_extensions_into_shared_registry(
         ext_registry,
@@ -371,6 +369,15 @@ fn load_extension_registry(
         );
     }
     Ok(push_rx)
+}
+
+fn extension_init_configs(tower_config: &TowerConfig) -> ExtensionInitConfigMap {
+    let mut init_configs = ExtensionInitConfigMap::new();
+    init_configs.insert("lsp".to_owned(), lsp_initialize_payload(&tower_config.lsp));
+    if let Some(debug_config) = tower_config.debug.for_extension_initialize() {
+        init_configs.insert("debug".to_owned(), debug_config);
+    }
+    init_configs
 }
 
 fn register_bundled_debug_extension(
@@ -538,6 +545,14 @@ fn replay_initial_index_to_extensions(
 /// calling this function.
 pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<EngineHandle, String> {
     let workspace_root = resolve_workspace_root(opts);
+    for outcome in validate_lsp_commands(
+        &tower_config.lsp,
+        &workspace_root,
+        std::env::var_os("PATH").as_deref(),
+    ) {
+        let diagnostic = serde_json::json!({ "outcome": outcome });
+        eprintln!("tower: LSP startup diagnostic {diagnostic}");
+    }
     let (mut storage, workspace, index) = open_storage(&workspace_root)?;
     let (workspace, index) = load_workspace_index(&workspace_root, &mut storage, workspace, index);
     let storage_for_watcher = storage.try_clone();
@@ -578,4 +593,46 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         diag_reader,
         _watcher,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::adapters::config::{LspConfig, LspServerConfig};
+
+    #[test]
+    fn f008_daemon_hands_lsp_configuration_to_extension_discovery() {
+        let tower_config = TowerConfig {
+            lsp: LspConfig {
+                servers: BTreeMap::from([(
+                    "rust".to_owned(),
+                    LspServerConfig {
+                        command: "rust-analyzer".to_owned(),
+                        extensions: vec!["rs".to_owned()],
+                        args: vec!["--log-file".to_owned(), "log with spaces".to_owned()],
+                    },
+                )]),
+                idle_timeout: Some(std::time::Duration::from_secs(45)),
+            },
+            ..TowerConfig::default()
+        };
+
+        let init_configs = extension_init_configs(&tower_config);
+
+        assert_eq!(
+            init_configs.get("lsp"),
+            Some(&serde_json::json!({
+                "servers": {
+                    "rust": {
+                        "command": "rust-analyzer",
+                        "extensions": ["rs"],
+                        "args": ["--log-file", "log with spaces"],
+                    },
+                },
+                "idle_timeout_secs": 45,
+            }))
+        );
+    }
 }

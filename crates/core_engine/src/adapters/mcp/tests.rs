@@ -20,10 +20,11 @@ use rmcp::{RoleClient, ServerHandler, ServiceExt};
 use serde_json::json;
 
 use super::{
+    ToolError,
     diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader},
     extension_merged_registry::ExtensionMergedRegistry,
     lsp_tools::SubscriptionRegistry,
-    rmcp_server::TowerMcpHandler,
+    rmcp_server::{TowerMcpHandler, tool_error_to_rmcp},
 };
 use crate::adapters::mcp::native_tools::EngineState;
 use crate::adapters::{InMemoryFs, InMemoryStorage};
@@ -101,6 +102,134 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .build()
         .expect("tokio runtime")
         .block_on(f)
+}
+
+// ── F008 T017: structured MCP application errors ────────────────────────────────
+
+#[test]
+fn f008_application_introduces_exact_struct_variant_and_retains_execution_failed() {
+    let data = json!({"outcome": "not_renameable"});
+    let application = ToolError::Application {
+        code: -32_042,
+        message: "symbol cannot be renamed".to_owned(),
+        data: Some(data.clone()),
+    };
+
+    match application {
+        ToolError::Application {
+            code,
+            message,
+            data: actual_data,
+        } => {
+            assert_eq!(code, -32_042);
+            assert_eq!(message, "symbol cannot be renamed");
+            assert_eq!(actual_data, Some(data));
+        }
+        other => panic!("expected application error, got {other:?}"),
+    }
+
+    assert!(matches!(
+        ToolError::ExecutionFailed("adapter crashed".to_owned()),
+        ToolError::ExecutionFailed(message) if message == "adapter crashed"
+    ));
+}
+
+#[test]
+fn f008_application_rmcp_branch_preserves_some_and_none_structured_content() {
+    let data = json!({"outcome": "not_renameable", "reason": "generated symbol"});
+    let with_data = tool_error_to_rmcp(ToolError::Application {
+        code: -32_042,
+        message: "symbol cannot be renamed".to_owned(),
+        data: Some(data.clone()),
+    })
+    .expect("application errors must be tool results");
+
+    assert_eq!(with_data.is_error, Some(true));
+    assert_eq!(
+        extract_first_text(&with_data.content),
+        "symbol cannot be renamed"
+    );
+    assert_eq!(with_data.structured_content, Some(data));
+
+    let without_data = tool_error_to_rmcp(ToolError::Application {
+        code: -32_043,
+        message: "rename unavailable".to_owned(),
+        data: None,
+    })
+    .expect("application errors must be tool results");
+
+    assert_eq!(without_data.is_error, Some(true));
+    assert_eq!(
+        extract_first_text(&without_data.content),
+        "rename unavailable"
+    );
+    assert_eq!(without_data.structured_content, None);
+}
+
+#[test]
+fn f008_application_invalid_args_behavior_is_unchanged() {
+    block_on(async {
+        let h = make_handler_from_merged(make_native_registry(), vec![]);
+        let client = start_server(h).await;
+        let error = client
+            .peer()
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("tower_find_file")
+                    .with_arguments(serde_json::Map::new()),
+            )
+            .await
+            .expect_err("missing query must remain a protocol-level InvalidParams error");
+
+        assert!(
+            error.to_string().contains("-32602")
+                || error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("invalid params"),
+            "unexpected InvalidArgs mapping: {error}"
+        );
+        client.cancel().await.expect("cancel failed");
+    });
+}
+
+#[test]
+fn f008_application_execution_failed_behavior_is_unchanged() {
+    assert_eq!(
+        ToolError::ExecutionFailed("adapter crashed".to_owned()).to_string(),
+        "tool execution failed: adapter crashed"
+    );
+
+    let result = tool_error_to_rmcp(ToolError::ExecutionFailed("adapter crashed".to_owned()))
+        .expect("execution failures must remain tool results");
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        extract_first_text(&result.content),
+        "execution failed: adapter crashed"
+    );
+    assert_eq!(result.structured_content, None);
+}
+
+#[test]
+fn f008_application_successful_result_behavior_is_unchanged() {
+    block_on(async {
+        let h = make_handler_from_merged(make_native_registry(), vec![]);
+        let client = start_server(h).await;
+        let result = client
+            .peer()
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("tower_find_file")
+                    .with_arguments(serde_json::from_value(json!({"query": "x"})).unwrap()),
+            )
+            .await
+            .expect("successful tool call must retain its result envelope");
+
+        assert_eq!(result.is_error, Some(false));
+        assert!(result.structured_content.is_none());
+        let payload: serde_json::Value = serde_json::from_str(&extract_first_text(&result.content))
+            .expect("successful content must remain serialized JSON text");
+        assert_eq!(payload, json!({"paths": []}));
+        client.cancel().await.expect("cancel failed");
+    });
 }
 
 // ── AC1: get_info advertises tools + resources ────────────────────────────────

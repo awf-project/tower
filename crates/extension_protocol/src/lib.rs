@@ -52,7 +52,8 @@ pub use manifest::{Activation, Capability, EventKind, ExtensionManifest, ToolDec
 pub use messages::{
     AnchoredSymbolEditError, AnchoredSymbolEditErrorCode, AnchoredSymbolEditRequest,
     AnchoredSymbolEditResult, ApplyEditsHostCallTextEdit, Event, HostCall, InitParams, InitResult,
-    Location, LspImplementationRequest, LspImplementationResult, PerFileEditResult, RenameError,
+    Location, LspImplementationRequest, LspImplementationResult, LspOperation, LspOutcome,
+    LspOutcomeCode, LspOutcomePhase, LspOutcomeStatus, PerFileEditResult, RenameError,
     RenameErrorCode, RenamePreview, RenameRequest, RenameResult, Request, Response,
     SymbolCandidate, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
     WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,

@@ -175,30 +175,7 @@ impl ServerHandler for TowerMcpHandler {
                     value.to_string(),
                 )]))
             }
-            Err(ToolError::NotFound(msg)) => {
-                // Application-level "tool not found". Encode as is_error:true
-                // per MCP spec (tool-level error, not a protocol error).
-                Ok(CallToolResult::error(vec![Content::text(format!(
-                    "tool not found: {msg}"
-                ))]))
-            }
-            Err(ToolError::InvalidArgs(msg)) => {
-                // Bad request structure — map to protocol-level invalid params.
-                Err(McpError::invalid_params(msg, None))
-            }
-            Err(ToolError::ExecutionFailed(msg)) => Ok(CallToolResult::error(vec![Content::text(
-                format!("execution failed: {msg}"),
-            )])),
-            Err(ToolError::ResourceNotFound(msg)) => {
-                Ok(CallToolResult::error(vec![Content::text(format!(
-                    "resource not found: {msg}"
-                ))]))
-            }
-            Err(ToolError::PreconditionFailed(msg)) => {
-                Ok(CallToolResult::error(vec![Content::text(format!(
-                    "precondition failed: {msg}"
-                ))]))
-            }
+            Err(error) => tool_error_to_rmcp(error),
         }
     }
 
@@ -278,6 +255,44 @@ impl ServerHandler for TowerMcpHandler {
             .unwrap_or_else(|p| p.into_inner())
             .unsubscribe(&req.uri);
         Ok(())
+    }
+}
+
+/// Convert an internal tool failure to its MCP protocol or tool-result shape.
+///
+/// Kept crate-internal so the conversion can be tested without manufacturing
+/// an extension registry failure that is not wired until the T034 migration.
+pub(super) fn tool_error_to_rmcp(error: ToolError) -> Result<CallToolResult, McpError> {
+    match error {
+        ToolError::NotFound(msg) => {
+            // Application-level "tool not found". Encode as is_error:true
+            // per MCP spec (tool-level error, not a protocol error).
+            Ok(CallToolResult::error(vec![Content::text(format!(
+                "tool not found: {msg}"
+            ))]))
+        }
+        ToolError::InvalidArgs(msg) => {
+            // Bad request structure — map to protocol-level invalid params.
+            Err(McpError::invalid_params(msg, None))
+        }
+        ToolError::ExecutionFailed(msg) => Ok(CallToolResult::error(vec![Content::text(format!(
+            "execution failed: {msg}"
+        ))])),
+        ToolError::Application {
+            code: _,
+            message,
+            data,
+        } => {
+            let mut result = CallToolResult::error(vec![Content::text(message)]);
+            result.structured_content = data;
+            Ok(result)
+        }
+        ToolError::ResourceNotFound(msg) => Ok(CallToolResult::error(vec![Content::text(
+            format!("resource not found: {msg}"),
+        )])),
+        ToolError::PreconditionFailed(msg) => Ok(CallToolResult::error(vec![Content::text(
+            format!("precondition failed: {msg}"),
+        )])),
     }
 }
 

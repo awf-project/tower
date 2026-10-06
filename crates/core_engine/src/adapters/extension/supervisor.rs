@@ -36,6 +36,7 @@ use serde_json::Value;
 use super::host_deps::HostDeps;
 use super::sidecar::SidecarHostAdapter;
 use crate::domain::ExtensionInstance;
+use crate::domain::extension_host::ExtensionCallError;
 
 // ── Backoff constants ─────────────────────────────────────────────────────────
 
@@ -244,8 +245,8 @@ impl ExtensionInstance for ExtensionSupervisor {
         &self.manifest
     }
 
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionFault> {
-        self.ensure_instance()?;
+    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError> {
+        self.ensure_instance().map_err(ExtensionCallError::Fault)?;
 
         let result = self
             .instance
@@ -255,7 +256,8 @@ impl ExtensionInstance for ExtensionSupervisor {
 
         match &result {
             Ok(_) => self.record_success(),
-            Err(_) => self.record_fault(),
+            Err(ExtensionCallError::Application(_)) => {}
+            Err(ExtensionCallError::Fault(_)) => self.record_fault(),
         }
         result
     }

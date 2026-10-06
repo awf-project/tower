@@ -329,6 +329,7 @@ fn lsp_implementation_result_serializes_fields_exactly_as_supported_and_location
             end_line: 4,
             end_character: 20,
         }],
+        outcome: None,
     };
 
     assert_eq!(
@@ -410,6 +411,7 @@ fn rename_error_serializes_fields_exactly_as_code_message_and_optional_path() {
         code: RenameErrorCode::UnsupportedWorkspaceEdit,
         message: "server returned an unsupported workspace edit".to_owned(),
         path: Some("src/lib.rs".to_owned()),
+        outcome: None,
     };
 
     assert_eq!(

@@ -32,6 +32,7 @@ use serde_json::Value;
 use super::host_deps::HostDeps;
 use super::path_validation::validate_capability_path;
 use crate::adapters::mcp::PushEvent;
+use crate::domain::extension_host::{ExtensionApplicationError, ExtensionCallError};
 use crate::domain::{DomainError, ExtensionInstance, RelativePath};
 use crate::ports::inbound::{
     PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
@@ -83,6 +84,16 @@ fn encode_response_err(id: Value, code: i32, message: String) -> String {
     s
 }
 
+fn application_error_from_protocol_error(
+    error: extension_protocol::ProtocolError,
+) -> ExtensionApplicationError {
+    ExtensionApplicationError {
+        code: error.code,
+        message: error.message,
+        data: error.data,
+    }
+}
+
 // ── Pending response slot ─────────────────────────────────────────────────────
 
 /// State of the one-shot pending-response slot (spec 24 — adds `ChildExited`).
@@ -92,11 +103,18 @@ enum SlotState {
     #[default]
     Waiting,
     /// The extension replied (success or protocol-level error).
-    Response(Result<Value, String>),
+    Response(PendingResponse),
     /// The child process exited before responding.
     ///
     /// Carries the exit code if the OS could retrieve it.
     ChildExited(Option<i32>),
+}
+
+#[derive(Debug)]
+enum PendingResponse {
+    Result(Value),
+    ApplicationError(JsonRpcError),
+    Malformed(String),
 }
 
 impl SlotState {
@@ -112,6 +130,7 @@ impl SlotState {
 /// thread transitions it to `Response` or `ChildExited` and notifies the condvar.
 #[derive(Debug, Default)]
 struct PendingSlot {
+    expected_id: Option<Value>,
     state: SlotState,
 }
 
@@ -355,6 +374,7 @@ impl SidecarHostAdapter {
         {
             let (lock, _) = &*pending;
             let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
+            slot.expected_id = Some(Value::Number(0.into()));
             slot.state = SlotState::Waiting;
         }
 
@@ -377,7 +397,24 @@ impl SidecarHostAdapter {
         // We do NOT have a `Child` handle here so we cannot kill on timeout during
         // initialize; instead we return `Timeout` and the caller must drop/kill.
         let raw = match Self::wait_response_timed(&pending, request_timeout, None) {
-            Ok(raw) => raw,
+            Ok(PendingResponse::Result(raw)) => raw,
+            Ok(PendingResponse::ApplicationError(error)) => {
+                return Err(InitializeError::after_reader(
+                    ExtensionFault::ProtocolError {
+                        message: format!(
+                            "initialize rejected: {} (code {})",
+                            error.message, error.code
+                        ),
+                    },
+                    reader,
+                ));
+            }
+            Ok(PendingResponse::Malformed(message)) => {
+                return Err(InitializeError::after_reader(
+                    ExtensionFault::ProtocolError { message },
+                    reader,
+                ));
+            }
             Err(fault) => return Err(InitializeError::after_reader(fault, reader)),
         };
 
@@ -430,7 +467,11 @@ impl SidecarHostAdapter {
     ///
     /// On timeout the child is killed and `ExtensionFault::Timeout` is returned
     /// (spec 24 UN1). On EOF/exit `ExtensionFault::Crashed` is returned (UN2).
-    fn send_request(&mut self, method: &str, params: Value) -> Result<Value, ExtensionFault> {
+    fn send_request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<PendingResponse, ExtensionFault> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -438,6 +479,7 @@ impl SidecarHostAdapter {
         {
             let (lock, _) = &*self.pending;
             let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
+            slot.expected_id = Some(Value::Number(id.into()));
             slot.state = SlotState::Waiting;
         }
 
@@ -479,7 +521,7 @@ impl SidecarHostAdapter {
         pending: &Arc<(Mutex<PendingSlot>, Condvar)>,
         timeout: Duration,
         child: Option<&mut Child>,
-    ) -> Result<Value, ExtensionFault> {
+    ) -> Result<PendingResponse, ExtensionFault> {
         let (lock, cvar) = &**pending;
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -488,6 +530,7 @@ impl SidecarHostAdapter {
             .unwrap_or_else(|p| p.into_inner());
 
         if timed_out.timed_out() {
+            guard.expected_id = None;
             // Kill the child to reclaim its resources (spec 24 UN1).
             if let Some(c) = child {
                 let _ = c.kill();
@@ -497,9 +540,9 @@ impl SidecarHostAdapter {
         }
 
         // Extract the state.
+        guard.expected_id = None;
         match std::mem::replace(&mut guard.state, SlotState::Waiting) {
-            SlotState::Response(Ok(v)) => Ok(v),
-            SlotState::Response(Err(msg)) => Err(ExtensionFault::ProtocolError { message: msg }),
+            SlotState::Response(response) => Ok(response),
             SlotState::ChildExited(code) => Err(ExtensionFault::Crashed { code }),
             SlotState::Waiting => {
                 // Should not happen: condvar woke but state is still Waiting.
@@ -516,25 +559,44 @@ impl ExtensionInstance for SidecarHostAdapter {
         &self.manifest
     }
 
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionFault> {
+    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError> {
         // Build the flat wire params with the tool name and original params.
         let flat_params = serde_json::json!({"name": name, "params": params});
 
-        let raw = self.send_request("invokeTool", flat_params)?;
+        let response = self
+            .send_request("invokeTool", flat_params)
+            .map_err(ExtensionCallError::Fault)?;
 
-        let response: Response =
-            serde_json::from_value(raw).map_err(|e| ExtensionFault::ProtocolError {
+        let raw = match response {
+            PendingResponse::Result(raw) => raw,
+            PendingResponse::ApplicationError(error) => {
+                return Err(ExtensionCallError::Application(ExtensionApplicationError {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                }));
+            }
+            PendingResponse::Malformed(message) => {
+                return Err(ExtensionCallError::Fault(ExtensionFault::ProtocolError {
+                    message,
+                }));
+            }
+        };
+
+        let response: Response = serde_json::from_value(raw).map_err(|e| {
+            ExtensionCallError::Fault(ExtensionFault::ProtocolError {
                 message: format!("parse ToolResult: {e}"),
-            })?;
+            })
+        })?;
 
         match response {
             Response::ToolResult(v) => Ok(v),
-            Response::Error(err) => Err(ExtensionFault::ProtocolError {
-                message: format!("tool error: {} (code {})", err.message, err.code),
-            }),
-            other => Err(ExtensionFault::ProtocolError {
+            Response::Error(error) => Err(ExtensionCallError::Application(
+                application_error_from_protocol_error(error),
+            )),
+            other => Err(ExtensionCallError::Fault(ExtensionFault::ProtocolError {
                 message: format!("expected ToolResult, got: {other:?}"),
-            }),
+            })),
         }
     }
 
@@ -543,7 +605,20 @@ impl ExtensionInstance for SidecarHostAdapter {
             message: format!("serialize Event: {e}"),
         })?;
 
-        let raw = self.send_request("deliverEvent", params)?;
+        let raw = match self.send_request("deliverEvent", params)? {
+            PendingResponse::Result(raw) => raw,
+            PendingResponse::ApplicationError(error) => {
+                return Err(ExtensionFault::ProtocolError {
+                    message: format!(
+                        "deliverEvent error: {} (code {})",
+                        error.message, error.code
+                    ),
+                });
+            }
+            PendingResponse::Malformed(message) => {
+                return Err(ExtensionFault::ProtocolError { message });
+            }
+        };
 
         let response: Response =
             serde_json::from_value(raw).map_err(|e| ExtensionFault::ProtocolError {
@@ -703,8 +778,8 @@ fn reader_loop(
                 eprintln!("[tower/sidecar] parse error: {e}: {line}");
                 let (lock, cvar) = &*pending;
                 let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
-                if slot.state.is_waiting() {
-                    slot.state = SlotState::Response(Err(format!(
+                if slot.expected_id.is_some() && slot.state.is_waiting() {
+                    slot.state = SlotState::Response(PendingResponse::Malformed(format!(
                         "undecodable frame from extension: {line}"
                     )));
                     cvar.notify_one();
@@ -719,20 +794,42 @@ fn reader_loop(
 
         if has_result || has_error {
             // This is a response to a host-initiated request.
-            let result = if has_result {
-                Ok(envelope["result"].clone())
-            } else {
-                let err_msg = envelope["error"]["message"]
-                    .as_str()
-                    .unwrap_or("unknown error")
-                    .to_owned();
-                Err(err_msg)
-            };
-
             let (lock, cvar) = &*pending;
             let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
-            slot.state = SlotState::Response(result);
-            cvar.notify_one();
+            if slot.expected_id.is_some() && slot.state.is_waiting() {
+                let response = match serde_json::from_value::<JsonRpcResponse>(envelope.clone()) {
+                    Ok(response) if response.jsonrpc != "2.0" => PendingResponse::Malformed(
+                        format!("invalid JSON-RPC version: {}", response.jsonrpc),
+                    ),
+                    Ok(response) if Some(&response.id) != slot.expected_id.as_ref() => {
+                        PendingResponse::Malformed(format!(
+                            "response id mismatch: expected {}, got {}",
+                            slot.expected_id.as_ref().expect("checked above"),
+                            response.id
+                        ))
+                    }
+                    Ok(_response) if has_result == has_error => PendingResponse::Malformed(
+                        "JSON-RPC response must contain exactly one of result or error".to_owned(),
+                    ),
+                    Ok(response) => {
+                        if has_result {
+                            PendingResponse::Result(envelope["result"].clone())
+                        } else if let Some(error) = response.error {
+                            PendingResponse::ApplicationError(error)
+                        } else {
+                            PendingResponse::Malformed(
+                                "JSON-RPC response must contain exactly one of result or error"
+                                    .to_owned(),
+                            )
+                        }
+                    }
+                    Err(error) => PendingResponse::Malformed(format!(
+                        "invalid JSON-RPC response envelope: {error}"
+                    )),
+                };
+                slot.state = SlotState::Response(response);
+                cvar.notify_one();
+            }
         } else if has_method {
             // This is a HostCall request from the extension.
             let method = envelope["method"].as_str().unwrap_or("").to_owned();
@@ -750,7 +847,7 @@ fn reader_loop(
     // spinning until the deadline (spec 24 UN2 fast path).
     let (lock, cvar) = &*pending;
     let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.state.is_waiting() {
+    if slot.expected_id.is_some() && slot.state.is_waiting() {
         slot.state = SlotState::ChildExited(None);
         cvar.notify_one();
     }
