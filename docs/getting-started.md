@@ -134,17 +134,21 @@ database there. This directory is created automatically; no manual setup is requ
     └── db/       ← sled database (persisted across restarts)
 ```
 
-### Initial scan
+### Startup reconciliation
 
-On the first run against a workspace, `tower` walks the directory tree, respects `.towerignore`
-when present, indexes every non-hidden text file, and reports progress to `stderr`:
+On every daemon startup, `tower` walks the eligible workspace inventory using the same
+`.towerignore`, hidden-file, symlink, and regular-file rules as `tower_reindex`. It reconciles
+that inventory with persisted state, adding missing files, removing confirmed stale or newly
+excluded paths, and preserving identities for surviving paths. It reports the reconciliation
+summary to `stderr`:
 
+```text
+tower: reconciled index — 2 added, 1 removed, 310 unchanged
 ```
-tower: initial scan complete — 312 files indexed
-```
 
-Subsequent starts reload the index from `sled` and skip the scan. The scan state is stored
-transactionally; a crash during the initial scan causes a fresh scan on the next start.
+The repair is transactional and idempotent. A failed reconciliation prevents the daemon from
+serving a partial index; the next startup retries it. Unchanged files are not re-read, rehashed,
+or rewritten merely because the daemon restarted.
 
 ---
 
@@ -158,10 +162,20 @@ Start the server pointed at a project directory:
 ```bash
 cd /path/to/your/project
 cargo run -p core_engine
-# stderr: tower: initial scan complete — N files indexed
+# stderr: tower: reconciled index — A added, R removed, U unchanged
 ```
 
 In a second terminal (or pipe input to the process), send JSON-RPC messages.
+
+### Configure the workspace
+
+`tower init` creates a canonical `.tower/config.toml` alongside `.towerignore`. The generated
+configuration uses native sidecar settings under `[extensions]` and host-owned formatter commands
+under `[formatter.tools.<id>]`; it does not create an index-completion marker or start external
+tools. Existing files are preserved byte-for-byte.
+
+See [Configuration](user-guide/configuration.md) for formatter fields, extension disabling, and
+the required manual migration for obsolete `[plugins]` configuration.
 
 ### Handshake
 

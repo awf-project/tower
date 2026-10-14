@@ -1,6 +1,6 @@
 # `.towerignore` — the index ignore source
 
-> Status: implemented and stable. The initial scan, forced reindex, and the live
+> Status: implemented and stable. Startup reconciliation, forced reindex, and the live
 > watcher all honour `.towerignore` consistently (verified clean). One unrelated
 > footgun remains in the `tower init` CLI dispatch (see
 > [Known issue](#known-issue-cli-dispatch)).
@@ -24,17 +24,17 @@ whatever happens to be in `.gitignore`.
   path all work identically.
 - **Cascading per-directory (scan & reindex).** A `.towerignore` may live in any
   subdirectory and applies to that subtree, exactly like nested `.gitignore` files —
-  during the initial scan and `tower_reindex`. The **live watcher** consults the root
+  during startup reconciliation and `tower_reindex`. The **live watcher** consults the root
   file only; see [Watcher limitation](#watcher-limitation--root-towerignore-only).
 - **Hidden files and `.git/` are always skipped**, independent of any
   `.towerignore` content. Symlinks are never followed.
 - **Honored outside a git repo.** Rules apply even when the workspace is not a git
   repository.
 - **The live watcher honours `.towerignore` and the hidden-file rule**, consistent
-  with the initial scan. A file created or modified *after* startup that matches an
+  with startup reconciliation. A file created or modified _after_ startup that matches an
   ignore pattern (or is hidden) is **never indexed** — a secret dropped in while the
   engine runs stays out of the index, exactly as it would on a cold scan. If an
-  existing indexed file *becomes* ignored (its path starts matching a pattern), the
+  existing indexed file _becomes_ ignored (its path starts matching a pattern), the
   watcher **drops it from the index** on the next event for that path.
 
 ### When `.towerignore` is absent
@@ -127,7 +127,7 @@ workspace/
 ## Watcher limitation — root `.towerignore` only
 
 The **live watcher** evaluates events against the **root** `<workspace>/.towerignore`
-only. Nested per-directory `.towerignore` files are **honoured by the initial scan
+only. Nested per-directory `.towerignore` files are **honoured by startup reconciliation
 and by `tower_reindex`** (the `ignore` crate's `WalkBuilder` cascades them), but the
 watcher's runtime filter does **not** consult them. A file matched solely by a nested
 `.towerignore` is therefore excluded on a scan/reindex but could be (re)indexed by a
@@ -138,7 +138,7 @@ globs are **un-anchored** — `*.key`, `*.pem`, and `secrets/` have no leading `
 the `ignore` crate matches them at **any depth** from the single root file. A secret
 named `crates/ast/secrets/foo` or `deep/nested/id_rsa.pem` is caught by the root rule
 alone; no nested file is required to protect it. The limitation only bites
-project-specific rules that exist *exclusively* in a nested `.towerignore` and have no
+project-specific rules that exist _exclusively_ in a nested `.towerignore` and have no
 equivalent at the root — and never the built-in secret protection.
 
 > Recommendation: keep secret patterns at the **root** `.towerignore`. Reserve nested
@@ -162,7 +162,7 @@ subcommand parsing) before `.towerignore` is declared stable.
 
 - Walker: `crates/core_engine/src/adapters/fs/scan.rs` — `workspace_walker()`
   configures the `ignore` crate's `WalkBuilder` (git off, custom ignore filename
-  on, cascading nested files). Shared by the initial scan and the forced
+  on, cascading nested files). Shared by startup reconciliation and the forced
   `tower_reindex` path so both apply identical rules.
 - Live watcher filter: the `NotifyWatcherAdapter` applies the same ignore + hidden
   rules at event time using the **root** `.towerignore` only (no nested-file

@@ -14,14 +14,15 @@
 //! we provide a closure that creates a tempdir and calls `open()`, discarding
 //! the workspace (contract tests only exercise the port, not the workspace).
 //!
-//! Each expansion creates a private `mod storage_contract { ... }` with
+//! Each expansion creates a private `storage_contract` module with
 //! concrete `#[test]` functions, so the tempdir is per-test-function.
 
 use tempfile::TempDir;
 
 use crate::adapters::storage::{SCHEMA_VERSION, SledStorageAdapter, StorageError};
+use crate::domain::token::Token;
 use crate::domain::{FileId, RelativePath};
-use crate::ports::StoragePort;
+use crate::ports::{PortError, ReconciliationDelta, StoragePort};
 use crate::test_support::make_virtual_file;
 
 // ── AC1: contract suite on a real tempdir ────────────────────────────────────
@@ -36,7 +37,222 @@ fn make_sled_adapter() -> SledStorageAdapter {
     adapter
 }
 
-crate::storage_contract_tests!(make_sled_adapter);
+impl crate::adapters::contract_tests::ReconciliationState for SledStorageAdapter {
+    fn file_id_for_path(&self, path: &RelativePath) -> Option<FileId> {
+        self.persisted_file_id_for_path_for_test(path)
+    }
+
+    fn search_ids(&self, query: &str) -> Vec<FileId> {
+        self.persisted_search_ids_for_test(query)
+    }
+
+    fn slot_generation(&self, index: u32) -> Option<u32> {
+        self.persisted_slot_generation_for_test(index)
+    }
+
+    fn slot_is_free(&self, index: u32) -> bool {
+        self.persisted_slot_is_free_for_test(index)
+    }
+
+    fn survivor_rewrites(&self) -> usize {
+        self.reconciliation_survivor_rewrites_for_test()
+    }
+}
+
+crate::storage_contract_tests!(make_sled_adapter, || {
+    let store = crate::adapters::contract_tests::reconciliation_delta_is_atomic(
+        make_sled_adapter,
+        |store| store.fail_next_reconciliation_before_commit_for_test(),
+    );
+
+    assert_eq!(store.reconciliation_survivor_rewrites_for_test(), 0);
+});
+
+#[test]
+fn reconciliation_delta_survives_reopen_and_rolls_back_on_failure() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let survivor = make_virtual_file(0, 0, "src/survivor.rs");
+    let removed = make_virtual_file(1, 0, "src/removed.rs");
+    let replacement = make_virtual_file(1, 1, "src/replacement.rs");
+    let retried = make_virtual_file(1, 2, "src/retried.rs");
+    let additional = make_virtual_file(2, 0, "src/additional.rs");
+
+    let (mut store, _, _) = SledStorageAdapter::open(&path).unwrap();
+    store
+        .put_batch(&[survivor.clone(), removed.clone()])
+        .unwrap();
+    store
+        .apply_reconciliation_delta(&ReconciliationDelta {
+            additions: vec![replacement.clone()],
+            removals: vec![removed.id],
+        })
+        .unwrap();
+
+    // Clones are how the watcher shares this adapter. Both handles must report
+    // the same instance-scoped instrumentation state, including after a failed
+    // reconciliation attempt.
+    let clone = store.try_clone();
+    assert_eq!(
+        store.reconciliation_survivor_rewrites_for_test(),
+        clone.reconciliation_survivor_rewrites_for_test()
+    );
+
+    let failed_delta = ReconciliationDelta {
+        additions: vec![additional.clone()],
+        removals: vec![replacement.id],
+    };
+    store.fail_next_reconciliation_before_commit_for_test();
+    assert!(matches!(
+        store.apply_reconciliation_delta(&failed_delta),
+        Err(PortError::ReconciliationFailed {
+            operation: "apply_reconciliation_delta",
+            ..
+        })
+    ));
+    assert_eq!(
+        store.reconciliation_survivor_rewrites_for_test(),
+        clone.reconciliation_survivor_rewrites_for_test()
+    );
+    assert_eq!(
+        store.persisted_file_id_for_path_for_test(&replacement.path),
+        Some(replacement.id)
+    );
+    assert_eq!(
+        store.persisted_file_id_for_path_for_test(&retried.path),
+        None
+    );
+    assert_eq!(
+        store.persisted_search_ids_for_test("replacement"),
+        vec![replacement.id]
+    );
+    assert!(store.persisted_search_ids_for_test("retried").is_empty());
+    assert_eq!(store.persisted_slot_generation_for_test(1), Some(1));
+    assert!(!store.persisted_slot_is_free_for_test(1));
+    assert_eq!(store.persisted_slot_generation_for_test(2), None);
+    drop(clone);
+    drop(store);
+
+    // Check both the rehydrated views and the backing Sled projections. The
+    // direct probes prevent `open()` from masking a torn secondary projection
+    // by reconstructing it from file records.
+    let (mut reopened, workspace, index) = SledStorageAdapter::open(&path).unwrap();
+    assert_eq!(workspace.get(survivor.id).unwrap(), &survivor);
+    assert_eq!(workspace.get(replacement.id).unwrap(), &replacement);
+    assert!(workspace.get(removed.id).is_err());
+    assert!(workspace.get(retried.id).is_err());
+    assert!(workspace.get(additional.id).is_err());
+    assert_eq!(workspace.get_by_path(&survivor.path), Some(survivor.id));
+    assert_eq!(workspace.get_by_path(&removed.path), None);
+    assert_eq!(
+        workspace.get_by_path(&replacement.path),
+        Some(replacement.id)
+    );
+    assert_eq!(workspace.get_by_path(&retried.path), None);
+    assert_eq!(workspace.get_by_path(&additional.path), None);
+    assert_eq!(index.query(&Token::new("src")).count(), 2);
+    assert_eq!(
+        index.query(&Token::new("survivor")).collect::<Vec<_>>(),
+        vec![survivor.id]
+    );
+    assert!(index.query(&Token::new("removed")).next().is_none());
+    assert_eq!(
+        index.query(&Token::new("replacement")).collect::<Vec<_>>(),
+        vec![replacement.id]
+    );
+    assert!(index.query(&Token::new("retried")).next().is_none());
+    assert!(index.query(&Token::new("additional")).next().is_none());
+    assert_eq!(workspace.snapshot().slot_generations, vec![0, 1]);
+    assert!(workspace.snapshot().free_slots.is_empty());
+    assert_eq!(
+        reopened.persisted_file_id_for_path_for_test(&replacement.path),
+        Some(replacement.id)
+    );
+    assert_eq!(
+        reopened.persisted_file_id_for_path_for_test(&retried.path),
+        None
+    );
+    assert_eq!(
+        reopened.persisted_search_ids_for_test("replacement"),
+        vec![replacement.id]
+    );
+    assert!(reopened.persisted_search_ids_for_test("retried").is_empty());
+    assert_eq!(reopened.persisted_slot_generation_for_test(1), Some(1));
+    assert!(!reopened.persisted_slot_is_free_for_test(1));
+    assert_eq!(reopened.persisted_slot_generation_for_test(2), None);
+
+    reopened.apply_reconciliation_delta(&failed_delta).unwrap();
+    drop(reopened);
+
+    // A second close/reopen proves the successful retry durably freed slot 1.
+    // This intermediate state makes omission of the persisted free-slot write
+    // observable instead of inferring allocator state from the file records.
+    let (mut reopened, workspace, index) = SledStorageAdapter::open(&path).unwrap();
+    assert_eq!(workspace.get(survivor.id).unwrap(), &survivor);
+    assert_eq!(workspace.get(additional.id).unwrap(), &additional);
+    assert!(workspace.get(removed.id).is_err());
+    assert!(workspace.get(replacement.id).is_err());
+    assert!(workspace.get(retried.id).is_err());
+    assert_eq!(workspace.get_by_path(&survivor.path), Some(survivor.id));
+    assert_eq!(workspace.get_by_path(&removed.path), None);
+    assert_eq!(workspace.get_by_path(&replacement.path), None);
+    assert_eq!(workspace.get_by_path(&retried.path), None);
+    assert_eq!(workspace.get_by_path(&additional.path), Some(additional.id));
+    assert_eq!(index.query(&Token::new("src")).count(), 2);
+    assert_eq!(
+        index.query(&Token::new("survivor")).collect::<Vec<_>>(),
+        vec![survivor.id]
+    );
+    assert!(index.query(&Token::new("removed")).next().is_none());
+    assert!(index.query(&Token::new("replacement")).next().is_none());
+    assert!(index.query(&Token::new("retried")).next().is_none());
+    assert_eq!(
+        index.query(&Token::new("additional")).collect::<Vec<_>>(),
+        vec![additional.id]
+    );
+    assert_eq!(workspace.snapshot().slot_generations, vec![0, 1, 0]);
+    assert_eq!(workspace.snapshot().free_slots, vec![1]);
+    assert_eq!(
+        reopened.persisted_file_id_for_path_for_test(&replacement.path),
+        None
+    );
+    assert_eq!(
+        reopened.persisted_file_id_for_path_for_test(&retried.path),
+        None
+    );
+    assert!(
+        reopened
+            .persisted_search_ids_for_test("replacement")
+            .is_empty()
+    );
+    assert!(reopened.persisted_search_ids_for_test("retried").is_empty());
+    assert_eq!(reopened.persisted_slot_generation_for_test(1), Some(1));
+    assert!(reopened.persisted_slot_is_free_for_test(1));
+    assert_eq!(reopened.persisted_slot_generation_for_test(2), Some(0));
+    assert!(!reopened.persisted_slot_is_free_for_test(2));
+
+    reopened
+        .apply_reconciliation_delta(&ReconciliationDelta {
+            additions: vec![retried.clone()],
+            removals: Vec::new(),
+        })
+        .unwrap();
+    drop(reopened);
+
+    // Reusing the freed slot increments its generation and keeps the removed
+    // identities stale after another reopen.
+    let (reopened, workspace, index) = SledStorageAdapter::open(&path).unwrap();
+    assert_eq!(workspace.get(retried.id).unwrap(), &retried);
+    assert!(workspace.get(removed.id).is_err());
+    assert!(workspace.get(replacement.id).is_err());
+    assert_eq!(workspace.get_by_path(&retried.path), Some(retried.id));
+    assert_eq!(
+        index.query(&Token::new("retried")).collect::<Vec<_>>(),
+        vec![retried.id]
+    );
+    assert_eq!(reopened.persisted_slot_generation_for_test(1), Some(2));
+    assert!(!reopened.persisted_slot_is_free_for_test(1));
+}
 
 // ── AC2: restart rebuilds workspace including allocator state ─────────────────
 

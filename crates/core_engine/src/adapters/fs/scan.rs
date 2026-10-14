@@ -76,6 +76,8 @@
 //! so symlinks are never dereferenced and cycles are impossible.
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ignore::{Walk, WalkBuilder};
@@ -85,8 +87,8 @@ use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{ContentHash, FileMetadata, RelativePath, Timestamp};
-use crate::domain::workspace::ProjectWorkspace;
-use crate::ports::StoragePort;
+use crate::domain::workspace::{ProjectWorkspace, WorkspaceSnapshot};
+use crate::ports::{PortError, ReconciliationDelta, StoragePort};
 
 /// Number of files accumulated per flush cycle (OP1 batching).
 ///
@@ -117,6 +119,354 @@ pub struct ScanReport {
     pub skipped_encoding: usize,
     /// `true` when the workspace was already populated and no walk was performed.
     pub already_indexed: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciliationReport {
+    pub added: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Debug)]
+pub enum ScanError {
+    MarkerRead {
+        source: PortError,
+    },
+    Enumeration {
+        path: PathBuf,
+        source: ignore::Error,
+    },
+    Metadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ContentRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Persistence {
+        operation: &'static str,
+        source: PortError,
+    },
+}
+
+impl fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MarkerRead { source } => {
+                write!(formatter, "failed to read scan marker: {source}")
+            }
+            Self::Enumeration { path, source } => {
+                write!(
+                    formatter,
+                    "failed to enumerate {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Metadata { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read metadata for {}: {source}",
+                    path.display()
+                )
+            }
+            Self::ContentRead { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read content for {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Persistence { operation, source } => {
+                write!(formatter, "{operation} failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MarkerRead { source } | Self::Persistence { source, .. } => Some(source),
+            Self::Enumeration { source, .. } => Some(source),
+            Self::Metadata { source, .. } | Self::ContentRead { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconciliationMetrics {
+    pub(crate) content_reads: usize,
+    pub(crate) content_hashes: usize,
+    pub(crate) file_record_rewrites: usize,
+}
+
+#[cfg(any(test, feature = "testing"))]
+static RECONCILIATION_METRICS: std::sync::Mutex<
+    Option<std::sync::Arc<std::sync::Mutex<ReconciliationMetrics>>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "testing"))]
+static RECONCILIATION_METRICS_COLLECTOR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn record_reconciliation_metric(update: impl FnOnce(&mut ReconciliationMetrics)) {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(metrics) = RECONCILIATION_METRICS
+        .lock()
+        .expect("reconciliation metrics registry lock poisoned")
+        .clone()
+        && let Ok(mut metrics) = metrics.lock()
+    {
+        update(&mut metrics);
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = update;
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+pub(crate) fn collect_reconciliation_metrics<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, ReconciliationMetrics) {
+    let _collector = RECONCILIATION_METRICS_COLLECTOR
+        .lock()
+        .expect("reconciliation metrics collector lock poisoned");
+    let metrics = std::sync::Arc::new(std::sync::Mutex::new(ReconciliationMetrics::default()));
+    *RECONCILIATION_METRICS
+        .lock()
+        .expect("reconciliation metrics registry lock poisoned") = Some(metrics.clone());
+    let result = operation();
+    *RECONCILIATION_METRICS
+        .lock()
+        .expect("reconciliation metrics registry lock poisoned") = None;
+    let collected = *metrics
+        .lock()
+        .expect("reconciliation metrics value lock poisoned");
+    (result, collected)
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
+pub(crate) fn record_reconciliation_file_record_rewrites(count: usize) {
+    record_reconciliation_metric(|metrics| metrics.file_record_rewrites += count);
+}
+
+pub(crate) trait ReconciliationOperations {
+    fn enumerate(&mut self, root: &Path) -> Result<Vec<PathBuf>, ScanError>;
+    fn metadata(&mut self, path: &Path) -> Result<std::fs::Metadata, std::io::Error>;
+    fn read_content(&mut self, path: &Path) -> Result<Vec<u8>, std::io::Error>;
+    fn hash_content(&mut self, content: &[u8]) -> ContentHash;
+}
+
+struct RealReconciliationOperations;
+
+impl ReconciliationOperations for RealReconciliationOperations {
+    fn enumerate(&mut self, root: &Path) -> Result<Vec<PathBuf>, ScanError> {
+        let mut paths = Vec::new();
+        for entry in workspace_walker(root) {
+            let entry = entry.map_err(|source| ScanError::Enumeration {
+                path: ignore_error_path(&source).unwrap_or_else(|| root.to_path_buf()),
+                source,
+            })?;
+            if matches!(entry.file_type(), Some(file_type) if file_type.is_file()) {
+                paths.push(entry.into_path());
+            }
+        }
+        Ok(paths)
+    }
+
+    fn metadata(&mut self, path: &Path) -> Result<std::fs::Metadata, std::io::Error> {
+        std::fs::metadata(path)
+    }
+
+    fn read_content(&mut self, path: &Path) -> Result<Vec<u8>, std::io::Error> {
+        std::fs::read(path)
+    }
+
+    fn hash_content(&mut self, content: &[u8]) -> ContentHash {
+        content_hash_of(content)
+    }
+}
+
+pub fn reconcile_workspace(
+    root: &Path,
+    storage: &mut dyn StoragePort,
+    workspace: &mut ProjectWorkspace,
+    index: &mut InvertedIndex,
+) -> Result<ReconciliationReport, ScanError> {
+    reconcile_workspace_before_commit(root, storage, workspace, index, || Ok(()))
+}
+
+pub(crate) fn reconcile_workspace_before_commit(
+    root: &Path,
+    storage: &mut dyn StoragePort,
+    workspace: &mut ProjectWorkspace,
+    index: &mut InvertedIndex,
+    before_commit: impl FnOnce() -> Result<(), ScanError>,
+) -> Result<ReconciliationReport, ScanError> {
+    let _marker = storage
+        .is_scan_complete()
+        .map_err(|source| ScanError::MarkerRead { source })?;
+    reconcile_workspace_with_before_commit(
+        root,
+        storage,
+        workspace,
+        index,
+        &mut RealReconciliationOperations,
+        before_commit,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn reconcile_workspace_with<O: ReconciliationOperations>(
+    root: &Path,
+    storage: &mut dyn StoragePort,
+    workspace: &mut ProjectWorkspace,
+    index: &mut InvertedIndex,
+    operations: &mut O,
+) -> Result<ReconciliationReport, ScanError> {
+    reconcile_workspace_with_before_commit(root, storage, workspace, index, operations, || Ok(()))
+}
+
+fn reconcile_workspace_with_before_commit<O: ReconciliationOperations>(
+    root: &Path,
+    storage: &mut dyn StoragePort,
+    workspace: &mut ProjectWorkspace,
+    index: &mut InvertedIndex,
+    operations: &mut O,
+    before_commit: impl FnOnce() -> Result<(), ScanError>,
+) -> Result<ReconciliationReport, ScanError> {
+    let inventory = collect_reconciliation_inventory(root, operations)?;
+    let staged = stage_reconciliation(workspace.snapshot(), &inventory, operations)?;
+    before_commit()?;
+    storage
+        .apply_reconciliation_delta(&staged.delta)
+        .map_err(|source| ScanError::Persistence {
+            operation: "apply_reconciliation_delta",
+            source,
+        })?;
+
+    let staged_index = build_reconciliation_index(&staged.workspace);
+    let report = ReconciliationReport {
+        added: staged.delta.additions.len(),
+        removed: staged.delta.removals.len(),
+        unchanged: staged.eligible_paths - staged.delta.additions.len(),
+    };
+    *workspace = staged.workspace;
+    *index = staged_index;
+    Ok(report)
+}
+
+type ReconciliationInventory = BTreeMap<RelativePath, (PathBuf, std::fs::Metadata)>;
+
+fn collect_reconciliation_inventory<O: ReconciliationOperations>(
+    root: &Path,
+    operations: &mut O,
+) -> Result<ReconciliationInventory, ScanError> {
+    let mut inventory = BTreeMap::new();
+    for absolute_path in operations.enumerate(root)? {
+        let Some(relative_path) = eligible_relative_path(root, &absolute_path) else {
+            continue;
+        };
+        let metadata =
+            operations
+                .metadata(&absolute_path)
+                .map_err(|source| ScanError::Metadata {
+                    path: relative_path_buf(&relative_path),
+                    source,
+                })?;
+        if !metadata.is_file() {
+            continue;
+        }
+        inventory.insert(relative_path, (absolute_path, metadata));
+    }
+    Ok(inventory)
+}
+
+struct StagedReconciliation {
+    workspace: ProjectWorkspace,
+    delta: ReconciliationDelta,
+    eligible_paths: usize,
+}
+
+fn stage_reconciliation<O: ReconciliationOperations>(
+    current: WorkspaceSnapshot,
+    inventory: &ReconciliationInventory,
+    operations: &mut O,
+) -> Result<StagedReconciliation, ScanError> {
+    let current_paths: HashSet<_> = current.files.iter().map(|file| file.path.clone()).collect();
+    let inventory_paths: HashSet<_> = inventory.keys().cloned().collect();
+    let removed_files: Vec<_> = current
+        .files
+        .iter()
+        .filter(|file| !inventory_paths.contains(&file.path))
+        .cloned()
+        .collect();
+    let added_paths: Vec<_> = inventory
+        .keys()
+        .filter(|path| !current_paths.contains(*path))
+        .cloned()
+        .collect();
+
+    let mut staged_workspace =
+        ProjectWorkspace::from_snapshot(current).map_err(|source| ScanError::Persistence {
+            operation: "stage_reconciliation",
+            source: PortError::WriteFailed(source.to_string()),
+        })?;
+    for file in &removed_files {
+        staged_workspace
+            .remove(file.id)
+            .expect("reconciliation removals originate from a live workspace snapshot");
+    }
+
+    let mut additions = Vec::with_capacity(added_paths.len());
+    for path in added_paths {
+        let (absolute_path, std_metadata) = inventory
+            .get(&path)
+            .expect("added paths originate from the completed inventory");
+        record_reconciliation_metric(|metrics| metrics.content_reads += 1);
+        let content =
+            operations
+                .read_content(absolute_path)
+                .map_err(|source| ScanError::ContentRead {
+                    path: relative_path_buf(&path),
+                    source,
+                })?;
+        record_reconciliation_metric(|metrics| metrics.content_hashes += 1);
+        let metadata = FileMetadata {
+            size: content.len() as u64,
+            modified: modified_from_std(std_metadata),
+            content_hash: Some(operations.hash_content(&content)),
+        };
+        let id = staged_workspace
+            .insert(path, metadata)
+            .expect("inventory additions are unique and absent from the workspace");
+        additions.push(
+            staged_workspace
+                .get(id)
+                .expect("newly inserted reconciliation file must be live")
+                .clone(),
+        );
+    }
+
+    let delta = ReconciliationDelta {
+        additions,
+        removals: removed_files.iter().map(|file| file.id).collect(),
+    };
+    Ok(StagedReconciliation {
+        workspace: staged_workspace,
+        delta,
+        eligible_paths: inventory_paths.len(),
+    })
+}
+
+fn build_reconciliation_index(workspace: &ProjectWorkspace) -> InvertedIndex {
+    let mut staged_index = InvertedIndex::new();
+    for file in &workspace.snapshot().files {
+        staged_index.insert(file.id, &tokenize(file.path.as_str()));
+    }
+    staged_index
 }
 
 /// Scan `root`, indexing every eligible file.
@@ -443,6 +793,29 @@ fn workspace_walker(root: &Path) -> Walk {
         .build()
 }
 
+fn eligible_relative_path(root: &Path, absolute_path: &Path) -> Option<RelativePath> {
+    let relative = absolute_path.strip_prefix(root).ok()?;
+    let raw = relative.to_str()?;
+    #[cfg(not(windows))]
+    let normalized: &str = raw;
+    #[cfg(windows)]
+    let normalized: String = raw.replace('\\', "/");
+    let path = RelativePath::new(normalized);
+    (!is_tmp_artifact(&path)).then_some(path)
+}
+
+fn relative_path_buf(path: &RelativePath) -> PathBuf {
+    PathBuf::from(path.as_str())
+}
+
+fn ignore_error_path(error: &ignore::Error) -> Option<PathBuf> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::Partial(errors) => errors.iter().find_map(ignore_error_path),
+        _ => None,
+    }
+}
+
 /// Emit a warning if `<root>/.towerignore` does not exist.
 ///
 /// Indexing proceeds normally when the file is absent (everything except `.git/`
@@ -500,95 +873,14 @@ pub(crate) fn collect_workspace_files(root: &Path) -> Vec<(RelativePath, FileMet
             _ => continue,
         }
         let abs_path = entry.path();
-        let Ok(rel_os) = abs_path.strip_prefix(root) else {
+        let Some(rel_path) = eligible_relative_path(root, abs_path) else {
             continue;
         };
-        let Some(rel_raw) = rel_os.to_str() else {
-            continue;
-        };
-        #[cfg(not(windows))]
-        let rel_str: &str = rel_raw;
-        #[cfg(windows)]
-        let rel_str: String = rel_raw.replace('\\', "/");
-        let rel_path = RelativePath::new(rel_str);
-        // Never index shadow-file temp artifacts (UN2/AC5).
-        if is_tmp_artifact(&rel_path) {
-            continue;
-        }
         if let Some(meta) = file_metadata_with_content(abs_path) {
             out.push((rel_path, meta));
         }
     }
     out
-}
-
-/// Prune index/workspace/storage entries whose path is no longer present in a
-/// fresh ignore-aware walk of `root` (deleted on disk, or now matched by
-/// `.towerignore`/hidden rules). Path-only — does NOT read file contents.
-///
-/// Returns the number of stale entries pruned. Additions are out of scope:
-/// the live watcher and `tower_reindex` handle newly-discovered files.
-///
-/// Run once at startup on a normal (scan-already-complete) boot, where the
-/// persisted sled state is loaded verbatim and would otherwise carry ghosts:
-/// files deleted while the server was down, entries indexed by an older code
-/// version before an ignore rule existed, or foreign temp files indexed live
-/// then deleted offline. Without this, `find_file` returns paths that no longer
-/// resolve on disk.
-pub fn reconcile_pruned(
-    root: &Path,
-    workspace: &mut ProjectWorkspace,
-    index: &mut InvertedIndex,
-    storage: &mut dyn StoragePort,
-) -> usize {
-    // 1. Build the set of currently-valid workspace-relative paths via the same
-    //    walker the scan uses (ignore + hidden aware). Path-only: no read/hash.
-    //    Mirrors collect_workspace_files's walk + path derivation, minus the
-    //    metadata read.
-    let mut present: std::collections::HashSet<RelativePath> = std::collections::HashSet::new();
-    for entry in workspace_walker(root) {
-        let Ok(entry) = entry else { continue };
-        match entry.file_type() {
-            Some(ft) if ft.is_file() => {}
-            _ => continue,
-        }
-        let abs_path = entry.path();
-        let Ok(rel_os) = abs_path.strip_prefix(root) else {
-            continue;
-        };
-        let Some(rel_raw) = rel_os.to_str() else {
-            continue;
-        };
-        #[cfg(not(windows))]
-        let rel_str: &str = rel_raw;
-        #[cfg(windows)]
-        let rel_str: String = rel_raw.replace('\\', "/");
-        let rel_path = RelativePath::new(rel_str);
-        // Never treat shadow-file temp artifacts as valid (UN2/AC5) — leaving
-        // them out means any tracked tmp artifact is pruned too.
-        if is_tmp_artifact(&rel_path) {
-            continue;
-        }
-        present.insert(rel_path);
-    }
-
-    // 2. Drop every tracked path absent from that set. Snapshot first so we are
-    //    not iterating the workspace while mutating it.
-    let mut pruned = 0;
-    for file in workspace.snapshot().files {
-        if present.contains(&file.path) {
-            continue;
-        }
-        let id = file.id;
-        // remove() can only fail on a stale handle, which the snapshot rules out.
-        let _ = workspace.remove(id);
-        index.remove(id);
-        // A missing storage record is benign — the in-memory state is now the
-        // source of truth and the next persist will reconcile sled.
-        let _ = storage.delete(id);
-        pruned += 1;
-    }
-    pruned
 }
 
 /// Build a [`FileMetadata`] for the file at `abs_path`, reading its content to

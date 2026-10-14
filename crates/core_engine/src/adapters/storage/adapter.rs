@@ -58,16 +58,20 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+#[cfg(any(test, feature = "testing"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "testing"))]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sled::Transactional;
-use sled::transaction::ConflictableTransactionError;
+use sled::transaction::{ConflictableTransactionError, TransactionalTree};
 
 use super::error::{StorageError, to_port_error, to_read_error};
 use super::keys::{blob_key, file_id_key, path_key};
 use crate::domain::index::InvertedIndex;
 use crate::domain::token::tokenize;
 use crate::domain::{ContentHash, FileId, ProjectWorkspace, VirtualFile, WorkspaceSnapshot};
-use crate::ports::{PortError, StoragePort};
+use crate::ports::{PortError, ReconciliationDelta, StoragePort};
 
 /// Schema version embedded in every new database.
 ///
@@ -101,8 +105,150 @@ enum TxAbort {
     /// corrupt the index — the transaction is aborted.
     IndexCodec(postcard::Error),
     /// Forced abort injected by tests to verify joint-rollback behaviour.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     ForcedAbort,
+}
+
+struct PreparedReconciliationAddition {
+    key: [u8; 8],
+    path: Vec<u8>,
+    bytes: Vec<u8>,
+    tokens: HashSet<String>,
+    id: FileId,
+}
+
+fn prepare_reconciliation_additions(
+    delta: &ReconciliationDelta,
+) -> Result<Vec<PreparedReconciliationAddition>, StorageError> {
+    delta
+        .additions
+        .iter()
+        .map(|file| {
+            Ok(PreparedReconciliationAddition {
+                key: file_id_key(file.id),
+                path: path_key(&file.path).to_vec(),
+                bytes: postcard::to_allocvec(file).map_err(StorageError::Codec)?,
+                tokens: tokenize(file.path.as_str())
+                    .into_iter()
+                    .map(|token| token.as_str().to_owned())
+                    .collect(),
+                id: file.id,
+            })
+        })
+        .collect()
+}
+
+type ReconciliationTxResult<T> = Result<T, ConflictableTransactionError<TxAbort>>;
+
+fn read_reconciliation_allocator(
+    tx_meta: &TransactionalTree,
+) -> ReconciliationTxResult<(Vec<u32>, Vec<u32>)> {
+    let slot_generations = match tx_meta.get(META_SLOT_GENS_KEY)? {
+        None => Vec::new(),
+        Some(bytes) => postcard::from_bytes(bytes.as_ref())
+            .map_err(TxAbort::IndexCodec)
+            .map_err(ConflictableTransactionError::Abort)?,
+    };
+    let free_slots = match tx_meta.get(META_FREE_SLOTS_KEY)? {
+        None => Vec::new(),
+        Some(bytes) => postcard::from_bytes(bytes.as_ref())
+            .map_err(TxAbort::IndexCodec)
+            .map_err(ConflictableTransactionError::Abort)?,
+    };
+    Ok((slot_generations, free_slots))
+}
+
+fn apply_reconciliation_removals(
+    tx_files: &TransactionalTree,
+    tx_paths: &TransactionalTree,
+    tx_index: &TransactionalTree,
+    removals: &[FileId],
+    free_slots: &mut Vec<u32>,
+    record_rewrite: &dyn Fn(FileId),
+) -> ReconciliationTxResult<()> {
+    for id in removals {
+        record_rewrite(*id);
+        let key = file_id_key(*id);
+        if let Some(bytes) = tx_files.remove(key.as_ref())? {
+            let file: VirtualFile = postcard::from_bytes(bytes.as_ref())
+                .map_err(TxAbort::Corrupt)
+                .map_err(ConflictableTransactionError::Abort)?;
+            tx_paths.remove(path_key(&file.path))?;
+            for token in tokenize(file.path.as_str()) {
+                update_posting(tx_index, token.as_str().as_bytes(), *id, false)
+                    .map_err(lift_index_codec)?;
+            }
+            if !free_slots.contains(&id.index()) {
+                free_slots.push(id.index());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_reconciliation_additions(
+    tx_files: &TransactionalTree,
+    tx_paths: &TransactionalTree,
+    tx_index: &TransactionalTree,
+    additions: &[PreparedReconciliationAddition],
+    slot_generations: &mut Vec<u32>,
+    free_slots: &mut Vec<u32>,
+    record_rewrite: &dyn Fn(FileId),
+) -> ReconciliationTxResult<()> {
+    for addition in additions {
+        let old_tokens: HashSet<String> = match tx_files.get(addition.key.as_ref())? {
+            Some(bytes) => {
+                let old_file: VirtualFile = postcard::from_bytes(bytes.as_ref())
+                    .map_err(TxAbort::Corrupt)
+                    .map_err(ConflictableTransactionError::Abort)?;
+                if path_key(&old_file.path) != addition.path.as_slice() {
+                    tx_paths.remove(path_key(&old_file.path))?;
+                }
+                tokenize(old_file.path.as_str())
+                    .into_iter()
+                    .map(|token| token.as_str().to_owned())
+                    .collect()
+            }
+            None => HashSet::new(),
+        };
+
+        record_rewrite(addition.id);
+        tx_files.insert(addition.key.as_ref(), addition.bytes.as_slice())?;
+        tx_paths.insert(addition.path.as_slice(), addition.key.as_ref())?;
+
+        let slot = addition.id.index() as usize;
+        if slot_generations.len() <= slot {
+            slot_generations.resize(slot + 1, 0);
+        }
+        slot_generations[slot] = addition.id.generation();
+        free_slots.retain(|index| *index != addition.id.index());
+
+        for token in addition.tokens.difference(&old_tokens) {
+            update_posting(tx_index, token.as_bytes(), addition.id, true)
+                .map_err(lift_index_codec)?;
+        }
+        for token in old_tokens.difference(&addition.tokens) {
+            update_posting(tx_index, token.as_bytes(), addition.id, false)
+                .map_err(lift_index_codec)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_reconciliation_allocator(
+    tx_meta: &TransactionalTree,
+    slot_generations: &[u32],
+    free_slots: &[u32],
+) -> ReconciliationTxResult<()> {
+    let generations = postcard::to_allocvec(slot_generations)
+        .map_err(TxAbort::IndexCodec)
+        .map_err(ConflictableTransactionError::Abort)?;
+    let free = postcard::to_allocvec(free_slots)
+        .map_err(TxAbort::IndexCodec)
+        .map_err(ConflictableTransactionError::Abort)?;
+    tx_meta.insert(META_SLOT_GENS_KEY, generations.as_slice())?;
+    tx_meta.insert(META_FREE_SLOTS_KEY, free.as_slice())?;
+    Ok(())
 }
 
 /// Sled-backed implementation of [`StoragePort`].
@@ -129,6 +275,21 @@ pub struct SledStorageAdapter {
     ///
     /// Key: token UTF-8 bytes.  Value: `postcard`-serialised `Vec<FileId>`.
     index: sled::Tree,
+    #[cfg(any(test, feature = "testing"))]
+    reconciliation_survivor_rewrites: Arc<AtomicUsize>,
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_reconciliation_before_commit: Arc<AtomicBool>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ReconciliationRewriteCounter(Arc<AtomicUsize>);
+
+#[cfg(any(test, feature = "testing"))]
+impl ReconciliationRewriteCounter {
+    pub(crate) fn snapshot(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl SledStorageAdapter {
@@ -193,6 +354,10 @@ impl SledStorageAdapter {
             blobs,
             meta,
             index,
+            #[cfg(any(test, feature = "testing"))]
+            reconciliation_survivor_rewrites: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_reconciliation_before_commit: Arc::new(AtomicBool::new(false)),
         };
 
         adapter.check_or_init_schema()?;
@@ -348,7 +513,76 @@ impl SledStorageAdapter {
             blobs: self.blobs.clone(),
             meta: self.meta.clone(),
             index: self.index.clone(),
+            #[cfg(any(test, feature = "testing"))]
+            reconciliation_survivor_rewrites: Arc::clone(&self.reconciliation_survivor_rewrites),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_reconciliation_before_commit: Arc::clone(
+                &self.fail_next_reconciliation_before_commit,
+            ),
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn reconciliation_survivor_rewrites_for_test(&self) -> usize {
+        self.reconciliation_rewrite_counter().snapshot()
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn reconciliation_rewrite_counter(&self) -> ReconciliationRewriteCounter {
+        ReconciliationRewriteCounter(Arc::clone(&self.reconciliation_survivor_rewrites))
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_reconciliation_before_commit_for_test(&mut self) {
+        self.fail_next_reconciliation_before_commit
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn persisted_file_id_for_path_for_test(
+        &self,
+        path: &crate::domain::RelativePath,
+    ) -> Option<FileId> {
+        let bytes = self.paths.get(path_key(path)).expect("read paths tree")?;
+        let bytes: [u8; 8] = bytes
+            .as_ref()
+            .try_into()
+            .expect("persisted path value is an encoded FileId");
+        Some(FileId::new_for_testing(
+            u32::from_be_bytes(bytes[..4].try_into().expect("FileId index bytes")),
+            u32::from_be_bytes(bytes[4..].try_into().expect("FileId generation bytes")),
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn persisted_search_ids_for_test(&self, query: &str) -> Vec<FileId> {
+        self.index
+            .get(query.as_bytes())
+            .expect("read index tree")
+            .map(|bytes| postcard::from_bytes(&bytes).expect("decode persisted posting list"))
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn persisted_slot_generation_for_test(&self, index: u32) -> Option<u32> {
+        self.meta
+            .get(META_SLOT_GENS_KEY)
+            .expect("read slot generations")
+            .map(|bytes| {
+                postcard::from_bytes::<Vec<u32>>(&bytes).expect("decode persisted slot generations")
+            })
+            .and_then(|generations| generations.get(index as usize).copied())
+    }
+
+    #[cfg(test)]
+    pub fn persisted_slot_is_free_for_test(&self, index: u32) -> bool {
+        self.meta
+            .get(META_FREE_SLOTS_KEY)
+            .expect("read free slots")
+            .map(|bytes| {
+                postcard::from_bytes::<Vec<u32>>(&bytes).expect("decode persisted free slots")
+            })
+            .is_some_and(|free_slots| free_slots.contains(&index))
     }
 
     /// Test-only: attempt a `put` that writes to both the files tree and the
@@ -416,6 +650,85 @@ impl SledStorageAdapter {
 // ── StoragePort implementation ────────────────────────────────────────────────
 
 impl StoragePort for SledStorageAdapter {
+    fn apply_reconciliation_delta(&mut self, delta: &ReconciliationDelta) -> Result<(), PortError> {
+        let additions =
+            prepare_reconciliation_additions(delta).map_err(reconciliation_port_error)?;
+
+        #[cfg(any(test, feature = "testing"))]
+        let survivor_ids = {
+            let changed_ids: HashSet<FileId> = delta
+                .removals
+                .iter()
+                .copied()
+                .chain(delta.additions.iter().map(|file| file.id))
+                .collect();
+            self.files
+                .iter()
+                .map(|entry| {
+                    let (_, bytes) = entry.map_err(StorageError::Sled)?;
+                    postcard::from_bytes::<VirtualFile>(&bytes)
+                        .map(|file| file.id)
+                        .map_err(StorageError::Codec)
+                })
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(reconciliation_port_error)?
+                .difference(&changed_ids)
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        #[cfg(any(test, feature = "testing"))]
+        let survivor_rewrites = Arc::clone(&self.reconciliation_survivor_rewrites);
+        #[cfg(any(test, feature = "testing"))]
+        let fail_before_commit = self
+            .fail_next_reconciliation_before_commit
+            .swap(false, Ordering::AcqRel);
+
+        let record_rewrite = |id: FileId| {
+            #[cfg(any(test, feature = "testing"))]
+            if survivor_ids.contains(&id) {
+                survivor_rewrites.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(not(any(test, feature = "testing")))]
+            let _ = id;
+        };
+
+        let result = (&self.files, &self.paths, &self.meta, &self.index).transaction(
+            |(tx_files, tx_paths, tx_meta, tx_index)| {
+                let (mut slot_generations, mut free_slots) =
+                    read_reconciliation_allocator(tx_meta)?;
+                apply_reconciliation_removals(
+                    tx_files,
+                    tx_paths,
+                    tx_index,
+                    &delta.removals,
+                    &mut free_slots,
+                    &record_rewrite,
+                )?;
+                apply_reconciliation_additions(
+                    tx_files,
+                    tx_paths,
+                    tx_index,
+                    &additions,
+                    &mut slot_generations,
+                    &mut free_slots,
+                    &record_rewrite,
+                )?;
+                write_reconciliation_allocator(tx_meta, &slot_generations, &free_slots)?;
+
+                #[cfg(any(test, feature = "testing"))]
+                if fail_before_commit {
+                    return Err(ConflictableTransactionError::Abort(TxAbort::ForcedAbort));
+                }
+
+                Ok::<(), ConflictableTransactionError<TxAbort>>(())
+            },
+        );
+
+        result
+            .map_err(map_tx_abort_error)
+            .map_err(reconciliation_port_error)
+    }
+
     /// Retrieve a `VirtualFile` by `FileId`.
     ///
     /// Reads directly from the Sled tree with `&self` — no application-level
@@ -761,7 +1074,7 @@ impl StoragePort for SledStorageAdapter {
             Err(sled::transaction::TransactionError::Storage(e)) => {
                 Err(to_port_error(StorageError::Sled(e)))
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             Err(sled::transaction::TransactionError::Abort(TxAbort::ForcedAbort)) => {
                 Err(to_port_error(StorageError::CorruptMetadata(
                     "forced abort for test".to_owned(),
@@ -820,6 +1133,13 @@ impl StoragePort for SledStorageAdapter {
             Some(bytes) => Ok(bytes.first() == Some(&1u8)),
             None => Ok(false),
         }
+    }
+}
+
+fn reconciliation_port_error(error: StorageError) -> PortError {
+    PortError::ReconciliationFailed {
+        operation: "apply_reconciliation_delta",
+        reason: error.to_string(),
     }
 }
 
@@ -915,7 +1235,7 @@ fn map_tx_abort_error(e: sled::transaction::TransactionError<TxAbort>) -> Storag
         sled::transaction::TransactionError::Abort(TxAbort::IndexCodec(e)) => {
             StorageError::Codec(e)
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         sled::transaction::TransactionError::Abort(TxAbort::ForcedAbort) => {
             StorageError::CorruptMetadata("forced abort for test".to_owned())
         }

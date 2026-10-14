@@ -1,3 +1,4 @@
+// Feature: F009
 //! End-to-end integration tests for the `ast` native extension (spec 26).
 //!
 //! # What this verifies
@@ -22,7 +23,15 @@
 //!
 //! All tests use `InMemoryFs` and `InMemoryAstIndex` — no real disk I/O.
 
+#[path = "support/process_binary.rs"]
+mod process_binary;
+
+use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
@@ -46,6 +55,7 @@ use core_engine::ports::inbound::{
     PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
     WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
 };
+use tempfile::tempdir;
 
 /// Default timeout: long enough for cooperative extensions in CI.
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -81,6 +91,146 @@ fn hello_extension_bin() -> String {
         .to_str()
         .unwrap()
         .to_owned()
+}
+
+struct DaemonChild(Child);
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn production_tower_bin() -> PathBuf {
+    process_binary::selected_binary("TOWER_PRODUCTION_BIN")
+}
+
+fn run_daemon_to_idle(binary: &Path, workspace: &Path) {
+    let output = Command::new(binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace)
+        .output()
+        .expect("run baseline daemon");
+    assert!(
+        output.status.success(),
+        "baseline daemon failed: {output:?}"
+    );
+    assert!(output.stdout.is_empty(), "daemon polluted stdout");
+}
+
+fn install_ast_extension(workspace: &Path) -> PathBuf {
+    let extension = workspace.join("extensions/ast");
+    fs::create_dir_all(&extension).unwrap();
+    fs::copy(
+        workspace_root().join("extensions/ast/extension.toml"),
+        extension.join("extension.toml"),
+    )
+    .unwrap();
+    let binary = extension.join("ast_extension");
+    fs::copy(ast_extension_bin(), &binary).unwrap();
+    binary
+}
+
+fn spawn_ast_daemon(binary: &Path, workspace: &Path) -> DaemonChild {
+    DaemonChild(
+        Command::new(binary)
+            .arg("daemon")
+            .arg("--workspace-dir")
+            .arg(workspace)
+            .arg("--extensions-dir")
+            .arg(workspace.join("extensions"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn AST daemon"),
+    )
+}
+
+#[cfg(unix)]
+fn ast_symbol_search(workspace: &Path, symbol: &str) -> serde_json::Value {
+    use core_engine::adapters::daemon::socket::socket_path;
+    use core_engine::adapters::daemon::wire::{ClientRole, Handshake};
+    use std::os::unix::net::UnixStream;
+
+    let socket = socket_path(workspace);
+    let mut stream = (0..400)
+        .find_map(|_| match UnixStream::connect(&socket) {
+            Ok(stream) => Some(stream),
+            Err(_) => {
+                thread::sleep(Duration::from_millis(25));
+                None
+            }
+        })
+        .expect("daemon socket becomes available");
+    stream
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    stream.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"reconciliation-test\",\"version\":\"1\"}}}\n").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let init: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert!(init.get("result").is_some(), "initialize failed: {init}");
+    stream
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .unwrap();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "tower_ast_search_symbols",
+            "arguments": { "name": symbol, "kind": "function" }
+        }
+    });
+    writeln!(stream, "{request}").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+#[cfg(unix)]
+fn repaired_files_reach_ast_once_after_parallel_startup() {
+    let workspace = tempdir().unwrap();
+    fs::create_dir_all(workspace.path().join(".tower")).unwrap();
+    fs::write(
+        workspace.path().join(".tower/config.toml"),
+        "[daemon]\nidle_timeout_secs = 1\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join("baseline.rs"),
+        "pub fn baseline() {}\n",
+    )
+    .unwrap();
+    let tower = production_tower_bin();
+    run_daemon_to_idle(&tower, workspace.path());
+
+    fs::write(
+        workspace.path().join("repaired.rs"),
+        "pub fn repaired_parallel_startup_symbol() {}\n",
+    )
+    .unwrap();
+    install_ast_extension(workspace.path());
+
+    for _ in 0..2 {
+        let mut daemon = spawn_ast_daemon(&tower, workspace.path());
+        let response = ast_symbol_search(workspace.path(), "repaired_parallel_startup_symbol");
+        let rendered = response.to_string();
+        assert_eq!(
+            rendered
+                .matches("\\\"name\\\":\\\"repaired_parallel_startup_symbol\\\"")
+                .count(),
+            1,
+            "repaired symbol must be visible exactly once after restart: {response}"
+        );
+        daemon.0.kill().unwrap();
+        daemon.0.wait().unwrap();
+    }
 }
 
 // ── HostDeps builders ─────────────────────────────────────────────────────────

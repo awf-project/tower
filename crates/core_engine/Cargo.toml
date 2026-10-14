@@ -19,6 +19,7 @@ path = "src/main.rs"
 # Decision: feature gate rather than a separate crate to avoid circular deps.
 # Trade-off: callers must opt-in; the feature is not automatically enabled.
 testing = []
+startup-test-hooks = ["testing"]
 
 [dev-dependencies]
 # Property-based testing: generates arbitrary inputs to verify invariants over

@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::lsp::validate_lsp_commands;
@@ -11,6 +13,13 @@ use core_engine::adapters::config::{LspConfig, LspServerConfig, TowerConfig};
 use core_engine::adapters::daemon::engine::build_engine;
 use core_engine::adapters::daemon::socket::socket_path;
 use core_engine::adapters::daemon::wire::{ClientRole, Handshake};
+use core_engine::adapters::fs::workspace_scan;
+use core_engine::adapters::watcher::WatcherError;
+use core_engine::adapters::{InMemoryStorage, NotifyWatcherAdapter, SledStorageAdapter};
+use core_engine::domain::index::InvertedIndex;
+use core_engine::domain::token::Token;
+use core_engine::domain::{ProjectWorkspace, RelativePath};
+use core_engine::ports::{ExtensionHostPort, NoOpExtensionHost, PortError};
 use extension_protocol::{LspOutcomeCode, LspOutcomePhase, LspOutcomeStatus};
 use tempfile::tempdir;
 
@@ -20,6 +29,51 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// Holds the watcher worker inside a real lifecycle callback.  This makes the
+/// queue-order assertion deterministic without reaching into its private
+/// message channel or relying on a wall-clock race.
+struct BlockingExtensionHost {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    blocked_once: AtomicBool,
+}
+
+impl ExtensionHostPort for BlockingExtensionHost {
+    fn on_file_indexed(&self, _id: core_engine::domain::FileId, _path: &RelativePath) {}
+
+    fn on_file_changed(&self, _id: core_engine::domain::FileId, _path: &RelativePath) {
+        if !self.blocked_once.swap(true, Ordering::AcqRel) {
+            self.entered.send(()).expect("report blocked watcher event");
+            self.release
+                .lock()
+                .expect("release channel lock")
+                .recv()
+                .expect("release blocked watcher event");
+        }
+    }
+
+    fn on_file_deleted(&self, _path: &RelativePath) {}
+
+    fn declared_tools(
+        &self,
+    ) -> Vec<(
+        core_engine::domain::ExtensionId,
+        extension_protocol::ToolDecl,
+    )> {
+        Vec::new()
+    }
+
+    fn invoke(
+        &self,
+        tool_name: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, core_engine::domain::InvokeError> {
+        Err(core_engine::domain::InvokeError::ToolNotFound(
+            tool_name.to_owned(),
+        ))
     }
 }
 
@@ -38,6 +92,419 @@ fn build_engine_indexes_a_fresh_workspace() {
     let ws = handle.state.read().unwrap();
     let count = ws.workspace_arc().read().unwrap().all_file_ids().len();
     assert_eq!(count, 2, "two source files indexed");
+}
+
+#[cfg(unix)]
+#[test]
+fn repaired_additions_replay_after_commit_and_watcher_catch_up() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+
+    let workspace = tempdir().expect("create workspace");
+    std::fs::write(
+        workspace.path().join("persisted.rs"),
+        "pub fn persisted() {}\n",
+    )
+    .expect("seed persisted file");
+    let db_path = workspace.path().join(".tower/db");
+    std::fs::create_dir_all(&db_path).expect("create database directory");
+    let (mut storage, mut initial_workspace, mut initial_index) =
+        SledStorageAdapter::open(&db_path).expect("open initial storage");
+    workspace_scan(
+        workspace.path(),
+        &mut storage,
+        &mut initial_workspace,
+        &mut initial_index,
+    )
+    .expect("persist initial workspace");
+    drop(storage);
+
+    std::fs::write(
+        workspace.path().join("repaired.rs"),
+        "pub fn repaired() {}\n",
+    )
+    .expect("create offline addition");
+    let extension_dir = workspace.path().join("extensions/recorder");
+    std::fs::create_dir_all(&extension_dir).expect("create recorder extension directory");
+    let replay_marker = workspace.path().join("replay.json");
+    let script = extension_dir.join("record-replay.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nread -r initialize\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"type\":\"Initialized\",\"data\":{{\"tools\":[],\"events\":[\"event/fileIndexed\"],\"capabilities\":[\"read_file\"]}}}}}}'\nwhile IFS= read -r event; do\n  request_id=$(printf '%s\\n' \"$event\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n  case \"$event\" in\n    *repaired.rs*)\n      printf '%s\\n' \"$event\" >> '{}'\n      printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"workspace/readFile\",\"params\":{{\"path\":\"repaired.rs\"}}}}'\n      IFS= read -r response\n      printf '%s\\n' \"$response\" >> '{}'\n      ;;\n  esac\n  if [ -n \"$request_id\" ]; then\n    printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"type\":\"Ack\"}}}}\\n' \"$request_id\"\n  fi\ndone\n",
+            replay_marker.display(),
+            replay_marker.display()
+        ),
+    )
+    .expect("write recorder extension");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make recorder executable");
+    std::fs::write(
+        extension_dir.join("extension.toml"),
+        format!(
+            "name = \"recorder\"\nversion = \"0.1.0\"\ncommand = [\"{}\"]\nactivation = \"eager\"\n\n[events]\nsubscribe = [\"event/fileIndexed\"]\n\n[capabilities]\nrequired = [\"read_file\"]\n",
+            script.display()
+        ),
+    )
+    .expect("write recorder manifest");
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: Some(workspace.path().join("extensions")),
+    };
+    let engine = build_engine(&opts, TowerConfig::default()).expect("repaired engine starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(&replay_marker)
+        .map(|replay| !replay.contains("\"result\""))
+        .unwrap_or(true)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let replay = std::fs::read_to_string(&replay_marker)
+        .expect("committed repaired addition is replayed exactly once");
+    assert_eq!(replay.matches("\"method\":\"deliverEvent\"").count(), 1);
+    assert!(replay.contains("repaired.rs"));
+    assert!(
+        replay.contains("\"result\""),
+        "replay callback HostCall must complete: {replay}"
+    );
+    let state = engine
+        .state
+        .try_read()
+        .expect("replay must not hold the engine-state lock");
+    let workspace_state = state.workspace_arc();
+    let index_state = state.index_arc();
+    drop(state);
+    let workspace_guard = workspace_state
+        .try_read()
+        .expect("replay must not hold the workspace lock");
+    let repaired_id = workspace_guard
+        .get_by_path(&RelativePath::new("repaired.rs"))
+        .expect("repaired addition is visible before replay completes");
+    drop(workspace_guard);
+    assert_eq!(
+        index_state
+            .try_read()
+            .expect("replay must not hold the index lock")
+            .query(&Token::new("repaired"))
+            .collect::<Vec<_>>(),
+        vec![repaired_id]
+    );
+}
+
+#[test]
+fn watcher_catch_up_converges_create_delete_and_rename() {
+    let dir = tempdir().expect("create workspace");
+    let deleted = dir.path().join("deleted.rs");
+    let renamed_from = dir.path().join("renamed_from.rs");
+    let renamed_to = dir.path().join("renamed_to.rs");
+    let created = dir.path().join("created.rs");
+    std::fs::write(&deleted, "pub fn deleted() {}\n").expect("seed deleted file");
+    std::fs::write(&renamed_from, "pub fn renamed() {}\n").expect("seed renamed file");
+
+    let mut storage = InMemoryStorage::new();
+    let mut initial_workspace = ProjectWorkspace::new();
+    let mut initial_index = InvertedIndex::new();
+    workspace_scan(
+        dir.path(),
+        &mut storage,
+        &mut initial_workspace,
+        &mut initial_index,
+    )
+    .expect("initial scan succeeds");
+    let workspace = Arc::new(RwLock::new(initial_workspace));
+    let index = Arc::new(RwLock::new(initial_index));
+
+    let (mutate_tx, mutate_rx) = mpsc::channel();
+    let (mutated_tx, mutated_rx) = mpsc::channel();
+    let mutation = std::thread::spawn(move || {
+        mutate_rx.recv().expect("mutation boundary opens");
+        std::fs::write(created, "pub fn created() {}\n").expect("create file");
+        std::fs::remove_file(deleted).expect("delete file");
+        std::fs::rename(renamed_from, renamed_to).expect("rename file");
+        mutated_tx.send(()).expect("report completed mutations");
+    });
+
+    mutate_tx.send(()).expect("open mutation boundary");
+    mutated_rx.recv().expect("mutations complete");
+    mutation.join().expect("mutation thread exits");
+
+    let watcher = NotifyWatcherAdapter::new(
+        dir.path().to_path_buf(),
+        Arc::clone(&workspace),
+        Arc::clone(&index),
+        Box::new(storage),
+        Box::new(NoOpExtensionHost),
+    )
+    .expect("watcher registers");
+    watcher.request_catch_up().expect("catch-up succeeds");
+    watcher.barrier().expect("barrier succeeds");
+
+    let workspace = workspace.read().expect("workspace lock");
+    let index = index.read().expect("index lock");
+    let created_id = workspace
+        .get_by_path(&RelativePath::new("created.rs"))
+        .expect("created file is indexed");
+    let renamed_id = workspace
+        .get_by_path(&RelativePath::new("renamed_to.rs"))
+        .expect("renamed destination is indexed");
+
+    assert_eq!(workspace.all_file_ids().len(), 2);
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("deleted.rs"))
+            .is_none()
+    );
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("renamed_from.rs"))
+            .is_none()
+    );
+    assert_eq!(
+        index.query(&Token::new("created")).collect::<Vec<_>>(),
+        vec![created_id]
+    );
+    assert_eq!(
+        index.query(&Token::new("renamed")).collect::<Vec<_>>(),
+        vec![renamed_id]
+    );
+    assert_eq!(index.posting_count(&Token::new("deleted")), 0);
+    assert_eq!(index.posting_count(&Token::new("from")), 0);
+}
+
+#[test]
+fn watcher_catch_up_preserves_typed_failure_mapping_and_confidentiality() {
+    let dir = tempdir().expect("create workspace");
+    let secret_contents = "do-not-expose-catch-up-file-contents";
+    std::fs::write(dir.path().join("tracked.rs"), secret_contents).expect("seed tracked file");
+
+    let mut storage = InMemoryStorage::new();
+    let mut workspace = ProjectWorkspace::new();
+    let mut index = InvertedIndex::new();
+    workspace_scan(dir.path(), &mut storage, &mut workspace, &mut index)
+        .expect("initial scan succeeds");
+    storage.fail_next_reconciliation_before_commit_for_test();
+
+    let watcher = NotifyWatcherAdapter::new(
+        dir.path().to_path_buf(),
+        Arc::new(RwLock::new(workspace)),
+        Arc::new(RwLock::new(index)),
+        Box::new(storage),
+        Box::new(NoOpExtensionHost),
+    )
+    .expect("watcher registers");
+
+    let error = watcher
+        .request_catch_up()
+        .expect_err("persistence failure is returned to the caller");
+    assert!(matches!(
+        error,
+        WatcherError::Storage(PortError::ReconciliationFailed {
+            operation: "apply_reconciliation_delta",
+            ..
+        })
+    ));
+    assert!(
+        !error.to_string().contains(secret_contents),
+        "catch-up errors must never include file contents"
+    );
+}
+
+#[test]
+fn watcher_catch_up_wraps_scan_errors_without_file_contents() {
+    let dir = tempdir().expect("create workspace");
+    let secret_contents = "do-not-expose-scan-file-contents";
+    std::fs::write(dir.path().join("tracked.rs"), secret_contents).expect("seed tracked file");
+
+    let watcher = NotifyWatcherAdapter::new(
+        dir.path().to_path_buf(),
+        Arc::new(RwLock::new(ProjectWorkspace::new())),
+        Arc::new(RwLock::new(InvertedIndex::new())),
+        Box::new(InMemoryStorage::new()),
+        Box::new(NoOpExtensionHost),
+    )
+    .expect("watcher registers");
+    std::fs::remove_dir_all(dir.path()).expect("remove workspace before catch-up");
+
+    let error = watcher
+        .request_catch_up()
+        .expect_err("scan failure is returned to the caller");
+    let WatcherError::Storage(PortError::ReadFailed(message)) = error else {
+        panic!("non-persistence scan errors must map to WatcherError::Storage(ReadFailed)");
+    };
+    assert!(message.starts_with("catch_up failed:"));
+    assert!(
+        !message.contains(secret_contents),
+        "catch-up errors must never include file contents"
+    );
+}
+
+#[test]
+fn watcher_catch_up_maps_acknowledgement_and_enqueue_disconnects_to_channel_closed() {
+    let dir = tempdir().expect("create workspace");
+    let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+    let index = Arc::new(RwLock::new(InvertedIndex::new()));
+
+    let poison_workspace = Arc::clone(&workspace);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison_workspace.write().expect("workspace lock");
+            panic!("poison workspace for worker-disconnect coverage");
+        })
+        .join()
+        .is_err(),
+        "test fixture must poison the worker's workspace lock"
+    );
+
+    let watcher = NotifyWatcherAdapter::new(
+        dir.path().to_path_buf(),
+        workspace,
+        index,
+        Box::new(InMemoryStorage::new()),
+        Box::new(NoOpExtensionHost),
+    )
+    .expect("watcher registers");
+
+    assert!(matches!(
+        watcher.request_catch_up(),
+        Err(WatcherError::ChannelClosed)
+    ));
+    assert!(matches!(
+        watcher.request_catch_up(),
+        Err(WatcherError::ChannelClosed)
+    ));
+}
+
+#[test]
+fn watcher_startup_failure_prevents_extension_loading() {
+    let failed_root = tempdir().expect("create failed startup workspace");
+    let failed_workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+    let poison_workspace = Arc::clone(&failed_workspace);
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poison_workspace.write().expect("workspace lock");
+            panic!("terminate watcher worker during startup catch-up");
+        })
+        .join()
+        .is_err()
+    );
+    let failed_watcher = NotifyWatcherAdapter::new(
+        failed_root.path().to_path_buf(),
+        failed_workspace,
+        Arc::new(RwLock::new(InvertedIndex::new())),
+        Box::new(InMemoryStorage::new()),
+        Box::new(NoOpExtensionHost),
+    )
+    .expect("watcher registers before startup catch-up");
+    assert!(matches!(
+        failed_watcher.request_catch_up(),
+        Err(WatcherError::ChannelClosed)
+    ));
+    assert!(matches!(
+        failed_watcher.barrier(),
+        Err(WatcherError::ChannelClosed)
+    ));
+
+    let retry_root = tempdir().expect("create retry workspace");
+    std::fs::write(
+        retry_root.path().join("retry.rs"),
+        "pub fn clean_retry() {}\n",
+    )
+    .expect("seed retry addition");
+    let retry_workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+    let retry_watcher = NotifyWatcherAdapter::new(
+        retry_root.path().to_path_buf(),
+        Arc::clone(&retry_workspace),
+        Arc::new(RwLock::new(InvertedIndex::new())),
+        Box::new(InMemoryStorage::new()),
+        Box::new(NoOpExtensionHost),
+    )
+    .expect("clean retry watcher registers");
+    retry_watcher
+        .request_catch_up()
+        .expect("first clean retry catch-up succeeds");
+    retry_watcher
+        .barrier()
+        .expect("first clean retry barrier succeeds");
+    assert!(
+        retry_workspace
+            .read()
+            .expect("retry workspace lock")
+            .get_by_path(&RelativePath::new("retry.rs"))
+            .is_some()
+    );
+
+    let opts = GlobalOpts {
+        workspace_dir: Some(retry_root.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let _engine = build_engine(&opts, TowerConfig::default())
+        .expect("daemon startup succeeds after the channel-closed attempt");
+}
+
+#[test]
+fn watcher_barrier_waits_for_earlier_worker_event() {
+    let dir = tempdir().expect("create workspace");
+    let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+    let index = Arc::new(RwLock::new(InvertedIndex::new()));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let host = BlockingExtensionHost {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        blocked_once: AtomicBool::new(false),
+    };
+    let watcher = NotifyWatcherAdapter::new(
+        dir.path().to_path_buf(),
+        Arc::clone(&workspace),
+        Arc::clone(&index),
+        Box::new(InMemoryStorage::new()),
+        Box::new(host),
+    )
+    .expect("watcher registers");
+
+    std::fs::write(dir.path().join("queued.rs"), "pub fn queued() {}\n")
+        .expect("create queued file");
+    entered_rx
+        .recv()
+        .expect("watcher event reaches controlled callback");
+
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let watcher_ref = &watcher;
+        let barrier_thread = scope.spawn(move || {
+            started_tx.send(()).expect("barrier call starts");
+            completed_tx
+                .send(watcher_ref.barrier())
+                .expect("barrier result delivered");
+        });
+        started_rx.recv().expect("barrier is enqueued after event");
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "barrier must not acknowledge while the earlier event is pending"
+        );
+
+        release_tx.send(()).expect("release earlier event");
+        assert!(
+            completed_rx
+                .recv()
+                .expect("barrier result available after release")
+                .is_ok(),
+            "barrier acknowledges after earlier event completes"
+        );
+        barrier_thread.join().expect("barrier caller exits");
+    });
+
+    assert!(
+        workspace
+            .read()
+            .expect("workspace lock")
+            .get_by_path(&RelativePath::new("queued.rs"))
+            .is_some(),
+        "the event preceding the barrier completes before acknowledgement"
+    );
 }
 
 #[test]

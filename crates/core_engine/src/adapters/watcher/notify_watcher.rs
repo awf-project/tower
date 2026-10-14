@@ -55,9 +55,16 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use super::debounce::debounce_events;
 use super::error::WatcherError;
 use super::event_processor::{EventProcessor, WatchEvent};
+use crate::adapters::fs::scan::ScanError;
 use crate::domain::index::InvertedIndex;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::ports::{DocumentSyncPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
+
+enum WorkerMessage {
+    Event(WatchEvent),
+    CatchUp(Sender<Result<(), WatcherError>>),
+    Barrier(Sender<Result<(), WatcherError>>),
+}
 
 /// OS-backed filesystem watcher adapter (spec 06).
 ///
@@ -104,7 +111,7 @@ pub struct NotifyWatcherAdapter {
     watcher: Option<RecommendedWatcher>,
     /// Sender half of the event channel; wrapped in `Option` so `Drop` can
     /// explicitly drop it (closing the channel) before joining the worker thread.
-    sender: Option<Sender<WatchEvent>>,
+    sender: Option<Sender<WorkerMessage>>,
     /// Worker thread handle; joined in `Drop` after the channel is closed.
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -158,7 +165,7 @@ impl NotifyWatcherAdapter {
         doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
         echo_set: Arc<Mutex<HashMap<String, ()>>>,
     ) -> Result<Self, WatcherError> {
-        let (tx, rx): (Sender<WatchEvent>, Receiver<WatchEvent>) = unbounded();
+        let (tx, rx): (Sender<WorkerMessage>, Receiver<WorkerMessage>) = unbounded();
 
         // Clone root for the notify callback closure.
         let root_for_callback = root.clone();
@@ -183,7 +190,7 @@ impl NotifyWatcherAdapter {
                         // the worker to finish extension callbacks. Deletion
                         // events are index-correctness signals, so dropping them
                         // under backpressure would create permanent ghosts.
-                        if tx_for_callback.send(watch_event).is_err() {
+                        if tx_for_callback.send(WorkerMessage::Event(watch_event)).is_err() {
                             // Channel closed during shutdown — log and continue.
                             eprintln!(
                                 "[tower/watcher] event channel closed during shutdown; dropping event"
@@ -229,24 +236,46 @@ impl NotifyWatcherAdapter {
             .name("tower-watcher".to_owned())
             .spawn(move || {
                 // `rx.into_iter()` blocks until the Sender is dropped.
-                for event in rx.into_iter() {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        processor.process_event(event)
-                    }));
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            eprintln!("[tower/watcher] process_event error: {e}");
+                for message in rx.into_iter() {
+                    match message {
+                        WorkerMessage::Event(event) => {
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                processor.process_event(event)
+                            }));
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    eprintln!("[tower/watcher] process_event error: {e}");
+                                }
+                                Err(payload) => {
+                                    let msg = payload
+                                        .downcast_ref::<&str>()
+                                        .copied()
+                                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                                        .unwrap_or("(unknown panic payload)");
+                                    eprintln!(
+                                        "[tower/watcher] process_event panicked (event dropped): {msg}"
+                                    );
+                                }
+                            }
                         }
-                        Err(payload) => {
-                            let msg = payload
-                                .downcast_ref::<&str>()
-                                .copied()
-                                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                                .unwrap_or("(unknown panic payload)");
-                            eprintln!(
-                                "[tower/watcher] process_event panicked (event dropped): {msg}"
+                        WorkerMessage::CatchUp(acknowledgement) => {
+                            let result = processor.reconcile_workspace().map(|_| ()).map_err(
+                                |source| match source {
+                                    ScanError::Persistence { source, .. } => {
+                                        WatcherError::Storage(source)
+                                    }
+                                    source => WatcherError::Storage(
+                                        crate::ports::PortError::ReadFailed(format!(
+                                            "catch_up failed: {source}"
+                                        )),
+                                    ),
+                                },
                             );
+                            let _ = acknowledgement.send(result);
+                        }
+                        WorkerMessage::Barrier(acknowledgement) => {
+                            let _ = acknowledgement.send(Ok(()));
                         }
                     }
                 }
@@ -259,6 +288,26 @@ impl NotifyWatcherAdapter {
             sender: Some(tx),
             worker: Some(worker),
         })
+    }
+
+    pub fn request_catch_up(&self) -> Result<(), WatcherError> {
+        let (acknowledgement, result) = unbounded();
+        self.sender
+            .as_ref()
+            .ok_or(WatcherError::ChannelClosed)?
+            .send(WorkerMessage::CatchUp(acknowledgement))
+            .map_err(|_| WatcherError::ChannelClosed)?;
+        result.recv().map_err(|_| WatcherError::ChannelClosed)?
+    }
+
+    pub fn barrier(&self) -> Result<(), WatcherError> {
+        let (acknowledgement, result) = unbounded();
+        self.sender
+            .as_ref()
+            .ok_or(WatcherError::ChannelClosed)?
+            .send(WorkerMessage::Barrier(acknowledgement))
+            .map_err(|_| WatcherError::ChannelClosed)?;
+        result.recv().map_err(|_| WatcherError::ChannelClosed)?
     }
 }
 

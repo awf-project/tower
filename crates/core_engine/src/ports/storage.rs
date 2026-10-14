@@ -24,6 +24,15 @@
 use crate::domain::{ContentHash, FileId, VirtualFile};
 use crate::ports::PortError;
 
+/// Records to add and remove during startup inventory reconciliation.
+///
+/// Records absent from both collections are survivors and retain their
+/// existing identities.
+pub struct ReconciliationDelta {
+    pub additions: Vec<VirtualFile>,
+    pub removals: Vec<FileId>,
+}
+
 /// Persistence contract for `VirtualFile` entities and raw content blobs.
 ///
 /// # Object safety
@@ -31,6 +40,24 @@ use crate::ports::PortError;
 /// This trait is object-safe so it can be used as `dyn StoragePort` where
 /// dynamic dispatch is needed (e.g. wiring domain services at runtime).
 pub trait StoragePort {
+    /// Commit reconciliation records and all associated index metadata as one
+    /// atomic operation.
+    ///
+    /// A successful return guarantees that file records, path mappings,
+    /// allocator metadata, and path-token search postings became visible
+    /// together. The default fails closed until an adapter provides that
+    /// guarantee.
+    fn apply_reconciliation_delta(&mut self, delta: &ReconciliationDelta) -> Result<(), PortError> {
+        Err(PortError::ReconciliationFailed {
+            operation: "apply_reconciliation_delta",
+            reason: format!(
+                "adapter does not support atomic reconciliation ({} additions, {} removals)",
+                delta.additions.len(),
+                delta.removals.len()
+            ),
+        })
+    }
+
     /// Retrieve a `VirtualFile` by its `FileId`.
     ///
     /// # Errors

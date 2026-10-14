@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn tower_config_exposes_lint_field_that_is_empty_when_config_has_no_lint_table() {
-        let cfg = parse_tower_config("[plugins]\ndisabled = []\n").expect("config must parse");
+        let cfg = parse_tower_config("[extensions]\ndisabled = []\n").expect("config must parse");
 
         assert!(cfg.lint.is_empty());
     }
