@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn debug_config_parses_a_missing_debug_section_as_empty_and_exposes_is_empty_true() {
-        let cfg = parse_tower_config("[plugins]\ndisabled = []\n").expect("config must parse");
+        let cfg = parse_tower_config("[extensions]\ndisabled = []\n").expect("config must parse");
 
         assert!(cfg.debug.is_empty());
         assert_eq!(cfg.debug.for_extension_initialize(), None);
@@ -443,7 +443,8 @@ idle_ttl_secs = 120
     #[test]
     fn debug_config_parses_debug_config_includes_record_without_changing_absent_empty_or_present_language_configs()
      {
-        let absent = parse_tower_config("[plugins]\ndisabled = []\n").expect("absent debug parses");
+        let absent =
+            parse_tower_config("[extensions]\ndisabled = []\n").expect("absent debug parses");
         assert!(absent.debug.languages.is_empty());
         assert_eq!(absent.debug.record, None);
 

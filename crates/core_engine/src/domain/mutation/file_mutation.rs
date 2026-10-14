@@ -795,7 +795,8 @@ impl<'ws> FileMutationService<'ws> {
 fn port_err_to_domain(err: PortError) -> DomainError {
     match err {
         PortError::NotFound => DomainError::NotFound,
-        PortError::WriteFailed(reason)
+        PortError::ReconciliationFailed { reason, .. }
+        | PortError::WriteFailed(reason)
         | PortError::ReadFailed(reason)
         | PortError::InvalidArgs(reason) => DomainError::IoError(reason),
     }

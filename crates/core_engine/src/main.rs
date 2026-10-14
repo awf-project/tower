@@ -52,10 +52,7 @@ fn main() {
             let cfg_result = config::load(&workspace_root).map_err(|e| e.to_string());
             match cfg_result {
                 Err(e) => Err(e),
-                Ok(mut cfg) => {
-                    for warning in config::apply_backcompat(&mut cfg) {
-                        eprintln!("{warning}");
-                    }
+                Ok(cfg) => {
                     warn_if_towerignore_absent(&workspace_root);
                     core_engine::adapters::daemon::server::run_daemon(&cli.global_opts, cfg, detach)
                 }

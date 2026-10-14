@@ -31,6 +31,68 @@ pub mod fixtures;
 
 pub use fixtures::{make_virtual_file, sample_content_hash};
 
+#[test]
+fn reconciliation_delta_contract_shape_is_stable() {
+    use crate::domain::{ContentHash, FileId, VirtualFile};
+    use crate::ports::{PortError, ReconciliationDelta, StoragePort};
+
+    struct MinimalStorage;
+
+    impl StoragePort for MinimalStorage {
+        fn get(&self, _id: FileId) -> Result<VirtualFile, PortError> {
+            Err(PortError::NotFound)
+        }
+
+        fn put(&mut self, _file: VirtualFile) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn put_batch(&mut self, _files: &[VirtualFile]) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn delete(&mut self, _id: FileId) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn put_blob(&mut self, _hash: ContentHash, _bytes: Vec<u8>) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn get_blob(&self, _hash: &ContentHash) -> Result<Vec<u8>, PortError> {
+            Err(PortError::NotFound)
+        }
+
+        fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn is_scan_complete(&self) -> Result<bool, PortError> {
+            Ok(false)
+        }
+    }
+
+    let delta = ReconciliationDelta {
+        additions: vec![make_virtual_file(7, 2, "src/new.rs")],
+        removals: vec![FileId::new_for_testing(3, 1)],
+    };
+    let ReconciliationDelta {
+        additions,
+        removals,
+    } = &delta;
+    assert_eq!(additions.len(), 1);
+    assert_eq!(removals, &[FileId::new_for_testing(3, 1)]);
+
+    let mut storage = MinimalStorage;
+    let port: &mut dyn StoragePort = &mut storage;
+    let error = port.apply_reconciliation_delta(&delta).unwrap_err();
+    assert!(matches!(error, PortError::ReconciliationFailed { .. }));
+    if let PortError::ReconciliationFailed { operation, reason } = error {
+        assert_eq!(operation, "apply_reconciliation_delta");
+        assert!(!reason.contains("src/new.rs"));
+    }
+}
+
 /// Expand a full behavioural contract test suite for any [`StoragePort`]
 /// implementation.
 ///
@@ -45,12 +107,14 @@ pub use fixtures::{make_virtual_file, sample_content_hash};
 /// each time it is called.
 #[macro_export]
 macro_rules! storage_contract_tests {
-    ($make:expr_2021) => {
+    ($make:expr_2021 $(, $reconciliation_test:expr_2021)?) => {
         mod storage_contract {
             use super::*;
             use $crate::domain::{FileId, VirtualFile};
             use $crate::ports::{PortError, StoragePort};
             use $crate::test_support::{make_virtual_file, sample_content_hash};
+
+            $crate::__storage_reconciliation_contract_test!($($reconciliation_test)?);
 
             #[test]
             fn put_then_get_returns_same_file() {
@@ -282,6 +346,18 @@ macro_rules! storage_contract_tests {
                     "marker must not be set by put — only mark_scan_complete sets it"
                 );
             }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __storage_reconciliation_contract_test {
+    () => {};
+    ($run:expr_2021) => {
+        #[test]
+        fn reconciliation_delta_is_atomic() {
+            ($run)();
         }
     };
 }

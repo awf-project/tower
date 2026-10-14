@@ -17,6 +17,14 @@
 /// rename operations.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PortError {
+    /// An adapter could not commit an atomic reconciliation delta.
+    ///
+    /// `operation` is a static, non-secret identifier. `reason` may contain
+    /// counts and adapter diagnostics, but must never contain file content.
+    ReconciliationFailed {
+        operation: &'static str,
+        reason: String,
+    },
     /// The requested key / path was not found in the backing store.
     NotFound,
     /// A write or rename operation failed (e.g. permission denied, disk full).
@@ -38,6 +46,9 @@ pub enum PortError {
 impl core::fmt::Display for PortError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::ReconciliationFailed { operation, reason } => {
+                write!(f, "{operation} failed: {reason}")
+            }
             Self::NotFound => write!(f, "key or path not found"),
             Self::WriteFailed(reason) => write!(f, "write failed: {reason}"),
             Self::ReadFailed(reason) => write!(f, "read failed: {reason}"),

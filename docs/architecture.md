@@ -186,10 +186,12 @@ Startup
 workspace root
   └─ SledStorageAdapter::open(.tower/db)
        ├─ reconstructs ProjectWorkspace + InvertedIndex from sled
-       └─ if not scan_complete:
-            workspace_scan(root, &mut storage, &mut workspace, &mut index)
-              uses ignore crate (respects .gitignore)
-              put_batch → mark_scan_complete
+       └─ reconcile_workspace(root, persisted state)
+            authoritative eligible walk (root/nested .towerignore; no .gitignore)
+            compare path inventory with persisted records
+            atomic add/remove/update of coupled projections
+            publish repaired file events after commit and lock release
+            report added/removed/unchanged counts to stderr
 
 Runtime (Arc<RwLock<EngineState>> shared by all handlers)
 ──────────────────────────────────────────────────────────
@@ -238,6 +240,20 @@ OS inotify/kqueue/FSEvents
                                                   re-indexes changed file
                                                   calls ExtensionHostPort::on_file_changed
 ```
+
+Startup reconciliation runs regardless of any historical scan-completion marker. It preserves
+surviving `FileId` generations, removes only paths confirmed absent or newly excluded, and leaves
+unverified records intact when enumeration or metadata access fails. Watcher activation is ordered
+with reconciliation so events observed during startup are replayed and converge the index with the
+filesystem before the daemon reports a successful startup.
+
+### Configuration boundary
+
+`.tower/config.toml` is parsed before engine construction. The canonical runtime schema keeps
+native extension controls in `[extensions]` and host-owned formatter commands in
+`[formatter.tools.<id>]`. Any top-level `[plugins]` table is rejected, including empty or mixed
+forms, before the engine or sidecars start. The error names the config path, rejected section, and
+the applicable canonical replacement; Tower never rewrites the rejected file automatically.
 
 ## Extension host runtime (Microkernel)
 
@@ -308,36 +324,40 @@ severs the MCP link.
 
 ## Non-negotiable invariants
 
-| Invariant | Where enforced |
-|-----------|----------------|
-| **Domain purity**: `domain/` imports no sled, std::process, notify, or std::fs | `#![forbid(unsafe_code)]` + module-level doc comment; compile-time |
-| **Generational FileId**: `struct FileId { index: u32, generation: u32 }`. A reused slot bumps generation; stale id never silently resolves to a different file | `domain/file_id.rs`; only `ProjectWorkspace` mints ids |
-| **Atomic file writes**: write to `<path>.tmp_write` → flush → `fs::rename`. No torn files on crash. `.tmp_write` files are never indexed | `FileMutationService`, `GlobalReplaceService`; `FileSystemPort::rename` contract |
-| **Zero lock contention**: `EngineState` behind `Arc<RwLock<EngineState>>`; critical sections are short and contain no blocking I/O; watcher (writer) must not starve MCP handlers (readers) | `main.rs` wiring; per-extension `Mutex` so one slow extension stalls only itself |
-| **Extension fault isolation**: a child crash, hang (timeout), or protocol violation must not crash the host or sever the MCP link | OS process boundary + `SidecarHostAdapter` (per-call timeout/kill) → `ExtensionFault` → `-32603` |
-| **Capability security**: extensions reach the workspace only via declared capability callbacks routed to outbound ports; an undeclared `HostCall` is rejected | `SidecarHostAdapter` capability gating + `path_validation` (rejects `..`/absolute/empty paths) |
-| **Protocol version guard**: the host compares the extension's `protocol_version` against `PROTOCOL_VERSION` (currently 1) at `initialize` | `extension_protocol::PROTOCOL_VERSION`; sidecar `initialize` handshake |
-| **Quarantine**: an extension is quarantined after `MAX_CONSECUTIVE_FAILURES` (=3) consecutive faults; a success resets the counter | `ExtensionRegistry` (domain policy) |
-| **Extension tool namespacing**: tools are always merged as `tower_<ext>_<tool_name>`; no un-namespaced extension tool is possible | `ExtensionMergedRegistry::list` |
-| **Reserved host prefix**: extension names beginning with `tower` are reserved for native host tools; no collision possible | `ExtensionMergedRegistry` |
-| **Single static binary**: `cargo build -p core_engine` produces a self-contained `tower` binary; no WASM, WASI SDK, JVM, Node, or container required | Cargo workspace; no runtime dynamic linking |
+| Invariant                                                                                                                                                                                   | Where enforced                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| **Domain purity**: `domain/` imports no sled, std::process, notify, or std::fs                                                                                                              | `#![forbid(unsafe_code)]` + module-level doc comment; compile-time                               |
+| **Generational FileId**: `struct FileId { index: u32, generation: u32 }`. A reused slot bumps generation; stale id never silently resolves to a different file                              | `domain/file_id.rs`; only `ProjectWorkspace` mints ids                                           |
+| **Atomic file writes**: write to `<path>.tmp_write` → flush → `fs::rename`. No torn files on crash. `.tmp_write` files are never indexed                                                    | `FileMutationService`, `GlobalReplaceService`; `FileSystemPort::rename` contract                 |
+| **Zero lock contention**: `EngineState` behind `Arc<RwLock<EngineState>>`; critical sections are short and contain no blocking I/O; watcher (writer) must not starve MCP handlers (readers) | `main.rs` wiring; per-extension `Mutex` so one slow extension stalls only itself                 |
+| **Extension fault isolation**: a child crash, hang (timeout), or protocol violation must not crash the host or sever the MCP link                                                           | OS process boundary + `SidecarHostAdapter` (per-call timeout/kill) → `ExtensionFault` → `-32603` |
+| **Capability security**: extensions reach the workspace only via declared capability callbacks routed to outbound ports; an undeclared `HostCall` is rejected                               | `SidecarHostAdapter` capability gating + `path_validation` (rejects `..`/absolute/empty paths)   |
+| **Protocol version guard**: the host compares the extension's `protocol_version` against `PROTOCOL_VERSION` (currently 1) at `initialize`                                                   | `extension_protocol::PROTOCOL_VERSION`; sidecar `initialize` handshake                           |
+| **Quarantine**: an extension is quarantined after `MAX_CONSECUTIVE_FAILURES` (=3) consecutive faults; a success resets the counter                                                          | `ExtensionRegistry` (domain policy)                                                              |
+| **Extension tool namespacing**: tools are always merged as `tower_<ext>_<tool_name>`; no un-namespaced extension tool is possible                                                           | `ExtensionMergedRegistry::list`                                                                  |
+| **Reserved host prefix**: extension names beginning with `tower` are reserved for native host tools; no collision possible                                                                  | `ExtensionMergedRegistry`                                                                        |
+| **Single static binary**: `cargo build -p core_engine` produces a self-contained `tower` binary; no WASM, WASI SDK, JVM, Node, or container required                                        | Cargo workspace; no runtime dynamic linking                                                      |
 
 ## JSON-RPC error codes
 
-| Code | Constant | When |
-|------|----------|------|
-| -32700 | ParseError | Malformed JSON or invalid UTF-8 frame |
-| -32600 | InvalidRequest | `jsonrpc` field is not `"2.0"` |
-| -32601 | MethodNotFound | Unknown RPC method name |
-| -32602 | InvalidParams | Missing required field in tool arguments |
-| -32603 | InternalError | Tool execution failed (including extension faults) |
-| -32001 | ToolNotFound | Named tool not in registry |
-| -32002 | ResourceNotFound | Domain entity not found |
+| Code   | Constant         | When                                               |
+| ------ | ---------------- | -------------------------------------------------- |
+| -32700 | ParseError       | Malformed JSON or invalid UTF-8 frame              |
+| -32600 | InvalidRequest   | `jsonrpc` field is not `"2.0"`                     |
+| -32601 | MethodNotFound   | Unknown RPC method name                            |
+| -32602 | InvalidParams    | Missing required field in tool arguments           |
+| -32603 | InternalError    | Tool execution failed (including extension faults) |
+| -32001 | ToolNotFound     | Named tool not in registry                         |
+| -32002 | ResourceNotFound | Domain entity not found                            |
 
 Success shape:
 
 ```json
-{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"<json-string>"}]},"id":1}
+{
+  "jsonrpc": "2.0",
+  "result": { "content": [{ "type": "text", "text": "<json-string>" }] },
+  "id": 1
+}
 ```
 
 ## Key design decisions
@@ -348,15 +368,15 @@ concurrent `tower_find_file` / `tower_search_text` readers while serialising mut
 (`create_file`, `delete_file`, `global_replace`). Critical sections hold no blocking I/O.
 
 **Out-of-process sidecars over in-process WASM** — extensions are separate native binaries, not
-embedded WASM modules. The earlier `wasmtime` model conflated a *security sandbox* with an
-*extensibility unit*; tower wants the latter, and rich extensions need subprocesses, sockets,
+embedded WASM modules. The earlier `wasmtime` model conflated a _security sandbox_ with an
+_extensibility unit_; tower wants the latter, and rich extensions need subprocesses, sockets,
 long-lived state, and threads that WASI deliberately removes. The OS process boundary provides
 isolation; native code regains full performance (notably for the Tree-sitter `ast` extension, which
 no longer needs a WASI sysroot) and extensions can be authored in any language.
 
 **JSON-RPC 2.0 over stdio, not MCP-as-protocol** — the host ↔ extension protocol is tower-specific
 because the engine needs native event subscription and host capability callbacks that MCP's
-client→server shape does not give cleanly. The *external* MCP contract is unchanged.
+client→server shape does not give cleanly. The _external_ MCP contract is unchanged.
 
 **`Mutex` per extension instance, not one global lock** — `ExtensionRegistry` wraps each instance in
 `Mutex<Box<dyn ExtensionInstance>>`. `ExtensionHostPort` methods take `&self` for object safety, while

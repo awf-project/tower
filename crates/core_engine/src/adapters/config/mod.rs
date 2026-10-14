@@ -1,8 +1,8 @@
 //! Local project configuration: `<workspace>/.tower/config.toml`.
 //!
 //! Infrastructure concern (reads `std::fs`, parses `toml`). Lives in `adapters/`;
-//! the domain never imports it. First feature: disabling plugins by file stem.
-//! Second feature (spec 13a): `[plugins.formatter.tools.<id>]` for external formatters.
+//! the domain never imports it. First feature: disabling extensions by manifest name.
+//! Second feature (spec 13a): `[formatter.tools.<id>]` for external formatters.
 //! Third feature (LSP plan 1, Task 6): `[lsp]` table parsed via `parse_lsp_config`.
 //!
 //! Absent file → `TowerConfig::default()` (silent). Present but unreadable or
@@ -27,7 +27,7 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct TowerConfig {
     #[serde(default)]
-    pub plugins: PluginConfig,
+    pub formatter: FormatterConfig,
     /// `[lsp]` section — language-server bindings (LSP plan 1, Task 8).
     ///
     /// Absent → `LspConfig::default()` (empty; no servers). Populated by
@@ -71,8 +71,6 @@ pub struct ExtensionConfig {
     /// Disabled extensions are never spawned — the check happens before any
     /// process is started (spec 25 U3).
     ///
-    /// Note for spec 28 migration: `[plugins] disabled` (WASM era) will be
-    /// mapped here during the config migration step.
     #[serde(default)]
     pub disabled: Vec<String>,
 }
@@ -128,36 +126,21 @@ impl Default for DaemonConfig {
     }
 }
 
-/// `[plugins]` section.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginConfig {
-    /// Plugin file stems (no `.wasm`) to skip loading, e.g. `["ast"]`.
-    #[serde(default)]
-    pub disabled: Vec<String>,
-    /// `[plugins.formatter]` — external formatter tool definitions (spec 13a).
-    ///
-    /// Absent → `FormatterConfig::default()` (empty map; capability present but
-    /// every request is a no-op because no tool matches any extension).
-    #[serde(default)]
-    pub formatter: FormatterConfig,
-}
-
-/// `[plugins.formatter]` section (spec 13a).
+/// `[formatter]` section (spec 13a).
 ///
 /// # Adding new optional fields
 ///
 /// This struct uses `#[serde(deny_unknown_fields)]`. Adding a new optional
 /// field in a future version is a **breaking config change** for users who have
-/// an existing `[plugins.formatter]` section: any unrecognised field causes
-/// startup to exit 1 (consistent with the `[plugins]` policy). Document new
+/// an existing `[formatter]` section: any unrecognised field causes startup to
+/// exit 1 (consistent with the strict configuration policy). Document new
 /// fields prominently in the changelog.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatterConfig {
     /// Tool definitions keyed by a human-readable ID (e.g. `"rustfmt"`).
     ///
-    /// The key is the TOML table name under `[plugins.formatter.tools.<id>]`.
+    /// The key is the TOML table name under `[formatter.tools.<id>]`.
     /// Duplicate keys within the TOML file are rejected by the TOML parser
     /// before we see them.
     #[serde(default)]
@@ -177,7 +160,7 @@ impl FormatterConfig {
     }
 }
 
-/// `[plugins.formatter.tools.<id>]` section — one external formatter tool.
+/// `[formatter.tools.<id>]` section — one external formatter tool.
 ///
 /// # Fields
 ///
@@ -191,7 +174,7 @@ impl FormatterConfig {
 /// # Note on `deny_unknown_fields`
 ///
 /// This struct rejects any unrecognised field in the TOML section. This is
-/// intentionally strict (consistent with the `[plugins]` policy) so typos in
+/// intentionally strict (consistent with the top-level configuration policy) so typos in
 /// field names cause startup to fail visibly rather than silently being ignored.
 /// Adding a new optional field (e.g. `timeout_secs`) in a future version is
 /// therefore a breaking config change for users with existing tool entries.
@@ -237,6 +220,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    LegacySection {
+        path: PathBuf,
+        section: &'static str,
+        replacements: Vec<&'static str>,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -248,6 +236,16 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Parse { path, source } => {
                 write!(f, "invalid config {}: {source}", path.display())
             }
+            ConfigError::LegacySection {
+                path,
+                section,
+                replacements,
+            } => write!(
+                f,
+                "legacy section {section} in {} is unsupported; replace it with {}",
+                path.display(),
+                replacements.join(", ")
+            ),
         }
     }
 }
@@ -258,85 +256,37 @@ impl std::fmt::Display for ConfigError {
 /// invalid → `Err`.
 pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
     let path = workspace_root.join(".tower").join("config.toml");
-    match fs::read_to_string(&path) {
-        Ok(contents) => {
-            toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(TowerConfig::default());
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(TowerConfig::default()),
-        Err(source) => Err(ConfigError::Io { path, source }),
-    }
-}
+        Err(source) => return Err(ConfigError::Io { path, source }),
+    };
 
-/// Apply backward-compatibility migrations to a loaded [`TowerConfig`] and
-/// return any deprecation warnings to be emitted by the caller (spec 28 O1).
-///
-/// # Migrations
-///
-/// | Legacy key / path                   | New key / path               |
-/// |-------------------------------------|------------------------------|
-/// | `[plugins] disabled`                | `[extensions] disabled`      |
-///
-/// The migration is **additive only** — it copies the legacy value into the new
-/// field when the new field is empty (the user hasn't set it yet). If the user
-/// has explicitly set `[extensions] disabled`, no migration occurs (their intent
-/// wins).
-///
-/// Callers should print each warning string to stderr exactly once at startup
-/// so operators know to update their config file.
-///
-/// # Example
-///
-/// ```rust
-/// use core_engine::adapters::config::{TowerConfig, PluginConfig, apply_backcompat};
-///
-/// let mut cfg = TowerConfig::default();
-/// cfg.plugins.disabled = vec!["ast".to_owned()];
-/// let warnings = apply_backcompat(&mut cfg);
-/// assert_eq!(cfg.extensions.disabled, vec!["ast".to_owned()]);
-/// assert!(!warnings.is_empty());
-/// ```
-pub fn apply_backcompat(cfg: &mut TowerConfig) -> Vec<String> {
-    let mut warnings = Vec::new();
+    let raw: toml::Value = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        path: path.clone(),
+        source,
+    })?;
 
-    // [plugins] disabled → [extensions] disabled
-    if !cfg.plugins.disabled.is_empty() && cfg.extensions.disabled.is_empty() {
-        cfg.extensions.disabled = cfg.plugins.disabled.clone();
-        warnings.push(
-            "tower: deprecated — `[plugins] disabled` in .tower/config.toml is superseded by \
-             `[extensions] disabled`. Please update your config file."
-                .to_owned(),
-        );
+    if let Some(plugins) = raw.get("plugins") {
+        let table = plugins.as_table();
+        let has_disabled = table.is_some_and(|plugins| plugins.contains_key("disabled"));
+        let has_formatter = table.is_some_and(|plugins| plugins.contains_key("formatter"));
+        let replacements = match (has_disabled, has_formatter) {
+            (true, false) => vec!["[extensions] disabled"],
+            (false, true) => vec!["[formatter.tools.<id>]"],
+            _ => vec!["[extensions] disabled", "[formatter.tools.<id>]"],
+        };
+
+        return Err(ConfigError::LegacySection {
+            path,
+            section: "[plugins]",
+            replacements,
+        });
     }
 
-    warnings
-}
-
-/// Resolve the legacy `.tower/plugins/` directory fallback (spec 28 O1).
-///
-/// Returns a deprecation warning string and the fallback path when:
-/// - `extensions_dir` does not exist on disk, **and**
-/// - the legacy `plugins_dir` exists on disk.
-///
-/// The caller should use the returned path as a fallback extension directory
-/// and emit the warning to stderr.
-///
-/// Returns `None` when no fallback is needed (the extensions dir exists or
-/// neither dir exists).
-#[must_use]
-pub fn legacy_plugins_dir_fallback(
-    extensions_dir: &Path,
-    plugins_dir: &Path,
-) -> Option<(PathBuf, String)> {
-    if !extensions_dir.exists() && plugins_dir.exists() {
-        let warning = format!(
-            "tower: deprecated — `.tower/plugins/` is superseded by `.tower/extensions/`. \
-             Move your extensions to {} and update any tooling.",
-            extensions_dir.display()
-        );
-        Some((plugins_dir.to_owned(), warning))
-    } else {
-        None
-    }
+    toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })
 }
 
 /// Default `.tower/config.toml` body seeded by `tower init`.
@@ -349,30 +299,32 @@ pub fn legacy_plugins_dir_fallback(
 pub const DEFAULT_CONFIG: &str = "\
 # Tower local project configuration.
 #
-# [plugins]
-# disabled = [\"ast\"]   # skip loading a plugin by its *.wasm file stem
+# [extensions] configures native out-of-process sidecars by manifest name.
+# Add names to `disabled` to prevent those sidecars from being spawned.
+[extensions]
+disabled = []
 #
-# [plugins.formatter.tools.<id>] — external formatters run by plugin_fmt when a
-# file changes. mode = \"filter\" (default, stdin->stdout) or \"inplace\".
+# [formatter.tools.<id>] entries are commands run by the host format queue when
+# a file changes. mode = \"filter\" (default, stdin->stdout) or \"inplace\".
 # Uninstalled tools are skipped, so you can safely keep entries you do not use.
 
-[plugins.formatter.tools.rustfmt]
+[formatter.tools.rustfmt]
 argv = [\"rustfmt\", \"--edition\", \"2021\"]
 extensions = [\"rs\"]
 
-[plugins.formatter.tools.gofmt]
+[formatter.tools.gofmt]
 argv = [\"gofmt\"]
 extensions = [\"go\"]
 
-[plugins.formatter.tools.zigfmt]
+[formatter.tools.zigfmt]
 argv = [\"zig\", \"fmt\", \"--stdin\"]
 extensions = [\"zig\"]
 
-[plugins.formatter.tools.prettier]
+[formatter.tools.prettier]
 argv = [\"prettier\", \"--stdin-filepath\", \"{path}\"]
 extensions = [\"ts\", \"tsx\", \"js\", \"jsx\"]
 
-[plugins.formatter.tools.php-cs-fixer]
+[formatter.tools.php-cs-fixer]
 mode = \"inplace\"
 argv = [\"php-cs-fixer\", \"fix\", \"{path}\"]
 extensions = [\"php\"]
@@ -409,19 +361,62 @@ mod tests {
     }
 
     #[test]
-    fn init_config_seeds_parseable_formatter_defaults() {
+    fn canonical_default_config_is_parseable_and_contains_no_legacy_examples() {
         let tmp = tempdir().unwrap();
         let path = init_config(tmp.path()).expect("first init must succeed");
         assert!(path.ends_with("config.toml"));
+        let generated = fs::read_to_string(&path).unwrap();
+        let config = load(tmp.path()).expect("generated config must parse");
 
-        let cfg = load(tmp.path()).expect("seeded config must parse");
-        let tools = &cfg.plugins.formatter.tools;
-        for id in ["rustfmt", "gofmt", "zigfmt", "prettier", "php-cs-fixer"] {
-            assert!(tools.contains_key(id), "seed must define {id}");
+        assert!(generated.contains("[extensions]"));
+        assert!(generated.contains("[formatter.tools.rustfmt]"));
+        assert!(generated.contains("native out-of-process sidecar"));
+        assert!(generated.contains("host format queue"));
+        for forbidden in ["[plugins]", "plugin_fmt", ".wasm", "apply_backcompat"] {
+            assert!(
+                !generated.contains(forbidden),
+                "generated config contains forbidden token {forbidden}"
+            );
         }
-        assert_eq!(tools["rustfmt"].mode, FormatterMode::Filter);
-        assert_eq!(tools["rustfmt"].extensions, vec!["rs".to_string()]);
-        assert_eq!(tools["php-cs-fixer"].mode, FormatterMode::Inplace);
+
+        let expected = [
+            (
+                "rustfmt",
+                FormatterMode::Filter,
+                &["rustfmt", "--edition", "2021"][..],
+                &["rs"][..],
+            ),
+            ("gofmt", FormatterMode::Filter, &["gofmt"][..], &["go"][..]),
+            (
+                "zigfmt",
+                FormatterMode::Filter,
+                &["zig", "fmt", "--stdin"][..],
+                &["zig"][..],
+            ),
+            (
+                "prettier",
+                FormatterMode::Filter,
+                &["prettier", "--stdin-filepath", "{path}"][..],
+                &["ts", "tsx", "js", "jsx"][..],
+            ),
+            (
+                "php-cs-fixer",
+                FormatterMode::Inplace,
+                &["php-cs-fixer", "fix", "{path}"][..],
+                &["php"][..],
+            ),
+        ];
+        assert_eq!(config.formatter.tools.len(), expected.len());
+        for (name, mode, argv, extensions) in expected {
+            let tool = config
+                .formatter
+                .tools
+                .get(name)
+                .unwrap_or_else(|| panic!("missing formatter default {name}"));
+            assert_eq!(tool.mode, mode, "mode for {name}");
+            assert_eq!(tool.argv, argv, "command and argv for {name}");
+            assert_eq!(tool.extensions, extensions, "extensions for {name}");
+        }
     }
 
     #[test]
@@ -436,7 +431,8 @@ mod tests {
     fn absent_file_yields_default() {
         let tmp = tempdir().unwrap();
         let cfg = load(tmp.path()).expect("absent config is not an error");
-        assert!(cfg.plugins.disabled.is_empty());
+        assert!(cfg.extensions.disabled.is_empty());
+        assert!(cfg.formatter.tools.is_empty());
     }
 
     #[test]
@@ -444,15 +440,16 @@ mod tests {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), "");
         let cfg = load(tmp.path()).expect("empty config is valid");
-        assert!(cfg.plugins.disabled.is_empty());
+        assert!(cfg.extensions.disabled.is_empty());
+        assert!(cfg.formatter.tools.is_empty());
     }
 
     #[test]
     fn parses_disabled_list() {
         let tmp = tempdir().unwrap();
-        write_config(tmp.path(), "[plugins]\ndisabled = [\"ast\"]\n");
+        write_config(tmp.path(), "[extensions]\ndisabled = [\"ast\"]\n");
         let cfg = load(tmp.path()).expect("valid config");
-        assert_eq!(cfg.plugins.disabled, vec!["ast".to_string()]);
+        assert_eq!(cfg.extensions.disabled, vec!["ast".to_string()]);
     }
 
     #[test]
@@ -466,39 +463,38 @@ mod tests {
     #[test]
     fn unknown_key_is_error() {
         let tmp = tempdir().unwrap();
-        write_config(tmp.path(), "[plugins]\nenabled = [\"ast\"]\n");
+        write_config(tmp.path(), "[extensions]\nenabled = [\"ast\"]\n");
         let err = load(tmp.path()).expect_err("unknown key must error via deny_unknown_fields");
         assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
-    // ── RED-9 → GREEN-9: [plugins.formatter.tools.*] parsing (spec 13a) ───────
+    // ── RED-9 → GREEN-9: [formatter.tools.*] parsing (spec 13a) ──────────────
 
-    /// GREEN-9 / AC8 (config): absent [plugins.formatter] yields empty FormatterConfig.
+    /// GREEN-9 / AC8 (config): absent [formatter] yields empty FormatterConfig.
     #[test]
     fn absent_formatter_section_yields_empty_tools() {
         let tmp = tempdir().unwrap();
         let cfg = load(tmp.path()).expect("absent config is ok");
         assert!(
-            cfg.plugins.formatter.tools.is_empty(),
+            cfg.formatter.tools.is_empty(),
             "absent formatter section must yield empty tools map"
         );
     }
 
-    /// GREEN-9: [plugins.formatter.tools.rustfmt] with filter mode (default).
+    /// GREEN-9: [formatter.tools.rustfmt] with filter mode (default).
     #[test]
     fn parses_filter_mode_tool() {
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-[plugins.formatter.tools.rustfmt]
+[formatter.tools.rustfmt]
 argv = ["rustfmt", "--edition", "2021"]
 extensions = ["rs"]
 "#,
         );
         let cfg = load(tmp.path()).expect("valid formatter config");
         let tool = cfg
-            .plugins
             .formatter
             .tools
             .get("rustfmt")
@@ -508,14 +504,14 @@ extensions = ["rs"]
         assert_eq!(tool.mode, FormatterMode::Filter, "default mode is filter");
     }
 
-    /// GREEN-9: [plugins.formatter.tools.php-cs-fixer] with inplace mode.
+    /// GREEN-9: [formatter.tools.php-cs-fixer] with inplace mode.
     #[test]
     fn parses_inplace_mode_tool() {
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-[plugins.formatter.tools.php-cs-fixer]
+[formatter.tools.php-cs-fixer]
 mode = "inplace"
 argv = ["php-cs-fixer", "fix", "{path}"]
 extensions = ["php"]
@@ -523,7 +519,6 @@ extensions = ["php"]
         );
         let cfg = load(tmp.path()).expect("valid inplace config");
         let tool = cfg
-            .plugins
             .formatter
             .tools
             .get("php-cs-fixer")
@@ -533,14 +528,14 @@ extensions = ["php"]
         assert!(tool.argv.contains(&"{path}".to_owned()));
     }
 
-    /// GREEN-9 (error): unknown key in [plugins.formatter.tools.rustfmt] → ConfigError::Parse.
+    /// GREEN-9 (error): unknown key in [formatter.tools.rustfmt] → ConfigError::Parse.
     #[test]
     fn unknown_key_in_tool_section_is_error() {
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-[plugins.formatter.tools.rustfmt]
+[formatter.tools.rustfmt]
 argv = ["rustfmt"]
 extensions = ["rs"]
 unknown_field = true
@@ -560,17 +555,17 @@ unknown_field = true
         write_config(
             tmp.path(),
             r#"
-[plugins.formatter.tools.rustfmt]
+[formatter.tools.rustfmt]
 argv = ["rustfmt"]
 extensions = ["rs"]
 
-[plugins.formatter.tools.prettier]
+[formatter.tools.prettier]
 argv = ["prettier", "--stdin-filepath", "{path}"]
 extensions = ["ts", "js"]
 "#,
         );
         let cfg = load(tmp.path()).expect("valid config");
-        let fmt = &cfg.plugins.formatter;
+        let fmt = &cfg.formatter;
 
         let rs_tool = fmt.tool_for_extension("rs").expect("rs must match rustfmt");
         assert_eq!(rs_tool.argv, vec!["rustfmt"]);
@@ -593,31 +588,31 @@ extensions = ["ts", "js"]
         write_config(
             tmp.path(),
             r#"
-[plugins]
+[extensions]
 disabled = ["ast"]
 
-[plugins.formatter.tools.rustfmt]
+[formatter.tools.rustfmt]
 argv = ["rustfmt"]
 extensions = ["rs"]
 "#,
         );
         let cfg = load(tmp.path()).expect("combined config is valid");
-        assert_eq!(cfg.plugins.disabled, vec!["ast"]);
-        assert!(cfg.plugins.formatter.tools.contains_key("rustfmt"));
+        assert_eq!(cfg.extensions.disabled, vec!["ast"]);
+        assert!(cfg.formatter.tools.contains_key("rustfmt"));
     }
 
-    // ── LSP section coexists with plugins section (Task 8 / Step B) ─────────
+    // ── LSP section coexists with canonical sections (Task 8 / Step B) ──────
 
-    /// A config file that contains BOTH an existing `[plugins]` section AND
+    /// A config file that contains BOTH an `[extensions]` section AND
     /// `[lsp.rust]` must load without a `deny_unknown_fields` error now that
     /// `TowerConfig` has an `lsp: LspConfig` field.
     #[test]
-    fn lsp_and_plugins_coexist_in_tower_config() {
+    fn lsp_and_extensions_coexist_in_tower_config() {
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-[plugins]
+[extensions]
 disabled = ["ast"]
 
 [lsp.rust]
@@ -627,7 +622,7 @@ extensions = ["rs"]
         );
         let cfg = load(tmp.path()).expect("[lsp] section must not cause deny_unknown_fields error");
         // Existing section still parses.
-        assert_eq!(cfg.plugins.disabled, vec!["ast"]);
+        assert_eq!(cfg.extensions.disabled, vec!["ast"]);
         // LSP section is accessible through the loaded TowerConfig.
         let server = cfg
             .lsp
@@ -642,7 +637,7 @@ extensions = ["rs"]
     #[test]
     fn absent_lsp_section_yields_empty_lsp_config() {
         let tmp = tempdir().unwrap();
-        write_config(tmp.path(), "[plugins]\ndisabled = []\n");
+        write_config(tmp.path(), "[extensions]\ndisabled = []\n");
         let cfg = load(tmp.path()).expect("config without [lsp] must load");
         assert!(
             cfg.lsp.servers.is_empty(),
@@ -711,19 +706,20 @@ extensions = ["rs"]
         );
     }
 
-    /// `[extensions]` and `[plugins]` and `[lsp]` all coexist.
+    /// `[extensions]`, `[formatter]`, and `[lsp]` all coexist.
     #[test]
-    fn extensions_plugins_lsp_coexist() {
+    fn extensions_formatter_lsp_coexist() {
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-[plugins]
-disabled = ["ast"]
-
 [extensions]
 request_timeout_secs = 60
 disabled = ["lsp"]
+
+[formatter.tools.rustfmt]
+argv = ["rustfmt"]
+extensions = ["rs"]
 
 [lsp.rust]
 command = "rust-analyzer"
@@ -731,114 +727,94 @@ extensions = ["rs"]
 "#,
         );
         let cfg = load(tmp.path()).expect("combined config must load");
-        assert_eq!(cfg.plugins.disabled, vec!["ast"]);
         assert_eq!(cfg.extensions.request_timeout_secs, 60);
         assert_eq!(cfg.extensions.disabled, vec!["lsp"]);
+        assert!(cfg.formatter.tools.contains_key("rustfmt"));
         assert!(cfg.lsp.for_extension("rs").is_some());
     }
 
-    // ── Spec 28: apply_backcompat + legacy_plugins_dir_fallback ──────────────
-
-    /// AC4 (key migration): `[plugins] disabled` is copied to `[extensions]
-    /// disabled` when the latter is empty, and a warning is returned.
     #[test]
-    fn apply_backcompat_copies_plugins_disabled_to_extensions_disabled() {
-        let mut cfg = TowerConfig::default();
-        cfg.plugins.disabled = vec!["ast".to_owned(), "hello".to_owned()];
+    fn legacy_plugins_sections_are_rejected_with_manual_replacements() {
+        let cases = [
+            (
+                "empty",
+                "[plugins]\n",
+                vec!["[extensions] disabled", "[formatter.tools.<id>]"],
+            ),
+            (
+                "disabling",
+                "[plugins]\ndisabled = [\"private-extension\"]\n",
+                vec!["[extensions] disabled"],
+            ),
+            (
+                "formatter-bearing",
+                "[plugins.formatter.tools.secret-tool]\nargv = [\"secret-command\"]\n",
+                vec!["[formatter.tools.<id>]"],
+            ),
+            (
+                "mixed legacy and canonical",
+                "[plugins]\ndisabled = [\"private-extension\"]\n\
+                 [plugins.formatter.tools.secret-tool]\nargv = [\"secret-command\"]\n\
+                 [extensions]\ndisabled = []\n\
+                 [formatter]\n",
+                vec!["[extensions] disabled", "[formatter.tools.<id>]"],
+            ),
+        ];
 
-        let warnings = apply_backcompat(&mut cfg);
+        for (name, body, expected_replacements) in cases {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), body);
+            let config_path = tmp.path().join(".tower/config.toml");
 
-        assert_eq!(
-            cfg.extensions.disabled,
-            vec!["ast".to_owned(), "hello".to_owned()],
-            "extensions.disabled must be populated from plugins.disabled"
-        );
-        assert!(
-            !warnings.is_empty(),
-            "a deprecation warning must be returned"
-        );
-        assert!(
-            warnings[0].contains("deprecated"),
-            "warning must mention deprecation: {}",
-            warnings[0]
-        );
+            let err = load(tmp.path()).expect_err(name);
+            let rendered = err.to_string();
+            match err {
+                ConfigError::LegacySection {
+                    path,
+                    section,
+                    replacements,
+                } => {
+                    assert_eq!(path, config_path, "{name}");
+                    assert_eq!(section, "[plugins]", "{name}");
+                    assert_eq!(replacements, expected_replacements, "{name}");
+                    assert_eq!(
+                        rendered,
+                        format!(
+                            "legacy section [plugins] in {} is unsupported; replace it with {}",
+                            config_path.display(),
+                            expected_replacements.join(", ")
+                        ),
+                        "{name}"
+                    );
+                    assert!(!rendered.contains("private-extension"), "{name}");
+                    assert!(!rendered.contains("secret-command"), "{name}");
+                    assert!(!rendered.contains("secret-tool"), "{name}");
+                }
+                other => panic!("{name}: expected LegacySection, got {other:?}"),
+            }
+            assert_eq!(fs::read_to_string(config_path).unwrap(), body, "{name}");
+        }
     }
 
-    /// AC4: If `[extensions] disabled` is already set, it wins — no migration.
     #[test]
-    fn apply_backcompat_does_not_overwrite_existing_extensions_disabled() {
-        let mut cfg = TowerConfig::default();
-        cfg.plugins.disabled = vec!["ast".to_owned()];
-        cfg.extensions.disabled = vec!["lsp".to_owned()];
+    fn malformed_toml_and_unknown_canonical_keys_fail_closed_without_rewriting() {
+        for (name, body) in [
+            ("malformed", "[formatter\nsecret = \"unchanged\"\n"),
+            (
+                "unknown canonical key",
+                "[formatter]\nsecret = \"unchanged\"\n",
+            ),
+        ] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), body);
+            let config_path = tmp.path().join(".tower/config.toml");
 
-        let warnings = apply_backcompat(&mut cfg);
-
-        assert_eq!(
-            cfg.extensions.disabled,
-            vec!["lsp".to_owned()],
-            "extensions.disabled must be preserved when already set"
-        );
-        assert!(
-            warnings.is_empty(),
-            "no warning when extensions.disabled is already set"
-        );
-    }
-
-    /// AC4: If `[plugins] disabled` is empty, no migration occurs and no warning.
-    #[test]
-    fn apply_backcompat_noop_when_plugins_disabled_is_empty() {
-        let mut cfg = TowerConfig::default();
-        // Both empty — no-op.
-        let warnings = apply_backcompat(&mut cfg);
-        assert!(cfg.extensions.disabled.is_empty());
-        assert!(warnings.is_empty());
-    }
-
-    /// AC4 (dir migration): `legacy_plugins_dir_fallback` returns the plugins
-    /// dir + warning when extensions dir is absent but plugins dir exists.
-    #[test]
-    fn legacy_plugins_dir_fallback_returns_fallback_when_plugins_dir_exists() {
-        let tmp = tempdir().unwrap();
-        let extensions_dir = tmp.path().join(".tower/extensions");
-        let plugins_dir = tmp.path().join(".tower/plugins");
-        fs::create_dir_all(&plugins_dir).unwrap();
-        // extensions dir does NOT exist.
-
-        let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
-        assert!(result.is_some(), "must return Some when plugins dir exists");
-        let (path, warning) = result.unwrap();
-        assert_eq!(path, plugins_dir);
-        assert!(
-            warning.contains("deprecated"),
-            "warning must mention deprecation: {warning}"
-        );
-    }
-
-    /// `legacy_plugins_dir_fallback` returns None when extensions dir exists.
-    #[test]
-    fn legacy_plugins_dir_fallback_returns_none_when_extensions_dir_exists() {
-        let tmp = tempdir().unwrap();
-        let extensions_dir = tmp.path().join(".tower/extensions");
-        let plugins_dir = tmp.path().join(".tower/plugins");
-        fs::create_dir_all(&extensions_dir).unwrap();
-        fs::create_dir_all(&plugins_dir).unwrap();
-
-        let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
-        assert!(
-            result.is_none(),
-            "must return None when extensions dir exists"
-        );
-    }
-
-    /// `legacy_plugins_dir_fallback` returns None when neither dir exists.
-    #[test]
-    fn legacy_plugins_dir_fallback_returns_none_when_neither_dir_exists() {
-        let tmp = tempdir().unwrap();
-        let extensions_dir = tmp.path().join(".tower/extensions");
-        let plugins_dir = tmp.path().join(".tower/plugins");
-
-        let result = legacy_plugins_dir_fallback(&extensions_dir, &plugins_dir);
-        assert!(result.is_none(), "must return None when neither dir exists");
+            assert!(
+                matches!(load(tmp.path()), Err(ConfigError::Parse { .. })),
+                "{name}"
+            );
+            assert_eq!(fs::read_to_string(config_path).unwrap(), body, "{name}");
+        }
     }
 
     // ── Task 2: [daemon] config section ──────────────────────────────────────

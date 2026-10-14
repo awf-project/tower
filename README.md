@@ -65,6 +65,12 @@ This creates:
 | `.towerignore`       | Authoritative ignore rules for the Tower index, independent of `.gitignore`. |
 | `.tower/config.toml` | Local Tower configuration, including formatter/linter/debug settings.        |
 
+The generated configuration uses the canonical `[extensions]` and
+`[formatter.tools.<id>]` sections. **BREAKING:** an existing `[plugins]` section now
+prevents startup and requires manual migration. `tower init` never overwrites an
+existing configuration or ignore file; see
+[Configuration](docs/user-guide/configuration.md) for the schema and migration steps.
+
 Secrets and generated output should be excluded in `.towerignore` before exposing a workspace to an
 agent. If `.towerignore` is missing, Tower warns and indexes all non-hidden files except `.git/`.
 
@@ -111,7 +117,8 @@ Workspace resolution is consistent across commands:
 ## Core Concepts
 
 **The index is Tower-owned.** Tower persists workspace metadata under `.tower/db/`, watches file
-changes, and serves file/search tools from the current index.
+changes, reconciles the eligible filesystem inventory at every daemon startup,
+and serves file/search tools from the repaired index.
 
 **`.towerignore` is the source of truth.** Tower does not inherit `.gitignore`. This keeps the agent
 visibility policy explicit and project-local.
@@ -142,17 +149,18 @@ stable error codes.
 
 ## Documentation
 
-| Page                                                                   | Contents                                                                     |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| [docs/getting-started.md](docs/getting-started.md)                     | Build, first MCP session, quality gate, and copy-paste examples.             |
-| [docs/towerignore.md](docs/towerignore.md)                             | `.towerignore` behavior, defaults, migration notes, and watcher limits.      |
-| [docs/architecture.md](docs/architecture.md)                           | Hexagonal boundary, ports/adapters, daemon flow, and invariants.             |
-| [docs/extensions.md](docs/extensions.md)                               | Native sidecar extension protocol, manifests, capabilities, and supervision. |
-| [docs/mcp-tools.md](docs/mcp-tools.md)                                 | Complete MCP tool reference and JSON-RPC details.                            |
-| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Safe AST and LSP edit workflows.                                             |
-| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)         | Previewing and applying structured linter fixes.                             |
-| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md) | Interactive DAP sessions and rr-backed reverse-debug workflows.              |
-| [docs/development.md](docs/development.md)                             | Contribution workflow, CI checks, tests, and project conventions.            |
+| Page                                                                   | Contents                                                                             |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [docs/getting-started.md](docs/getting-started.md)                     | Build, first MCP session, quality gate, and copy-paste examples.                     |
+| [docs/towerignore.md](docs/towerignore.md)                             | `.towerignore` behavior, defaults, migration notes, and watcher limits.              |
+| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)   | Canonical configuration, formatter tools, extension disabling, and legacy migration. |
+| [docs/architecture.md](docs/architecture.md)                           | Hexagonal boundary, ports/adapters, daemon flow, and invariants.                     |
+| [docs/extensions.md](docs/extensions.md)                               | Native sidecar extension protocol, manifests, capabilities, and supervision.         |
+| [docs/mcp-tools.md](docs/mcp-tools.md)                                 | Complete MCP tool reference and JSON-RPC details.                                    |
+| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Safe AST and LSP edit workflows.                                                     |
+| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)         | Previewing and applying structured linter fixes.                                     |
+| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md) | Interactive DAP sessions and rr-backed reverse-debug workflows.                      |
+| [docs/development.md](docs/development.md)                             | Contribution workflow, CI checks, tests, and project conventions.                    |
 
 ## Development
 

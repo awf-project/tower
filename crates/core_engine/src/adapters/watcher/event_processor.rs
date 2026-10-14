@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-use crate::adapters::fs::scan::TOWERIGNORE_FILE_NAME;
+use crate::adapters::fs::scan::{self, ReconciliationReport, ScanError, TOWERIGNORE_FILE_NAME};
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
@@ -188,6 +188,25 @@ impl EventProcessor {
             WatchEvent::Delete(path) => self.handle_delete(path),
             WatchEvent::Rename { from, to } => self.handle_rename(from, to),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reconcile_workspace(&mut self) -> Result<ReconciliationReport, ScanError> {
+        let mut workspace = self
+            .workspace
+            .write()
+            .expect("workspace lock poisoned — unrecoverable");
+        let mut index = self
+            .index
+            .write()
+            .expect("index lock poisoned — unrecoverable");
+
+        scan::reconcile_workspace(
+            &self.root,
+            self.storage.as_mut(),
+            &mut workspace,
+            &mut index,
+        )
     }
 
     // ── Event handlers ────────────────────────────────────────────────────────
@@ -693,11 +712,14 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::*;
+    use crate::adapters::fs::scan::{ScanError, collect_reconciliation_metrics};
     use crate::adapters::in_memory_storage::InMemoryStorage;
     use crate::domain::index::{FileSearch, InvertedIndex};
+    use crate::domain::token::Token;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::NoOpExtensionHost;
+    use crate::domain::{ContentHash, FileId, VirtualFile};
     use crate::ports::inbound::SearchUseCase as _;
+    use crate::ports::{NoOpExtensionHost, PortError, ReconciliationDelta, StoragePort};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -761,6 +783,197 @@ mod tests {
         Arc<RwLock<InvertedIndex>>,
     ) {
         make_processor_with_extension_host(root, Box::new(NoOpExtensionHost))
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct ReconciliationCalls {
+        attempts: usize,
+        additions: Vec<usize>,
+        removals: Vec<usize>,
+    }
+
+    struct CountingFailureStorage {
+        inner: InMemoryStorage,
+        calls: Arc<Mutex<ReconciliationCalls>>,
+    }
+
+    impl StoragePort for CountingFailureStorage {
+        fn apply_reconciliation_delta(
+            &mut self,
+            delta: &ReconciliationDelta,
+        ) -> Result<(), PortError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.attempts += 1;
+            calls.additions.push(delta.additions.len());
+            calls.removals.push(delta.removals.len());
+            drop(calls);
+            self.inner.apply_reconciliation_delta(delta)
+        }
+
+        fn get(&self, id: FileId) -> Result<VirtualFile, PortError> {
+            self.inner.get(id)
+        }
+
+        fn put(&mut self, file: VirtualFile) -> Result<(), PortError> {
+            self.inner.put(file)
+        }
+
+        fn put_batch(&mut self, files: &[VirtualFile]) -> Result<(), PortError> {
+            self.inner.put_batch(files)
+        }
+
+        fn delete(&mut self, id: FileId) -> Result<(), PortError> {
+            self.inner.delete(id)
+        }
+
+        fn put_blob(&mut self, hash: ContentHash, bytes: Vec<u8>) -> Result<(), PortError> {
+            self.inner.put_blob(hash, bytes)
+        }
+
+        fn get_blob(&self, hash: &ContentHash) -> Result<Vec<u8>, PortError> {
+            self.inner.get_blob(hash)
+        }
+
+        fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+            self.inner.mark_scan_complete()
+        }
+
+        fn is_scan_complete(&self) -> Result<bool, PortError> {
+            self.inner.is_scan_complete()
+        }
+    }
+
+    #[test]
+    fn catch_up_uses_authoritative_reconciliation_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("survivor.rs"), b"fn survivor() {}").unwrap();
+        std::fs::write(root.join("addition.rs"), b"fn addition() {}").unwrap();
+
+        let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+        let index = Arc::new(RwLock::new(InvertedIndex::new()));
+        let survivor_path = RelativePath::new("survivor.rs");
+        let stale_path = RelativePath::new("stale.rs");
+        let survivor_id = workspace
+            .write()
+            .unwrap()
+            .insert(survivor_path.clone(), FileMetadata::default())
+            .unwrap();
+        let stale_id = workspace
+            .write()
+            .unwrap()
+            .insert(stale_path.clone(), FileMetadata::default())
+            .unwrap();
+        index
+            .write()
+            .unwrap()
+            .insert(survivor_id, &tokenize(survivor_path.as_str()));
+        index
+            .write()
+            .unwrap()
+            .insert(stale_id, &tokenize(stale_path.as_str()));
+        let (survivor, stale) = {
+            let workspace = workspace.read().unwrap();
+            (
+                workspace.get(survivor_id).unwrap().clone(),
+                workspace.get(stale_id).unwrap().clone(),
+            )
+        };
+        let workspace_before = workspace.read().unwrap().snapshot();
+
+        let calls = Arc::new(Mutex::new(ReconciliationCalls::default()));
+        let mut inner = InMemoryStorage::new();
+        inner.put(survivor).unwrap();
+        inner.put(stale).unwrap();
+        inner.fail_next_reconciliation_before_commit_for_test();
+        let storage = CountingFailureStorage {
+            inner,
+            calls: Arc::clone(&calls),
+        };
+        let mut processor = EventProcessor::new(
+            root,
+            Arc::clone(&workspace),
+            Arc::clone(&index),
+            Box::new(storage),
+            Box::new(NoOpExtensionHost),
+        );
+
+        let (failure, failure_metrics) =
+            collect_reconciliation_metrics(|| processor.reconcile_workspace());
+        assert!(matches!(
+            failure,
+            Err(ScanError::Persistence {
+                operation: "apply_reconciliation_delta",
+                source: PortError::ReconciliationFailed {
+                    operation: "apply_reconciliation_delta",
+                    ..
+                }
+            })
+        ));
+        let workspace_after_failure = workspace.read().unwrap().snapshot();
+        assert_eq!(workspace_after_failure.files, workspace_before.files);
+        assert_eq!(
+            workspace_after_failure.slot_generations,
+            workspace_before.slot_generations
+        );
+        assert_eq!(
+            workspace_after_failure.free_slots,
+            workspace_before.free_slots
+        );
+        assert_eq!(
+            index.read().unwrap().posting_count(&Token::new("survivor")),
+            1
+        );
+        assert_eq!(
+            index.read().unwrap().posting_count(&Token::new("addition")),
+            0
+        );
+        assert_eq!(index.read().unwrap().posting_count(&Token::new("stale")), 1);
+        assert_eq!(failure_metrics.content_reads, 1);
+        assert_eq!(failure_metrics.file_record_rewrites, 0);
+
+        let (retry, retry_metrics) =
+            collect_reconciliation_metrics(|| processor.reconcile_workspace());
+        assert_eq!(
+            retry.unwrap(),
+            crate::adapters::fs::scan::ReconciliationReport {
+                added: 1,
+                removed: 1,
+                unchanged: 1,
+            }
+        );
+        assert_eq!(retry_metrics.content_reads, 1);
+        assert_eq!(retry_metrics.file_record_rewrites, 0);
+        assert_eq!(
+            workspace
+                .read()
+                .unwrap()
+                .snapshot()
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [RelativePath::new("addition.rs"), survivor_path]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            index.read().unwrap().posting_count(&Token::new("survivor")),
+            1
+        );
+        assert_eq!(
+            index.read().unwrap().posting_count(&Token::new("addition")),
+            1
+        );
+        assert_eq!(index.read().unwrap().posting_count(&Token::new("stale")), 0);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ReconciliationCalls {
+                attempts: 2,
+                additions: vec![1, 1],
+                removals: vec![1, 1],
+            }
+        );
     }
 
     // ── Document-sync wiring (spec 14b) ───────────────────────────────────────

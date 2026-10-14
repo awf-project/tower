@@ -15,16 +15,22 @@
 #[cfg(test)]
 mod scan_integration {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
-    use crate::adapters::fs::scan::{scan, scan_with_batch_size};
+    use crate::adapters::InMemoryStorage;
+    use crate::adapters::fs::scan::{
+        ReconciliationOperations, ScanError, collect_reconciliation_metrics, content_hash_of,
+        reconcile_workspace, reconcile_workspace_with, record_reconciliation_file_record_rewrites,
+        scan, scan_with_batch_size,
+    };
     use crate::adapters::storage::SledStorageAdapter;
     use crate::domain::index::{FileSearch, InvertedIndex};
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::StoragePort;
+    use crate::domain::{ContentHash, FileId, VirtualFile};
     use crate::ports::inbound::SearchUseCase;
+    use crate::ports::{PortError, ReconciliationDelta, StoragePort};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -41,6 +47,84 @@ mod scan_integration {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(full, content).unwrap();
+    }
+
+    struct ScriptedOperations {
+        paths: Vec<PathBuf>,
+        metadata_error: Option<PathBuf>,
+        content_reads: usize,
+        content_hashes: usize,
+    }
+
+    impl ReconciliationOperations for ScriptedOperations {
+        fn enumerate(&mut self, _root: &Path) -> Result<Vec<PathBuf>, ScanError> {
+            Ok(self.paths.clone())
+        }
+
+        fn metadata(&mut self, path: &Path) -> Result<std::fs::Metadata, std::io::Error> {
+            if self.metadata_error.as_deref() == Some(path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "scripted metadata failure",
+                ));
+            }
+            std::fs::metadata(path)
+        }
+
+        fn read_content(&mut self, path: &Path) -> Result<Vec<u8>, std::io::Error> {
+            self.content_reads += 1;
+            std::fs::read(path)
+        }
+
+        fn hash_content(&mut self, content: &[u8]) -> ContentHash {
+            self.content_hashes += 1;
+            content_hash_of(content)
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingStorage {
+        inner: InMemoryStorage,
+        inject_survivor_rewrite: bool,
+        reconciliation_calls: usize,
+    }
+
+    impl StoragePort for CountingStorage {
+        fn apply_reconciliation_delta(
+            &mut self,
+            delta: &ReconciliationDelta,
+        ) -> Result<(), PortError> {
+            self.reconciliation_calls += 1;
+            if self.inject_survivor_rewrite {
+                record_reconciliation_file_record_rewrites(1);
+            }
+            self.inner.apply_reconciliation_delta(delta)
+        }
+
+        fn get(&self, id: FileId) -> Result<VirtualFile, PortError> {
+            self.inner.get(id)
+        }
+        fn put(&mut self, file: VirtualFile) -> Result<(), PortError> {
+            self.inner.put(file)
+        }
+        fn put_batch(&mut self, files: &[VirtualFile]) -> Result<(), PortError> {
+            self.inner.put_batch(files)
+        }
+        fn delete(&mut self, id: FileId) -> Result<(), PortError> {
+            self.inner.delete(id)
+        }
+        fn put_blob(&mut self, hash: ContentHash, bytes: Vec<u8>) -> Result<(), PortError> {
+            self.inner.put_blob(hash, bytes)
+        }
+        fn get_blob(&self, hash: &ContentHash) -> Result<Vec<u8>, PortError> {
+            self.inner.get_blob(hash)
+        }
+        fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+            self.inner.mark_scan_complete()
+        }
+        fn is_scan_complete(&self) -> Result<bool, PortError> {
+            self.inner.is_scan_complete()
+        }
     }
 
     // ── AC1: N eligible files → exactly N distinct FileIds ───────────────────
@@ -901,10 +985,9 @@ mod scan_integration {
         );
     }
 
-    // ── Startup reconciliation: prune stale entries against the filesystem ────
+    // ── Startup reconciliation ──────────────────────────────────────────────
 
-    use crate::adapters::fs::scan::reconcile_pruned;
-    use crate::domain::token::tokenize;
+    use crate::domain::token::{Token, tokenize};
     use crate::domain::virtual_file::{FileMetadata, RelativePath};
 
     /// Insert `rel` into workspace + index + storage exactly the way `scan`
@@ -925,88 +1008,296 @@ mod scan_integration {
         storage.put(file).unwrap();
     }
 
-    /// A tracked path that no longer exists on disk must be pruned; real files
-    /// on disk must survive. Path-only — no content read.
     #[test]
-    fn reconcile_prunes_path_missing_on_disk() {
+    fn startup_reconciliation_matches_authoritative_eligible_paths() {
+        use std::collections::BTreeMap;
+
         let workspace_dir = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
 
-        write_file(workspace_dir.path(), "keep_a.rs", b"fn a() {}");
-        write_file(workspace_dir.path(), "keep_b.rs", b"fn b() {}");
+        write_file(workspace_dir.path(), "survivor.rs", b"fn survivor() {}");
+        write_file(workspace_dir.path(), "deleted.rs", b"fn deleted() {}");
+        write_file(workspace_dir.path(), "renamed_old.rs", b"fn renamed() {}");
+        write_file(workspace_dir.path(), "ignored.rs", b"fn ignored() {}");
 
         let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
-
-        track("keep_a.rs", &mut workspace, &mut index, &mut storage);
-        track("keep_b.rs", &mut workspace, &mut index, &mut storage);
-        // Ghost: never written to disk — a stale entry surviving from a prior boot.
-        let ghost = "gone.rs.tmp.999.dead";
-        track(ghost, &mut workspace, &mut index, &mut storage);
-
-        let pruned = reconcile_pruned(
+        scan(
             workspace_dir.path(),
+            &mut storage,
             &mut workspace,
             &mut index,
+        )
+        .unwrap();
+
+        let survivor_id = workspace
+            .get_by_path(&RelativePath::new("survivor.rs"))
+            .unwrap();
+        let survivor_before = workspace.get(survivor_id).unwrap().clone();
+
+        fs::remove_file(workspace_dir.path().join("deleted.rs")).unwrap();
+        fs::rename(
+            workspace_dir.path().join("renamed_old.rs"),
+            workspace_dir.path().join("renamed_new.rs"),
+        )
+        .unwrap();
+        write_file(workspace_dir.path(), "added.rs", b"fn added() {}");
+        write_file(workspace_dir.path(), "unignored.rs", b"fn unignored() {}");
+        write_file(
+            workspace_dir.path(),
+            ".towerignore",
+            b"ignored.rs\n!unignored.rs\n",
+        );
+        write_file(workspace_dir.path(), ".hidden.rs", b"fn hidden() {}");
+        write_file(
+            workspace_dir.path(),
+            "orphan.rs.tmp_write",
+            b"partial write",
+        );
+        fs::create_dir(workspace_dir.path().join("not_a_file.rs")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            use std::os::unix::fs::symlink;
+
+            symlink(
+                workspace_dir.path().join("survivor.rs"),
+                workspace_dir.path().join("survivor_link.rs"),
+            )
+            .unwrap();
+            let invalid_name = std::ffi::OsString::from_vec(vec![b'n', b'o', b'n', 0xff]);
+            fs::write(workspace_dir.path().join(invalid_name), b"not utf-8").unwrap();
+        }
+
+        let report = reconcile_workspace(
+            workspace_dir.path(),
             &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        assert_eq!(report.added, 3);
+        assert_eq!(report.removed, 3);
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(
+            workspace.get_by_path(&RelativePath::new("survivor.rs")),
+            Some(survivor_id),
+            "an unchanged survivor must retain its generational identity"
+        );
+        assert_eq!(
+            workspace.get(survivor_id).unwrap(),
+            &survivor_before,
+            "an unchanged survivor must not be rewritten"
         );
 
-        assert_eq!(pruned, 1, "exactly the ghost entry must be pruned");
-        assert!(
-            workspace.get_by_path(&RelativePath::new(ghost)).is_none(),
-            "ghost path must be removed from the workspace"
+        let actual: BTreeMap<_, _> = workspace
+            .snapshot()
+            .files
+            .into_iter()
+            .map(|file| (file.path.as_str().to_owned(), file.id))
+            .collect();
+        assert_eq!(
+            actual.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["added.rs", "renamed_new.rs", "survivor.rs", "unignored.rs"]
         );
-        assert!(
-            workspace
-                .get_by_path(&RelativePath::new("keep_a.rs"))
-                .is_some(),
-            "keep_a.rs must still be tracked"
+        assert_eq!(index.posting_count(&Token::new("deleted")), 0);
+        assert_eq!(index.posting_count(&Token::new("ignored")), 0);
+        assert_eq!(index.posting_count(&Token::new("added")), 1);
+        assert_eq!(index.posting_count(&Token::new("renamed")), 1);
+
+        drop(storage);
+        let (reopened_storage, reopened_workspace, reopened_index) = open_storage(db_dir.path());
+        assert!(reopened_storage.is_scan_complete().unwrap());
+        let reopened: BTreeMap<_, _> = reopened_workspace
+            .snapshot()
+            .files
+            .into_iter()
+            .map(|file| (file.path.as_str().to_owned(), file.id))
+            .collect();
+        assert_eq!(reopened, actual);
+        assert_eq!(reopened_index.posting_count(&Token::new("survivor")), 1);
+
+        let partial_workspace_dir = TempDir::new().unwrap();
+        let partial_db_dir = TempDir::new().unwrap();
+        write_file(
+            partial_workspace_dir.path(),
+            "persisted.rs",
+            b"fn persisted() {}",
         );
+        write_file(
+            partial_workspace_dir.path(),
+            "offline_add.rs",
+            b"fn offline_add() {}",
+        );
+        let (mut partial_storage, mut partial_workspace, mut partial_index) =
+            open_storage(partial_db_dir.path());
+        track(
+            "persisted.rs",
+            &mut partial_workspace,
+            &mut partial_index,
+            &mut partial_storage,
+        );
+        assert!(!partial_storage.is_scan_complete().unwrap());
+
+        let partial_report = reconcile_workspace(
+            partial_workspace_dir.path(),
+            &mut partial_storage,
+            &mut partial_workspace,
+            &mut partial_index,
+        )
+        .unwrap();
+        assert_eq!(partial_report.added, 1);
+        assert_eq!(partial_report.removed, 0);
+        assert_eq!(partial_report.unchanged, 1);
         assert!(
-            workspace
-                .get_by_path(&RelativePath::new("keep_b.rs"))
+            partial_workspace
+                .get_by_path(&RelativePath::new("offline_add.rs"))
                 .is_some(),
-            "keep_b.rs must still be tracked"
+            "an incomplete marker must not suppress authoritative reconciliation"
         );
     }
 
-    /// A tracked path that EXISTS on disk but is now matched by `.towerignore`
-    /// must be pruned (proves now-ignored paths are dropped, not only
-    /// missing-on-disk ones).
     #[test]
-    fn reconcile_prunes_now_ignored_path() {
-        let workspace_dir = TempDir::new().unwrap();
-        let db_dir = TempDir::new().unwrap();
+    fn reconciliation_failure_is_atomic_and_first_clean_retry_succeeds() {
+        let root = TempDir::new().unwrap();
+        write_file(root.path(), "survivor.rs", b"fn survivor() {}");
+        write_file(root.path(), "addition.rs", b"fn addition() {}");
 
-        write_file(workspace_dir.path(), ".towerignore", b"ignored/\n");
-        write_file(workspace_dir.path(), "keep.rs", b"fn keep() {}");
-        write_file(workspace_dir.path(), "ignored/x.rs", b"fn x() {}");
-
-        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
-
-        track("keep.rs", &mut workspace, &mut index, &mut storage);
-        // Tracked from a prior boot before the ignore rule existed; file is on
-        // disk but now matches .towerignore, so the walk no longer surfaces it.
-        track("ignored/x.rs", &mut workspace, &mut index, &mut storage);
-
-        let pruned = reconcile_pruned(
-            workspace_dir.path(),
+        let mut storage = CountingStorage::default();
+        let mut workspace = ProjectWorkspace::new();
+        let mut index = InvertedIndex::new();
+        track(
+            "survivor.rs",
             &mut workspace,
             &mut index,
-            &mut storage,
+            &mut storage.inner,
+        );
+        let workspace_before = workspace.snapshot();
+        let survivor_id = workspace
+            .get_by_path(&RelativePath::new("survivor.rs"))
+            .unwrap();
+
+        let survivor = root.path().join("survivor.rs");
+        let addition = root.path().join("addition.rs");
+        let mut failing = ScriptedOperations {
+            paths: vec![addition.clone(), survivor.clone()],
+            metadata_error: Some(survivor.clone()),
+            content_reads: 0,
+            content_hashes: 0,
+        };
+        let (result, failure_metrics) = collect_reconciliation_metrics(|| {
+            reconcile_workspace_with(
+                root.path(),
+                &mut storage,
+                &mut workspace,
+                &mut index,
+                &mut failing,
+            )
+        });
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, ScanError::Metadata { path, .. } if path == Path::new("survivor.rs"))
+        );
+        assert_eq!(storage.reconciliation_calls, 0);
+        assert_eq!(failure_metrics.content_reads, 0);
+        assert_eq!(failure_metrics.content_hashes, 0);
+        assert_eq!(failure_metrics.file_record_rewrites, 0);
+        let workspace_after_error = workspace.snapshot();
+        assert_eq!(workspace_after_error.files, workspace_before.files);
+        assert_eq!(
+            workspace_after_error.slot_generations,
+            workspace_before.slot_generations
+        );
+        assert_eq!(
+            workspace_after_error.free_slots,
+            workspace_before.free_slots
+        );
+        assert_eq!(index.posting_count(&Token::new("survivor")), 1);
+        assert_eq!(index.posting_count(&Token::new("addition")), 0);
+        assert_eq!(
+            storage.get(survivor_id).unwrap(),
+            workspace.get(survivor_id).unwrap().clone()
         );
 
-        assert_eq!(pruned, 1, "the now-ignored entry must be pruned");
+        failing.metadata_error = None;
+        let (result, retry_metrics) = collect_reconciliation_metrics(|| {
+            reconcile_workspace_with(
+                root.path(),
+                &mut storage,
+                &mut workspace,
+                &mut index,
+                &mut failing,
+            )
+        });
+        let report = result.unwrap();
+        assert_eq!(report.added, 1);
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(storage.reconciliation_calls, 1);
+        assert_eq!(retry_metrics.content_reads, 1);
+        assert_eq!(retry_metrics.content_hashes, 1);
+        assert_eq!(retry_metrics.file_record_rewrites, 0);
+        assert_eq!(failing.content_reads, 1);
+        assert_eq!(failing.content_hashes, 1);
         assert!(
             workspace
-                .get_by_path(&RelativePath::new("ignored/x.rs"))
-                .is_none(),
-            "now-ignored path must be removed from the workspace"
+                .get_by_path(&RelativePath::new("addition.rs"))
+                .is_some()
         );
-        assert!(
-            workspace
-                .get_by_path(&RelativePath::new("keep.rs"))
-                .is_some(),
-            "keep.rs must still be tracked"
+    }
+
+    #[test]
+    fn reconciliation_metrics_measure_operations_and_storage_boundary_rewrites() {
+        let root = TempDir::new().unwrap();
+        write_file(root.path(), "survivor.rs", b"fn survivor() {}");
+        let survivor = root.path().join("survivor.rs");
+
+        let mut storage = CountingStorage::default();
+        let mut workspace = ProjectWorkspace::new();
+        let mut index = InvertedIndex::new();
+        track(
+            "survivor.rs",
+            &mut workspace,
+            &mut index,
+            &mut storage.inner,
+        );
+        let mut operations = ScriptedOperations {
+            paths: vec![survivor],
+            metadata_error: None,
+            content_reads: 0,
+            content_hashes: 0,
+        };
+
+        let (result, metrics) = collect_reconciliation_metrics(|| {
+            reconcile_workspace_with(
+                root.path(),
+                &mut storage,
+                &mut workspace,
+                &mut index,
+                &mut operations,
+            )
+        });
+        result.unwrap();
+        assert_eq!(metrics.content_reads, 0);
+        assert_eq!(metrics.content_hashes, 0);
+        assert_eq!(metrics.file_record_rewrites, 0);
+        assert_eq!(operations.content_reads, 0);
+        assert_eq!(operations.content_hashes, 0);
+
+        storage.inject_survivor_rewrite = true;
+        let (result, metrics) = collect_reconciliation_metrics(|| {
+            reconcile_workspace_with(
+                root.path(),
+                &mut storage,
+                &mut workspace,
+                &mut index,
+                &mut operations,
+            )
+        });
+        result.unwrap();
+        assert_eq!(
+            metrics.file_record_rewrites, 1,
+            "a storage-boundary survivor rewrite must be observable even for an empty delta"
         );
     }
 }

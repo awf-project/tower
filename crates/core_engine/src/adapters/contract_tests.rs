@@ -22,6 +22,120 @@ use crate::{
 // Expand StoragePort contract suite against InMemoryStorage.
 storage_contract_tests!(InMemoryStorage::new);
 
+pub(super) trait ReconciliationState {
+    fn file_id_for_path(&self, path: &crate::domain::RelativePath)
+    -> Option<crate::domain::FileId>;
+    fn search_ids(&self, query: &str) -> Vec<crate::domain::FileId>;
+    fn slot_generation(&self, index: u32) -> Option<u32>;
+    fn slot_is_free(&self, index: u32) -> bool;
+    fn survivor_rewrites(&self) -> usize;
+}
+
+pub(super) fn reconciliation_delta_is_atomic<S, Make, Arm>(make: Make, arm: Arm) -> S
+where
+    S: crate::ports::StoragePort + ReconciliationState,
+    Make: FnOnce() -> S,
+    Arm: FnOnce(&mut S),
+{
+    use crate::domain::FileId;
+    use crate::ports::{PortError, ReconciliationDelta};
+    use crate::test_support::make_virtual_file;
+
+    let mut store = make();
+    let survivor = make_virtual_file(0, 0, "src/survivor.rs");
+    let removed = make_virtual_file(1, 0, "src/removed.rs");
+    store
+        .put_batch(&[survivor.clone(), removed.clone()])
+        .unwrap();
+
+    let replacement = make_virtual_file(1, 1, "src/replacement.rs");
+    let valid_delta = ReconciliationDelta {
+        additions: vec![replacement.clone()],
+        removals: vec![removed.id],
+    };
+    store.apply_reconciliation_delta(&valid_delta).unwrap();
+
+    assert_eq!(store.get(survivor.id).unwrap(), survivor);
+    assert_eq!(store.get(removed.id).unwrap_err(), PortError::NotFound);
+    assert_eq!(store.get(replacement.id).unwrap(), replacement);
+    assert_eq!(store.file_id_for_path(&survivor.path), Some(survivor.id));
+    assert_eq!(store.file_id_for_path(&removed.path), None);
+    assert_eq!(
+        store.file_id_for_path(&replacement.path),
+        Some(replacement.id)
+    );
+    assert_eq!(store.search_ids("survivor"), vec![survivor.id]);
+    assert!(store.search_ids("removed").is_empty());
+    assert_eq!(store.search_ids("replacement"), vec![replacement.id]);
+    assert_eq!(store.slot_generation(1), Some(1));
+    assert!(!store.slot_is_free(1));
+    assert_eq!(store.survivor_rewrites(), 0);
+
+    let retried = make_virtual_file(1, 2, "src/retried.rs");
+    let additional = make_virtual_file(2, 0, "src/additional.rs");
+    let failing_delta = ReconciliationDelta {
+        additions: vec![retried.clone(), additional.clone()],
+        removals: vec![replacement.id],
+    };
+    arm(&mut store);
+
+    assert!(matches!(
+        store.apply_reconciliation_delta(&failing_delta),
+        Err(PortError::ReconciliationFailed { .. })
+    ));
+    assert_eq!(store.get(survivor.id).unwrap(), survivor);
+    assert_eq!(store.get(replacement.id).unwrap(), replacement);
+    assert_eq!(store.get(retried.id).unwrap_err(), PortError::NotFound);
+    assert_eq!(store.get(additional.id).unwrap_err(), PortError::NotFound);
+    assert_eq!(
+        store.file_id_for_path(&replacement.path),
+        Some(replacement.id)
+    );
+    assert_eq!(store.file_id_for_path(&retried.path), None);
+    assert_eq!(store.file_id_for_path(&additional.path), None);
+    assert_eq!(store.search_ids("replacement"), vec![replacement.id]);
+    assert!(store.search_ids("retried").is_empty());
+    assert!(store.search_ids("additional").is_empty());
+    assert_eq!(store.slot_generation(1), Some(1));
+    assert_eq!(store.slot_generation(2), None);
+    assert!(!store.slot_is_free(1));
+    assert_eq!(store.survivor_rewrites(), 0);
+
+    store.apply_reconciliation_delta(&failing_delta).unwrap();
+    assert_eq!(store.get(survivor.id).unwrap(), survivor);
+    assert_eq!(store.get(replacement.id).unwrap_err(), PortError::NotFound);
+    assert_eq!(store.get(retried.id).unwrap(), retried);
+    assert_eq!(store.get(additional.id).unwrap(), additional);
+    assert_eq!(
+        store.get(FileId::new_for_testing(1, 0)).unwrap_err(),
+        PortError::NotFound
+    );
+    assert_eq!(store.file_id_for_path(&replacement.path), None);
+    assert_eq!(store.file_id_for_path(&retried.path), Some(retried.id));
+    assert_eq!(
+        store.file_id_for_path(&additional.path),
+        Some(additional.id)
+    );
+    assert!(store.search_ids("replacement").is_empty());
+    assert_eq!(store.search_ids("retried"), vec![retried.id]);
+    assert_eq!(store.search_ids("additional"), vec![additional.id]);
+    assert_eq!(store.slot_generation(1), Some(2));
+    assert_eq!(store.slot_generation(2), Some(0));
+    assert!(!store.slot_is_free(1));
+    assert!(!store.slot_is_free(2));
+    assert_eq!(store.survivor_rewrites(), 0);
+
+    store
+        .apply_reconciliation_delta(&ReconciliationDelta {
+            additions: Vec::new(),
+            removals: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(store.survivor_rewrites(), 0);
+
+    store
+}
+
 // Expand FileSystemPort contract suite against InMemoryFs.
 filesystem_contract_tests!(InMemoryFs::new);
 

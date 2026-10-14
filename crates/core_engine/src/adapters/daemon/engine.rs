@@ -13,29 +13,39 @@ use crate::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
 use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_workspace_root};
+use crate::adapters::config::TowerConfig;
 use crate::adapters::config::lsp::{lsp_initialize_payload, validate_lsp_commands};
-use crate::adapters::config::{TowerConfig, legacy_plugins_dir_fallback};
 use crate::adapters::extension::host_deps::ApplyEditsHostPort;
 use crate::adapters::extension::{
     ExtensionInitConfigMap, ExtensionSupervisor, HostDeps as ExtensionHostDeps,
     global_extensions_dir, load_extensions_into_shared_registry, resolve_extension_dirs,
 };
-use crate::adapters::fs::scan::reconcile_pruned;
-use crate::adapters::fs::{RealFs, workspace_scan};
+use crate::adapters::fs::RealFs;
+#[cfg(any(test, feature = "startup-test-hooks"))]
+use crate::adapters::fs::scan::ReconciliationMetrics;
+#[cfg(not(feature = "startup-test-hooks"))]
+use crate::adapters::fs::scan::reconcile_workspace;
+use crate::adapters::fs::scan::{ReconciliationReport, ScanError};
+#[cfg(feature = "startup-test-hooks")]
+use crate::adapters::fs::scan::{
+    collect_reconciliation_metrics, reconcile_workspace_before_commit,
+};
 use crate::adapters::mcp::PushEvent;
 use crate::adapters::mcp::diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader};
 use crate::adapters::mcp::native_tools::EngineState;
-use crate::adapters::watcher::NotifyWatcherAdapter;
+use crate::adapters::watcher::{NotifyWatcherAdapter, WatcherError};
 use crate::domain::DomainError;
 use crate::domain::extension_host::{ExtensionRegistry, RegistrationError};
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::FileMutationService;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{FileId, RelativePath};
+#[cfg(feature = "startup-test-hooks")]
+use crate::ports::PortError;
 use crate::ports::inbound::{
     FileMutationUseCase, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
 };
-use crate::ports::{AstIndexPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
+use crate::ports::{AstIndexPort, ExtensionHostPort, NoOpDocumentSync};
 use extension_protocol::ExtensionManifest;
 
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
@@ -52,6 +62,38 @@ const RR_DEBUG_TOOL_NAMES: &[&str] = &[
     "find_origin",
     "record_and_find_origin",
 ];
+
+#[cfg(feature = "startup-test-hooks")]
+#[derive(Debug, Default)]
+struct StartupTestHooks {
+    fail_initial_reconciliation_before_commit: bool,
+    emit_reconciliation_metrics: bool,
+}
+
+#[cfg(feature = "startup-test-hooks")]
+impl StartupTestHooks {
+    fn for_workspace(workspace_root: &Path) -> Self {
+        let Some(selector) = env::var_os("TOWER_TEST_WORKSPACE") else {
+            return Self::default();
+        };
+        let Ok(selector) = Path::new(&selector).canonicalize() else {
+            return Self::default();
+        };
+        let Ok(workspace_root) = workspace_root.canonicalize() else {
+            return Self::default();
+        };
+        if selector != workspace_root {
+            return Self::default();
+        }
+
+        Self {
+            fail_initial_reconciliation_before_commit: env::var("TOWER_TEST_FAIL_RECONCILIATION")
+                .is_ok_and(|value| value == "before_commit"),
+            emit_reconciliation_metrics: env::var("TOWER_TEST_METRICS")
+                .is_ok_and(|value| value == "1"),
+        }
+    }
+}
 
 struct EngineApplyEditsHost {
     state: Arc<RwLock<EngineState>>,
@@ -222,41 +264,138 @@ fn open_storage(
         .map_err(|e| format!("failed to open sled database at {}: {e}", db_path.display()))
 }
 
+struct WorkspaceLoadResult {
+    workspace: ProjectWorkspace,
+    index: InvertedIndex,
+    reconciliation: ReconciliationReport,
+}
+
+#[derive(Debug)]
+enum WorkspaceLoadError {
+    Reconciliation(ScanError),
+    Watcher {
+        operation: &'static str,
+        source: WatcherError,
+    },
+}
+
+impl WorkspaceLoadError {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Reconciliation(ScanError::MarkerRead { .. }) => "marker_read",
+            Self::Reconciliation(ScanError::Enumeration { .. }) => "enumeration",
+            Self::Reconciliation(ScanError::Metadata { .. }) => "metadata_read",
+            Self::Reconciliation(ScanError::ContentRead { .. }) => "content_read",
+            Self::Reconciliation(ScanError::Persistence { operation, .. }) => operation,
+            Self::Watcher { operation, .. } => operation,
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Reconciliation(
+                ScanError::Enumeration { path, .. }
+                | ScanError::Metadata { path, .. }
+                | ScanError::ContentRead { path, .. },
+            ) => Some(path),
+            Self::Reconciliation(ScanError::MarkerRead { .. } | ScanError::Persistence { .. })
+            | Self::Watcher { .. } => None,
+        }
+    }
+
+    fn redacted_reason(&self) -> &'static str {
+        match self {
+            Self::Reconciliation(ScanError::MarkerRead { .. }) => "scan marker read failed",
+            Self::Reconciliation(ScanError::Enumeration { .. }) => "workspace enumeration failed",
+            Self::Reconciliation(ScanError::Metadata { .. }) => "file metadata read failed",
+            Self::Reconciliation(ScanError::ContentRead { .. }) => "file content read failed",
+            Self::Reconciliation(ScanError::Persistence { .. }) => {
+                "reconciliation persistence failed"
+            }
+            Self::Watcher {
+                source: WatcherError::ChannelClosed,
+                ..
+            } => "watcher channel closed",
+            Self::Watcher {
+                source: WatcherError::NotifyInit(_),
+                ..
+            } => "watcher initialization failed",
+            Self::Watcher {
+                source: WatcherError::NotifyWatch(_),
+                ..
+            } => "watcher registration failed",
+            Self::Watcher {
+                source: WatcherError::Storage(_),
+                ..
+            } => "watcher storage operation failed",
+            Self::Watcher {
+                source: WatcherError::SpawnFailed(_),
+                ..
+            } => "watcher worker startup failed",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "tower: workspace reconciliation failed during {}",
+            self.operation()
+        )?;
+        if let Some(path) = self.path() {
+            write!(formatter, " at {}", path.display())?;
+        }
+        write!(formatter, ": {}", self.redacted_reason())
+    }
+}
+
+impl std::error::Error for WorkspaceLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Reconciliation(source) => Some(source),
+            Self::Watcher { source, .. } => Some(source),
+        }
+    }
+}
+
 fn load_workspace_index(
     workspace_root: &Path,
     storage: &mut SledStorageAdapter,
     workspace: ProjectWorkspace,
     index: InvertedIndex,
-) -> (ProjectWorkspace, InvertedIndex) {
-    if !storage.is_scan_complete().unwrap_or(false) {
-        let mut fresh_workspace = ProjectWorkspace::new();
-        let mut fresh_index = InvertedIndex::new();
-        match workspace_scan(
-            workspace_root,
-            storage,
-            &mut fresh_workspace,
-            &mut fresh_index,
-        ) {
-            Ok(report) => {
-                eprintln!(
-                    "tower: initial scan complete — {} files indexed",
-                    report.indexed
-                );
-            }
-            Err(e) => {
-                eprintln!("tower: warning — initial scan failed: {e}");
-            }
-        }
-        return (fresh_workspace, fresh_index);
-    }
-
+    #[cfg(feature = "startup-test-hooks")] hooks: &StartupTestHooks,
+) -> Result<WorkspaceLoadResult, WorkspaceLoadError> {
     let mut workspace = workspace;
     let mut index = index;
-    let pruned = reconcile_pruned(workspace_root, &mut workspace, &mut index, storage);
-    if pruned > 0 {
-        eprintln!("tower: reconciled index — {pruned} stale entries pruned");
-    }
-    (workspace, index)
+    #[cfg(not(feature = "startup-test-hooks"))]
+    let reconciliation = reconcile_workspace(workspace_root, storage, &mut workspace, &mut index);
+    #[cfg(feature = "startup-test-hooks")]
+    let reconciliation = reconcile_workspace_before_commit(
+        workspace_root,
+        storage,
+        &mut workspace,
+        &mut index,
+        || {
+            if hooks.fail_initial_reconciliation_before_commit {
+                Err(ScanError::Persistence {
+                    operation: "apply_reconciliation_delta",
+                    source: PortError::ReconciliationFailed {
+                        operation: "apply_reconciliation_delta",
+                        reason: "injected startup reconciliation failure".to_owned(),
+                    },
+                })
+            } else {
+                Ok(())
+            }
+        },
+    );
+    let reconciliation = reconciliation.map_err(WorkspaceLoadError::Reconciliation)?;
+    Ok(WorkspaceLoadResult {
+        workspace,
+        index,
+        reconciliation,
+    })
 }
 
 fn ast_index_for_workspace(workspace_root: &Path) -> Arc<dyn AstIndexPort + Send + Sync> {
@@ -278,7 +417,7 @@ fn format_queue_for_workspace(
     tower_config: &TowerConfig,
 ) -> (SharedFormatQueue, FormatterEchoSet) {
     let format_queue: SharedFormatQueue = Arc::new(crate::adapters::formatter::FormatQueue::new(
-        tower_config.plugins.formatter.clone(),
+        tower_config.formatter.clone(),
         workspace_root.to_path_buf(),
     ));
     let echo_set = format_queue
@@ -297,33 +436,14 @@ fn load_extension_registry(
     format_queue: Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>,
 ) -> Result<mpsc::Receiver<PushEvent>, String> {
     let (push_tx, push_rx) = mpsc::channel::<PushEvent>();
-    let extensions_dir_local = workspace_root.join(".tower/extensions");
-    let plugins_dir_legacy = workspace_root.join(".tower/plugins");
     let ext_dir_arg = resolve_extensions_dir_arg(opts);
 
-    let mut extension_dirs = resolve_extension_dirs(
+    let extension_dirs = resolve_extension_dirs(
         ext_dir_arg.as_deref(),
         env::var("TOWER_EXTENSIONS_DIR").ok().as_deref(),
         global_extensions_dir(),
         workspace_root,
     );
-
-    if let Some((fallback_dir, warning)) =
-        legacy_plugins_dir_fallback(&extensions_dir_local, &plugins_dir_legacy)
-    {
-        eprintln!("{warning}");
-        if ext_dir_arg.is_none()
-            && env::var("TOWER_EXTENSIONS_DIR")
-                .unwrap_or_default()
-                .is_empty()
-        {
-            for dir in &mut extension_dirs {
-                if dir == &extensions_dir_local {
-                    *dir = fallback_dir.clone();
-                }
-            }
-        }
-    }
 
     let ext_fs: Arc<dyn crate::adapters::extension::host_deps::FsAdapter + Send + Sync> =
         Arc::new(Mutex::new(RealFs::new(workspace_root)));
@@ -465,14 +585,14 @@ fn start_watcher(
     storage_for_watcher: SledStorageAdapter,
     ext_registry: &Arc<RwLock<ExtensionRegistry>>,
     echo_set: FormatterEchoSet,
-) -> Result<NotifyWatcherAdapter, String> {
+) -> Result<NotifyWatcherAdapter, WatcherError> {
     let watcher_workspace = state
         .read()
-        .map_err(|_| "engine state lock poisoned".to_string())?
+        .unwrap_or_else(|poison| poison.into_inner())
         .workspace_arc();
     let watcher_index = state
         .read()
-        .map_err(|_| "engine state lock poisoned".to_string())?
+        .unwrap_or_else(|poison| poison.into_inner())
         .index_arc();
     let watcher_ext_host: Box<dyn ExtensionHostPort + Send + Sync> =
         Box::new(SharedExtensionHost(Arc::clone(ext_registry)));
@@ -487,8 +607,7 @@ fn start_watcher(
         watcher_ext_host,
         doc_sync,
         echo_set,
-    )
-    .map_err(|e| format!("failed to start filesystem watcher: {e}"))?;
+    )?;
 
     eprintln!(
         "tower: filesystem watcher active on {}",
@@ -517,18 +636,13 @@ fn replay_initial_index_to_extensions(
     }
 
     eprintln!(
-        "tower: delivering {} indexed file(s) to extensions (background)",
+        "tower: delivering {} indexed file(s) to extensions",
         replay.len()
     );
     let host = SharedExtensionHost(Arc::clone(ext_registry));
-    std::thread::Builder::new()
-        .name("ext-initial-index".to_owned())
-        .spawn(move || {
-            for (id, path) in replay {
-                host.on_file_indexed(id, &path);
-            }
-        })
-        .map_err(|e| format!("failed to spawn initial-index thread: {e}"))?;
+    for (id, path) in replay {
+        host.on_file_indexed(id, &path);
+    }
     Ok(())
 }
 
@@ -541,10 +655,11 @@ fn replay_initial_index_to_extensions(
 /// watcher. Serving (stdio or socket) is the caller's responsibility.
 ///
 /// The `tower_config` is passed in ready-to-use; callers are responsible for
-/// loading it via `config::load` and running `config::apply_backcompat` before
-/// calling this function.
+/// loading it via `config::load` before calling this function.
 pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<EngineHandle, String> {
     let workspace_root = resolve_workspace_root(opts);
+    #[cfg(feature = "startup-test-hooks")]
+    let startup_test_hooks = StartupTestHooks::for_workspace(&workspace_root);
     for outcome in validate_lsp_commands(
         &tower_config.lsp,
         &workspace_root,
@@ -554,19 +669,81 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         eprintln!("tower: LSP startup diagnostic {diagnostic}");
     }
     let (mut storage, workspace, index) = open_storage(&workspace_root)?;
-    let (workspace, index) = load_workspace_index(&workspace_root, &mut storage, workspace, index);
-    let storage_for_watcher = storage.try_clone();
-    let state = Arc::new(RwLock::new(EngineState::new(
-        workspace,
-        index,
-        Box::new(storage),
-        Box::new(RealFs::new(&workspace_root)),
-    )));
-
+    #[cfg(feature = "startup-test-hooks")]
+    let rewrite_counter = storage.reconciliation_rewrite_counter();
+    #[cfg(feature = "startup-test-hooks")]
+    let rewrite_count_before_prepare = rewrite_counter.snapshot();
     let ext_ast_index = ast_index_for_workspace(&workspace_root);
     let (format_queue, echo_set) = format_queue_for_workspace(&workspace_root, &tower_config);
     let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
-    inject_extension_host(&state, &ext_registry)?;
+    let prepare = || -> Result<_, String> {
+        let WorkspaceLoadResult {
+            workspace,
+            index,
+            reconciliation,
+        } = load_workspace_index(
+            &workspace_root,
+            &mut storage,
+            workspace,
+            index,
+            #[cfg(feature = "startup-test-hooks")]
+            &startup_test_hooks,
+        )
+        .map_err(|error| format!("{error} at {}", workspace_root.display()))?;
+        eprintln!(
+            "tower: reconciled index — {} added, {} removed, {} unchanged",
+            reconciliation.added, reconciliation.removed, reconciliation.unchanged
+        );
+        let storage_for_watcher = storage.try_clone();
+        let state = Arc::new(RwLock::new(EngineState::new(
+            workspace,
+            index,
+            Box::new(storage),
+            Box::new(RealFs::new(&workspace_root)),
+        )));
+        inject_extension_host(&state, &ext_registry)?;
+        let watcher = start_watcher(
+            &workspace_root,
+            &state,
+            storage_for_watcher,
+            &ext_registry,
+            echo_set,
+        )
+        .map_err(|source| WorkspaceLoadError::Watcher {
+            operation: "watcher_registration",
+            source,
+        })
+        .map_err(|error| error.to_string())?;
+        watcher
+            .request_catch_up()
+            .map_err(|source| WorkspaceLoadError::Watcher {
+                operation: "watcher_catch_up",
+                source,
+            })
+            .map_err(|error| error.to_string())?;
+        watcher
+            .barrier()
+            .map_err(|source| WorkspaceLoadError::Watcher {
+                operation: "watcher_barrier",
+                source,
+            })
+            .map_err(|error| error.to_string())?;
+        Ok((state, watcher))
+    };
+    #[cfg(feature = "startup-test-hooks")]
+    let (prepared, mut reconciliation_metrics) = collect_reconciliation_metrics(prepare);
+    #[cfg(not(feature = "startup-test-hooks"))]
+    let prepared = prepare();
+    let (state, _watcher) = prepared?;
+    #[cfg(feature = "startup-test-hooks")]
+    if startup_test_hooks.emit_reconciliation_metrics {
+        reconciliation_metrics = with_storage_rewrite_delta(
+            reconciliation_metrics,
+            rewrite_count_before_prepare,
+            rewrite_counter.snapshot(),
+        );
+        emit_reconciliation_metrics(reconciliation_metrics);
+    }
     let push_rx = load_extension_registry(
         opts,
         &workspace_root,
@@ -575,13 +752,6 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         &ext_registry,
         ext_ast_index,
         format_queue,
-    )?;
-    let _watcher = start_watcher(
-        &workspace_root,
-        &state,
-        storage_for_watcher,
-        &ext_registry,
-        echo_set,
     )?;
     replay_initial_index_to_extensions(&state, &ext_registry)?;
     let diag_reader: Arc<dyn DiagnosticsReader> = Arc::new(NoOpDiagnosticsReader);
@@ -595,12 +765,44 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
     })
 }
 
+#[cfg(any(test, feature = "startup-test-hooks"))]
+fn with_storage_rewrite_delta(
+    mut metrics: ReconciliationMetrics,
+    before: usize,
+    after: usize,
+) -> ReconciliationMetrics {
+    metrics.file_record_rewrites += after.saturating_sub(before);
+    metrics
+}
+
+#[cfg(feature = "startup-test-hooks")]
+fn emit_reconciliation_metrics(metrics: ReconciliationMetrics) {
+    eprintln!(
+        "tower: reconciliation-metrics {{\"content_reads\":{},\"content_hashes\":{},\"file_record_rewrites\":{}}}",
+        metrics.content_reads, metrics.content_hashes, metrics.file_record_rewrites
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
     use crate::adapters::config::{LspConfig, LspServerConfig};
+
+    #[test]
+    fn storage_rewrite_delta_is_added_to_collected_reconciliation_metrics() {
+        let metrics = ReconciliationMetrics {
+            content_reads: 2,
+            content_hashes: 1,
+            file_record_rewrites: 0,
+        };
+
+        assert_eq!(
+            with_storage_rewrite_delta(metrics, 7, 9).file_record_rewrites,
+            2
+        );
+    }
 
     #[test]
     fn f008_daemon_hands_lsp_configuration_to_extension_discovery() {
