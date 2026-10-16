@@ -1,0 +1,14 @@
+[package]
+publish = false
+name = "fixture_lsp_server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic native LSP server for adapter and process tests"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["stdio"] }

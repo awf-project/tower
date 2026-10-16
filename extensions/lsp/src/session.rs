@@ -12,7 +12,7 @@ use core_engine::adapters::config::lsp::LspConfig;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position};
 use core_engine::ports::DocumentSyncPort;
-use extension_protocol::WorkspaceEditSpan;
+use extension_protocol::{TypeHierarchyQuery, TypeHierarchyResult, WorkspaceEditSpan};
 
 /// The sidecar extension's LSP session manager.
 ///
@@ -45,6 +45,15 @@ impl LspSessionPool {
         }
     }
 
+    /// Construct a façade around a scripted pool for its contract tests.
+    #[cfg(test)]
+    pub(crate) fn with_session_pool_for_test(inner: SessionPool, workspace_root: PathBuf) -> Self {
+        Self {
+            inner,
+            workspace_root,
+        }
+    }
+
     /// Check diagnostics for the file at `path` (workspace-relative).
     ///
     /// Reads the file content from `text` (already resolved by the caller).
@@ -54,6 +63,15 @@ impl LspSessionPool {
         text: &str,
     ) -> Result<Vec<Diagnostic>, LspSessionError> {
         self.inner.check_lsp(path, text)
+    }
+
+    #[allow(dead_code)]
+    pub fn type_hierarchy(
+        &self,
+        query: &TypeHierarchyQuery,
+        text: &str,
+    ) -> Result<TypeHierarchyResult, LspSessionError> {
+        self.inner.type_hierarchy_lsp(query, text)
     }
 
     /// Go to definition at `position` in `path`.

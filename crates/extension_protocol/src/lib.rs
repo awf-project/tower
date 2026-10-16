@@ -55,8 +55,10 @@ pub use messages::{
     Location, LspImplementationRequest, LspImplementationResult, LspOperation, LspOutcome,
     LspOutcomeCode, LspOutcomePhase, LspOutcomeStatus, PerFileEditResult, RenameError,
     RenameErrorCode, RenamePreview, RenameRequest, RenameResult, Request, Response,
-    SymbolCandidate, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
-    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
+    SymbolCandidate, TypeHierarchyDirection, TypeHierarchyItem, TypeHierarchyQuery,
+    TypeHierarchyRange, TypeHierarchyResult, WorkspaceApplyEditsError,
+    WorkspaceApplyEditsErrorCode, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
+    WorkspaceEditSpan,
 };
 
 /// The current protocol version carried in every [`InitParams`].

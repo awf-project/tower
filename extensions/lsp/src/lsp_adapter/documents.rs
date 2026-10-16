@@ -41,6 +41,7 @@ pub enum DocSync {
 }
 
 /// Per-uri open-document state.
+#[derive(Clone)]
 struct OpenDocument {
     version: i64,
     refcount: u32,
@@ -51,6 +52,11 @@ struct OpenDocument {
 #[derive(Default)]
 pub struct DocumentTracker {
     docs: HashMap<String, OpenDocument>,
+}
+
+/// Exact pre-acquire state used to make transport-backed acquisition atomic.
+pub(super) struct AcquireRollback {
+    previous: Option<OpenDocument>,
 }
 
 fn hash_text(text: &str) -> u64 {
@@ -73,8 +79,20 @@ impl DocumentTracker {
     /// - Later hold, content changed → [`DocSync::Change`] with bumped version.
     /// - Later hold, content identical → `None` (no spurious sync).
     pub fn acquire(&mut self, uri: &str, language_id: &str, text: &str) -> Option<DocSync> {
+        self.acquire_with_rollback(uri, language_id, text).0
+    }
+
+    /// Acquire a hold while retaining enough state to undo it if its sync action
+    /// cannot be written to the language server.
+    pub(super) fn acquire_with_rollback(
+        &mut self,
+        uri: &str,
+        language_id: &str,
+        text: &str,
+    ) -> (Option<DocSync>, AcquireRollback) {
+        let previous = self.docs.get(uri).cloned();
         let hash = hash_text(text);
-        match self.docs.get_mut(uri) {
+        let sync = match self.docs.get_mut(uri) {
             None => {
                 self.docs.insert(
                     uri.to_owned(),
@@ -103,6 +121,19 @@ impl DocumentTracker {
                         text: text.to_owned(),
                     })
                 }
+            }
+        };
+        (sync, AcquireRollback { previous })
+    }
+
+    /// Restore the exact tracker state captured by [`acquire_with_rollback`](Self::acquire_with_rollback).
+    pub(super) fn rollback_acquire(&mut self, uri: &str, rollback: AcquireRollback) {
+        match rollback.previous {
+            Some(previous) => {
+                self.docs.insert(uri.to_owned(), previous);
+            }
+            None => {
+                self.docs.remove(uri);
             }
         }
     }

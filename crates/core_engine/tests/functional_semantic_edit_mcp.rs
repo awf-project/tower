@@ -118,8 +118,7 @@ fn lsp_engine(mode: &str) -> FunctionalEngine {
     fs::create_dir_all(workspace.path().join(".tower")).expect("create .tower");
     write_file(workspace.path(), "src/lib.rs", "fn old_name() {}\n");
     install_extension(workspace.path(), "lsp", "lsp_extension");
-    let script = write_fake_lsp_server(workspace.path(), mode);
-    let config_src = lsp_config_source(&script, mode);
+    let config_src = lsp_config_source(mode);
     fs::write(workspace.path().join(".tower/config.toml"), &config_src)
         .expect("write LSP workspace config");
     let config = toml::from_str(&config_src).expect("parse LSP test config");
@@ -139,125 +138,20 @@ fn lsp_engine(mode: &str) -> FunctionalEngine {
     }
 }
 
-fn lsp_config_source(script: &Path, mode: &str) -> String {
-    let script = script.to_string_lossy().replace('\\', "\\\\");
-    let mode = mode.replace('\\', "\\\\");
+fn lsp_config_source(mode: &str) -> String {
     format!(
         r#"
 [extensions]
 request_timeout_secs = 10
 
 [lsp.rust]
-command = "python3"
-args = ["{script}", "{mode}"]
+command = {}
+args = [{}]
 extensions = ["rs"]
-"#
-    )
-}
-
-fn write_fake_lsp_server(workspace: &Path, mode: &str) -> PathBuf {
-    let script = workspace.join(format!("fake_lsp_{mode}.py"));
-    fs::write(
-        &script,
-        r#"#!/usr/bin/env python3
-import json
-import sys
-
-MODE = sys.argv[1]
-
-def read_message():
-    headers = {}
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            sys.exit(0)
-        if line in (b"\r\n", b"\n"):
-            break
-        key, value = line.decode("ascii").split(":", 1)
-        headers[key.lower()] = value.strip()
-    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])).decode("utf-8"))
-
-def send_message(payload):
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-
-while True:
-    message = read_message()
-    request_id = message.get("id")
-    if request_id is None:
-        continue
-    method = message.get("method")
-    params = message.get("params") or {}
-    text_document = params.get("textDocument") or {}
-    uri = text_document.get("uri") or "file:///workspace/src/lib.rs"
-
-    if method == "initialize":
-        send_message({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "capabilities": {
-                    "textDocumentSync": 1,
-                    "implementationProvider": True,
-                    "renameProvider": {"prepareProvider": True}
-                }
-            }
-        })
-    elif method == "textDocument/implementation":
-        send_message({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": [{
-                "uri": uri,
-                "range": {
-                    "start": {"line": 0, "character": 3},
-                    "end": {"line": 0, "character": 11}
-                }
-            }]
-        })
-    elif method == "textDocument/prepareRename":
-        if MODE == "reject":
-            send_message({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32602, "message": "not valid rename target"}
-            })
-        else:
-            send_message({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "range": {
-                        "start": {"line": 0, "character": 3},
-                        "end": {"line": 0, "character": 11}
-                    },
-                    "placeholder": "old_name"
-                }
-            })
-    elif method == "textDocument/rename":
-        send_message({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "changes": {
-                    uri: [{
-                        "range": {
-                            "start": {"line": 0, "character": 3},
-                            "end": {"line": 0, "character": 11}
-                        },
-                        "newText": params.get("newName", "new_name")
-                    }]
-                }
-            }
-        })
-    else:
-        send_message({"jsonrpc": "2.0", "id": request_id, "result": None})
 "#,
+        serde_json::to_string(&fixture_lsp_server::binary_path()).unwrap(),
+        serde_json::to_string(mode).unwrap(),
     )
-    .expect("write fake LSP server");
-    script
 }
 
 fn read_workspace_file(engine: &FunctionalEngine, path: &str) -> String {

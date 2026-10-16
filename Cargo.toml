@@ -15,6 +15,8 @@ members = [
     "extensions/fixtures/ignore_shutdown",
     # F004 deterministic Debug Adapter Protocol fixture for debug e2e tests.
     "extensions/fixtures/debug_adapter",
+    # Shared native LSP peer for dispatch and process tests.
+    "extensions/fixtures/lsp_server",
     # Spec 26 native extensions (native binaries, no WASM).
     "extensions/ast",
     "extensions/hello",
@@ -45,6 +47,8 @@ default-members = [
     "extensions/fixtures/ignore_shutdown",
     # F004 deterministic Debug Adapter Protocol fixture for debug e2e tests.
     "extensions/fixtures/debug_adapter",
+    # Built before tests so both the host and LSP sidecar suites can spawn it.
+    "extensions/fixtures/lsp_server",
     # Spec 26 native extensions — compiled natively (no WASM, no WASI SDK).
     "extensions/ast",
     "extensions/hello",

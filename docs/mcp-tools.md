@@ -667,7 +667,7 @@ formatting.
 
 ## Code-intelligence tools (LSP)
 
-Six `tower_lsp_*` tools surface language-server intelligence over the same
+Seven `tower_lsp_*` tools surface language-server intelligence over the same
 `tools/call` interface. They are contributed by the `lsp` extension (manifest
 `name = "lsp"`) and appear in `tools/list` whenever that extension is discovered.
 When there is no backend, or when the file's language is not supported by the
@@ -777,6 +777,68 @@ Find implementation sites for the symbol at a position. Same arguments as
 
 If the configured server or language does not support implementation lookup, the
 tool returns `{"supported": false, "locations": []}`.
+
+### tower_lsp_type_hierarchy
+
+Query the supertypes, subtypes, or both for the symbol at a position. The tool uses the configured
+language server's type-hierarchy capability and is read-only.
+
+| Field       | Type    | Required | Description                                  |
+|-------------|---------|----------|----------------------------------------------|
+| `path`      | string  | yes      | Workspace-relative path of the file          |
+| `line`      | integer | yes      | Zero-based line number                       |
+| `character` | integer | yes      | Zero-based UTF-16 code-unit column           |
+| `direction` | string  | yes      | `supertypes`, `subtypes`, or `both`          |
+
+**Request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lsp_type_hierarchy",
+    "arguments": {
+      "path": "src/lib.rs",
+      "line": 12,
+      "character": 7,
+      "direction": "both"
+    }
+  }
+}
+```
+
+**Returns**
+
+```json
+{
+  "supported": true,
+  "supertypes": [
+    {
+      "name": "Base",
+      "kind": "class",
+      "detail": null,
+      "range": { "line": 2, "character": 6, "endLine": 2, "endCharacter": 10 },
+      "selectionRange": { "line": 2, "character": 6, "endLine": 2, "endCharacter": 10 },
+      "path": "src/base.rs",
+      "externalUri": null,
+      "external": false
+    }
+  ],
+  "subtypes": []
+}
+```
+
+Workspace items contain a workspace-relative `path` and set `external:false`. Items outside the
+workspace are retained as read-only results with `path:null`, their `externalUri`, and
+`external:true`; they cannot be used as writable workspace paths. `range` and `selectionRange`
+use zero-based UTF-16 coordinates.
+
+When no language server is configured or the server does not advertise type hierarchy, the call
+still succeeds with `supported:false`, empty `supertypes` and `subtypes`, and an `outcome` describing
+the unsupported reason. Invalid arguments return a JSON-RPC error; backend failures use the standard
+read-only LSP outcome envelope described in [Error codes](#error-codes).
 
 ### tower_lsp_rename
 

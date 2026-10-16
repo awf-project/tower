@@ -22,6 +22,7 @@ testing = []
 startup-test-hooks = ["testing"]
 
 [dev-dependencies]
+fixture_lsp_server = { path = "../../extensions/fixtures/lsp_server" }
 # Property-based testing: generates arbitrary inputs to verify invariants over
 # a large random search space (DoD: determinism property test).
 proptest = "1"

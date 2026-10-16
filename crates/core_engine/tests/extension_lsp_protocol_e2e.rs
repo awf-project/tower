@@ -11,16 +11,22 @@
 //! the actual `lsp_extension` binary (which requires a language server).
 //! Real rust-analyzer e2e tests live in `lsp_rust_analyzer_e2e.rs`.
 
-use std::sync::{Arc, Mutex, RwLock};
+// Feature: F010
 
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
+use core_engine::adapters::extension::{HostDeps, SidecarHostAdapter};
+use core_engine::adapters::formatter::NoOpFormatQueue;
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::registry::ToolRegistry;
-use core_engine::adapters::{InMemoryFs, InMemoryStorage};
+use core_engine::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage};
 use core_engine::domain::extension_host::{ExtensionCallError, ExtensionId, ExtensionRegistry};
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::domain::{FileId, RelativePath};
+use core_engine::domain::{ExtensionInstance, FileId, RelativePath};
 use core_engine::ports::ExtensionHostPort;
 use extension_protocol::manifest::{CapabilitiesSection, EventsSection};
 use extension_protocol::{Capability, Event, ExtensionFault, ExtensionManifest, ToolDecl};
@@ -71,6 +77,30 @@ fn workspace_root() -> std::path::PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+fn spawn_initialized_lsp(mut manifest: ExtensionManifest) -> Box<dyn ExtensionInstance> {
+    manifest.command = vec![
+        workspace_root()
+            .join("target/debug/lsp_extension")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let deps = HostDeps {
+        fs: Arc::new(Mutex::new(InMemoryFs::new())),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
+        push_tx: None,
+    };
+
+    SidecarHostAdapter::spawn(
+        manifest,
+        deps,
+        Duration::from_secs(15),
+        Some(serde_json::json!({"servers": {}, "idle_timeout_secs": null})),
+    )
+    .expect("spawn and initialize shipped lsp_extension")
 }
 
 fn empty_engine_state() -> Arc<RwLock<EngineState>> {
@@ -332,6 +362,54 @@ fn f007_t015_mcp_tool_discovery_exposes_tower_lsp_implementations_and_tower_lsp_
     assert!(
         names.iter().any(|name| name == "tower_lsp_rename"),
         "tools/list must expose tower_lsp_rename; got {names:?}"
+    );
+}
+
+#[test]
+fn type_hierarchy_manifest_and_public_discovery_share_request_schema() {
+    let manifest_path = workspace_root().join("extensions/lsp/extension.toml");
+    let toml = std::fs::read_to_string(&manifest_path).expect("read lsp extension.toml");
+    let manifest: ExtensionManifest = toml::from_str(&toml).expect("manifest must parse");
+    let manifest_hierarchy = manifest
+        .tools
+        .iter()
+        .find(|tool| tool.name == "type_hierarchy")
+        .expect("manifest must declare type_hierarchy")
+        .clone();
+    let expected_schema: Value =
+        serde_json::from_str(&manifest_hierarchy.schema_json).expect("request schema must parse");
+
+    let lsp_ext = spawn_initialized_lsp(manifest);
+    let runtime_hierarchy = lsp_ext
+        .manifest()
+        .tools
+        .iter()
+        .find(|tool| tool.name == "type_hierarchy")
+        .expect("runtime InitResult must declare bare type_hierarchy");
+    assert_eq!(runtime_hierarchy, &manifest_hierarchy);
+
+    let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
+    ext_registry
+        .write()
+        .unwrap()
+        .register(lsp_ext)
+        .expect("register lsp");
+
+    let merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
+    let public = merged
+        .list()
+        .into_iter()
+        .find(|tool| tool.name == "tower_lsp_type_hierarchy")
+        .expect("public discovery must expose tower_lsp_type_hierarchy");
+
+    assert_eq!(public.input_schema, expected_schema);
+    assert_eq!(
+        public.input_schema["required"],
+        serde_json::json!(["path", "line", "character", "direction"])
+    );
+    assert_eq!(
+        public.input_schema["properties"]["direction"]["enum"],
+        serde_json::json!(["supertypes", "subtypes", "both"])
     );
 }
 

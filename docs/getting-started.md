@@ -230,6 +230,40 @@ listed in the config disable list) is skipped with a stderr warning and never bl
 same extension name appears in both scopes, the local copy wins. See [`extensions.md`](extensions.md)
 for the manifest schema, capabilities, activation, and the supervision/fault model.
 
+### Explore a type hierarchy
+
+With an LSP binding configured for the file type, query the supertypes, subtypes, or both for a
+symbol position. Positions use zero-based lines and UTF-16 character offsets:
+
+```toml
+[lsp.rust]
+command = "rust-analyzer"
+args = []
+extensions = ["rs"]
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_lsp_type_hierarchy",
+    "arguments": {
+      "path": "src/lib.rs",
+      "line": 12,
+      "character": 7,
+      "direction": "both"
+    }
+  }
+}
+```
+
+The result separates `supertypes` and `subtypes`. If the language server is not configured or does
+not support the capability, Tower returns `supported:false` with empty arrays so clients can fall
+back to another navigation strategy. See [Type hierarchy](user-guide/type-hierarchy.md) for the
+location and external-result contract.
+
 ### Find a file
 
 ```json

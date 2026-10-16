@@ -81,7 +81,7 @@ use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::{Value, json};
 
-use crate::lsp_adapter::decode::RawLocation;
+use crate::lsp_adapter::decode::{RawLocation, UriAccessPolicy, UriClassification};
 use crate::lsp_adapter::documents::{DocSync, DocumentTracker};
 use core_engine::adapters::fs::scan::TOWERIGNORE_FILE_NAME;
 use core_engine::domain::RelativePath;
@@ -245,6 +245,7 @@ struct SemanticCapabilities {
     references: ProviderCapability,
     hover: ProviderCapability,
     implementation: ProviderCapability,
+    type_hierarchy: ProviderCapability,
     rename: RenameCapability,
 }
 
@@ -261,6 +262,7 @@ impl SemanticCapabilities {
             references: parse_provider(capabilities.get("referencesProvider"))?,
             hover: parse_provider(capabilities.get("hoverProvider"))?,
             implementation: parse_provider(capabilities.get("implementationProvider"))?,
+            type_hierarchy: parse_provider(capabilities.get("typeHierarchyProvider"))?,
             rename: parse_rename_provider(capabilities.get("renameProvider"))?,
         })
     }
@@ -816,6 +818,7 @@ impl LspClientAdapter {
                 references: ProviderCapability::Unavailable,
                 hover: ProviderCapability::Unavailable,
                 implementation: ProviderCapability::Unavailable,
+                type_hierarchy: ProviderCapability::Unavailable,
                 rename: RenameCapability::Unavailable,
             }),
             ignore,
@@ -870,6 +873,124 @@ impl LspClientAdapter {
         path_to_uri(&self.workspace_root.join(path.as_str()))
     }
 
+    #[allow(dead_code)]
+    fn normalize_type_hierarchy_items(
+        &self,
+        value: &Value,
+    ) -> Result<Vec<extension_protocol::TypeHierarchyItem>, LspSessionError> {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        let raw_items = serde_json::from_value::<Vec<lsp_types::TypeHierarchyItem>>(value.clone())
+            .map_err(|_| malformed_response())?;
+
+        raw_items
+            .into_iter()
+            .map(|raw| {
+                let kind = serde_json::to_value(raw.kind)
+                    .ok()
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(malformed_response)
+                    .map(decode::symbol_kind_name)?;
+                let uri = raw.uri.to_string();
+                let classification =
+                    decode::classify_uri(&uri, &self.workspace_root, UriAccessPolicy::ReadOnly)
+                        .ok_or_else(malformed_response)?;
+                let (path, external_uri, external) = match classification {
+                    UriClassification::WorkspacePath(path) => (Some(path), None, false),
+                    UriClassification::ExternalUri(uri) => (None, Some(uri), true),
+                };
+
+                Ok(extension_protocol::TypeHierarchyItem {
+                    name: raw.name,
+                    kind,
+                    detail: raw.detail,
+                    range: type_hierarchy_range(raw.range),
+                    selection_range: type_hierarchy_range(raw.selection_range),
+                    path,
+                    external_uri,
+                    external,
+                })
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn type_hierarchy_lsp(
+        &self,
+        query: &extension_protocol::TypeHierarchyQuery,
+        text: &str,
+    ) -> Result<extension_protocol::TypeHierarchyResult, LspSessionError> {
+        let path = RelativePath::new(query.path.clone());
+        if !self.supports(&path)
+            || self
+                .semantic_capabilities
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .type_hierarchy
+                == ProviderCapability::Unavailable
+        {
+            return Err(LspSessionError::CapabilityUnavailable);
+        }
+
+        let uri = self.uri_for(&path);
+        self.acquire_doc(&uri, text)?;
+        let result = (|| {
+            let deadline = Instant::now() + REQUEST_BUDGET;
+            let prepared = self.send_request_before(
+                "textDocument/prepareTypeHierarchy",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": query.line, "character": query.character }
+                }),
+                deadline,
+            )?;
+            let prepared = decode_prepared_type_hierarchy(prepared)?;
+            let mut supertypes = Vec::new();
+            let mut subtypes = Vec::new();
+
+            let follow_ups = [
+                (
+                    matches!(
+                        query.direction,
+                        extension_protocol::TypeHierarchyDirection::Supertypes
+                            | extension_protocol::TypeHierarchyDirection::Both
+                    ),
+                    "typeHierarchy/supertypes",
+                    &mut supertypes,
+                ),
+                (
+                    matches!(
+                        query.direction,
+                        extension_protocol::TypeHierarchyDirection::Subtypes
+                            | extension_protocol::TypeHierarchyDirection::Both
+                    ),
+                    "typeHierarchy/subtypes",
+                    &mut subtypes,
+                ),
+            ];
+            for (requested, method, items) in follow_ups {
+                if !requested {
+                    continue;
+                }
+                for item in &prepared {
+                    let response =
+                        self.send_request_before(method, json!({ "item": item }), deadline)?;
+                    append_unique(items, self.normalize_type_hierarchy_items(&response)?);
+                }
+            }
+
+            Ok(extension_protocol::TypeHierarchyResult {
+                supported: true,
+                supertypes,
+                subtypes,
+                outcome: None,
+            })
+        })();
+        self.release_doc(&uri);
+        result
+    }
+
     fn supports(&self, path: &RelativePath) -> bool {
         path.as_str()
             .rsplit_once('.')
@@ -881,8 +1002,14 @@ impl LspClientAdapter {
     /// resulting `didOpen`/`didChange`. Pair with [`release_doc`](Self::release_doc).
     fn acquire_doc(&self, uri: &str, text: &str) -> Result<(), LspSessionError> {
         let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(sync) = session.docs.acquire(uri, &self.language_id, text) {
-            write_doc_sync(&self.writer, uri, &sync).map_err(|_| self.transport_failure())?;
+        let (sync, rollback) = session
+            .docs
+            .acquire_with_rollback(uri, &self.language_id, text);
+        if let Some(sync) = sync
+            && write_doc_sync(&self.writer, uri, &sync).is_err()
+        {
+            session.docs.rollback_acquire(uri, rollback);
+            return Err(self.transport_failure());
         }
         Ok(())
     }
@@ -933,6 +1060,52 @@ impl LspClientAdapter {
         method: &str,
         params: Value,
     ) -> Result<RequestOutcome, LspSessionError> {
+        self.send_request_once_before(method, params, Instant::now() + REQUEST_BUDGET)
+    }
+
+    fn send_request_before(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, LspSessionError> {
+        let mut attempt = 0;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(LspSessionError::Backend(
+                    extension_protocol::LspOutcomeCode::ServerTimeout,
+                ));
+            }
+            match self.send_request_once_before(method, params.clone(), deadline)? {
+                RequestOutcome::Ok(value) => return Ok(value),
+                RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(LspSessionError::Backend(
+                            extension_protocol::LspOutcomeCode::ServerTimeout,
+                        ));
+                    }
+                    std::thread::sleep(CONTENT_MODIFIED_BACKOFF.min(remaining));
+                    attempt += 1;
+                }
+                RequestOutcome::ContentModified => {
+                    return Err(LspSessionError::Backend(
+                        extension_protocol::LspOutcomeCode::ServerError,
+                    ));
+                }
+                RequestOutcome::Error(failure) => {
+                    return Err(self.classify_request_failure(&failure));
+                }
+            }
+        }
+    }
+
+    fn send_request_once_before(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<RequestOutcome, LspSessionError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if self.dead_flag.load(Ordering::Acquire) {
             return Err(self.reader_failure());
@@ -943,7 +1116,6 @@ impl LspClientAdapter {
 
         let (lock, cvar) = &*self.responses;
         let mut map = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let deadline = Instant::now() + REQUEST_BUDGET;
         loop {
             if let Some(msg) = map.remove(&id) {
                 let has_result = msg.get("result").is_some();
@@ -1366,6 +1538,14 @@ impl Drop for LspClientAdapter {
 }
 
 impl pool::PooledSession for LspClientAdapter {
+    fn type_hierarchy_lsp(
+        &self,
+        query: &extension_protocol::TypeHierarchyQuery,
+        text: &str,
+    ) -> Result<extension_protocol::TypeHierarchyResult, LspSessionError> {
+        LspClientAdapter::type_hierarchy_lsp(self, query, text)
+    }
+
     fn check_lsp(
         &self,
         path: &RelativePath,
@@ -1681,39 +1861,9 @@ fn encode_uri_path(path: &str) -> String {
     out
 }
 
-/// Decode `%XX` escapes back to bytes, then to a UTF-8 path. Returns `None` on
-/// malformed escapes or non-UTF-8 results.
-fn decode_uri_path(encoded: &str) -> Option<PathBuf> {
-    let bytes = encoded.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 < bytes.len() {
-                let hi = (bytes[i + 1] as char).to_digit(16)?;
-                let lo = (bytes[i + 2] as char).to_digit(16)?;
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-            } else {
-                return None; // truncated escape
-            }
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    Some(PathBuf::from(String::from_utf8(out).ok()?))
-}
-
 /// Build a `file://` URI from an absolute path, percent-encoding unsafe bytes.
 fn path_to_uri(path: &std::path::Path) -> String {
     format!("file://{}", encode_uri_path(&path.display().to_string()))
-}
-
-/// Parse a `file://` URI back to an absolute path, decoding `%XX` escapes.
-fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    decode_uri_path(rest)
 }
 
 /// Build the root `.towerignore` matcher used to filter navigation results.
@@ -1766,14 +1916,13 @@ fn write_doc_sync(writer: &Writer, uri: &str, sync: &DocSync) -> std::io::Result
 fn workspace_locations(raws: Vec<RawLocation>, root: &Path, ignore: &Gitignore) -> Vec<Location> {
     raws.into_iter()
         .filter_map(|raw| {
-            let abs = uri_to_path(&raw.uri)?;
-            let rel = abs.strip_prefix(root).ok()?;
-            let rel_str = rel.to_str()?;
-            if rel_str.is_empty() {
+            let UriClassification::WorkspacePath(rel_str) =
+                decode::classify_uri(&raw.uri, root, UriAccessPolicy::Writable)?
+            else {
                 return None;
-            }
+            };
             if matches!(
-                ignore.matched_path_or_any_parents(rel_str, false),
+                ignore.matched_path_or_any_parents(&rel_str, false),
                 Match::Ignore(_)
             ) {
                 return None;
@@ -1784,6 +1933,32 @@ fn workspace_locations(raws: Vec<RawLocation>, root: &Path, ignore: &Gitignore) 
             })
         })
         .collect()
+}
+
+fn type_hierarchy_range(range: lsp_types::Range) -> extension_protocol::TypeHierarchyRange {
+    extension_protocol::TypeHierarchyRange {
+        line: range.start.line,
+        character: range.start.character,
+        end_line: range.end.line,
+        end_character: range.end.character,
+    }
+}
+
+fn decode_prepared_type_hierarchy(
+    value: Value,
+) -> Result<Vec<lsp_types::TypeHierarchyItem>, LspSessionError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_value(value).map_err(|_| malformed_response())
+}
+
+fn append_unique<T: PartialEq>(target: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
+    for item in items {
+        if !target.contains(&item) {
+            target.push(item);
+        }
+    }
 }
 
 fn malformed_response() -> LspSessionError {
@@ -1891,6 +2066,7 @@ fn looks_like_workspace_edit(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::{BufReader, Error, ErrorKind, Write};
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8};
     use std::sync::{Arc, Condvar, Mutex};
@@ -1899,19 +2075,21 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CHECK_TIMEOUT, DiagnosticsEvent, LspClientAdapter, ProviderCapability, RawLocation,
-        RawWorkspaceEdit, ReaderExit, RenameCapability, RenameNavigationError, ResponseCache,
-        SemanticCapabilities, Session, SharedState, Writer, build_dispatcher,
-        classify_reader_error, current_generation, mark_ready, parse_publish_diagnostics,
-        path_to_uri, progress_kind, record_diagnostics, server_status_is_quiescent, uri_to_path,
-        wait_for_settled, workspace_locations,
+        CHECK_TIMEOUT, DiagnosticsEvent, LspClientAdapter, LspSessionError, ProviderCapability,
+        RawLocation, RawWorkspaceEdit, ReaderExit, RenameCapability, RenameNavigationError,
+        ResponseCache, SemanticCapabilities, Session, SharedState, UriAccessPolicy,
+        UriClassification, Writer, build_dispatcher, classify_reader_error, current_generation,
+        decode, mark_ready, parse_publish_diagnostics, path_to_uri, progress_kind,
+        record_diagnostics, server_status_is_quiescent, wait_for_settled, workspace_locations,
     };
     use crate::lsp_adapter::documents::DocumentTracker;
     use crate::lsp_adapter::pool::PooledSession;
     use core_engine::domain::RelativePath;
     use core_engine::domain::code_intel::{Diagnostic, Location, Position, Range, Severity};
-    use core_engine::ports::{CodeIntelError, NavigationPort};
-    use extension_protocol::LspOutcomeCode;
+    use core_engine::ports::{CodeIntelError, DocumentSyncPort, NavigationPort};
+    use extension_protocol::{
+        LspOutcomeCode, TypeHierarchyDirection, TypeHierarchyQuery, TypeHierarchyRange,
+    };
 
     fn new_state() -> SharedState {
         Arc::new((
@@ -2175,6 +2353,7 @@ mod tests {
                 references: ProviderCapability::Available,
                 hover: ProviderCapability::Available,
                 implementation: ProviderCapability::Available,
+                type_hierarchy: ProviderCapability::Unavailable,
                 rename: RenameCapability::RenameWithPrepare,
             }),
             ignore: empty_ignore(),
@@ -2183,6 +2362,223 @@ mod tests {
             reader_exit: Arc::new(AtomicU8::new(ReaderExit::Crashed as u8)),
         };
         (adapter, sink, responses)
+    }
+
+    fn hierarchy_item(
+        name: &str,
+        kind: u64,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> serde_json::Value {
+        json!({
+            "name": name,
+            "kind": kind,
+            "detail": format!("detail for {name}"),
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": character },
+                "end": { "line": line + 2, "character": character + 4 }
+            },
+            "selectionRange": {
+                "start": { "line": line + 1, "character": character + 1 },
+                "end": { "line": line + 1, "character": character + 3 }
+            },
+            "data": { "opaque": "adapter-only" }
+        })
+    }
+
+    fn hierarchy_query(direction: TypeHierarchyDirection) -> TypeHierarchyQuery {
+        TypeHierarchyQuery {
+            path: "src/main.rs".to_owned(),
+            line: 4,
+            character: 9,
+            direction,
+        }
+    }
+
+    fn enable_type_hierarchy(adapter: &LspClientAdapter) {
+        adapter.semantic_capabilities.lock().unwrap().type_hierarchy =
+            ProviderCapability::Available;
+    }
+
+    fn methods(messages: &[serde_json::Value]) -> Vec<&str> {
+        messages
+            .iter()
+            .filter_map(|message| message.get("method").and_then(serde_json::Value::as_str))
+            .collect()
+    }
+
+    fn method_count(messages: &[serde_json::Value], method: &str) -> usize {
+        methods(messages)
+            .iter()
+            .filter(|item| **item == method)
+            .count()
+    }
+
+    fn assert_hierarchy_item_ranges(
+        items: &[extension_protocol::TypeHierarchyItem],
+        expected: &[(&str, u32, u32)],
+    ) {
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect::<Vec<_>>()
+        );
+        for (item, (_, line, character)) in items.iter().zip(expected) {
+            assert_eq!(
+                item.range,
+                TypeHierarchyRange {
+                    line: *line,
+                    character: *character,
+                    end_line: line + 2,
+                    end_character: character + 4,
+                }
+            );
+            assert_eq!(
+                item.selection_range,
+                TypeHierarchyRange {
+                    line: line + 1,
+                    character: character + 1,
+                    end_line: line + 1,
+                    end_character: character + 3,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn hierarchy_response_normalizes_null_and_mixed_array_in_backend_order() {
+        let (adapter, _, _) = test_adapter();
+        assert_eq!(
+            adapter.normalize_type_hierarchy_items(&serde_json::Value::Null),
+            Ok(Vec::new())
+        );
+
+        let value = json!([
+            hierarchy_item("WorkspaceType", 12, "file:///workspace/src/lib.rs", 3, 5),
+            hierarchy_item("ExternalType", 23, "file:///dependency/src/lib.rs", 8, 13)
+        ]);
+        let items = adapter.normalize_type_hierarchy_items(&value).unwrap();
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["WorkspaceType", "ExternalType"]
+        );
+        assert_eq!(items[0].detail.as_deref(), Some("detail for WorkspaceType"));
+        assert_eq!(items[0].range.line, 3);
+        assert_eq!(items[0].range.character, 5);
+        assert_eq!(items[0].range.end_line, 5);
+        assert_eq!(items[0].range.end_character, 9);
+        assert_eq!(items[0].selection_range.line, 4);
+        assert_eq!(items[0].selection_range.character, 6);
+        assert_eq!(items[0].selection_range.end_line, 4);
+        assert_eq!(items[0].selection_range.end_character, 8);
+        assert_eq!(items[1].detail.as_deref(), Some("detail for ExternalType"));
+        assert_eq!(items[1].kind, "struct");
+        assert_eq!(items[1].range.line, 8);
+        assert_eq!(items[1].range.character, 13);
+        assert_eq!(items[1].range.end_line, 10);
+        assert_eq!(items[1].range.end_character, 17);
+        assert_eq!(items[1].selection_range.line, 9);
+        assert_eq!(items[1].selection_range.character, 14);
+        assert_eq!(items[1].selection_range.end_line, 9);
+        assert_eq!(items[1].selection_range.end_character, 16);
+    }
+
+    #[test]
+    fn hierarchy_symbol_kinds_use_known_name_and_unknown_fallback() {
+        let (adapter, _, _) = test_adapter();
+        let value = json!([
+            hierarchy_item("Known", 12, "file:///workspace/src/lib.rs", 0, 0),
+            hierarchy_item("Unknown", 999, "file:///workspace/src/lib.rs", 1, 0)
+        ]);
+
+        let items = adapter.normalize_type_hierarchy_items(&value).unwrap();
+
+        assert_eq!(items[0].kind, "function");
+        assert_eq!(items[1].kind, "symbol");
+    }
+
+    #[test]
+    fn hierarchy_workspace_file_uri_becomes_relative_path() {
+        let (adapter, _, _) = test_adapter();
+        let value = json!([hierarchy_item(
+            "WorkspaceType",
+            5,
+            "file:///workspace/src/types.rs",
+            0,
+            0
+        )]);
+
+        let items = adapter.normalize_type_hierarchy_items(&value).unwrap();
+
+        assert_eq!(items[0].path.as_deref(), Some("src/types.rs"));
+        assert_eq!(items[0].external_uri, None);
+        assert!(!items[0].external);
+    }
+
+    #[test]
+    fn hierarchy_external_uri_remains_read_only_external_uri() {
+        let (adapter, _, _) = test_adapter();
+        let external_uri = "file:///dependency/src/types.rs";
+        let value = json!([hierarchy_item("ExternalType", 5, external_uri, 0, 0)]);
+
+        let items = adapter.normalize_type_hierarchy_items(&value).unwrap();
+
+        assert_eq!(items[0].path, None);
+        assert_eq!(items[0].external_uri.as_deref(), Some(external_uri));
+        assert!(items[0].external);
+    }
+
+    #[test]
+    fn hierarchy_malformed_item_fails_whole_response() {
+        let (adapter, _, _) = test_adapter();
+        let value = json!([
+            hierarchy_item("Valid", 5, "file:///workspace/src/types.rs", 0, 0),
+            {
+                "name": "MissingSelectionRange",
+                "kind": 5,
+                "uri": "file:///workspace/src/broken.rs",
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                }
+            }
+        ]);
+
+        let error = adapter.normalize_type_hierarchy_items(&value).unwrap_err();
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse)
+        );
+        assert_eq!(
+            serde_json::to_value(LspOutcomeCode::ServerMalformedResponse).unwrap(),
+            "server_malformed_response"
+        );
+    }
+
+    #[test]
+    fn hierarchy_non_array_response_fails_with_server_malformed_response() {
+        let (adapter, _, _) = test_adapter();
+
+        let error = adapter
+            .normalize_type_hierarchy_items(&json!({ "name": "not an array" }))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse)
+        );
     }
 
     fn complete_response(responses: ResponseCache, response: serde_json::Value) {
@@ -2205,6 +2601,383 @@ mod tests {
             }
             cvar.notify_all();
         });
+    }
+
+    fn assert_hierarchy_error(
+        injected: Vec<serde_json::Value>,
+        direction: TypeHierarchyDirection,
+        expected: LspSessionError,
+    ) {
+        let (adapter, sink, responses) = test_adapter();
+        enable_type_hierarchy(&adapter);
+        complete_responses(responses, injected);
+
+        let error = adapter
+            .type_hierarchy_lsp(&hierarchy_query(direction), "private source text")
+            .unwrap_err();
+
+        assert_eq!(error, expected);
+        assert!(!error.to_string().contains("private"));
+        assert_eq!(
+            method_count(&written_messages(&sink), "textDocument/didClose"),
+            1
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_provider_parsing_and_unavailable_directions_are_classified() {
+        for (provider, expected) in [
+            (None, ProviderCapability::Unavailable),
+            (Some(json!(false)), ProviderCapability::Unavailable),
+            (Some(json!(true)), ProviderCapability::Available),
+            (Some(json!({})), ProviderCapability::Available),
+        ] {
+            let mut capabilities = serde_json::Map::new();
+            if let Some(provider) = provider {
+                capabilities.insert("typeHierarchyProvider".to_owned(), provider);
+            }
+            let parsed = SemanticCapabilities::from_initialize_result(&json!({
+                "capabilities": capabilities
+            }))
+            .unwrap();
+            assert_eq!(parsed.type_hierarchy, expected);
+        }
+
+        let malformed = SemanticCapabilities::from_initialize_result(&json!({
+            "capabilities": {"typeHierarchyProvider": "yes"}
+        }))
+        .unwrap_err();
+        assert_eq!(
+            malformed,
+            LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse)
+        );
+
+        for direction in [
+            TypeHierarchyDirection::Supertypes,
+            TypeHierarchyDirection::Subtypes,
+            TypeHierarchyDirection::Both,
+        ] {
+            let (adapter, sink, _) = test_adapter();
+            let error = adapter
+                .type_hierarchy_lsp(&hierarchy_query(direction), "private source")
+                .unwrap_err();
+            assert_eq!(error, LspSessionError::CapabilityUnavailable);
+            assert!(
+                methods(&written_messages(&sink))
+                    .iter()
+                    .all(|method| *method != "textDocument/prepareTypeHierarchy")
+            );
+        }
+    }
+
+    #[test]
+    fn type_hierarchy_pooled_session_delegates_to_the_adapter_sequence() {
+        let (adapter, sink, responses) = test_adapter();
+        enable_type_hierarchy(&adapter);
+        let prepared = hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9);
+        let parent = hierarchy_item("Parent", 23, "file:///workspace/src/parent.rs", 7, 11);
+        complete_responses(
+            responses,
+            vec![
+                json!({"id": 1, "result": [prepared]}),
+                json!({"id": 2, "result": [parent]}),
+            ],
+        );
+
+        let session: &dyn PooledSession = &adapter;
+        let result = session
+            .type_hierarchy_lsp(
+                &hierarchy_query(TypeHierarchyDirection::Supertypes),
+                "private hierarchy source text",
+            )
+            .unwrap();
+
+        assert!(result.supported);
+        assert_eq!(
+            result
+                .supertypes
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Parent"]
+        );
+        assert!(result.subtypes.is_empty());
+        assert_eq!(
+            methods(&written_messages(&sink)),
+            vec![
+                "textDocument/didOpen",
+                "textDocument/prepareTypeHierarchy",
+                "typeHierarchy/supertypes",
+                "textDocument/didClose",
+            ]
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_supported_directions_preserve_order_ranges_and_raw_items() {
+        for (direction, expected_methods, expect_supertypes, expect_subtypes) in [
+            (
+                TypeHierarchyDirection::Supertypes,
+                vec![
+                    "textDocument/prepareTypeHierarchy",
+                    "typeHierarchy/supertypes",
+                ],
+                true,
+                false,
+            ),
+            (
+                TypeHierarchyDirection::Subtypes,
+                vec![
+                    "textDocument/prepareTypeHierarchy",
+                    "typeHierarchy/subtypes",
+                ],
+                false,
+                true,
+            ),
+            (
+                TypeHierarchyDirection::Both,
+                vec![
+                    "textDocument/prepareTypeHierarchy",
+                    "typeHierarchy/supertypes",
+                    "typeHierarchy/subtypes",
+                ],
+                true,
+                true,
+            ),
+        ] {
+            let (adapter, sink, responses) = test_adapter();
+            enable_type_hierarchy(&adapter);
+            let mut prepared = hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9);
+            prepared["data"] = json!({ "opaque": "opaque hierarchy marker" });
+            let parent_a = hierarchy_item("ParentA", 23, "file:///workspace/src/a.rs", 7, 11);
+            let parent_b = hierarchy_item("ParentB", 23, "file:///workspace/src/b.rs", 20, 3);
+            let child_a = hierarchy_item("ChildA", 12, "file:///dependency/src/a.rs", 13, 17);
+            let child_b = hierarchy_item("ChildB", 12, "file:///dependency/src/b.rs", 30, 1);
+            let mut injected = vec![json!({"id": 1, "result": [prepared.clone()]})];
+            match direction {
+                TypeHierarchyDirection::Supertypes => {
+                    injected.push(
+                        json!({"id": 2, "result": [parent_a.clone(), parent_b.clone(), parent_a]}),
+                    );
+                }
+                TypeHierarchyDirection::Subtypes => {
+                    injected.push(json!({"id": 2, "result": [child_a, child_b]}));
+                }
+                TypeHierarchyDirection::Both => {
+                    injected.push(
+                        json!({"id": 2, "result": [parent_a.clone(), parent_b.clone(), parent_a]}),
+                    );
+                    injected.push(json!({"id": 3, "result": [child_a, child_b]}));
+                }
+            }
+            complete_responses(responses, injected);
+
+            let result = adapter
+                .type_hierarchy_lsp(&hierarchy_query(direction), "private hierarchy source text")
+                .unwrap();
+
+            assert!(result.supported);
+            if expect_supertypes {
+                assert_hierarchy_item_ranges(
+                    &result.supertypes,
+                    &[("ParentA", 7, 11), ("ParentB", 20, 3)],
+                );
+            } else {
+                assert!(result.supertypes.is_empty());
+            }
+            if expect_subtypes {
+                assert_hierarchy_item_ranges(
+                    &result.subtypes,
+                    &[("ChildA", 13, 17), ("ChildB", 30, 1)],
+                );
+            } else {
+                assert!(result.subtypes.is_empty());
+            }
+
+            let messages = written_messages(&sink);
+            let request_methods: Vec<_> = methods(&messages)
+                .into_iter()
+                .filter(|method| {
+                    method.contains("TypeHierarchy") || method.starts_with("typeHierarchy/")
+                })
+                .collect();
+            assert_eq!(request_methods, expected_methods);
+            let prepare = request_with_method(&messages, "textDocument/prepareTypeHierarchy");
+            assert_eq!(
+                prepare["params"]["textDocument"]["uri"],
+                "file:///workspace/src/main.rs"
+            );
+            assert_eq!(
+                prepare["params"]["position"],
+                json!({"line": 4, "character": 9})
+            );
+            for method in ["typeHierarchy/supertypes", "typeHierarchy/subtypes"] {
+                if expected_methods.contains(&method) {
+                    let followup = request_with_method(&messages, method);
+                    assert_eq!(followup["params"]["item"], prepared);
+                }
+            }
+
+            let public_json = serde_json::to_string(&result).unwrap();
+            assert!(!public_json.contains("opaque hierarchy marker"));
+            assert!(!public_json.contains("private hierarchy source text"));
+            for log_host_call in messages
+                .iter()
+                .filter(|message| message["method"] == "log" || message["params"]["type"] == "log")
+            {
+                let log_json = serde_json::to_string(log_host_call).unwrap();
+                assert!(!log_json.contains("opaque hierarchy marker"));
+                assert!(!log_json.contains("private hierarchy source text"));
+            }
+        }
+    }
+
+    #[test]
+    fn type_hierarchy_empty_prepare_is_supported_and_releases_document() {
+        for prepared in [serde_json::Value::Null, json!([])] {
+            let (adapter, sink, responses) = test_adapter();
+            enable_type_hierarchy(&adapter);
+            let path = RelativePath::new("src/main.rs");
+            adapter.document_opened(&path, "struct Empty;");
+            complete_response(responses, json!({"id": 1, "result": prepared}));
+
+            let result = adapter
+                .type_hierarchy_lsp(
+                    &hierarchy_query(TypeHierarchyDirection::Both),
+                    "struct Empty;",
+                )
+                .unwrap();
+
+            assert!(result.supported);
+            assert!(result.supertypes.is_empty());
+            assert!(result.subtypes.is_empty());
+            let messages = written_messages(&sink);
+            assert_eq!(
+                methods(&messages)
+                    .iter()
+                    .filter(|method| method.starts_with("typeHierarchy/"))
+                    .count(),
+                0
+            );
+            assert_eq!(method_count(&messages, "textDocument/didClose"), 0);
+            adapter.document_closed(&path);
+            assert_eq!(
+                method_count(&written_messages(&sink), "textDocument/didClose"),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn type_hierarchy_prepare_method_not_found_is_capability_unavailable_and_releases_document() {
+        assert_hierarchy_error(
+            vec![json!({"id": 1, "error": {"code": -32601, "message": "private server detail"}})],
+            TypeHierarchyDirection::Supertypes,
+            LspSessionError::CapabilityUnavailable,
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_followup_backend_error_is_server_error_and_releases_document() {
+        assert_hierarchy_error(
+            vec![
+                json!({"id": 1, "result": [hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9)]}),
+                json!({"id": 2, "error": {"code": -32603, "message": "private backend detail"}}),
+            ],
+            TypeHierarchyDirection::Subtypes,
+            LspSessionError::Backend(LspOutcomeCode::ServerError),
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_invalid_prepare_response_is_malformed_and_releases_document() {
+        assert_hierarchy_error(
+            vec![json!({"id": 1, "result": {"unexpected": "private source text"}})],
+            TypeHierarchyDirection::Both,
+            LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse),
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_failed_document_sync_rolls_back_document_hold() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(Error::new(ErrorKind::BrokenPipe, "document sync failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (adapter, _sink, _responses) = test_adapter();
+        enable_type_hierarchy(&adapter);
+        *adapter.writer.lock().unwrap() = Box::new(FailingWriter);
+
+        let error = adapter
+            .type_hierarchy_lsp(
+                &hierarchy_query(TypeHierarchyDirection::Both),
+                "private source text",
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(LspOutcomeCode::ServerTransportError)
+        );
+        let uri = adapter.uri_for(&RelativePath::new("src/main.rs"));
+        assert!(
+            !adapter
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .docs
+                .is_open(&uri),
+            "a failed didOpen must not retain a document hold"
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_combined_requests_share_one_timeout_budget() {
+        let (adapter, sink, responses) = test_adapter();
+        enable_type_hierarchy(&adapter);
+        let delayed_responses = Arc::clone(&responses);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            let (lock, cvar) = &*delayed_responses;
+            lock.lock().unwrap().insert(
+                1,
+                json!({"id": 1, "result": [hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9)]}),
+            );
+            cvar.notify_all();
+            std::thread::sleep(Duration::from_secs(6));
+            lock.lock()
+                .unwrap()
+                .insert(2, json!({"id": 2, "result": []}));
+            cvar.notify_all();
+        });
+
+        let started = std::time::Instant::now();
+        let error = adapter
+            .type_hierarchy_lsp(
+                &hierarchy_query(TypeHierarchyDirection::Both),
+                "private source text",
+            )
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(LspOutcomeCode::ServerTimeout)
+        );
+        assert!(elapsed >= Duration::from_secs(9));
+        assert!(elapsed < Duration::from_secs(12));
+        assert_eq!(
+            method_count(&written_messages(&sink), "textDocument/didClose"),
+            1
+        );
     }
 
     fn adapter_with_malformed_server_output(output: &str) -> LspClientAdapter {
@@ -2722,6 +3495,7 @@ mod tests {
                     references: ProviderCapability::Available,
                     hover: ProviderCapability::Available,
                     implementation: ProviderCapability::Available,
+                    type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::RenameOnly,
                 },
             ),
@@ -2740,6 +3514,7 @@ mod tests {
                     references: ProviderCapability::Available,
                     hover: ProviderCapability::Available,
                     implementation: ProviderCapability::Available,
+                    type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::RenameWithPrepare,
                 },
             ),
@@ -2758,6 +3533,7 @@ mod tests {
                     references: ProviderCapability::Unavailable,
                     hover: ProviderCapability::Unavailable,
                     implementation: ProviderCapability::Unavailable,
+                    type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::Unavailable,
                 },
             ),
@@ -2768,6 +3544,7 @@ mod tests {
                     references: ProviderCapability::Unavailable,
                     hover: ProviderCapability::Unavailable,
                     implementation: ProviderCapability::Unavailable,
+                    type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::Unavailable,
                 },
             ),
@@ -3426,21 +4203,33 @@ mod tests {
         assert!(uri.starts_with("file://"));
         assert!(uri.contains("%20"), "space must be percent-encoded: {uri}");
         assert!(!uri.contains(' '), "no raw spaces in the uri");
-        let back = uri_to_path(&uri).unwrap();
-        assert_eq!(back, p.to_path_buf());
+        assert_eq!(
+            decode::classify_uri(&uri, Path::new("/home/u"), UriAccessPolicy::Writable,),
+            Some(UriClassification::WorkspacePath(
+                "my project/café/main.rs".to_owned()
+            ))
+        );
     }
 
     #[test]
     fn uri_to_path_decodes_server_echoed_encoding() {
-        let back = uri_to_path("file:///w/a%20b/caf%C3%A9.rs").unwrap();
-        assert_eq!(back, std::path::Path::new("/w/a b/café.rs").to_path_buf());
+        assert_eq!(
+            decode::classify_uri(
+                "file:///w/a%20b/caf%C3%A9.rs",
+                Path::new("/w"),
+                UriAccessPolicy::Writable,
+            ),
+            Some(UriClassification::WorkspacePath("a b/café.rs".to_owned()))
+        );
     }
 
     #[test]
     fn uri_to_path_returns_none_on_truncated_escape() {
-        assert!(uri_to_path("file:///x/%A").is_none());
-        assert!(uri_to_path("file:///x/%").is_none());
-        assert!(uri_to_path("file:///x/%ZZ").is_none());
+        for uri in ["file:///x/%A", "file:///x/%", "file:///x/%ZZ"] {
+            assert!(
+                decode::classify_uri(uri, Path::new("/x"), UriAccessPolicy::Writable).is_none()
+            );
+        }
     }
 
     #[test]

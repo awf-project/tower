@@ -80,6 +80,7 @@ pub enum LspOperation {
     References,
     Hover,
     Implementations,
+    TypeHierarchy,
     Rename,
 }
 
@@ -88,6 +89,111 @@ pub enum LspOperation {
 pub enum LspOutcomePhase {
     Startup,
     Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeHierarchyDirection {
+    Supertypes,
+    Subtypes,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeHierarchyQuery {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+    pub direction: TypeHierarchyDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeHierarchyRange {
+    pub line: u32,
+    pub character: u32,
+    #[serde(rename = "endLine")]
+    pub end_line: u32,
+    #[serde(rename = "endCharacter")]
+    pub end_character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TypeHierarchyItem {
+    pub name: String,
+    pub kind: String,
+    pub detail: Option<String>,
+    pub range: TypeHierarchyRange,
+    #[serde(rename = "selectionRange")]
+    pub selection_range: TypeHierarchyRange,
+    pub path: Option<String>,
+    #[serde(rename = "externalUri")]
+    pub external_uri: Option<String>,
+    pub external: bool,
+}
+
+#[derive(Deserialize)]
+struct TypeHierarchyItemWire {
+    name: String,
+    kind: String,
+    detail: Option<String>,
+    range: TypeHierarchyRange,
+    #[serde(rename = "selectionRange")]
+    selection_range: TypeHierarchyRange,
+    path: Option<String>,
+    #[serde(rename = "externalUri")]
+    external_uri: Option<String>,
+    external: bool,
+}
+
+impl TryFrom<TypeHierarchyItemWire> for TypeHierarchyItem {
+    type Error = &'static str;
+
+    fn try_from(wire: TypeHierarchyItemWire) -> Result<Self, Self::Error> {
+        let TypeHierarchyItemWire {
+            name,
+            kind,
+            detail,
+            range,
+            selection_range,
+            path,
+            external_uri,
+            external,
+        } = wire;
+        match (external, path.as_ref(), external_uri.as_ref()) {
+            (false, Some(_), None) | (true, None, Some(_)) => Ok(Self {
+                name,
+                kind,
+                detail,
+                range,
+                selection_range,
+                path,
+                external_uri,
+                external,
+            }),
+            _ => Err(
+                "type hierarchy item location must match external: path for workspace items, externalUri for external items",
+            ),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TypeHierarchyItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TypeHierarchyItemWire::deserialize(deserializer)?;
+        Self::try_from(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeHierarchyResult {
+    pub supported: bool,
+    pub supertypes: Vec<TypeHierarchyItem>,
+    pub subtypes: Vec<TypeHierarchyItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<LspOutcome>,
 }
 
 // ── Lifecycle types ───────────────────────────────────────────────────────────

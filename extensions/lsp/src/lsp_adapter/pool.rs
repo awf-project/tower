@@ -42,6 +42,7 @@ use core_engine::ports::{
     CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
     RenameNavigationError,
 };
+use extension_protocol::{TypeHierarchyQuery, TypeHierarchyResult};
 
 // ── PooledSession trait ───────────────────────────────────────────────────────
 
@@ -72,6 +73,13 @@ pub trait PooledSession:
     /// Called by `SessionPool::diagnostics_for` to serve `resources/read` (AC6 pull).
     #[allow(dead_code)]
     fn diagnostics_for(&self, uri: &str) -> Vec<Diagnostic>;
+
+    #[allow(dead_code)]
+    fn type_hierarchy_lsp(
+        &self,
+        query: &TypeHierarchyQuery,
+        text: &str,
+    ) -> Result<TypeHierarchyResult, LspSessionError>;
 
     fn check_lsp(
         &self,
@@ -545,6 +553,16 @@ impl NavigationPort for SessionPool {
 }
 
 impl SessionPool {
+    #[allow(dead_code)]
+    pub fn type_hierarchy_lsp(
+        &self,
+        query: &TypeHierarchyQuery,
+        text: &str,
+    ) -> Result<TypeHierarchyResult, LspSessionError> {
+        let path = RelativePath::new(query.path.clone());
+        self.session_for_lsp(&path)?.type_hierarchy_lsp(query, text)
+    }
+
     pub fn check_lsp(
         &self,
         path: &RelativePath,
@@ -740,6 +758,8 @@ mod tests {
     struct FakeSession {
         dead: AtomicBool,
         check_calls: AtomicUsize,
+        type_hierarchy_calls: AtomicUsize,
+        type_hierarchy_block: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         implementation_calls: AtomicUsize,
         prepare_rename_calls: AtomicUsize,
         rename_calls: AtomicUsize,
@@ -754,6 +774,8 @@ mod tests {
             Arc::new(Self {
                 dead: AtomicBool::new(false),
                 check_calls: AtomicUsize::new(0),
+                type_hierarchy_calls: AtomicUsize::new(0),
+                type_hierarchy_block: Mutex::new(None),
                 implementation_calls: AtomicUsize::new(0),
                 prepare_rename_calls: AtomicUsize::new(0),
                 rename_calls: AtomicUsize::new(0),
@@ -802,6 +824,18 @@ mod tests {
             self.check_calls.load(Ordering::Relaxed)
         }
 
+        fn type_hierarchy_calls(&self) -> usize {
+            self.type_hierarchy_calls.load(Ordering::Relaxed)
+        }
+
+        fn block_next_type_hierarchy_call(
+            &self,
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        ) {
+            *self.type_hierarchy_block.lock().unwrap() = Some((entered, release));
+        }
+
         fn implementation_calls(&self) -> usize {
             self.implementation_calls.load(Ordering::Relaxed)
         }
@@ -829,6 +863,24 @@ mod tests {
 
         fn diagnostics_for(&self, _uri: &str) -> Vec<Diagnostic> {
             self.canned_diags.clone()
+        }
+
+        fn type_hierarchy_lsp(
+            &self,
+            _: &TypeHierarchyQuery,
+            _: &str,
+        ) -> Result<TypeHierarchyResult, LspSessionError> {
+            self.type_hierarchy_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some((entered, release)) = self.type_hierarchy_block.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Ok(TypeHierarchyResult {
+                supported: true,
+                supertypes: Vec::new(),
+                subtypes: Vec::new(),
+                outcome: None,
+            })
         }
 
         fn rename(
@@ -934,6 +986,7 @@ mod tests {
         per_lang: Mutex<HashMap<String, SessionQueue>>,
         failures: Mutex<HashMap<String, VecDeque<LspSessionError>>>,
         spawn_barrier: Mutex<Option<Arc<Barrier>>>,
+        total_spawn_attempts: AtomicUsize,
     }
 
     impl FakeSpawner {
@@ -942,6 +995,7 @@ mod tests {
                 per_lang: Mutex::new(HashMap::new()),
                 failures: Mutex::new(HashMap::new()),
                 spawn_barrier: Mutex::new(None),
+                total_spawn_attempts: AtomicUsize::new(0),
             })
         }
 
@@ -971,6 +1025,10 @@ mod tests {
                 .unwrap_or(0)
         }
 
+        fn total_spawn_attempts(&self) -> usize {
+            self.total_spawn_attempts.load(Ordering::Relaxed)
+        }
+
         fn fail_next(&self, lang: &str, error: LspSessionError) {
             self.failures
                 .lock()
@@ -994,6 +1052,7 @@ mod tests {
             _workspace_root: &std::path::Path,
             _push_tx: Option<DiagnosticsSender>,
         ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
+            self.total_spawn_attempts.fetch_add(1, Ordering::Relaxed);
             let session = match self.per_lang.lock().unwrap().get_mut(language_id) {
                 Some((sessions, count)) => {
                     let session = sessions
@@ -1864,6 +1923,109 @@ mod tests {
             0,
             "spawner must NOT be called for unconfigured ext"
         );
+    }
+
+    #[test]
+    fn type_hierarchy_routes_first_request_and_reuses_the_language_session() {
+        let spawner = FakeSpawner::new();
+        let session = FakeSession::new();
+        spawner.register("rust", Arc::clone(&session));
+        let pool = pool_with_spawner(
+            rust_config(),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+        );
+        let query = TypeHierarchyQuery {
+            path: "src/main.rs".to_owned(),
+            line: 2,
+            character: 7,
+            direction: extension_protocol::TypeHierarchyDirection::Both,
+        };
+
+        let first = pool.type_hierarchy_lsp(&query, "struct Child;").unwrap();
+        let second = pool.type_hierarchy_lsp(&query, "struct Child;").unwrap();
+
+        assert!(first.supported);
+        assert_eq!(second, first);
+        assert_eq!(spawner.spawn_count("rust"), 1);
+        assert_eq!(session.type_hierarchy_calls(), 2);
+    }
+
+    #[test]
+    fn type_hierarchy_unconfigured_pool_returns_unconfigured_without_spawning() {
+        let spawner = FakeSpawner::new();
+        let pool = pool_with_spawner(
+            rust_config(),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+        );
+        let query = TypeHierarchyQuery {
+            path: "src/main.js".to_owned(),
+            line: 0,
+            character: 0,
+            direction: extension_protocol::TypeHierarchyDirection::Supertypes,
+        };
+
+        assert_eq!(
+            pool.type_hierarchy_lsp(&query, "class Child {}")
+                .unwrap_err(),
+            LspSessionError::Unconfigured
+        );
+        assert_eq!(spawner.total_spawn_attempts(), 0);
+    }
+
+    #[test]
+    fn type_hierarchy_releases_pool_lock_during_session_io() {
+        let spawner = FakeSpawner::new();
+        let session = FakeSession::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        session.block_next_type_hierarchy_call(entered_tx, release_rx);
+        spawner.register("rust", Arc::clone(&session));
+        let pool = Arc::new(pool_with_spawner(
+            rust_config(),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+        ));
+        let query = TypeHierarchyQuery {
+            path: "src/main.rs".to_owned(),
+            line: 2,
+            character: 7,
+            direction: extension_protocol::TypeHierarchyDirection::Both,
+        };
+
+        let worker_pool = Arc::clone(&pool);
+        let worker =
+            std::thread::spawn(move || worker_pool.type_hierarchy_lsp(&query, "struct Child;"));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("hierarchy request must enter session I/O");
+        assert!(
+            pool.sessions.try_lock().is_ok(),
+            "the pool mutex must be released while session I/O is in progress"
+        );
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap().supported);
+    }
+
+    #[test]
+    fn type_hierarchy_unconfigured_facade_returns_unconfigured_without_spawning() {
+        let spawner = FakeSpawner::new();
+        let query = TypeHierarchyQuery {
+            path: "src/main.js".to_owned(),
+            line: 0,
+            character: 0,
+            direction: extension_protocol::TypeHierarchyDirection::Supertypes,
+        };
+        let facade = crate::session::LspSessionPool::with_session_pool_for_test(
+            pool_with_spawner(
+                LspConfig::default(),
+                Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+            ),
+            PathBuf::from("/workspace"),
+        );
+        assert_eq!(
+            facade.type_hierarchy(&query, "class Child {}").unwrap_err(),
+            LspSessionError::Unconfigured
+        );
+        assert_eq!(spawner.total_spawn_attempts(), 0);
     }
 
     #[test]
