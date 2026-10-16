@@ -30,6 +30,18 @@ pub struct RawLocation {
     pub range: Range,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UriAccessPolicy {
+    ReadOnly,
+    Writable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UriClassification {
+    WorkspacePath(String),
+    ExternalUri(String),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceEditDecodeError {
@@ -169,20 +181,37 @@ fn workspace_path_from_uri(
     workspace_root: &Path,
 ) -> Result<String, WorkspaceEditDecodeError> {
     let raw = uri.to_string();
-    let Some(encoded_path) = raw.strip_prefix("file://") else {
-        return Err(WorkspaceEditDecodeError::InvalidPath { uri: raw });
-    };
-    let decoded = decode_uri_path(encoded_path)
-        .ok_or_else(|| WorkspaceEditDecodeError::InvalidPath { uri: raw.clone() })?;
-    let abs_path = normalize_path(Path::new(&decoded));
-    let root = absolute_normalized_root(workspace_root)
-        .ok_or_else(|| WorkspaceEditDecodeError::InvalidPath { uri: raw.clone() })?;
-    let rel = abs_path
-        .strip_prefix(&root)
-        .ok()
-        .and_then(path_to_workspace_string)
-        .ok_or_else(|| WorkspaceEditDecodeError::InvalidPath { uri: raw.clone() })?;
-    Ok(rel)
+    match classify_uri(&raw, workspace_root, UriAccessPolicy::Writable) {
+        Some(UriClassification::WorkspacePath(path)) => Ok(path),
+        Some(UriClassification::ExternalUri(_)) | None => {
+            Err(WorkspaceEditDecodeError::InvalidPath { uri: raw })
+        }
+    }
+}
+
+pub(crate) fn classify_uri(
+    uri: &str,
+    workspace_root: &Path,
+    policy: UriAccessPolicy,
+) -> Option<UriClassification> {
+    let workspace_path = uri
+        .strip_prefix("file://")
+        .and_then(decode_uri_path)
+        .map(|path| normalize_path(Path::new(&path)))
+        .zip(absolute_normalized_root(workspace_root))
+        .and_then(|(path, root)| {
+            path.strip_prefix(root)
+                .ok()
+                .and_then(path_to_workspace_string)
+        });
+
+    match workspace_path {
+        Some(path) => Some(UriClassification::WorkspacePath(path)),
+        None if policy == UriAccessPolicy::ReadOnly => {
+            Some(UriClassification::ExternalUri(uri.to_owned()))
+        }
+        None => None,
+    }
 }
 
 fn absolute_normalized_root(root: &Path) -> Option<PathBuf> {
@@ -796,6 +825,23 @@ mod tests {
             serde_json::to_value(error.workspace_apply_edits_error_code()).unwrap(),
             "invalid_path"
         );
+    }
+
+    #[test]
+    fn hierarchy_writable_locations_remain_workspace_contained() {
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri("file:///dependency/src/lib.rs"),
+            vec![text_edit(0, 0, 0, 1, "replacement")],
+        );
+
+        let error = decode_workspace_edit(WorkspaceEdit::new(changes), &workspace_root(), resolver)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceEditDecodeError::InvalidPath { .. }
+        ));
     }
 
     #[test]

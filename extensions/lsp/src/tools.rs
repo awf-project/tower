@@ -18,7 +18,8 @@ use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position, Sev
 use extension_protocol::{
     HostCall, LspImplementationRequest, LspImplementationResult, LspOperation, LspOutcome,
     LspOutcomeCode, LspOutcomePhase, LspOutcomeStatus, RenameError, RenameErrorCode, RenamePreview,
-    RenameRequest, RenameResult, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
+    RenameRequest, RenameResult, TypeHierarchyQuery, TypeHierarchyResult,
+    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
 };
 use serde_json::{Value, json};
 
@@ -74,6 +75,16 @@ fn unsupported_read_only_outcome(
     }
 }
 
+fn unsupported_type_hierarchy(outcome: LspOutcome) -> Result<Value, ToolDispatchError> {
+    serde_json::to_value(TypeHierarchyResult {
+        supported: false,
+        supertypes: Vec::new(),
+        subtypes: Vec::new(),
+        outcome: Some(outcome),
+    })
+    .map_err(|error| error.to_string().into())
+}
+
 fn read_only_session_error(
     error: LspSessionError,
     operation: LspOperation,
@@ -121,6 +132,9 @@ where
         "hover" => hover(params, pool, workspace_root, out, lines, next_id, deferred),
         "implementations" => {
             implementations(params, pool, workspace_root, out, lines, next_id, deferred)
+        }
+        "type_hierarchy" => {
+            type_hierarchy(params, pool, workspace_root, out, lines, next_id, deferred)
         }
         "rename" => {
             rename(params, pool, workspace_root, out, lines, next_id, deferred).map_err(Into::into)
@@ -505,6 +519,62 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+fn type_hierarchy<W, R>(
+    params: Value,
+    pool: &mut LspSessionPool,
+    _workspace_root: &PathBuf,
+    out: &Arc<Mutex<W>>,
+    lines: &mut R,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
+) -> Result<Value, ToolDispatchError>
+where
+    W: Write,
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let query: TypeHierarchyQuery = serde_json::from_value(params)
+        .map_err(|error| format!("bad TypeHierarchyQuery: {error}"))?;
+    let rel = RelativePath::new(&query.path);
+    if !pool.serves(&rel) {
+        return unsupported_type_hierarchy(unsupported_read_only_outcome(
+            LspOperation::TypeHierarchy,
+            LspOutcomeCode::LanguageNotConfigured,
+            query.path,
+        ));
+    }
+
+    let text = read_file(&query.path, out, lines, next_id, deferred)?;
+    match pool.type_hierarchy(&query, &text) {
+        Ok(result) => serde_json::to_value(result).map_err(|error| error.to_string().into()),
+        Err(LspSessionError::Unconfigured) => {
+            unsupported_type_hierarchy(unsupported_read_only_outcome(
+                LspOperation::TypeHierarchy,
+                LspOutcomeCode::LanguageNotConfigured,
+                query.path,
+            ))
+        }
+        Err(LspSessionError::CapabilityUnavailable) => {
+            let mut outcome = unsupported_read_only_outcome(
+                LspOperation::TypeHierarchy,
+                LspOutcomeCode::CapabilityUnavailable,
+                query.path,
+            );
+            if let Some((language, command)) = pool.binding_for(&rel) {
+                outcome.language = Some(language.to_owned());
+                outcome.command = Some(command.to_owned());
+            }
+            unsupported_type_hierarchy(outcome)
+        }
+        Err(error) => Err(read_only_session_error(
+            error,
+            LspOperation::TypeHierarchy,
+            query.path,
+            pool.binding_for(&rel),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rename<W, R>(
     params: Value,
     pool: &mut LspSessionPool,
@@ -774,71 +844,23 @@ mod tests {
     }
 
     fn lsp_fixture_config(workspace: &Path, providers_available: bool) -> LspConfig {
-        let fixture = workspace.join("lsp-fixture.sh");
+        lsp_fixture_config_with_backend_failure(workspace, providers_available, false)
+    }
+
+    fn lsp_fixture_config_with_backend_failure(
+        workspace: &Path,
+        providers_available: bool,
+        backend_failure: bool,
+    ) -> LspConfig {
+        let fixture = fixture_lsp_server::binary_path();
         let log = workspace.join("lsp-fixture.log");
-        let providers = if providers_available {
-            r#""definitionProvider":True,"referencesProvider":True,"hoverProvider":True,"implementationProvider":True,"renameProvider":True"#
+        let mode = if !providers_available {
+            "dispatch_unavailable"
+        } else if backend_failure {
+            "dispatch_backend_error"
         } else {
-            ""
+            "dispatch_normal"
         };
-        let script = r#"#!/usr/bin/env python3
-import json
-import sys
-
-LOG = sys.argv[1]
-PROVIDERS = {__PROVIDERS__}
-
-def read_message():
-    headers = {}
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            sys.exit(0)
-        if line in (b"\r\n", b"\n"):
-            break
-        key, value = line.decode("ascii").split(":", 1)
-        headers[key.lower()] = value.strip()
-    body = sys.stdin.buffer.read(int(headers["content-length"]))
-    return json.loads(body.decode("utf-8"))
-
-def send_message(payload):
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(body)
-    sys.stdout.buffer.flush()
-
-while True:
-    message = read_message()
-    with open(LOG, "a", encoding="utf-8") as log:
-        log.write(json.dumps(message, separators=(",", ":")) + "\n")
-    method = message.get("method")
-    request_id = message.get("id")
-    params = message.get("params") or {}
-    text_document = params.get("textDocument") or {}
-    uri = text_document.get("uri") or "file:///workspace/src/main.rs"
-    if method == "initialize":
-        send_message({"jsonrpc": "2.0", "id": request_id, "result": {"capabilities": PROVIDERS}})
-    elif method == "textDocument/didOpen":
-        send_message({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": []}})
-        send_message({"jsonrpc": "2.0", "method": "experimental/serverStatus", "params": {"quiescent": True}})
-    elif method in ("textDocument/definition", "textDocument/references", "textDocument/implementation"):
-        send_message({"jsonrpc": "2.0", "id": request_id, "result": [{"uri": uri.replace("main.rs", "answer.rs"), "range": {"start": {"line": 7, "character": 2}, "end": {"line": 7, "character": 8}}}]})
-    elif method == "textDocument/hover":
-        send_message({"jsonrpc": "2.0", "id": request_id, "result": None})
-    elif method == "textDocument/rename":
-        send_message({"jsonrpc": "2.0", "id": request_id, "result": {"changes": {uri: [{"range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 11}}, "newText": params.get("newName", "renamed")}]}}})
-"#
-        .replace("__PROVIDERS__", providers);
-        std::fs::write(&fixture, script).expect("write LSP fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fixture)
-                .expect("read fixture permissions")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(&fixture, permissions).expect("make LSP fixture executable");
-        }
 
         let mut servers = BTreeMap::new();
         servers.insert(
@@ -846,7 +868,7 @@ while True:
             LspServerConfig {
                 command: fixture.to_string_lossy().into_owned(),
                 extensions: vec!["rs".to_owned()],
-                args: vec![log.to_string_lossy().into_owned()],
+                args: vec![mode.to_owned(), log.to_string_lossy().into_owned()],
             },
         );
         LspConfig {
@@ -905,6 +927,355 @@ while True:
         assert!(
             out.lock().expect("host output lock").is_empty(),
             "unconfigured dispatch must not make HostCalls"
+        );
+    }
+
+    #[test]
+    fn type_hierarchy_unconfigured_dispatch_is_unsupported_without_host_call() {
+        let workspace_root = PathBuf::from("/workspace");
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
+        let mut next_id = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+
+        for direction in ["supertypes", "subtypes", "both"] {
+            let result = dispatch(
+                "type_hierarchy",
+                json!({ "path": "src/main.unknown", "line": 0, "character": 7, "direction": direction }),
+                &mut pool,
+                &workspace_root,
+                &out,
+                &mut lines,
+                &mut next_id,
+                &mut deferred,
+            )
+            .expect("unconfigured hierarchy remains a successful unsupported result");
+            assert_eq!(
+                result,
+                json!({
+                    "supported": false,
+                    "supertypes": [],
+                    "subtypes": [],
+                    "outcome": {
+                        "status": "unsupported",
+                        "code": "language_not_configured",
+                        "language": null,
+                        "command": null,
+                        "operation": "type_hierarchy",
+                        "path": "src/main.unknown",
+                        "phase": "runtime",
+                        "message": "No language server is configured for this file."
+                    }
+                })
+            );
+        }
+        assert!(out.lock().expect("host output lock").is_empty());
+    }
+
+    fn parse_fixture_messages(log: &str) -> Vec<Value> {
+        log.lines()
+            .map(|line| serde_json::from_str(line).expect("valid fixture JSON envelope"))
+            .collect()
+    }
+
+    #[test]
+    fn type_hierarchy_configured_dispatch_uses_one_read_only_host_call() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let workspace_root = workspace.path().to_path_buf();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(
+            lsp_fixture_config(&workspace_root, true),
+            workspace_root.clone(),
+            None,
+        );
+        let source = "private immutable hierarchy source";
+        let mut lines = vec![Ok(
+            json!({ "jsonrpc": "2.0", "id": 10_000, "result": source }).to_string(),
+        )]
+        .into_iter();
+        let mut next_id = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+
+        let result = dispatch(
+            "type_hierarchy",
+            json!({ "path": "src/main.rs", "line": 0, "character": 7, "direction": "both" }),
+            &mut pool,
+            &workspace_root,
+            &out,
+            &mut lines,
+            &mut next_id,
+            &mut deferred,
+        )
+        .expect("configured hierarchy dispatch succeeds");
+
+        assert_eq!(result["supported"], true);
+        assert_eq!(result["supertypes"][0]["name"], "Parent");
+        assert_eq!(result["subtypes"][0]["name"], "Grandchild");
+        assert!(result["outcome"].is_null());
+        let host_calls = parse_fixture_messages(
+            &String::from_utf8(out.lock().expect("host output lock").clone())
+                .expect("host calls are UTF-8"),
+        );
+        assert_eq!(
+            host_calls,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 10_000,
+                "method": "workspace/readFile",
+                "params": { "type": "ReadFile", "path": "src/main.rs" }
+            })],
+            "the hierarchy invocation may issue exactly its one read-only HostCall"
+        );
+        assert!(!result.to_string().contains(source));
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn type_hierarchy_dispatch_preserves_snapshot_and_replays_the_deferred_event() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let workspace_root = workspace.path().to_path_buf();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(
+            lsp_fixture_config(&workspace_root, true),
+            workspace_root.clone(),
+            None,
+        );
+        let source = "private immutable hierarchy source";
+        let deferred_content = "queued event content must not replace the active snapshot";
+        std::fs::create_dir_all(workspace_root.join("src"))
+            .expect("create fixture source directory");
+        std::fs::write(workspace_root.join("src/main.rs"), deferred_content)
+            .expect("write deferred-event fixture content");
+        let queued_event = QueuedFrame::Request {
+            id: Some(json!(77)),
+            method: "deliverEvent".to_owned(),
+            params: json!({ "data": { "type": "FileChanged", "path": "src/main.rs" } }),
+        };
+        let mut lines = vec![
+            Ok(json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "deliverEvent",
+                "params": { "data": { "type": "FileChanged", "path": "src/main.rs" } }
+            })
+            .to_string()),
+            Ok(json!({ "jsonrpc": "2.0", "id": 10_000, "result": source }).to_string()),
+        ]
+        .into_iter();
+        let mut next_id = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+
+        let result = dispatch(
+            "type_hierarchy",
+            json!({ "path": "src/main.rs", "line": 0, "character": 7, "direction": "both" }),
+            &mut pool,
+            &workspace_root,
+            &out,
+            &mut lines,
+            &mut next_id,
+            &mut deferred,
+        )
+        .expect("configured hierarchy dispatch succeeds");
+
+        assert!(!result.to_string().contains(source));
+        let queued = deferred.pop_front().expect("the inbound event is deferred");
+        assert_eq!(
+            queued, queued_event,
+            "the exact inbound fileChanged frame remains FIFO-queued until after ToolResult"
+        );
+        assert!(deferred.is_empty());
+
+        let lsp_messages = parse_fixture_messages(
+            &std::fs::read_to_string(workspace_root.join("lsp-fixture.log"))
+                .expect("fixture records LSP traffic"),
+        );
+        let did_open = lsp_messages
+            .iter()
+            .find(|message| message["method"] == "textDocument/didOpen")
+            .expect("active hierarchy query opens its document");
+        assert_eq!(
+            did_open["params"]["textDocument"]["text"], source,
+            "the immutable readFile snapshot is forwarded to the LSP query"
+        );
+
+        let QueuedFrame::Request { method, params, .. } = queued else {
+            panic!("the deferred frame must remain a host request");
+        };
+        assert_eq!(method, "deliverEvent");
+        crate::handle_event(params, &mut pool, &workspace_root);
+        let log_path = workspace_root.join("lsp-fixture.log");
+        let updated_log = (0..100)
+            .find_map(|_| {
+                let log = std::fs::read_to_string(&log_path).ok()?;
+                if log.contains(deferred_content) {
+                    Some(log)
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("fixture records the deferred event content");
+        let updated_messages = parse_fixture_messages(&updated_log);
+        let active_open = updated_messages
+            .iter()
+            .position(|message| {
+                message["method"] == "textDocument/didOpen"
+                    && message["params"]["textDocument"]["text"] == source
+            })
+            .expect("active query completes with its immutable source");
+        let deferred_open = updated_messages
+            .iter()
+            .position(|message| {
+                message["method"] == "textDocument/didOpen"
+                    && message["params"]["textDocument"]["text"] == deferred_content
+            })
+            .expect("queued event is processed only after the active result");
+        assert!(active_open < deferred_open);
+    }
+
+    #[test]
+    fn type_hierarchy_unavailable_provider_is_unsupported_for_every_direction() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let workspace_root = workspace.path().to_path_buf();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(
+            lsp_fixture_config(&workspace_root, false),
+            workspace_root.clone(),
+            None,
+        );
+        let mut lines = (10_000..10_003)
+            .map(|id| {
+                Ok(json!({ "jsonrpc": "2.0", "id": id, "result": "struct Child;" }).to_string())
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        let mut next_id = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+
+        let command = lsp_fixture_config(&workspace_root, false).servers["rust"]
+            .command
+            .clone();
+        for direction in ["supertypes", "subtypes", "both"] {
+            let result = dispatch(
+                "type_hierarchy",
+                json!({ "path": "src/main.rs", "line": 0, "character": 7, "direction": direction }),
+                &mut pool,
+                &workspace_root,
+                &out,
+                &mut lines,
+                &mut next_id,
+                &mut deferred,
+            )
+            .expect("missing provider remains a successful unsupported result");
+            assert_eq!(
+                result,
+                json!({
+                    "supported": false,
+                    "supertypes": [],
+                    "subtypes": [],
+                    "outcome": {
+                        "status": "unsupported",
+                        "code": "capability_unavailable",
+                        "language": "rust",
+                        "command": command.clone(),
+                        "operation": "type_hierarchy",
+                        "path": "src/main.rs",
+                        "phase": "runtime",
+                        "message": "The configured language server does not provide this operation."
+                    }
+                }),
+                "{direction} must expose the complete identical unsupported envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn type_hierarchy_invalid_query_is_legacy_error_before_host_call() {
+        let workspace_root = PathBuf::from("/workspace");
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut next_id = HostCallIdAllocator::new(10_000);
+
+        for params in [
+            json!({ "line": 0, "character": 7, "direction": "both" }),
+            json!({ "path": "src/main.rs", "line": "zero", "character": 7, "direction": "sideways" }),
+        ] {
+            let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
+            let mut deferred = VecDeque::new();
+            let error = dispatch(
+                "type_hierarchy",
+                params,
+                &mut pool,
+                &workspace_root,
+                &out,
+                &mut lines,
+                &mut next_id,
+                &mut deferred,
+            )
+            .expect_err("invalid hierarchy query is rejected");
+            assert!(
+                matches!(error, ToolDispatchError::Legacy(ref message) if message.starts_with("bad TypeHierarchyQuery:"))
+            );
+        }
+        assert!(out.lock().expect("host output lock").is_empty());
+    }
+
+    #[test]
+    fn type_hierarchy_backend_error_preserves_read_only_outcome_metadata() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let workspace_root = workspace.path().to_path_buf();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(
+            lsp_fixture_config_with_backend_failure(&workspace_root, true, true),
+            workspace_root.clone(),
+            None,
+        );
+        let secret = "opaque backend data must stay private";
+        let mut lines = vec![Ok(
+            json!({ "jsonrpc": "2.0", "id": 10_000, "result": secret }).to_string(),
+        )]
+        .into_iter();
+        let mut next_id = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+        let error = dispatch(
+            "type_hierarchy",
+            json!({ "path": "src/main.rs", "line": 0, "character": 7, "direction": "supertypes" }),
+            &mut pool,
+            &workspace_root,
+            &out,
+            &mut lines,
+            &mut next_id,
+            &mut deferred,
+        )
+        .expect_err("backend hierarchy failure maps through public dispatch");
+        let error_text = error.to_string();
+        let ToolDispatchError::ReadOnlyOutcome(outcome) = error else {
+            panic!("backend failures use the typed read-only outcome variant");
+        };
+        assert_eq!(outcome.status, LspOutcomeStatus::Error);
+        assert_eq!(outcome.code, LspOutcomeCode::ServerError);
+        assert_eq!(outcome.operation, Some(LspOperation::TypeHierarchy));
+        assert_eq!(outcome.path.as_deref(), Some("src/main.rs"));
+        assert_eq!(outcome.phase, LspOutcomePhase::Runtime);
+        assert_eq!(outcome.message, "language server request failed");
+        assert_eq!(outcome.language.as_deref(), Some("rust"));
+        assert!(
+            outcome
+                .command
+                .as_deref()
+                .is_some_and(|command| !command.is_empty())
+        );
+        assert!(!error_text.contains(secret));
+        let host_frames = String::from_utf8(out.lock().expect("host output lock").clone())
+            .expect("host calls are UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid HostCall envelope"))
+            .collect::<Vec<_>>();
+        assert!(
+            host_frames
+                .iter()
+                .all(|frame| { frame["method"] != "log" && !frame.to_string().contains(secret) })
         );
     }
 

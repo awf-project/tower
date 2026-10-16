@@ -42,6 +42,11 @@ description = "Find implementations for the symbol at the given position in a wo
 schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}'
 
 [[tools]]
+name        = "type_hierarchy"
+description = "Find supertypes, subtypes, or both for the symbol at the given position in a workspace-relative source file."
+schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"direction":{"type":"string","enum":["supertypes","subtypes","both"],"description":"Hierarchy direction"}},"required":["path","line","character","direction"]}'
+
+[[tools]]
 name        = "rename"
 description = "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability."
 schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}'

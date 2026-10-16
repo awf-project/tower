@@ -239,6 +239,11 @@ fn main() {
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
                         },
                         ToolDecl {
+                            name: "type_hierarchy".to_owned(),
+                            description: "Find supertypes, subtypes, or both for the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"direction":{"type":"string","enum":["supertypes","subtypes","both"],"description":"Hierarchy direction"}},"required":["path","line","character","direction"]}"#.to_owned(),
+                        },
+                        ToolDecl {
                             name: "rename".to_owned(),
                             description: "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}"#.to_owned(),

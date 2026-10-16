@@ -286,6 +286,7 @@ dependencies = [
  "directories",
  "extension_protocol",
  "extension_sidecar_harness",
+ "fixture_lsp_server",
  "ignore",
  "notify",
  "postcard",
@@ -554,6 +555,14 @@ name = "fixture_ignore_shutdown"
 version = "0.1.0"
 dependencies = [
  "extension_protocol",
+ "serde_json",
+]
+
+[[package]]
+name = "fixture_lsp_server"
+version = "0.1.0"
+dependencies = [
+ "rustix",
  "serde_json",
 ]
 
@@ -992,6 +1001,7 @@ dependencies = [
  "core_engine",
  "extension_protocol",
  "extension_sidecar_harness",
+ "fixture_lsp_server",
  "ignore",
  "lsp-types",
  "serde",
