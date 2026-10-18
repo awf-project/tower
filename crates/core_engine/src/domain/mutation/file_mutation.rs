@@ -6,17 +6,24 @@ use std::collections::{HashMap, HashSet};
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::compute_content_version;
 use crate::domain::refactor::GlobalReplaceService;
+use crate::domain::refactor::{
+    PathMove, PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult,
+    PathRenameSemanticOutcome, PathRenameSemanticPolicy, PathRenameStatus,
+};
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, RelativePath};
 use crate::ports::inbound::{
-    ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, FileMutationUseCase,
-    FileReplaceError, PerFileEditResult, SkippedEdit, SkippedEditReason, TextEdit, TxReport,
-    WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode, WorkspaceApplyEditsRequest,
-    WorkspaceApplyEditsResult, WorkspaceEditSpan,
+    ApplyEditsFileResult, ApplyEditsPreview, ApplyEditsRequest, DirectoryEntryKind,
+    FileMutationUseCase, FileReplaceError, PerFileEditResult, SkippedEdit, SkippedEditReason,
+    TextEdit, TxReport, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
+    WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
 };
-use crate::ports::{ExtensionHostPort, FileSystemPort, PortError, StoragePort};
+use crate::ports::{
+    ExtensionHostPort, FileSystemPort, PathExclusionDecision, PathExclusionError,
+    PathExclusionPort, PortError, ReconciliationDelta, StoragePort,
+};
 
 // ── FileMutationService ───────────────────────────────────────────────────────
 
@@ -70,6 +77,104 @@ pub struct FileMutationService<'ws> {
 }
 
 impl<'ws> FileMutationService<'ws> {
+    fn validate_rename_path(
+        path: &RelativePath,
+        exclusions: &dyn PathExclusionPort,
+    ) -> Result<(), PathRenameError> {
+        if path.as_str().is_empty()
+            || std::path::Path::new(path.as_str()).is_absolute()
+            || std::path::Path::new(path.as_str())
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(PathRenameError::WorkspaceEscape { path: path.clone() });
+        }
+        match exclusions.classify(path) {
+            Ok(PathExclusionDecision::Allowed) => Ok(()),
+            Ok(PathExclusionDecision::Excluded(reason)) => {
+                Err(PathRenameError::DestinationExcluded {
+                    path: path.clone(),
+                    reason: format!("{reason:?}"),
+                })
+            }
+            Err(PathExclusionError::OutsideWorkspace | PathExclusionError::SymlinkEscape) => {
+                Err(PathRenameError::WorkspaceEscape { path: path.clone() })
+            }
+            Err(PathExclusionError::PolicyEvaluation) => {
+                Err(PathRenameError::DestinationExcluded {
+                    path: path.clone(),
+                    reason: "policy evaluation failed".to_owned(),
+                })
+            }
+        }
+    }
+
+    fn current_version(&self, path: &RelativePath) -> Result<String, PathRenameError> {
+        self.fs
+            .read(path)
+            .map(|bytes| compute_content_version(&bytes))
+            .map_err(|error| match error {
+                PortError::NotFound => PathRenameError::SourceNotFound { path: path.clone() },
+                _ => PathRenameError::Filesystem,
+            })
+    }
+
+    fn validate_caller_versions(&self, plan: &PathRenamePlan) -> Result<(), PathRenameError> {
+        for (path, expected) in plan.expected_versions() {
+            let actual = self.current_version(path)?;
+            if &actual != expected {
+                return Err(PathRenameError::VersionConflict {
+                    path: path.clone(),
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_destination_absent(&self, plan: &PathRenamePlan) -> Result<(), PathRenameError> {
+        for path_move in plan.moves() {
+            if self.fs.exists(&path_move.destination) {
+                return Err(PathRenameError::DestinationExists {
+                    path: path_move.destination.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_move_membership(&self, plan: &PathRenamePlan) -> Result<(), PathRenameError> {
+        let root = &plan.moves()[0];
+        let expected: HashSet<_> = plan
+            .moved_identities()
+            .iter()
+            .map(|(path, id)| (path.clone(), *id))
+            .collect();
+        let actual: HashSet<_> = if root.kind == DirectoryEntryKind::Dir {
+            let prefix = format!("{}/", root.source.as_str());
+            self.workspace
+                .snapshot()
+                .files
+                .into_iter()
+                .filter(|file| file.path.as_str().starts_with(&prefix))
+                .map(|file| (file.path, file.id))
+                .collect()
+        } else {
+            self.workspace
+                .get_by_path(&root.source)
+                .map(|id| HashSet::from([(root.source.clone(), id)]))
+                .unwrap_or_default()
+        };
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(PathRenameError::SourceNotFound {
+                path: root.source.clone(),
+            })
+        }
+    }
+
     /// Construct a new service.
     ///
     /// # Arguments
@@ -165,6 +270,278 @@ impl<'ws> FileMutationService<'ws> {
 }
 
 impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
+    fn plan_path_rename(
+        &self,
+        request: PathRenameRequest,
+        exclusions: &dyn PathExclusionPort,
+    ) -> Result<PathRenamePlan, PathRenameError> {
+        Self::validate_rename_path(&request.source, exclusions)?;
+        Self::validate_rename_path(&request.destination, exclusions)?;
+        if request.source == request.destination {
+            return Err(PathRenameError::IdenticalPaths {
+                path: request.source,
+            });
+        }
+
+        let source_id = self.workspace.get_by_path(&request.source);
+        let prefix = format!("{}/", request.source.as_str());
+        let mut descendants: Vec<_> = self
+            .workspace
+            .snapshot()
+            .files
+            .into_iter()
+            .filter(|file| file.path.as_str().starts_with(&prefix))
+            .collect();
+        descendants.sort_by(|left, right| left.path.cmp(&right.path));
+        let is_directory = source_id.is_none() && !descendants.is_empty();
+        if source_id.is_none() && !is_directory {
+            return Err(PathRenameError::SourceNotFound {
+                path: request.source,
+            });
+        }
+
+        let mut moves = Vec::with_capacity(1 + descendants.len());
+        let mut identities =
+            Vec::with_capacity(descendants.len() + usize::from(source_id.is_some()));
+        if let Some(id) = source_id {
+            moves.push(PathMove {
+                source: request.source.clone(),
+                destination: request.destination.clone(),
+                kind: DirectoryEntryKind::File,
+            });
+            identities.push((request.source.clone(), id));
+        } else {
+            moves.push(PathMove {
+                source: request.source.clone(),
+                destination: request.destination.clone(),
+                kind: DirectoryEntryKind::Dir,
+            });
+            for file in descendants {
+                let suffix = file
+                    .path
+                    .as_str()
+                    .strip_prefix(request.source.as_str())
+                    .unwrap();
+                let destination =
+                    RelativePath::new(format!("{}{suffix}", request.destination.as_str()));
+                Self::validate_rename_path(&destination, exclusions)?;
+                moves.push(PathMove {
+                    source: file.path.clone(),
+                    destination,
+                    kind: DirectoryEntryKind::File,
+                });
+                identities.push((file.path, file.id));
+            }
+        }
+
+        let mut staged = ProjectWorkspace::from_snapshot(self.workspace.snapshot())
+            .map_err(|_| PathRenameError::SemanticBackend)?;
+        staged.remap_paths(&moves)?;
+        let outcome = match request.semantic_policy {
+            PathRenameSemanticPolicy::None => PathRenameSemanticOutcome::NotRequested,
+            _ => PathRenameSemanticOutcome::Pending,
+        };
+        let plan = PathRenamePlan::new(
+            moves,
+            Vec::new(),
+            request.semantic_policy,
+            request.dry_run,
+            request.expected_versions,
+            outcome,
+            Vec::new(),
+            identities,
+        )?;
+        self.validate_caller_versions(&plan)?;
+        self.validate_destination_absent(&plan)?;
+        Ok(plan)
+    }
+
+    fn complete_path_rename_plan(
+        &self,
+        plan: PathRenamePlan,
+        semantic: Result<Vec<WorkspaceEditSpan>, PathRenameError>,
+    ) -> Result<PathRenamePlan, PathRenameError> {
+        if plan.semantic_policy() == PathRenameSemanticPolicy::None {
+            return Ok(plan);
+        }
+        self.validate_caller_versions(&plan)?;
+        let (mut edits, outcome, errors) = match semantic {
+            Ok(edits) => (edits, PathRenameSemanticOutcome::Planned, Vec::new()),
+            Err(error) if plan.semantic_policy() == PathRenameSemanticPolicy::Required => {
+                return Err(error);
+            }
+            Err(PathRenameError::SemanticUnsupported) => (
+                Vec::new(),
+                PathRenameSemanticOutcome::Unsupported,
+                vec![PathRenameError::SemanticUnsupported],
+            ),
+            Err(
+                error
+                @ (PathRenameError::SemanticBackend | PathRenameError::WorkspaceEscape { .. }),
+            ) => (Vec::new(), PathRenameSemanticOutcome::Failed, vec![error]),
+            Err(_) => return Err(PathRenameError::SemanticBackend),
+        };
+        let invalid_target = edits.iter().find_map(|edit| {
+            let raw_path = std::path::Path::new(edit.path.as_str());
+            let invalid_path = edit.path.as_str().is_empty()
+                || raw_path.is_absolute()
+                || raw_path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir));
+            invalid_path
+                .then(|| PathRenameError::WorkspaceEscape {
+                    path: edit.path.clone(),
+                })
+                .or_else(|| {
+                    let moved = plan.moves().iter().any(|path_move| {
+                        path_move.kind == DirectoryEntryKind::File && path_move.source == edit.path
+                    });
+                    (!moved && self.workspace.get_by_path(&edit.path).is_none()).then(|| {
+                        PathRenameError::WorkspaceEscape {
+                            path: edit.path.clone(),
+                        }
+                    })
+                })
+        });
+        if let Some(error) = invalid_target {
+            if plan.semantic_policy() == PathRenameSemanticPolicy::Required {
+                return Err(error);
+            }
+            edits.clear();
+            return PathRenamePlan::new(
+                plan.moves().to_vec(),
+                edits,
+                plan.semantic_policy(),
+                plan.dry_run(),
+                plan.expected_versions().clone(),
+                PathRenameSemanticOutcome::Failed,
+                vec![error],
+                plan.moved_identities().to_vec(),
+            );
+        }
+        for edit in &mut edits {
+            if let Some(path_move) = plan.moves().iter().find(|path_move| {
+                path_move.kind == DirectoryEntryKind::File && path_move.source == edit.path
+            }) {
+                edit.path = path_move.destination.clone();
+            }
+        }
+        let ready = PathRenamePlan::new(
+            plan.moves().to_vec(),
+            edits,
+            plan.semantic_policy(),
+            plan.dry_run(),
+            plan.expected_versions().clone(),
+            outcome,
+            errors,
+            plan.moved_identities().to_vec(),
+        )?;
+        Ok(ready)
+    }
+
+    fn apply_path_rename(
+        &mut self,
+        plan: PathRenamePlan,
+        exclusions: &dyn PathExclusionPort,
+    ) -> Result<PathRenameResult, PathRenameError> {
+        if plan.semantic_outcome() == PathRenameSemanticOutcome::Pending {
+            return Err(PathRenameError::SemanticBackend);
+        }
+        for path_move in plan.moves() {
+            Self::validate_rename_path(&path_move.destination, exclusions)?;
+        }
+        self.validate_caller_versions(&plan)?;
+        self.validate_move_membership(&plan)?;
+        self.validate_destination_absent(&plan)?;
+
+        let current_identities: Vec<_> = plan
+            .moved_identities()
+            .iter()
+            .map(
+                |(path, expected_id)| match self.workspace.get_by_path(path) {
+                    Some(id) if id == *expected_id => Ok((path.clone(), id)),
+                    _ => Err(PathRenameError::SourceNotFound { path: path.clone() }),
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        let mut staged = ProjectWorkspace::from_snapshot(self.workspace.snapshot())
+            .map_err(|_| PathRenameError::SemanticBackend)?;
+        staged.remap_paths(plan.moves())?;
+        if plan.dry_run() {
+            return Ok(PathRenameResult {
+                status: PathRenameStatus::Preview,
+                plan,
+                edit_result: None,
+                errors: Vec::new(),
+            });
+        }
+
+        let root = &plan.moves()[0];
+        if root.kind == DirectoryEntryKind::Dir {
+            self.fs
+                .rename(&root.source, root.destination.clone())
+                .map_err(|_| PathRenameError::Filesystem)?;
+        } else {
+            self.fs
+                .rename(&root.source, root.destination.clone())
+                .map_err(|_| PathRenameError::Filesystem)?;
+        }
+
+        self.workspace
+            .remap_paths(plan.moves())
+            .expect("path rename was staged and validated before filesystem movement");
+        let mut additions = Vec::with_capacity(current_identities.len());
+        for (_, id) in &current_identities {
+            self.index.remove(*id);
+            let file = self
+                .workspace
+                .get(*id)
+                .expect("moved identity remains live")
+                .clone();
+            self.index.insert(*id, &tokenize(file.path.as_str()));
+            additions.push(file);
+        }
+        let delta = ReconciliationDelta {
+            removals: current_identities.iter().map(|(_, id)| *id).collect(),
+            additions,
+        };
+        let persistence_failed = self.storage.apply_reconciliation_delta(&delta).is_err();
+        if persistence_failed {
+            return Ok(PathRenameResult {
+                status: PathRenameStatus::Partial,
+                plan,
+                edit_result: None,
+                errors: vec![PathRenameError::Persistence],
+            });
+        }
+
+        let mut errors = plan.semantic_errors().to_vec();
+        let edit_result = if plan.edits().is_empty() {
+            None
+        } else {
+            Some(
+                self.apply_batch_edits(WorkspaceApplyEditsRequest {
+                    edits: plan.edits().to_vec(),
+                    dry_run: Some(false),
+                })
+                .map_err(|_| PathRenameError::SemanticBackend)?,
+            )
+        };
+        let edits_failed = edit_result
+            .as_ref()
+            .is_some_and(|result| result.per_file.iter().any(|file| !file.applied));
+        Ok(PathRenameResult {
+            status: if edits_failed {
+                PathRenameStatus::Partial
+            } else {
+                PathRenameStatus::Applied
+            },
+            plan,
+            edit_result,
+            errors: std::mem::take(&mut errors),
+        })
+    }
+
     /// Create or overwrite the file at `path` with `content`.
     ///
     /// Uses the shadow-file pattern:

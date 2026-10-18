@@ -57,6 +57,9 @@ impl Server {
                 );
             }
         }
+        if self.mode.starts_with("path_rename_") && self.mode != "path_rename_unsupported" {
+            capabilities["workspace"] = json!({"fileOperations": {"willRename": true}});
+        }
         capabilities
     }
 
@@ -112,7 +115,7 @@ impl Server {
         while let Some(message) = wire::read(&mut input)? {
             let method = message["method"].as_str().unwrap_or_default();
             if let Some(log) = &self.log {
-                let line = if self.dispatch_profile {
+                let line = if self.dispatch_profile || self.mode.starts_with("path_rename_") {
                     message.to_string()
                 } else {
                     method.to_owned()
@@ -145,6 +148,47 @@ impl Server {
                 || method.starts_with("typeHierarchy/")
             {
                 self.hierarchy(method, id, params, uri)?;
+            } else if method == "workspace/willRenameFiles" {
+                if matches!(
+                    self.mode.as_str(),
+                    "path_rename_malformed" | "path_rename_timeout" | "path_rename_crash"
+                ) && let Some(log) = &self.log
+                {
+                    append_line(log, &format!("privacy_fixture_exercised:{}", self.mode))?;
+                }
+                match self.mode.as_str() {
+                    "path_rename_null" => wire::reply(id, Value::Null)?,
+                    "path_rename_edit" => {
+                        let target = params["files"][0]["oldUri"].clone();
+                        wire::reply(
+                            id,
+                            json!({"changes": {
+                                target.as_str().expect("rename URI"): [{
+                                    "range": {
+                                        "start": {"line": 0, "character": 3},
+                                        "end": {"line": 0, "character": 11}
+                                    },
+                                    "newText": "new_name"
+                                }]
+                            }}),
+                        )?
+                    }
+                    "path_rename_malformed" => wire::reply(
+                        id,
+                        json!({
+                            "changes": concat!(
+                                "PRIVATE_RAW_BACKEND_SENTINEL ",
+                                "/absolute/PRIVATE_ABSOLUTE_PATH_SENTINEL ",
+                                "file:///PRIVATE_EXTERNAL_URI_SENTINEL ",
+                                "PRIVATE_REPLACEMENT_CONTENT_SENTINEL"
+                            )
+                        }),
+                    )?,
+                    "path_rename_timeout" => std::thread::sleep(Duration::from_secs(30)),
+                    "path_rename_crash" => std::process::exit(71),
+                    "path_rename_semantic" => self.path_rename_semantic(id, params)?,
+                    _ => wire::reply(id, json!({"changes": {}}))?,
+                }
             } else {
                 self.navigation(method, id, params, uri)?;
             }

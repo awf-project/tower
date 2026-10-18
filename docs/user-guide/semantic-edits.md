@@ -4,11 +4,16 @@ Use Tower's semantic edit tools when you want the sidecars to find the right
 symbol or reference set, but you still want the host to own validation, compare-
 and-swap checks, atomic writes, and index refresh.
 
-F007 adds two workflows:
+Tower supports three refactoring workflows:
 
 - `tower_lsp_rename` for language-server-backed rename across one or more files
+- `tower_rename_path` for safe file or directory moves, with optional language-server reference updates
 - `tower_ast_*` anchored symbol edits for exact one-symbol body replacement,
   insert-before, insert-after, and delete
+
+`tower_rename_path` is host-owned: Tower validates the complete move, keeps the
+filesystem and index in sync, and applies any returned text edits through the
+existing CAS-guarded workspace-edit path. The sidecar never moves files itself.
 
 ## Before You Start
 
@@ -78,7 +83,10 @@ Typical preview:
 If the position is not renameable, the tool returns a structured payload such as:
 
 ```json
-{ "code": "not_renameable", "message": "the symbol at this position cannot be renamed" }
+{
+  "code": "not_renameable",
+  "message": "the symbol at this position cannot be renamed"
+}
 ```
 
 ## Apply a Rename
@@ -196,6 +204,8 @@ scopes.
 ## Choose the Right Tool
 
 - Use `tower_lsp_rename` when you want reference-aware renaming across files.
+- Use `tower_rename_path` when you want to move a file or directory and optionally
+  update imports and references to its path. See [Rename a path](path-rename.md).
 - Use `tower_ast_replace_symbol_body` when you want to rewrite one declaration's
   body and leave surrounding bytes unchanged.
 - Use `tower_ast_insert_before_symbol` or `tower_ast_insert_after_symbol` when

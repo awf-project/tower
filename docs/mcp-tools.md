@@ -663,6 +663,69 @@ formatting.
 }
 ```
 
+### tower_rename_path
+
+Rename a workspace-relative file or directory after validating the complete
+move against workspace boundaries, exclusions, conflicts, and optimistic
+concurrency checks. With a configured language server, the tool can also plan
+and apply import/reference edits through the existing workspace-edit path.
+
+| Field | Type | Required | Description |
+|---|---|---:|---|
+| `source` | string | yes | Workspace-relative file or directory to move |
+| `destination` | string | yes | Workspace-relative destination; it must not already exist or be inside the source |
+| `dry_run` | boolean | no | Return the plan without changing disk, contents, versions, or indexes; defaults to `false` |
+| `semantic_policy` | string | yes | `none`, `best_effort`, or `required` |
+| `expected_versions` | object | no | Map of workspace-relative paths to 64-character SHA-256 CAS tokens; defaults to `{}` |
+
+`none` performs a native-only move. `best_effort` uses semantic edits when
+available and reports backend failures in the result. `required` returns an
+`unsupported` result without mutation when the backend cannot provide the
+requested rename support.
+
+**Request**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 30,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_rename_path",
+    "arguments": {
+      "source": "src/old.rs",
+      "destination": "src/new.rs",
+      "semantic_policy": "none"
+    }
+  }
+}
+```
+
+**Result**
+
+```json
+{
+  "status": "applied",
+  "plan": {
+    "moves": [
+      { "source": "src/old.rs", "destination": "src/new.rs", "kind": "file" }
+    ],
+    "edits": [],
+    "semantic_policy": "none"
+  },
+  "errors": []
+}
+```
+
+Possible statuses are `preview`, `applied`, `partial`, `unsupported`, and
+`rejected`. Errors use stable codes such as `source_not_found`,
+`destination_exists`, `destination_excluded`, `workspace_escape`,
+`semantic_unsupported`, `filesystem_error`, `persistence_error`, and
+`cas_conflict`. All returned paths are workspace-relative. A `partial` result
+means the native move committed but persistence or later semantic edits failed;
+cross-file rename work is intentionally not a single transaction. See
+[Rename a File or Directory](user-guide/path-rename.md) for preview and recovery steps.
+
 ---
 
 ## Code-intelligence tools (LSP)

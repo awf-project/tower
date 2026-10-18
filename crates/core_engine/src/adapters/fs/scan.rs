@@ -80,9 +80,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use ignore::{Walk, WalkBuilder};
 use sha2::{Digest, Sha256};
 
+use super::WorkspacePathExclusion;
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
@@ -202,16 +202,33 @@ pub(crate) struct ReconciliationMetrics {
     pub(crate) file_record_rewrites: usize,
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(not(test), feature = "testing"))]
 static RECONCILIATION_METRICS: std::sync::Mutex<
     Option<std::sync::Arc<std::sync::Mutex<ReconciliationMetrics>>>,
 > = std::sync::Mutex::new(None);
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(not(test), feature = "testing"))]
 static RECONCILIATION_METRICS_COLLECTOR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Unit tests reconcile independent workspaces in parallel. Only their own
+// synchronous operations belong in each collection; startup instrumentation in
+// feature-enabled binaries still aggregates the watcher worker's operations.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_RECONCILIATION_METRICS: std::cell::Cell<Option<ReconciliationMetrics>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 fn record_reconciliation_metric(update: impl FnOnce(&mut ReconciliationMetrics)) {
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
+    TEST_RECONCILIATION_METRICS.with(|collector| {
+        if let Some(mut metrics) = collector.get() {
+            update(&mut metrics);
+            collector.set(Some(metrics));
+        }
+    });
+    #[cfg(all(not(test), feature = "testing"))]
     if let Some(metrics) = RECONCILIATION_METRICS
         .lock()
         .expect("reconciliation metrics registry lock poisoned")
@@ -224,7 +241,28 @@ fn record_reconciliation_metric(update: impl FnOnce(&mut ReconciliationMetrics))
     let _ = update;
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
+pub(crate) fn collect_reconciliation_metrics<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, ReconciliationMetrics) {
+    struct RestoreCollector(Option<ReconciliationMetrics>);
+    impl Drop for RestoreCollector {
+        fn drop(&mut self) {
+            TEST_RECONCILIATION_METRICS.set(self.0);
+        }
+    }
+
+    let _restore = RestoreCollector(
+        TEST_RECONCILIATION_METRICS.replace(Some(ReconciliationMetrics::default())),
+    );
+    let result = operation();
+    let collected = TEST_RECONCILIATION_METRICS
+        .get()
+        .expect("active metrics collector");
+    (result, collected)
+}
+
+#[cfg(all(not(test), feature = "testing"))]
 #[allow(dead_code)]
 pub(crate) fn collect_reconciliation_metrics<T>(
     operation: impl FnOnce() -> T,
@@ -264,7 +302,7 @@ struct RealReconciliationOperations;
 impl ReconciliationOperations for RealReconciliationOperations {
     fn enumerate(&mut self, root: &Path) -> Result<Vec<PathBuf>, ScanError> {
         let mut paths = Vec::new();
-        for entry in workspace_walker(root) {
+        for entry in WorkspacePathExclusion::walker(root) {
             let entry = entry.map_err(|source| ScanError::Enumeration {
                 path: ignore_error_path(&source).unwrap_or_else(|| root.to_path_buf()),
                 source,
@@ -559,7 +597,7 @@ pub(crate) fn scan_with_batch_size(
     let mut batch: Vec<(crate::domain::VirtualFile, Vec<crate::domain::token::Token>)> =
         Vec::with_capacity(batch_size);
 
-    let walker = workspace_walker(root);
+    let walker = WorkspacePathExclusion::walker(root);
 
     for entry in walker {
         let entry = match entry {
@@ -755,43 +793,13 @@ fn collect_ignore_error_paths(err: &ignore::Error, out: &mut Vec<PathBuf>) {
 }
 
 /// File name of tower's dedicated, git-independent ignore file.
-pub const TOWERIGNORE_FILE_NAME: &str = ".towerignore";
+pub use super::path_exclusion::TOWERIGNORE_FILE_NAME;
 
 /// Default `.towerignore` content written by `tower init`.
 ///
 /// Authoritative and independent of `.gitignore`; same syntax, with `!` to
 /// re-include. Secrets are excluded so they are never fed to the agent/LLM.
 pub const DEFAULT_TOWERIGNORE: &str = "# tower index ignore — authoritative, independent of .gitignore.\n# Same syntax as .gitignore. Negate with ! to re-include a path.\n\n# Build artifacts\ntarget/\nnode_modules/\ndist/\nvendor/\n\n# Secrets (must never be fed to the agent/LLM)\n*.key\n*.pem\n.env\n.env.*\nsecrets/\n";
-
-/// Build the shared workspace [`Walk`]er. tower's walker is authoritative and
-/// **independent of git**: `.gitignore`, `.git/info/exclude` and the global
-/// gitignore are NOT consulted. The sole ignore source is [`.towerignore`]
-/// (`TOWERIGNORE_FILE_NAME`), which uses the same syntax (with `!` negation and
-/// cascading per-directory files). Hidden files and `.git/` are skipped; symlinks
-/// are never followed (UN2/AC4).
-///
-/// Shared by the initial [`scan`] and by [`collect_workspace_files`] (the forced
-/// `tower_reindex` path) so both walk the tree with identical rules — preventing
-/// the two from drifting apart. The absent-`.towerignore` warning lives in the
-/// public entry points (not here) so it is emitted exactly once, not per caller.
-fn workspace_walker(root: &Path) -> Walk {
-    WalkBuilder::new(root)
-        // Do not follow symlinks — prevents loops (UN2/AC4).
-        .follow_links(false)
-        // `require_git(false)`: apply custom-ignore rules even outside a git repo.
-        .require_git(false)
-        // Git is NOT consulted — tower honors only .towerignore.
-        .git_ignore(false)
-        .git_exclude(false)
-        .git_global(false)
-        // The sole ignore source: .towerignore (same syntax as .gitignore,
-        // with `!` negation and cascading per-directory files).
-        .add_custom_ignore_filename(TOWERIGNORE_FILE_NAME)
-        // Skip hidden files (names starting with '.') (U1). .git/ stays
-        // auto-skipped structurally by the crate.
-        .hidden(true)
-        .build()
-}
 
 fn eligible_relative_path(root: &Path, absolute_path: &Path) -> Option<RelativePath> {
     let relative = absolute_path.strip_prefix(root).ok()?;
@@ -866,7 +874,7 @@ pub(crate) fn collect_workspace_files(root: &Path) -> Vec<(RelativePath, FileMet
     warn_if_towerignore_absent(root);
 
     let mut out = Vec::new();
-    for entry in workspace_walker(root) {
+    for entry in WorkspacePathExclusion::walker(root) {
         let Ok(entry) = entry else { continue };
         match entry.file_type() {
             Some(ft) if ft.is_file() => {}

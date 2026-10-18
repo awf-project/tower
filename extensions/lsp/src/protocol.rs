@@ -99,6 +99,28 @@ where
     extension_sidecar_harness::read_host_response(lines, id, queued).map_err(harness_error_message)
 }
 
+/// Emit a sanitized log HostCall without blocking the active tool request.
+pub fn send_log(
+    out: &Arc<Mutex<impl Write>>,
+    ids: &mut HostCallIdAllocator,
+    level: &str,
+    msg: &str,
+) {
+    let id = ids.next_id();
+    let _ = extension_sidecar_harness::write_envelope(
+        out,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "log",
+            "params": HostCall::Log {
+                level: level.to_owned(),
+                msg: msg.to_owned(),
+            },
+        }),
+    );
+}
+
 /// Send a `notify/resourceUpdated` HostCall from the push thread.
 ///
 /// This variant takes a plain `impl Write` because the push thread owns the

@@ -42,6 +42,7 @@ use core_engine::ports::{
     CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
     RenameNavigationError,
 };
+use extension_protocol::messages::{PathRenameError, PathRenamePlanningRequest};
 use extension_protocol::{TypeHierarchyQuery, TypeHierarchyResult};
 
 // ── PooledSession trait ───────────────────────────────────────────────────────
@@ -80,6 +81,12 @@ pub trait PooledSession:
         query: &TypeHierarchyQuery,
         text: &str,
     ) -> Result<TypeHierarchyResult, LspSessionError>;
+
+    #[allow(dead_code)]
+    fn plan_path_rename(
+        &self,
+        request: &PathRenamePlanningRequest,
+    ) -> Result<RawWorkspaceEdit, PathRenameError>;
 
     fn check_lsp(
         &self,
@@ -259,6 +266,28 @@ pub struct SessionPool {
 }
 
 impl SessionPool {
+    pub fn plan_path_rename(
+        &self,
+        request: &PathRenamePlanningRequest,
+    ) -> Result<RawWorkspaceEdit, PathRenameError> {
+        let Some(route) = request
+            .moves
+            .iter()
+            .find(|path_move| path_move.kind == extension_protocol::messages::PathMoveKind::File)
+            .or_else(|| request.moves.first())
+        else {
+            return Err(PathRenameError {
+                code: extension_protocol::messages::PathRenameErrorCode::SemanticBackend,
+                path: None,
+                message: "Semantic planning failed".to_owned(),
+            });
+        };
+        let path = RelativePath::new(route.source.clone());
+        self.session_for_lsp(&path)
+            .map_err(path_rename_pool_error)?
+            .plan_path_rename(request)
+    }
+
     /// Production constructor: uses `RealSpawner` and no push channel.
     #[allow(dead_code)]
     #[must_use]
@@ -470,6 +499,26 @@ impl SessionPool {
             .iter()
             .find(|(key, _)| key.language == lang)
             .map(|(_, entry)| entry.session.is_dead())
+    }
+}
+
+fn path_rename_pool_error(error: LspSessionError) -> PathRenameError {
+    let code = match error {
+        LspSessionError::Unconfigured | LspSessionError::CapabilityUnavailable => {
+            extension_protocol::messages::PathRenameErrorCode::SemanticUnsupported
+        }
+        _ => extension_protocol::messages::PathRenameErrorCode::SemanticBackend,
+    };
+    PathRenameError {
+        code,
+        path: None,
+        message:
+            if code == extension_protocol::messages::PathRenameErrorCode::SemanticUnsupported {
+                "Semantic rename is unavailable"
+            } else {
+                "Semantic planning failed"
+            }
+            .to_owned(),
     }
 }
 
@@ -744,14 +793,345 @@ impl DocumentSyncPort for SessionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp_adapter::LspClientAdapter;
+    use crate::lsp_adapter::decode::{WorkspaceEditDecodeError, decode_workspace_edit};
     use core_engine::adapters::config::lsp::{LspConfig, LspServerConfig};
     use core_engine::domain::RelativePath;
     use core_engine::ports::CodeIntelError;
+    use extension_protocol::messages::{
+        PathMove, PathMoveKind, PathRenameErrorCode, PathRenameSemanticPolicy,
+    };
+    use lsp_types::WorkspaceEdit;
     use std::collections::{BTreeMap, VecDeque};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
+
+    fn path_rename_request() -> PathRenamePlanningRequest {
+        PathRenamePlanningRequest {
+            moves: vec![
+                PathMove {
+                    source: "src/old".to_owned(),
+                    destination: "src/new".to_owned(),
+                    kind: PathMoveKind::Directory,
+                },
+                PathMove {
+                    source: "src/old/child.rs".to_owned(),
+                    destination: "src/new/child.rs".to_owned(),
+                    kind: PathMoveKind::File,
+                },
+            ],
+            semantic_policy: PathRenameSemanticPolicy::Required,
+        }
+    }
+
+    fn path_rename_adapter(
+        workspace: &tempfile::TempDir,
+        mode: &str,
+    ) -> (LspClientAdapter, PathBuf) {
+        let requests = workspace.path().join("requests.jsonrpc");
+        let binary = fixture_lsp_server::binary_path();
+        (
+            LspClientAdapter::spawn(
+                binary.to_str().expect("fixture path is UTF-8"),
+                &[mode.to_owned(), requests.display().to_string()],
+                vec!["rs".to_owned()],
+                "rust".to_owned(),
+                workspace.path().to_path_buf(),
+                None,
+            )
+            .expect("scripted language server must initialize"),
+            requests,
+        )
+    }
+
+    #[test]
+    fn path_rename_supported_planning_returns_raw_edit_for_complete_move_set() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (adapter, requests_path) = path_rename_adapter(&workspace, "path_rename_supported");
+
+        let edit = adapter
+            .plan_path_rename(&path_rename_request())
+            .expect("willRenameFiles must return the raw workspace edit");
+
+        assert_eq!(edit, WorkspaceEdit::default());
+        let requests = (0..100)
+            .find_map(|_| {
+                let captured = std::fs::read_to_string(&requests_path).unwrap_or_default();
+                if captured.contains("workspace/willRenameFiles") {
+                    Some(captured)
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("server must receive the path-rename request");
+        let messages = requests
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let initialize = messages
+            .iter()
+            .find(|message| message["method"] == "initialize")
+            .expect("initialize request captured");
+        assert_eq!(
+            initialize["params"]["capabilities"]["workspace"]["fileOperations"]["willRename"],
+            true
+        );
+        let request = messages
+            .iter()
+            .find(|message| message["method"] == "workspace/willRenameFiles")
+            .expect("rename request captured");
+        let root = workspace.path().display();
+        assert_eq!(
+            *request,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "workspace/willRenameFiles",
+                "params": {
+                    "files": [
+                        {
+                            "oldUri": format!("file://{root}/src/old"),
+                            "newUri": format!("file://{root}/src/new")
+                        },
+                        {
+                            "oldUri": format!("file://{root}/src/old/child.rs"),
+                            "newUri": format!("file://{root}/src/new/child.rs")
+                        }
+                    ]
+                }
+            }),
+            "planning must send exactly the normalized complete move set in order"
+        );
+    }
+
+    #[test]
+    fn path_rename_absent_capability_is_semantic_unsupported() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (adapter, _) = path_rename_adapter(&workspace, "path_rename_unsupported");
+
+        let error = adapter
+            .plan_path_rename(&path_rename_request())
+            .expect_err("missing willRename capability must be unsupported");
+
+        assert_eq!(error.code, PathRenameErrorCode::SemanticUnsupported);
+        assert_eq!(error.message, "Semantic rename is unavailable");
+    }
+
+    #[test]
+    fn path_rename_malformed_edit_is_sanitized_semantic_backend() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let sentinel = "PRIVATE_BACKEND_DETAIL";
+        let (adapter, _) = path_rename_adapter(&workspace, "path_rename_malformed");
+
+        let error = adapter
+            .plan_path_rename(&path_rename_request())
+            .expect_err("malformed workspace edit must fail planning");
+
+        assert_eq!(error.code, PathRenameErrorCode::SemanticBackend);
+        assert!(!error.message.contains(sentinel));
+    }
+
+    #[test]
+    fn path_rename_resource_operation_rejects_the_complete_plan() {
+        let raw: RawWorkspaceEdit = serde_json::from_value(serde_json::json!({
+            "documentChanges": [{
+                "kind": "rename",
+                "oldUri": "file:///workspace/src/old.rs",
+                "newUri": "file:///workspace/src/new.rs"
+            }]
+        }))
+        .expect("valid resource-operation workspace edit");
+
+        let error = decode_workspace_edit(raw, std::path::Path::new("/workspace"), |_| {
+            panic!("resource operations must reject before resolving file contents")
+        })
+        .expect_err("resource operations are unsupported");
+
+        assert!(matches!(
+            error,
+            WorkspaceEditDecodeError::UnsupportedWorkspaceEdit { .. }
+        ));
+    }
+
+    #[test]
+    fn path_rename_null_result_is_an_empty_workspace_edit() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (adapter, _) = path_rename_adapter(&workspace, "path_rename_null");
+        assert_eq!(
+            adapter.plan_path_rename(&path_rename_request()).unwrap(),
+            WorkspaceEdit::default()
+        );
+    }
+
+    #[test]
+    fn path_rename_rejects_inconsistent_root_descendant_move_sets() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (adapter, _) = path_rename_adapter(&workspace, "path_rename_supported");
+        for moves in [
+            vec![
+                PathMove {
+                    source: "src/old.rs".into(),
+                    destination: "src/new.rs".into(),
+                    kind: PathMoveKind::File,
+                },
+                PathMove {
+                    source: "src/old/child.rs".into(),
+                    destination: "src/new/child.rs".into(),
+                    kind: PathMoveKind::File,
+                },
+            ],
+            vec![
+                PathMove {
+                    source: "src/old".into(),
+                    destination: "src/new".into(),
+                    kind: PathMoveKind::Directory,
+                },
+                PathMove {
+                    source: "unrelated.rs".into(),
+                    destination: "z.rs".into(),
+                    kind: PathMoveKind::File,
+                },
+            ],
+            vec![
+                PathMove {
+                    source: "src/old".into(),
+                    destination: "src/new".into(),
+                    kind: PathMoveKind::Directory,
+                },
+                PathMove {
+                    source: "src/old/child.rs".into(),
+                    destination: "src/wrong/child.rs".into(),
+                    kind: PathMoveKind::File,
+                },
+            ],
+            vec![
+                PathMove {
+                    source: "src/old".into(),
+                    destination: "src/new".into(),
+                    kind: PathMoveKind::Directory,
+                },
+                PathMove {
+                    source: "src/old/nested".into(),
+                    destination: "src/new/nested".into(),
+                    kind: PathMoveKind::Directory,
+                },
+            ],
+        ] {
+            let error = adapter
+                .plan_path_rename(&PathRenamePlanningRequest {
+                    moves,
+                    semantic_policy: PathRenameSemanticPolicy::Required,
+                })
+                .expect_err("inconsistent move set must be rejected");
+            assert_eq!(error.code, PathRenameErrorCode::SemanticBackend);
+        }
+    }
+
+    #[test]
+    fn path_rename_routes_through_the_resident_session_pool() {
+        let spawner = FakeSpawner::new();
+        spawner.register("rust", FakeSession::new());
+        let pool = pool_with_spawner(rust_config(), spawner.clone());
+
+        let error = pool.plan_path_rename(&path_rename_request()).unwrap_err();
+
+        assert_eq!(error.code, PathRenameErrorCode::SemanticUnsupported);
+        assert_eq!(spawner.spawn_count("rust"), 1);
+    }
+
+    #[test]
+    fn path_rename_reader_crash_is_sanitized_semantic_backend() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (adapter, _) = path_rename_adapter(&workspace, "path_rename_crash");
+
+        let error = adapter
+            .plan_path_rename(&path_rename_request())
+            .expect_err("reader exit must fail planning without terminating the host");
+
+        assert_eq!(error.code, PathRenameErrorCode::SemanticBackend);
+        assert_eq!(error.message, "Semantic planning failed");
+    }
+
+    #[test]
+    fn path_rename_timeout_is_sanitized_semantic_backend() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (adapter, _) = path_rename_adapter(&workspace, "path_rename_timeout");
+
+        let error = adapter
+            .plan_path_rename(&path_rename_request())
+            .expect_err("request timeout must fail planning without terminating the host");
+
+        assert_eq!(error.code, PathRenameErrorCode::SemanticBackend);
+        assert_eq!(error.message, "Semantic planning failed");
+    }
+
+    #[test]
+    fn path_rename_decoder_contains_targets_hashes_exact_bytes_and_preserves_order() {
+        let raw: RawWorkspaceEdit = serde_json::from_value(serde_json::json!({
+            "documentChanges": [
+                {
+                    "textDocument": {"uri": "file:///workspace/src/b.rs", "version": null},
+                    "edits": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "B"}]
+                },
+                {
+                    "textDocument": {"uri": "file:///workspace/src/a.rs", "version": null},
+                    "edits": [{"range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}}, "newText": "A"}]
+                }
+            ]
+        }))
+        .expect("valid text-only workspace edit");
+        let mut resolved = Vec::new();
+
+        let spans = decode_workspace_edit(raw, std::path::Path::new("/workspace"), |path| {
+            resolved.push(path.to_owned());
+            Ok(match path {
+                "src/b.rs" => "bravo",
+                "src/a.rs" => "alpha",
+                _ => panic!("decoder exposed a non-workspace-relative path: {path}"),
+            }
+            .to_owned())
+        })
+        .expect("contained text edits must decode");
+
+        assert_eq!(resolved, ["src/b.rs", "src/a.rs"]);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/b.rs", "src/a.rs"]
+        );
+        assert_eq!(
+            spans[0].base_hash.as_deref(),
+            Some(core_engine::domain::mutation::compute_content_version(b"bravo").as_str())
+        );
+        assert_eq!(
+            spans[1].base_hash.as_deref(),
+            Some(core_engine::domain::mutation::compute_content_version(b"alpha").as_str())
+        );
+
+        let external: RawWorkspaceEdit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                "file:///outside/private.rs": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                    "newText": "PRIVATE_REPLACEMENT"
+                }]
+            }
+        }))
+        .expect("valid external workspace edit");
+        let external_error =
+            decode_workspace_edit(external, std::path::Path::new("/workspace"), |_| {
+                panic!("external targets must reject before content resolution")
+            })
+            .expect_err("external edit targets must be rejected");
+        assert!(matches!(
+            external_error,
+            WorkspaceEditDecodeError::InvalidPath { .. }
+        ));
+    }
 
     // ── FakeSession ───────────────────────────────────────────────────────────
 
@@ -850,6 +1230,17 @@ mod tests {
     }
 
     impl PooledSession for FakeSession {
+        fn plan_path_rename(
+            &self,
+            _request: &PathRenamePlanningRequest,
+        ) -> Result<RawWorkspaceEdit, PathRenameError> {
+            Err(PathRenameError {
+                code: PathRenameErrorCode::SemanticUnsupported,
+                path: None,
+                message: "Semantic rename is unavailable".to_owned(),
+            })
+        }
+
         fn is_dead(&self) -> bool {
             self.dead.load(Ordering::Relaxed)
         }

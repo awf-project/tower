@@ -15,7 +15,11 @@ use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::refactor::{
+    PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult,
+};
 use crate::domain::{DomainError, FileId, RelativePath};
+use crate::ports::PathExclusionPort;
 
 // ── Supporting value types ───────────────────────────────────────────────────
 
@@ -265,6 +269,24 @@ pub trait SearchUseCase {
 ///
 /// Object-safe: mutation methods take `&mut self` and return owned values.
 pub trait FileMutationUseCase {
+    fn plan_path_rename(
+        &self,
+        request: PathRenameRequest,
+        exclusions: &dyn PathExclusionPort,
+    ) -> Result<PathRenamePlan, PathRenameError>;
+
+    fn complete_path_rename_plan(
+        &self,
+        plan: PathRenamePlan,
+        semantic: Result<Vec<WorkspaceEditSpan>, PathRenameError>,
+    ) -> Result<PathRenamePlan, PathRenameError>;
+
+    fn apply_path_rename(
+        &mut self,
+        plan: PathRenamePlan,
+        exclusions: &dyn PathExclusionPort,
+    ) -> Result<PathRenameResult, PathRenameError>;
+
     /// Create or overwrite the file at `path` with `content` (upsert semantics).
     ///
     /// If the path already exists the file is overwritten atomically; the

@@ -20,6 +20,7 @@ mod scan_integration {
     use tempfile::TempDir;
 
     use crate::adapters::InMemoryStorage;
+    use crate::adapters::fs::WorkspacePathExclusion;
     use crate::adapters::fs::scan::{
         ReconciliationOperations, ScanError, collect_reconciliation_metrics, content_hash_of,
         reconcile_workspace, reconcile_workspace_with, record_reconciliation_file_record_rewrites,
@@ -30,7 +31,9 @@ mod scan_integration {
     use crate::domain::workspace::ProjectWorkspace;
     use crate::domain::{ContentHash, FileId, VirtualFile};
     use crate::ports::inbound::SearchUseCase;
-    use crate::ports::{PortError, ReconciliationDelta, StoragePort};
+    use crate::ports::{
+        PathExclusionDecision, PathExclusionPort, PortError, ReconciliationDelta, StoragePort,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -366,6 +369,121 @@ mod scan_integration {
         assert!(
             paths.iter().any(|p| p.ends_with("main.rs")),
             "src/main.rs must be indexed; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn initial_scan_and_forced_reconciliation_use_the_workspace_exclusion_policy() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        write_file(workspace_dir.path(), ".towerignore", b"generated/*\n");
+        write_file(workspace_dir.path(), "src/initial.rs", b"fn initial() {}");
+        write_file(workspace_dir.path(), "generated/initial.rs", b"generated");
+
+        let policy = WorkspacePathExclusion::new(workspace_dir.path().to_path_buf()).unwrap();
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+        scan(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        write_file(workspace_dir.path(), "src/later.rs", b"fn later() {}");
+        write_file(workspace_dir.path(), "generated/later.rs", b"generated");
+        reconcile_workspace(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+
+        let indexed: std::collections::BTreeSet<_> = workspace
+            .snapshot()
+            .files
+            .iter()
+            .map(|file| file.path.as_str().to_owned())
+            .collect();
+        for candidate in [
+            "src/initial.rs",
+            "generated/initial.rs",
+            "src/later.rs",
+            "generated/later.rs",
+        ] {
+            let included = policy.classify(&RelativePath::new(candidate)).unwrap()
+                == PathExclusionDecision::Allowed;
+            assert_eq!(
+                indexed.contains(candidate),
+                included,
+                "policy parity for {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_parity_preserves_cascading_ignore_and_negated_descendant_results() {
+        let workspace_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        write_file(
+            workspace_dir.path(),
+            ".towerignore",
+            b"build/*\n!build/keep/\npruned/\n",
+        );
+        write_file(
+            workspace_dir.path(),
+            "build/keep/.towerignore",
+            b"*.rs\n!kept.rs\n",
+        );
+        write_file(workspace_dir.path(), "pruned/.towerignore", b"!keep.rs\n");
+        for candidate in [
+            "src/lib.rs",
+            "build/drop.rs",
+            "build/keep/dropped.rs",
+            "build/keep/kept.rs",
+            "pruned/keep.rs",
+        ] {
+            write_file(workspace_dir.path(), candidate, b"fixture");
+        }
+
+        let policy = WorkspacePathExclusion::new(workspace_dir.path().to_path_buf()).unwrap();
+        let (mut storage, mut workspace, mut index) = open_storage(db_dir.path());
+        scan(
+            workspace_dir.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+        )
+        .unwrap();
+        let indexed: std::collections::BTreeSet<_> = workspace
+            .snapshot()
+            .files
+            .iter()
+            .map(|file| file.path.as_str().to_owned())
+            .collect();
+        let policy_included: std::collections::BTreeSet<_> = [
+            "src/lib.rs",
+            "build/drop.rs",
+            "build/keep/dropped.rs",
+            "build/keep/kept.rs",
+            "pruned/keep.rs",
+        ]
+        .into_iter()
+        .filter(|candidate| {
+            policy.classify(&RelativePath::new(*candidate)).unwrap()
+                == PathExclusionDecision::Allowed
+        })
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(indexed, policy_included);
+        assert_eq!(
+            indexed,
+            std::collections::BTreeSet::from([
+                "build/keep/kept.rs".to_owned(),
+                "src/lib.rs".to_owned(),
+            ])
         );
     }
 
@@ -1244,6 +1362,38 @@ mod scan_integration {
                 .get_by_path(&RelativePath::new("addition.rs"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn reconciliation_metrics_exclude_unrelated_threads() {
+        let ((), metrics) = collect_reconciliation_metrics(|| {
+            record_reconciliation_file_record_rewrites(1);
+            std::thread::spawn(|| {
+                // An unrelated scan without a collector must not contaminate ours.
+                record_reconciliation_file_record_rewrites(100);
+            })
+            .join()
+            .unwrap();
+        });
+        assert_eq!(metrics.file_record_rewrites, 1);
+    }
+
+    #[test]
+    fn reconciliation_metrics_restore_outer_collection_after_nested_panic() {
+        let ((), metrics) = collect_reconciliation_metrics(|| {
+            record_reconciliation_file_record_rewrites(1);
+            let panic = std::panic::catch_unwind(|| {
+                collect_reconciliation_metrics(|| {
+                    record_reconciliation_file_record_rewrites(100);
+                    panic!("simulated failed scan");
+                });
+            });
+            assert!(panic.is_err());
+            record_reconciliation_file_record_rewrites(2);
+        });
+        assert_eq!(metrics.file_record_rewrites, 3);
+        let ((), clean) = collect_reconciliation_metrics(|| {});
+        assert_eq!(clean.file_record_rewrites, 0);
     }
 
     #[test]

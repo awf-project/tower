@@ -43,6 +43,7 @@ use serde_json::Value as JsonValue;
 use crate::adapters::mcp::native_tools::{EngineState, NativeToolRegistry};
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
+use crate::adapters::watcher::RenameCoordinator;
 use crate::domain::extension_host::{ExtensionRegistry, InvokeError};
 
 // ── ExtensionMergedRegistry ───────────────────────────────────────────────────
@@ -88,8 +89,21 @@ impl ExtensionMergedRegistry {
         engine_state: Arc<RwLock<EngineState>>,
         extension_host: Arc<RwLock<ExtensionRegistry>>,
     ) -> Self {
+        Self::with_rename_coordinator(
+            engine_state,
+            extension_host,
+            Arc::new(RenameCoordinator::default()),
+        )
+    }
+
+    /// Construct with the daemon-scoped coordinator shared by the watcher.
+    pub fn with_rename_coordinator(
+        engine_state: Arc<RwLock<EngineState>>,
+        extension_host: Arc<RwLock<ExtensionRegistry>>,
+        rename_coordinator: Arc<RenameCoordinator>,
+    ) -> Self {
         Self {
-            native: NativeToolRegistry::new(engine_state),
+            native: NativeToolRegistry::with_rename_coordinator(engine_state, rename_coordinator),
             extension_host,
         }
     }

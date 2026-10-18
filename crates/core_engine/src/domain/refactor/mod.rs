@@ -22,8 +22,15 @@
 #![forbid(unsafe_code)]
 
 mod global_replace;
+mod path_rename;
+#[cfg(test)]
+mod path_rename_tests;
 
 pub use global_replace::GlobalReplaceService;
+pub use path_rename::{
+    PathMove, PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult,
+    PathRenameSemanticOutcome, PathRenameSemanticPolicy, PathRenameStatus,
+};
 
 #[cfg(test)]
 mod tests;

@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 use crate::adapters::storage::{SCHEMA_VERSION, SledStorageAdapter, StorageError};
 use crate::domain::token::Token;
-use crate::domain::{FileId, RelativePath};
+use crate::domain::{ContentHash, FileId, RelativePath, VirtualFile};
 use crate::ports::{PortError, ReconciliationDelta, StoragePort};
 use crate::test_support::make_virtual_file;
 
@@ -35,6 +35,84 @@ fn make_sled_adapter() -> SledStorageAdapter {
     let path = dir.keep();
     let (adapter, _ws, _index) = SledStorageAdapter::open(&path).expect("SledStorageAdapter::open");
     adapter
+}
+
+/// Injects the only failure mode that can occur after Sled has accepted the
+/// reconciliation transaction: durable completion.  The wrapper deliberately
+/// delegates the real transaction first, so the test does not mistake a
+/// pre-commit abort for a synchronous flush failure.
+struct FlushFailingSledStorage {
+    inner: SledStorageAdapter,
+}
+
+impl StoragePort for FlushFailingSledStorage {
+    fn apply_reconciliation_delta(&mut self, delta: &ReconciliationDelta) -> Result<(), PortError> {
+        self.inner.apply_reconciliation_delta(delta)?;
+        Err(PortError::ReconciliationFailed {
+            operation: "apply_reconciliation_delta",
+            reason: "injected synchronous flush failure".to_owned(),
+        })
+    }
+
+    fn get(&self, id: FileId) -> Result<VirtualFile, PortError> {
+        self.inner.get(id)
+    }
+
+    fn put(&mut self, file: VirtualFile) -> Result<(), PortError> {
+        self.inner.put(file)
+    }
+
+    fn put_batch(&mut self, files: &[VirtualFile]) -> Result<(), PortError> {
+        self.inner.put_batch(files)
+    }
+
+    fn delete(&mut self, id: FileId) -> Result<(), PortError> {
+        self.inner.delete(id)
+    }
+
+    fn put_blob(&mut self, hash: ContentHash, bytes: Vec<u8>) -> Result<(), PortError> {
+        self.inner.put_blob(hash, bytes)
+    }
+
+    fn get_blob(&self, hash: &ContentHash) -> Result<Vec<u8>, PortError> {
+        self.inner.get_blob(hash)
+    }
+
+    fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+        self.inner.mark_scan_complete()
+    }
+
+    fn is_scan_complete(&self) -> Result<bool, PortError> {
+        self.inner.is_scan_complete()
+    }
+}
+
+#[test]
+fn post_transaction_synchronous_flush_failure_is_reported_as_reconciliation_failure() {
+    let dir = TempDir::new().unwrap();
+    let (inner, _, _) = SledStorageAdapter::open(dir.path()).unwrap();
+    let mut store = FlushFailingSledStorage { inner };
+    let original = make_virtual_file(0, 0, "src/old.rs");
+    let replacement = make_virtual_file(0, 0, "src/new.rs");
+    store.put(original.clone()).unwrap();
+
+    assert_eq!(
+        store.apply_reconciliation_delta(&ReconciliationDelta {
+            additions: vec![replacement.clone()],
+            removals: vec![original.id],
+        }),
+        Err(PortError::ReconciliationFailed {
+            operation: "apply_reconciliation_delta",
+            reason: "injected synchronous flush failure".to_owned(),
+        })
+    );
+    assert_eq!(store.get(replacement.id).unwrap().path, replacement.path);
+    assert_eq!(
+        store
+            .inner
+            .persisted_file_id_for_path_for_test(&replacement.path),
+        Some(replacement.id)
+    );
 }
 
 impl crate::adapters::contract_tests::ReconciliationState for SledStorageAdapter {

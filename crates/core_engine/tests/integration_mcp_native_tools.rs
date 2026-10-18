@@ -17,10 +17,15 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
+use extension_protocol::messages::{
+    PATH_RENAME_REQUEST_SCHEMA_JSON, PathRenameError, PathRenameErrorCode,
+    PathRenameRequest as WirePathRenameRequest, PathRenameResult as WirePathRenameResult,
+};
 use rmcp::model::CallToolRequestParams;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
 
+use core_engine::adapters::fs::WorkspacePathExclusion;
 use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
@@ -29,14 +34,21 @@ use core_engine::adapters::mcp::native_tools::{
 };
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
-use core_engine::adapters::{InMemoryFs, InMemoryStorage};
+use core_engine::adapters::{InMemoryFs, InMemoryStorage, RealFs};
 use core_engine::domain::RelativePath;
 use core_engine::domain::extension_host::ExtensionRegistry;
 use core_engine::domain::index::InvertedIndex;
+use core_engine::domain::mutation::FileMutationService;
+use core_engine::domain::refactor::{
+    PathRenameError as DomainPathRenameError, PathRenameRequest, PathRenameSemanticPolicy,
+};
 use core_engine::domain::token::tokenize;
 use core_engine::domain::virtual_file::FileMetadata;
 use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::FileSystemPort;
+use core_engine::ports::{
+    FileMutationUseCase, FileSystemPort, NoOpExtensionHost, PortError, ReconciliationDelta,
+    StoragePort,
+};
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -895,4 +907,589 @@ fn create_directory_succeeds() {
 
         client.cancel().await.expect("cancel failed");
     });
+}
+
+// ── tower_rename_path ───────────────────────────────────────────────────────
+
+fn call_native_rename(
+    state: Arc<RwLock<EngineState>>,
+    args: Value,
+) -> Result<Value, core_engine::adapters::mcp::ToolError> {
+    NativeToolRegistry::new(state).call("tower_rename_path", args)
+}
+
+/// Canonical public examples.  Keep these literals independent of the
+/// serializer under test so a wire-format regression cannot update both sides
+/// of an assertion at once.
+fn rename_result_fixture(status: &str) -> Value {
+    let plan = json!({
+        "moves": [{"source": "src/old.rs", "destination": "src/new.rs", "kind": "file"}],
+        "edits": [],
+        "semantic_policy": "none"
+    });
+
+    match status {
+        "preview" => json!({"status": "preview", "plan": plan, "errors": []}),
+        "applied" => json!({"status": "applied", "plan": plan, "errors": []}),
+        "unsupported" => json!({
+            "status": "unsupported",
+            "plan": plan,
+            "errors": [{"code": "semantic_unsupported", "message": "Semantic rename is unavailable"}]
+        }),
+        "rejected" => json!({
+            "status": "rejected",
+            "plan": {"moves": [], "edits": [], "semantic_policy": "none"},
+            "errors": [{"code": "source_not_found", "path": "missing.rs", "message": "Source path was not found"}]
+        }),
+        "partial" => json!({
+            "status": "partial",
+            "plan": plan,
+            "errors": [{"code": "persistence_error", "message": "Persistence operation failed"}]
+        }),
+        other => panic!("unknown path-rename fixture status: {other}"),
+    }
+}
+
+fn typed_rename_result_fixture(status: &str) -> WirePathRenameResult {
+    serde_json::from_value(rename_result_fixture(status)).unwrap_or_else(|error| {
+        panic!("{status} fixture must deserialize as PathRenameResult: {error}")
+    })
+}
+
+fn state_with_paths(paths: &[(&str, &str)]) -> Arc<RwLock<EngineState>> {
+    let mut workspace = ProjectWorkspace::new();
+    let mut index = InvertedIndex::new();
+    let mut fs = InMemoryFs::new();
+
+    for (path, content) in paths {
+        let path = RelativePath::new(*path);
+        let id = workspace
+            .insert(path.clone(), FileMetadata::default())
+            .unwrap();
+        index.insert(id, &tokenize(path.as_str()));
+        fs.write(path, content.as_bytes().to_vec()).unwrap();
+    }
+
+    Arc::new(RwLock::new(EngineState::new(
+        workspace,
+        index,
+        Box::new(InMemoryStorage::new()),
+        Box::new(fs),
+    )))
+}
+
+#[derive(Default)]
+struct RenamePersistenceFailure {
+    inner: InMemoryStorage,
+}
+
+impl StoragePort for RenamePersistenceFailure {
+    fn apply_reconciliation_delta(&mut self, _: &ReconciliationDelta) -> Result<(), PortError> {
+        Err(PortError::WriteFailed(
+            "PRIVATE_PERSISTENCE_SENTINEL".to_owned(),
+        ))
+    }
+
+    fn get(
+        &self,
+        id: core_engine::domain::FileId,
+    ) -> Result<core_engine::domain::VirtualFile, PortError> {
+        self.inner.get(id)
+    }
+
+    fn put(&mut self, file: core_engine::domain::VirtualFile) -> Result<(), PortError> {
+        self.inner.put(file)
+    }
+
+    fn put_batch(&mut self, files: &[core_engine::domain::VirtualFile]) -> Result<(), PortError> {
+        self.inner.put_batch(files)
+    }
+
+    fn delete(&mut self, id: core_engine::domain::FileId) -> Result<(), PortError> {
+        self.inner.delete(id)
+    }
+
+    fn put_blob(
+        &mut self,
+        hash: core_engine::domain::ContentHash,
+        bytes: Vec<u8>,
+    ) -> Result<(), PortError> {
+        self.inner.put_blob(hash, bytes)
+    }
+
+    fn get_blob(&self, hash: &core_engine::domain::ContentHash) -> Result<Vec<u8>, PortError> {
+        self.inner.get_blob(hash)
+    }
+
+    fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+        self.inner.mark_scan_complete()
+    }
+
+    fn is_scan_complete(&self) -> Result<bool, PortError> {
+        self.inner.is_scan_complete()
+    }
+}
+
+#[test]
+fn rename_path_is_registered_with_the_exact_public_schema_and_dispatch() {
+    let state = empty_state();
+    let mut registry = NativeToolRegistry::new(state);
+    let descriptor = registry
+        .list()
+        .into_iter()
+        .find(|tool| tool.name == "tower_rename_path")
+        .expect("tower_rename_path must be listed");
+
+    assert_eq!(
+        descriptor.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "source": {"type": "string"},
+                "destination": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": false},
+                "semantic_policy": {"type": "string", "enum": ["none", "best_effort", "required"]},
+                "expected_versions": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string", "pattern": "^[0-9A-Fa-f]{64}$"},
+                    "default": {}
+                }
+            },
+            "required": ["source", "destination", "semantic_policy"],
+            "additionalProperties": false
+        })
+    );
+    assert_eq!(
+        descriptor.input_schema,
+        serde_json::from_str::<Value>(PATH_RENAME_REQUEST_SCHEMA_JSON)
+            .expect("canonical request schema must be valid JSON"),
+        "the registered descriptor must remain independently schema-compatible"
+    );
+
+    let request_fixture = json!({
+        "source": "src/old.rs",
+        "destination": "src/new.rs",
+        "dry_run": false,
+        "semantic_policy": "none",
+        "expected_versions": {"src/old.rs": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+    });
+    let typed_request: WirePathRenameRequest = serde_json::from_value(request_fixture.clone())
+        .expect("canonical request fixture must deserialize through the public DTO");
+    assert_eq!(
+        serde_json::to_value(typed_request).expect("request fixture must serialize"),
+        request_fixture,
+        "typed request serialization must retain the exact public fixture"
+    );
+
+    for status in ["preview", "applied", "unsupported", "rejected", "partial"] {
+        assert_eq!(
+            serde_json::to_value(typed_rename_result_fixture(status))
+                .expect("result fixture must serialize"),
+            rename_result_fixture(status),
+            "typed {status} result serialization must retain the entire public fixture"
+        );
+    }
+
+    let error = registry
+        .call(
+            "tower_rename_path",
+            json!({"source": "missing.rs", "destination": "renamed.rs", "semantic_policy": "none"}),
+        )
+        .expect("domain rejection must be a successful structured payload");
+    assert_eq!(error, rename_result_fixture("rejected"));
+}
+
+#[test]
+fn rename_path_validates_all_public_fields_and_malformed_cas_fails_closed() {
+    let malformed = [
+        json!({"source": 7, "destination": "b.rs", "semantic_policy": "none"}),
+        json!({"source": "a.rs", "destination": false, "semantic_policy": "none"}),
+        json!({"source": "a.rs", "destination": "b.rs", "dry_run": "yes", "semantic_policy": "none"}),
+        json!({"source": "a.rs", "destination": "b.rs", "semantic_policy": "sometimes"}),
+        json!({"source": "a.rs", "destination": "b.rs", "semantic_policy": "none", "expected_versions": []}),
+        json!({"source": "a.rs", "destination": "b.rs", "semantic_policy": "none", "expected_versions": {"a.rs": 42}}),
+        json!({"source": "a.rs", "destination": "b.rs", "semantic_policy": "none", "expected_versions": {"a.rs": "abc"}}),
+        json!({"source": "a.rs", "destination": "b.rs", "semantic_policy": "none", "unknown": true}),
+    ];
+
+    for args in malformed {
+        let error =
+            call_native_rename(empty_state(), args).expect_err("malformed request must fail");
+        assert!(
+            matches!(error, core_engine::adapters::mcp::ToolError::InvalidArgs(_)),
+            "malformed request must map to invalid arguments: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn rename_path_error_code_fixtures_are_one_to_one_and_use_public_messages() {
+    let cases = [
+        (
+            PathRenameErrorCode::SourceNotFound,
+            "source_not_found",
+            "Source path was not found",
+        ),
+        (
+            PathRenameErrorCode::DestinationExists,
+            "destination_exists",
+            "Destination path already exists",
+        ),
+        (
+            PathRenameErrorCode::IdenticalPaths,
+            "identical_paths",
+            "Source and destination paths are identical",
+        ),
+        (
+            PathRenameErrorCode::DestinationInsideSource,
+            "destination_inside_source",
+            "Destination is inside the source path",
+        ),
+        (
+            PathRenameErrorCode::DestinationExcluded,
+            "destination_excluded",
+            "Destination path is excluded",
+        ),
+        (
+            PathRenameErrorCode::WorkspaceEscape,
+            "workspace_escape",
+            "Path is outside the workspace",
+        ),
+        (
+            PathRenameErrorCode::DuplicateDestination,
+            "duplicate_destination",
+            "Multiple moves have the same destination",
+        ),
+        (
+            PathRenameErrorCode::InvalidExpectedVersion,
+            "invalid_expected_version",
+            "Expected version is invalid",
+        ),
+        (
+            PathRenameErrorCode::SemanticUnsupported,
+            "semantic_unsupported",
+            "Semantic rename is unavailable",
+        ),
+        (
+            PathRenameErrorCode::SemanticBackend,
+            "semantic_backend",
+            "Semantic planning failed",
+        ),
+        (
+            PathRenameErrorCode::FilesystemError,
+            "filesystem_error",
+            "Filesystem operation failed",
+        ),
+        (
+            PathRenameErrorCode::CasConflict,
+            "cas_conflict",
+            "File changed before semantic edits were applied",
+        ),
+        (
+            PathRenameErrorCode::PersistenceError,
+            "persistence_error",
+            "Persistence operation failed",
+        ),
+    ];
+
+    for (code, expected_code, expected_message) in cases {
+        let error = PathRenameError {
+            code,
+            path: Some("src/public.rs".to_owned()),
+            // The serializer must discard this backend string, not preserve it.
+            message: "PRIVATE_RAW_BACKEND_SENTINEL".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(error).expect("public error fixture must serialize"),
+            json!({"code": expected_code, "path": "src/public.rs", "message": expected_message}),
+            "{expected_code} must have its own stable public code and message"
+        );
+    }
+}
+
+#[test]
+fn rename_path_error_serialization_redacts_all_forbidden_boundary_sentinels() {
+    let sentinels = [
+        "/absolute/PRIVATE_ABSOLUTE_PATH_SENTINEL",
+        "file:///PRIVATE_EXTERNAL_URI_SENTINEL",
+        "PRIVATE_REPLACEMENT_CONTENT_SENTINEL",
+        "PRIVATE_WORKSPACE_EXTERNAL_CONTENT_SENTINEL",
+        "PRIVATE_RAW_BACKEND_SENTINEL",
+    ];
+    let error = PathRenameError {
+        code: PathRenameErrorCode::FilesystemError,
+        path: Some(sentinels[0].to_owned()),
+        message: sentinels.join(" "),
+    };
+    let serialized = serde_json::to_string(&error).expect("public error must serialize");
+
+    for sentinel in sentinels {
+        assert!(
+            !serialized.contains(sentinel),
+            "the public error/message boundary must redact {sentinel}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&serialized).expect("error JSON"),
+        json!({"code": "filesystem_error", "message": "Filesystem operation failed"})
+    );
+
+    let preview = json!({
+        "status": "preview",
+        "plan": {
+            "moves": [{"source": "src/old.rs", "destination": "src/new.rs", "kind": "file"}],
+            "edits": [{
+                "path": "src/old.rs",
+                "start_byte": 0,
+                "end_byte": 2,
+                "replacement": "PRIVATE_REPLACEMENT_CONTENT_SENTINEL",
+                "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }],
+            "semantic_policy": "best_effort"
+        },
+        "errors": []
+    });
+    let typed_preview: WirePathRenameResult = serde_json::from_value(preview.clone())
+        .expect("successful preview fixture must be a typed public result");
+    assert_eq!(
+        serde_json::to_value(typed_preview).expect("preview serialization"),
+        preview,
+        "replacement content is intentionally retained in successful preview edits"
+    );
+}
+
+#[test]
+fn rename_path_rejects_an_ignored_destination_via_the_real_exclusion_adapter_without_mutation() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(root.path().join(".towerignore"), b"ignored.rs\n")
+        .expect("write real ignore policy");
+    std::fs::create_dir_all(root.path().join("src")).expect("create source directory");
+    std::fs::write(root.path().join("src/old.rs"), b"fn old() {}").expect("write source file");
+
+    let source = RelativePath::new("src/old.rs");
+    let mut workspace = ProjectWorkspace::new();
+    let id = workspace
+        .insert(source.clone(), FileMetadata::default())
+        .expect("seed workspace source");
+    let before_workspace: Vec<_> = workspace
+        .snapshot()
+        .files
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    let mut index = InvertedIndex::new();
+    index.insert(id, &tokenize(source.as_str()));
+    let mut storage = InMemoryStorage::new();
+    let mut filesystem = RealFs::new(root.path());
+    let exclusions = WorkspacePathExclusion::new(root.path().to_path_buf())
+        .expect("real workspace exclusion adapter");
+
+    let error = FileMutationService::new(
+        &mut filesystem,
+        &mut workspace,
+        &mut index,
+        &mut storage,
+        &NoOpExtensionHost,
+    )
+    .plan_path_rename(
+        PathRenameRequest {
+            source: source.clone(),
+            destination: RelativePath::new("ignored.rs"),
+            dry_run: false,
+            semantic_policy: PathRenameSemanticPolicy::None,
+            expected_versions: Default::default(),
+        },
+        &exclusions,
+    )
+    .expect_err("a real .towerignore match must reject a native path rename");
+
+    assert!(matches!(
+        error,
+        DomainPathRenameError::DestinationExcluded { .. }
+    ));
+    let after_workspace: Vec<_> = workspace
+        .snapshot()
+        .files
+        .into_iter()
+        .map(|file| (file.path, file.id))
+        .collect();
+    assert_eq!(
+        after_workspace, before_workspace,
+        "workspace must not change"
+    );
+    assert!(
+        filesystem.exists(&source),
+        "source file must remain on disk"
+    );
+    assert!(
+        !filesystem.exists(&RelativePath::new("ignored.rs")),
+        "destination must not be created"
+    );
+    assert!(
+        storage.get(id).is_err(),
+        "rejected planning must not persist a record"
+    );
+}
+
+#[test]
+fn rename_path_applies_native_file_move_and_serializes_the_exact_result() {
+    let state = state_with_paths(&[("src/old.rs", "fn old() {}")]);
+    let result = call_native_rename(
+        Arc::clone(&state),
+        json!({"source": "src/old.rs", "destination": "src/new.rs", "semantic_policy": "none"}),
+    )
+    .unwrap();
+
+    assert_eq!(result, rename_result_fixture("applied"));
+    let guard = state.read().unwrap();
+    let workspace = guard.workspace.read().unwrap();
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("src/old.rs"))
+            .is_none()
+    );
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("src/new.rs"))
+            .is_some()
+    );
+}
+
+#[test]
+fn rename_path_applies_native_directory_move_with_one_root_filesystem_mutation() {
+    let state = state_with_paths(&[("src/a.rs", "a"), ("src/nested/b.rs", "b")]);
+    let result = call_native_rename(
+        Arc::clone(&state),
+        json!({"source": "src", "destination": "lib", "semantic_policy": "none"}),
+    )
+    .unwrap();
+
+    assert_eq!(result["status"], "applied");
+    assert_eq!(
+        result["plan"]["moves"],
+        json!([
+            {"source": "src", "destination": "lib", "kind": "directory"},
+            {"source": "src/a.rs", "destination": "lib/a.rs", "kind": "file"},
+            {"source": "src/nested/b.rs", "destination": "lib/nested/b.rs", "kind": "file"}
+        ])
+    );
+    let guard = state.read().unwrap();
+    let workspace = guard.workspace.read().unwrap();
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("lib/a.rs"))
+            .is_some()
+    );
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("lib/nested/b.rs"))
+            .is_some()
+    );
+}
+
+#[test]
+fn rename_path_rejects_missing_and_workspace_external_sources_without_mutation() {
+    for (source, expected_code) in [
+        ("missing.rs", "source_not_found"),
+        ("../PRIVATE_EXTERNAL_SENTINEL.rs", "workspace_escape"),
+    ] {
+        let state = state_with_paths(&[("src/kept.rs", "kept")]);
+        let before = state
+            .read()
+            .unwrap()
+            .workspace
+            .read()
+            .unwrap()
+            .snapshot()
+            .files;
+        let result = call_native_rename(
+            Arc::clone(&state),
+            json!({"source": source, "destination": "src/moved.rs", "semantic_policy": "none"}),
+        )
+        .expect("domain rejection must be returned as a structured result");
+
+        assert_eq!(result["status"], "rejected");
+        assert_eq!(result["errors"][0]["code"], expected_code);
+        assert!(
+            result["errors"][0]["message"].is_string(),
+            "{expected_code} must include a stable public error message"
+        );
+        assert_eq!(
+            state
+                .read()
+                .unwrap()
+                .workspace
+                .read()
+                .unwrap()
+                .snapshot()
+                .files,
+            before
+        );
+        assert!(!result.to_string().contains("PRIVATE_EXTERNAL_SENTINEL"));
+    }
+}
+
+#[test]
+fn rename_path_required_semantics_without_lsp_returns_structured_unsupported() {
+    let result = call_native_rename(
+        state_with_paths(&[("src/old.rs", "fn old() {}")]),
+        json!({"source": "src/old.rs", "destination": "src/new.rs", "semantic_policy": "required"}),
+    )
+    .expect("unsupported semantic planning is a successful structured result");
+
+    let mut expected = rename_result_fixture("unsupported");
+    expected["plan"]["semantic_policy"] = json!("required");
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn rename_path_dry_run_returns_exact_preview_and_does_not_mutate() {
+    let state = state_with_paths(&[("src/old.rs", "fn old() {}")]);
+    let result = call_native_rename(
+        Arc::clone(&state),
+        json!({"source": "src/old.rs", "destination": "src/new.rs", "dry_run": true, "semantic_policy": "none"}),
+    )
+    .unwrap();
+
+    assert_eq!(result, rename_result_fixture("preview"));
+    let guard = state.read().unwrap();
+    let workspace = guard.workspace.read().unwrap();
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("src/old.rs"))
+            .is_some()
+    );
+    assert!(
+        workspace
+            .get_by_path(&RelativePath::new("src/new.rs"))
+            .is_none()
+    );
+}
+
+#[test]
+fn rename_path_persistence_failure_returns_sanitized_structured_partial() {
+    let mut workspace = ProjectWorkspace::new();
+    let mut index = InvertedIndex::new();
+    let mut fs = InMemoryFs::new();
+    let source = RelativePath::new("src/old.rs");
+    let id = workspace
+        .insert(source.clone(), FileMetadata::default())
+        .unwrap();
+    index.insert(id, &tokenize(source.as_str()));
+    fs.write(source, b"fn old() {}".to_vec()).unwrap();
+    let state = Arc::new(RwLock::new(EngineState::new(
+        workspace,
+        index,
+        Box::new(RenamePersistenceFailure::default()),
+        Box::new(fs),
+    )));
+
+    let result = call_native_rename(
+        state,
+        json!({"source": "src/old.rs", "destination": "src/new.rs", "semantic_policy": "none"}),
+    )
+    .expect("post-move persistence failure must remain a successful structured payload");
+
+    assert_eq!(result, rename_result_fixture("partial"));
+    assert!(!result.to_string().contains("PRIVATE_PERSISTENCE_SENTINEL"));
 }

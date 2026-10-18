@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex};
 
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position, Severity};
+use extension_protocol::messages::{
+    PathRenameError, PathRenameErrorCode, PathRenamePlan, PathRenamePlanningRequest,
+    PathRenamePlanningResult,
+};
 use extension_protocol::{
     HostCall, LspImplementationRequest, LspImplementationResult, LspOperation, LspOutcome,
     LspOutcomeCode, LspOutcomePhase, LspOutcomeStatus, RenameError, RenameErrorCode, RenamePreview,
@@ -30,6 +34,7 @@ use crate::session::LspSessionPool;
 
 #[derive(Debug)]
 pub(crate) enum ToolDispatchError {
+    InvalidParams(String),
     Legacy(String),
     ReadOnlyOutcome(LspOutcome),
 }
@@ -37,6 +42,7 @@ pub(crate) enum ToolDispatchError {
 impl fmt::Display for ToolDispatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidParams(message) => formatter.write_str(message),
             Self::Legacy(message) => formatter.write_str(message),
             Self::ReadOnlyOutcome(outcome) => formatter.write_str(&outcome.message),
         }
@@ -139,7 +145,91 @@ where
         "rename" => {
             rename(params, pool, workspace_root, out, lines, next_id, deferred).map_err(Into::into)
         }
+        "planPathRename" => {
+            plan_path_rename(params, pool, workspace_root, out, lines, next_id, deferred)
+        }
         other => Err(format!("unknown LSP tool: {other}").into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_path_rename<W, R>(
+    params: Value,
+    pool: &mut LspSessionPool,
+    _workspace_root: &PathBuf,
+    out: &Arc<Mutex<W>>,
+    lines: &mut R,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
+) -> Result<Value, ToolDispatchError>
+where
+    W: Write,
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let request: PathRenamePlanningRequest = serde_json::from_value(params).map_err(|_| {
+        ToolDispatchError::InvalidParams(
+            "invalid_params: planPathRename params must match PathRenamePlanningRequest".to_owned(),
+        )
+    })?;
+
+    let result = match pool.plan_path_rename(&request) {
+        Ok(raw_edit) => {
+            let mut resolved: HashMap<String, String> = HashMap::new();
+            match pool.decode_rename_workspace_edit(raw_edit, |path| {
+                if let Some(text) = resolved.get(path) {
+                    return Ok(text.clone());
+                }
+                let text = read_file(path, out, lines, next_id, deferred).map_err(|_| {
+                    WorkspaceEditDecodeError::UnreadableFile {
+                        path: path.to_owned(),
+                        message: "workspace file could not be read".to_owned(),
+                    }
+                })?;
+                resolved.insert(path.to_owned(), text.clone());
+                Ok(text)
+            }) {
+                Ok(edits) => PathRenamePlanningResult {
+                    plan: Some(PathRenamePlan {
+                        moves: request.moves,
+                        edits,
+                        semantic_policy: request.semantic_policy,
+                    }),
+                    error: None,
+                },
+                Err(error) => PathRenamePlanningResult {
+                    plan: None,
+                    error: Some(path_rename_decode_error(error)),
+                },
+            }
+        }
+        Err(error) => PathRenamePlanningResult {
+            plan: None,
+            error: Some(error),
+        },
+    };
+
+    if result.error.is_some() {
+        protocol::send_log(out, next_id, "warn", "LSP path-rename planning failed");
+    }
+    serde_json::to_value(result).map_err(|error| error.to_string().into())
+}
+
+fn path_rename_decode_error(error: WorkspaceEditDecodeError) -> PathRenameError {
+    let code = match error {
+        WorkspaceEditDecodeError::UnsupportedWorkspaceEdit { .. } => {
+            PathRenameErrorCode::SemanticUnsupported
+        }
+        _ => PathRenameErrorCode::SemanticBackend,
+    };
+    PathRenameError {
+        code,
+        path: None,
+        message: if code == PathRenameErrorCode::SemanticUnsupported {
+            "Semantic rename is unavailable"
+        } else {
+            "Semantic planning failed"
+        }
+        .to_owned(),
     }
 }
 
@@ -802,6 +892,8 @@ fn optional_combined_preview(result: &WorkspaceApplyEditsResult) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::{BufRead, Write as _};
+    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 
     use std::collections::BTreeMap;
@@ -809,8 +901,598 @@ mod tests {
 
     use core_engine::adapters::config::lsp::{LspConfig, LspServerConfig};
     use core_engine::domain::code_intel::Range;
+    use core_engine::ports::{
+        CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort,
+        PrepareRenameResult, RenameNavigationError,
+    };
 
     use super::*;
+
+    /// A pool seam that supplies an edit requiring the production read resolver.
+    /// The dispatch path, decoder, and HostCall transport remain real.
+    struct PlanningSession {
+        edit: crate::lsp_adapter::RawWorkspaceEdit,
+    }
+
+    impl crate::lsp_adapter::pool::PooledSession for PlanningSession {
+        fn plan_path_rename(
+            &self,
+            _: &extension_protocol::messages::PathRenamePlanningRequest,
+        ) -> Result<
+            crate::lsp_adapter::RawWorkspaceEdit,
+            extension_protocol::messages::PathRenameError,
+        > {
+            Ok(self.edit.clone())
+        }
+
+        fn is_dead(&self) -> bool {
+            false
+        }
+
+        fn shared_state(&self) -> crate::lsp_adapter::SharedState {
+            Arc::new((
+                Mutex::new(crate::lsp_adapter::SessionStateInner::default()),
+                std::sync::Condvar::new(),
+            ))
+        }
+
+        fn diagnostics_for(&self, _: &str) -> Vec<core_engine::domain::code_intel::Diagnostic> {
+            Vec::new()
+        }
+
+        fn type_hierarchy_lsp(
+            &self,
+            _: &extension_protocol::TypeHierarchyQuery,
+            _: &str,
+        ) -> Result<extension_protocol::TypeHierarchyResult, crate::lsp_adapter::LspSessionError>
+        {
+            Err(crate::lsp_adapter::LspSessionError::CapabilityUnavailable)
+        }
+
+        fn rename(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+            _: &str,
+        ) -> Result<crate::lsp_adapter::RawWorkspaceEdit, RenameNavigationError> {
+            Err(RenameNavigationError::UnsupportedLanguage)
+        }
+
+        fn kill_for_test(&self) {}
+    }
+
+    impl CodeIntelligencePort for PlanningSession {
+        fn check(&self, _: &RelativePath, _: &str) -> Result<Vec<Diagnostic>, CodeIntelError> {
+            Err(CodeIntelError::Unsupported)
+        }
+    }
+
+    impl NavigationPort for PlanningSession {
+        fn definition(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+        ) -> Result<Vec<Location>, CodeIntelError> {
+            Err(CodeIntelError::Unsupported)
+        }
+        fn implementations(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+        ) -> Result<Vec<Location>, CodeIntelError> {
+            Err(CodeIntelError::Unsupported)
+        }
+        fn references(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+        ) -> Result<Vec<Location>, CodeIntelError> {
+            Err(CodeIntelError::Unsupported)
+        }
+        fn hover(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+        ) -> Result<Option<Hover>, CodeIntelError> {
+            Err(CodeIntelError::Unsupported)
+        }
+        fn document_symbols(
+            &self,
+            _: &RelativePath,
+            _: &str,
+        ) -> Result<Vec<core_engine::domain::code_intel::Symbol>, CodeIntelError> {
+            Err(CodeIntelError::Unsupported)
+        }
+        fn prepare_rename(
+            &self,
+            _: &RelativePath,
+            _: &str,
+            _: Position,
+        ) -> Result<PrepareRenameResult, RenameNavigationError> {
+            Err(RenameNavigationError::UnsupportedLanguage)
+        }
+    }
+
+    impl DocumentSyncPort for PlanningSession {
+        fn serves(&self, _: &RelativePath) -> bool {
+            true
+        }
+        fn document_opened(&self, _: &RelativePath, _: &str) {}
+        fn document_changed(&self, _: &RelativePath, _: &str) {}
+        fn document_closed(&self, _: &RelativePath) {}
+    }
+
+    struct PlanningSpawner(Arc<PlanningSession>);
+
+    impl crate::lsp_adapter::pool::SessionSpawner for PlanningSpawner {
+        fn spawn(
+            &self,
+            _: &LspServerConfig,
+            _: &str,
+            _: PathBuf,
+            _: &Path,
+            _: Option<crate::lsp_adapter::DiagnosticsSender>,
+        ) -> Result<
+            Arc<dyn crate::lsp_adapter::pool::PooledSession>,
+            crate::lsp_adapter::LspSessionError,
+        > {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn path_rename_fixture_config(workspace: &Path, mode: &str) -> LspConfig {
+        let fixture = fixture_lsp_server::binary_path();
+        let log = workspace.join("path-rename-lsp.jsonl");
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "rust".to_owned(),
+            LspServerConfig {
+                command: fixture.to_string_lossy().into_owned(),
+                extensions: vec!["rs".to_owned()],
+                args: vec![mode.to_owned(), log.to_string_lossy().into_owned()],
+            },
+        );
+        LspConfig {
+            servers,
+            idle_timeout: None,
+        }
+    }
+
+    fn path_rename_params() -> Value {
+        json!({
+            "moves": [
+                { "source": "src/old", "destination": "src/new", "kind": "directory" },
+                { "source": "src/old/lib.rs", "destination": "src/new/lib.rs", "kind": "file" }
+            ],
+            "semantic_policy": "required"
+        })
+    }
+
+    fn dispatch_path_rename(
+        workspace: &Path,
+        mode: &str,
+        params: Value,
+        input: Vec<Result<String, std::io::Error>>,
+    ) -> (
+        Result<Value, ToolDispatchError>,
+        String,
+        VecDeque<QueuedFrame>,
+    ) {
+        let workspace_root = workspace.to_path_buf();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(
+            path_rename_fixture_config(workspace, mode),
+            workspace_root.clone(),
+            None,
+        );
+        let mut lines = input.into_iter();
+        let mut next_id = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+        let result = dispatch(
+            "planPathRename",
+            params,
+            &mut pool,
+            &workspace_root,
+            &out,
+            &mut lines,
+            &mut next_id,
+            &mut deferred,
+        );
+        let output = String::from_utf8(out.lock().expect("host output lock").clone())
+            .expect("HostCall output is UTF-8");
+        (result, output, deferred)
+    }
+
+    #[test]
+    fn path_rename_advertises_the_distinct_internal_planning_request_schema() {
+        let manifest: toml::Value = toml::from_str(include_str!("../extension.toml"))
+            .expect("LSP extension manifest is valid TOML");
+        let tools = manifest["tools"].as_array().expect("manifest tools array");
+        let declaration = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("planPathRename"))
+            .expect("internal path-rename planner is advertised");
+        let schema: Value = serde_json::from_str(
+            declaration["schema_json"]
+                .as_str()
+                .expect("planner schema is JSON text"),
+        )
+        .expect("planner schema is valid JSON");
+
+        assert_eq!(schema["required"], json!(["moves", "semantic_policy"]));
+        assert!(schema["properties"].get("source").is_none());
+        assert!(schema["properties"].get("destination").is_none());
+        assert_eq!(schema["properties"]["moves"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["semantic_policy"]["enum"],
+            json!(["none", "best_effort", "required"])
+        );
+        assert!(
+            include_str!("main.rs").contains("name: \"planPathRename\".to_owned()"),
+            "initialize must advertise the same internal planning tool"
+        );
+    }
+
+    #[test]
+    fn path_rename_dispatches_exact_name_and_separates_invalid_params_from_planner_outcomes() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let (supported, _, _) = dispatch_path_rename(
+            workspace.path(),
+            "path_rename_supported",
+            path_rename_params(),
+            Vec::new(),
+        );
+        let supported = supported.expect("planner outcome is a successful tool payload");
+        assert_eq!(supported["plan"]["moves"], path_rename_params()["moves"]);
+        assert_eq!(supported["plan"]["semantic_policy"], "required");
+        assert_eq!(supported["plan"]["edits"], json!([]));
+        assert!(supported.get("error").is_none());
+
+        let (invalid, _, _) = dispatch_path_rename(
+            workspace.path(),
+            "path_rename_supported",
+            json!({ "moves": "not-an-array", "semantic_policy": "required" }),
+            Vec::new(),
+        );
+        match invalid {
+            Err(ToolDispatchError::InvalidParams(message)) => assert_eq!(
+                message,
+                "invalid_params: planPathRename params must match PathRenamePlanningRequest",
+                "malformed planner arguments must retain the invocation invalid-params classification"
+            ),
+            other => panic!("expected an invalid-params invocation error, got {other:?}"),
+        }
+
+        let workspace_root = workspace.path().to_path_buf();
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
+        let mut ids = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+        assert!(
+            dispatch(
+                "planpathrename",
+                path_rename_params(),
+                &mut pool,
+                &workspace_root,
+                &out,
+                &mut lines,
+                &mut ids,
+                &mut deferred,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn path_rename_host_calls_are_read_only_and_never_apply_or_move_files() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let target = workspace.path().join("src/old/lib.rs");
+        let raw_edit = serde_json::from_value(json!({
+            "changes": {
+                format!("file://{}", target.display()): [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    },
+                    "newText": "renamed"
+                }]
+            }
+        }))
+        .expect("fixture workspace edit is valid");
+        let session = Arc::new(PlanningSession { edit: raw_edit });
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "rust".to_owned(),
+            LspServerConfig {
+                command: "unused-by-planning-spawner".to_owned(),
+                extensions: vec!["rs".to_owned()],
+                args: Vec::new(),
+            },
+        );
+        let config = LspConfig {
+            servers,
+            idle_timeout: None,
+        };
+        let inner = crate::lsp_adapter::SessionPool::with_spawner(
+            config,
+            workspace.path().to_path_buf(),
+            Arc::new(PlanningSpawner(session)),
+            None,
+        );
+        let mut pool =
+            LspSessionPool::with_session_pool_for_test(inner, workspace.path().to_path_buf());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut lines = vec![Ok(json!({
+            "jsonrpc": "2.0", "id": 10_000, "result": "original contents"
+        })
+        .to_string())]
+        .into_iter();
+        let mut ids = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+
+        let result = dispatch(
+            "planPathRename",
+            path_rename_params(),
+            &mut pool,
+            &workspace.path().to_path_buf(),
+            &out,
+            &mut lines,
+            &mut ids,
+            &mut deferred,
+        )
+        .expect("a resolved semantic edit is a successful planning payload");
+        assert_eq!(result["plan"]["edits"][0]["path"], "src/old/lib.rs");
+        assert_eq!(result["plan"]["edits"][0]["replacement"], "renamed");
+        let host_calls = out.lock().expect("host output lock").clone();
+        let host_calls = String::from_utf8(host_calls).expect("HostCalls are UTF-8");
+        let frames = host_calls
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("captured HostCall is valid JSON")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frames,
+            vec![json!({
+                "jsonrpc": "2.0", "id": 10_000, "method": "workspace/readFile",
+                "params": { "type": "ReadFile", "path": "src/old/lib.rs" }
+            })]
+        );
+        assert!(deferred.is_empty());
+    }
+
+    fn dispatch_planning_edit(
+        workspace: &Path,
+        edit: crate::lsp_adapter::RawWorkspaceEdit,
+        input: Vec<Result<String, std::io::Error>>,
+    ) -> (Value, Vec<Value>) {
+        let session = Arc::new(PlanningSession { edit });
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "rust".to_owned(),
+            LspServerConfig {
+                command: "unused-by-planning-spawner".to_owned(),
+                extensions: vec!["rs".to_owned()],
+                args: Vec::new(),
+            },
+        );
+        let inner = crate::lsp_adapter::SessionPool::with_spawner(
+            LspConfig {
+                servers,
+                idle_timeout: None,
+            },
+            workspace.to_path_buf(),
+            Arc::new(PlanningSpawner(session)),
+            None,
+        );
+        let mut pool = LspSessionPool::with_session_pool_for_test(inner, workspace.to_path_buf());
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut lines = input.into_iter();
+        let mut ids = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+        let result = dispatch(
+            "planPathRename",
+            path_rename_params(),
+            &mut pool,
+            &workspace.to_path_buf(),
+            &out,
+            &mut lines,
+            &mut ids,
+            &mut deferred,
+        )
+        .expect("decoder failures remain successful structured payloads");
+        assert!(deferred.is_empty());
+        let frames = String::from_utf8(out.lock().expect("host output lock").clone())
+            .expect("HostCalls are UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured HostCall is valid JSON"))
+            .collect();
+        (result, frames)
+    }
+
+    #[test]
+    fn path_rename_rejects_external_edit_targets_without_reading_them() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let edit = serde_json::from_value(json!({
+            "changes": {
+                "file:///outside/private.rs": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "newText": "private replacement"
+                }]
+            }
+        }))
+        .expect("fixture workspace edit is valid");
+
+        let (result, frames) = dispatch_planning_edit(workspace.path(), edit, Vec::new());
+
+        assert_eq!(result["error"]["code"], "semantic_backend");
+        assert!(result.get("plan").is_none());
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame["method"] != "workspace/readFile")
+        );
+    }
+
+    #[test]
+    fn path_rename_returns_structured_error_when_edit_target_cannot_be_read() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let target = workspace.path().join("src/old/lib.rs");
+        let edit = serde_json::from_value(json!({
+            "changes": {
+                format!("file://{}", target.display()): [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "newText": "renamed"
+                }]
+            }
+        }))
+        .expect("fixture workspace edit is valid");
+        let input = vec![Ok(json!({
+            "jsonrpc": "2.0",
+            "id": 10_000,
+            "error": {"code": -32000, "message": "PRIVATE_HOST_FAILURE"}
+        })
+        .to_string())];
+
+        let (result, frames) = dispatch_planning_edit(workspace.path(), edit, input);
+
+        assert_eq!(result["error"]["code"], "semantic_backend");
+        assert!(result.get("plan").is_none());
+        assert_eq!(frames[0]["method"], "workspace/readFile");
+        assert_eq!(frames[0]["params"]["path"], "src/old/lib.rs");
+        assert!(!result.to_string().contains("PRIVATE_HOST_FAILURE"));
+    }
+
+    #[test]
+    fn path_rename_logs_at_the_real_host_call_boundary_exclude_private_backend_data() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let absolute_path = workspace.path().join("PRIVATE_ABSOLUTE_PATH");
+        let external_uri = "PRIVATE_EXTERNAL_URI/secret.rs";
+        let replacement = "PRIVATE_REPLACEMENT_TEXT";
+        let contents = "PRIVATE_FILE_CONTENTS";
+        let backend = "PRIVATE_BACKEND_DETAIL";
+        let params = json!({
+            "moves": [{
+                "source": external_uri,
+                "destination": format!("{replacement}/{contents}/{backend}.rs"),
+                "kind": "file"
+            }],
+            "semantic_policy": "required"
+        });
+        let (result, host_calls, _) = dispatch_path_rename(
+            workspace.path(),
+            "path_rename_malformed",
+            params,
+            Vec::new(),
+        );
+        let payload = result.expect("backend failures remain successful structured payloads");
+        assert_eq!(payload["error"]["code"], "semantic_backend");
+
+        let logs = host_calls
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("captured HostCall is valid JSON")
+            })
+            .filter(|frame| frame["method"] == "log")
+            .collect::<Vec<_>>();
+        assert!(
+            !logs.is_empty(),
+            "planner failure must emit a sanitized log HostCall"
+        );
+        for log in logs {
+            let rendered = log.to_string();
+            for secret in [
+                absolute_path.to_string_lossy().as_ref(),
+                external_uri,
+                replacement,
+                contents,
+                backend,
+            ] {
+                assert!(!rendered.contains(secret), "log HostCall leaked {secret}");
+            }
+        }
+    }
+
+    #[test]
+    fn path_rename_capability_waits_fifo_queue_and_replay_inbound_host_requests() {
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let first = json!({
+            "jsonrpc": "2.0", "id": 41, "method": "deliverEvent",
+            "params": { "data": { "type": "FileChanged", "path": "src/a.rs" } }
+        });
+        let second = json!({
+            "jsonrpc": "2.0", "id": 42, "method": "shutdown", "params": {}
+        });
+        let mut lines = vec![
+            Ok(first.to_string()),
+            Ok(second.to_string()),
+            Ok(json!({ "jsonrpc": "2.0", "id": 10_000, "result": "contents" }).to_string()),
+        ]
+        .into_iter();
+        let mut ids = HostCallIdAllocator::new(10_000);
+        let mut deferred = VecDeque::new();
+
+        assert_eq!(
+            read_file("src/a.rs", &out, &mut lines, &mut ids, &mut deferred).unwrap(),
+            "contents"
+        );
+        assert_eq!(deferred.pop_front(), protocol::frame_from_envelope(first));
+        assert_eq!(deferred.pop_front(), protocol::frame_from_envelope(second));
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn path_rename_initialize_contract_requires_no_capability_host_call_after_initialized() {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/lsp_extension");
+        let mut child = Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("prebuilt LSP sidecar binary is available for protocol testing");
+        let mut stdin = child.stdin.take().expect("sidecar stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocol_version": 1,
+                    "client_info": "path-rename-test",
+                    "extension_config": { "servers": {}, "idle_timeout_secs": null }
+                }
+            })
+        )
+        .expect("send initialize request");
+        let stdout = child.stdout.take().expect("sidecar stdout");
+        let first = std::io::BufReader::new(stdout)
+            .lines()
+            .next()
+            .expect("initialize emits a response")
+            .expect("read sidecar frame");
+        let first: Value = serde_json::from_str(&first).expect("valid JSON-RPC frame");
+        assert_eq!(first["result"]["type"], "Initialized");
+        assert!(
+            first["result"]["data"]["tools"]
+                .as_array()
+                .expect("initialized tools")
+                .iter()
+                .any(|tool| tool["name"] == "planPathRename")
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn diagnostic_severities_use_shared_mcp_vocabulary() {

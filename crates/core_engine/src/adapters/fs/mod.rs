@@ -66,11 +66,13 @@
 //! | other (write context)  | `WriteFailed(reason)`   |
 
 mod atomic;
+pub mod path_exclusion;
 mod real_fs;
 pub mod scan;
 
 pub(crate) use atomic::durable_write;
 
+pub use path_exclusion::WorkspacePathExclusion;
 pub use real_fs::RealFs;
 pub use scan::{ScanReport, scan as workspace_scan};
 

@@ -1278,8 +1278,8 @@ fn f007_t015_lsp_process_spawns_and_declares_implementations_and_rename_tools() 
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         tool_names.len(),
-        7,
-        "must declare exactly 7 tools; got: {tool_names:?}"
+        8,
+        "must declare exactly 8 tools; got: {tool_names:?}"
     );
     assert!(
         tool_names.contains(&"diagnostics"),
@@ -1289,6 +1289,7 @@ fn f007_t015_lsp_process_spawns_and_declares_implementations_and_rename_tools() 
         tool_names.contains(&"definition"),
         "must declare 'definition'; got: {tool_names:?}"
     );
+    assert!(tool_names.contains(&"planPathRename"));
     assert!(
         tool_names.contains(&"references"),
         "must declare 'references'; got: {tool_names:?}"
@@ -1775,6 +1776,74 @@ fn type_hierarchy_invalid_and_backend_failures_use_public_error_envelopes() {
     let serialized_logs = serde_json::to_string(&logs).unwrap();
     assert!(!serialized_logs.contains("PRIVATE_SOURCE_BYTES"));
     assert!(!serialized_logs.contains("PRIVATE_BACKEND_FAILURE"));
+}
+
+#[test]
+fn path_rename_malformed_params_use_invalid_params_error_at_process_boundary() {
+    let mut child = RawLspChild::spawn();
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 650,
+        "method": "invokeTool",
+        "params": {
+            "name": "planPathRename",
+            "params": {"moves": "not-an-array", "semantic_policy": "required"},
+        },
+    }));
+
+    let response = child.read_frame_bounded();
+    assert_eq!(response["id"], 650);
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(response.get("result").is_none());
+}
+
+#[test]
+fn path_rename_replays_deferred_host_requests_fifo_after_tool_result() {
+    let workspace = fake_lsp_workspace("path_rename_edit");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 651,
+        "method": "invokeTool",
+        "params": {
+            "name": "planPathRename",
+            "params": {
+                "moves": [{
+                    "source": "src/lib.rs",
+                    "destination": "src/renamed.rs",
+                    "kind": "file"
+                }],
+                "semantic_policy": "required"
+            },
+        },
+    }));
+    let read = child.read_frame_bounded();
+    assert_eq!(read["method"], "workspace/readFile");
+    assert_eq!(read["params"]["path"], "src/lib.rs");
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 652,
+        "method": "deliverEvent",
+        "params": {"data": {"type": "FileChanged", "path": "src/lib.rs"}}
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0", "id": 653, "method": "shutdown", "params": {}
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0", "id": read["id"], "result": "fn old_name() {}\n"
+    }));
+
+    let tool_result = child.read_frame_bounded();
+    assert_eq!(tool_result["id"], 651);
+    assert_eq!(tool_result["result"]["type"], "ToolResult");
+    assert!(tool_result["result"]["data"]["plan"].is_object());
+    assert_eq!(child.read_frame_bounded()["id"], 652);
+    assert_eq!(child.read_frame_bounded()["id"], 653);
 }
 
 #[test]
@@ -2536,12 +2605,13 @@ fn lsp_process_push_response_frame_during_idle_is_discarded() {
         .collect::<Vec<_>>();
     assert_eq!(
         tool_names.len(),
-        7,
-        "must declare 7 tools; got: {tool_names:?} (full resp: {init_resp})"
+        8,
+        "must declare 8 tools; got: {tool_names:?} (full resp: {init_resp})"
     );
     assert!(tool_names.contains(&"implementations"));
     assert!(tool_names.contains(&"type_hierarchy"));
     assert!(tool_names.contains(&"rename"));
+    assert!(tool_names.contains(&"planPathRename"));
 
     // ── 2. Inject a push-response frame (simulates host ACK of notify/resourceUpdated) ──
     //

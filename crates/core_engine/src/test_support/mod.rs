@@ -31,6 +31,376 @@ pub mod fixtures;
 
 pub use fixtures::{make_virtual_file, sample_content_hash};
 
+#[derive(Clone, Debug, Default)]
+pub struct PathExclusionFixture {
+    pub files: Vec<(crate::domain::RelativePath, Vec<u8>)>,
+    pub directories: Vec<crate::domain::RelativePath>,
+}
+
+pub struct InMemoryPathExclusion {
+    fixture: PathExclusionFixture,
+}
+
+impl InMemoryPathExclusion {
+    pub fn new(fixture: PathExclusionFixture) -> Self {
+        Self { fixture }
+    }
+}
+
+impl crate::ports::PathExclusionPort for InMemoryPathExclusion {
+    fn classify(
+        &self,
+        path: &crate::domain::RelativePath,
+    ) -> Result<crate::ports::PathExclusionDecision, crate::ports::PathExclusionError> {
+        use crate::ports::{PathExclusionDecision, PathExclusionError, PathExclusionReason};
+        use std::path::{Component, Path};
+
+        let candidate = Path::new(path.as_str());
+        if path.as_str().is_empty()
+            || candidate.is_absolute()
+            || candidate.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(PathExclusionError::OutsideWorkspace);
+        }
+
+        let components: Vec<_> = candidate
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                Component::CurDir => None,
+                _ => None,
+            })
+            .collect();
+
+        if components.contains(&".git") {
+            return Ok(PathExclusionDecision::Excluded(
+                PathExclusionReason::GitMetadata,
+            ));
+        }
+        if components
+            .iter()
+            .any(|component| component.starts_with('.'))
+        {
+            return Ok(PathExclusionDecision::Excluded(PathExclusionReason::Hidden));
+        }
+        if path.as_str().ends_with(".tmp_write") {
+            return Ok(PathExclusionDecision::Excluded(
+                PathExclusionReason::AtomicWriteArtifact,
+            ));
+        }
+        if path.as_str().ends_with(".~tmp") {
+            return Ok(PathExclusionDecision::Excluded(
+                PathExclusionReason::FormatterTemporary,
+            ));
+        }
+
+        let mut ignore_files: Vec<_> = self
+            .fixture
+            .files
+            .iter()
+            .filter(|(fixture_path, _)| {
+                Path::new(fixture_path.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(".towerignore")
+            })
+            .filter(|(fixture_path, _)| {
+                Path::new(fixture_path.as_str())
+                    .parent()
+                    .is_some_and(|parent| candidate.starts_with(parent))
+            })
+            .collect();
+        ignore_files
+            .sort_by_key(|(fixture_path, _)| Path::new(fixture_path.as_str()).components().count());
+
+        let is_directory = self
+            .fixture
+            .directories
+            .iter()
+            .any(|directory| directory.as_str() == path.as_str());
+        let mut ignored = false;
+        for (ignore_path, contents) in ignore_files {
+            let contents =
+                std::str::from_utf8(contents).map_err(|_| PathExclusionError::PolicyEvaluation)?;
+            let ignore_path = Path::new(ignore_path.as_str());
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(
+                ignore_path.parent().unwrap_or_else(|| Path::new("")),
+            );
+            for line in contents.lines() {
+                builder
+                    .add_line(Some(ignore_path.to_path_buf()), line)
+                    .map_err(|_| PathExclusionError::PolicyEvaluation)?;
+            }
+            let matcher = builder
+                .build()
+                .map_err(|_| PathExclusionError::PolicyEvaluation)?;
+            let direct_match = matcher.matched(candidate, is_directory);
+            if direct_match.is_whitelist() {
+                ignored = false;
+            } else if direct_match.is_ignore()
+                || matcher
+                    .matched_path_or_any_parents(candidate, is_directory)
+                    .is_ignore()
+            {
+                ignored = true;
+            }
+        }
+        if ignored {
+            return Ok(PathExclusionDecision::Excluded(
+                PathExclusionReason::IgnoreRule,
+            ));
+        }
+
+        Ok(PathExclusionDecision::Allowed)
+    }
+}
+
+pub fn path_exclusion_contract(
+    make: impl Fn(PathExclusionFixture) -> Box<dyn crate::ports::PathExclusionPort>,
+) {
+    use crate::domain::RelativePath;
+    use crate::ports::{PathExclusionDecision, PathExclusionError, PathExclusionReason};
+
+    let path = RelativePath::new;
+    let fixture = PathExclusionFixture {
+        files: vec![
+            (path(".towerignore"), b"target/\n*.generated.rs\n".to_vec()),
+            (
+                path("src/.towerignore"),
+                b"ignored/*\n!ignored/keep.rs\n".to_vec(),
+            ),
+        ],
+        directories: vec![path("target"), path("src/ignored")],
+    };
+    let port = make(fixture);
+    let cases = [
+        ("src/lib.rs", PathExclusionDecision::Allowed),
+        (
+            "target/debug/app",
+            PathExclusionDecision::Excluded(PathExclusionReason::IgnoreRule),
+        ),
+        (
+            "src/ignored/drop.rs",
+            PathExclusionDecision::Excluded(PathExclusionReason::IgnoreRule),
+        ),
+        ("src/ignored/keep.rs", PathExclusionDecision::Allowed),
+        (
+            "src/.private/config",
+            PathExclusionDecision::Excluded(PathExclusionReason::Hidden),
+        ),
+        (
+            ".git/index",
+            PathExclusionDecision::Excluded(PathExclusionReason::GitMetadata),
+        ),
+        (
+            "src/lib.rs.tmp_write",
+            PathExclusionDecision::Excluded(PathExclusionReason::AtomicWriteArtifact),
+        ),
+        (
+            "src/lib.rs.~tmp",
+            PathExclusionDecision::Excluded(PathExclusionReason::FormatterTemporary),
+        ),
+    ];
+
+    for (candidate, expected) in cases {
+        assert_eq!(
+            port.classify(&path(candidate)),
+            Ok(expected),
+            "classification for {candidate}"
+        );
+    }
+    assert_eq!(
+        port.classify(&path("../outside.rs")),
+        Err(PathExclusionError::OutsideWorkspace)
+    );
+    assert_eq!(
+        port.classify(&path("src/../outside.rs")),
+        Err(PathExclusionError::OutsideWorkspace)
+    );
+}
+
+#[cfg(test)]
+mod path_exclusion_contract {
+    use super::{InMemoryPathExclusion, PathExclusionFixture, path_exclusion_contract};
+    use crate::domain::RelativePath;
+    use crate::ports::{
+        PathExclusionDecision, PathExclusionError, PathExclusionPort, PathExclusionReason,
+    };
+
+    fn path(value: &str) -> RelativePath {
+        RelativePath::new(value)
+    }
+
+    #[test]
+    fn shared_fixture_has_exactly_files_and_directories() {
+        let PathExclusionFixture { files, directories } = PathExclusionFixture::default();
+
+        assert!(files.is_empty());
+        assert!(directories.is_empty());
+    }
+
+    fn classify(
+        fixture: PathExclusionFixture,
+        candidate: &str,
+    ) -> Result<PathExclusionDecision, PathExclusionError> {
+        InMemoryPathExclusion::new(fixture).classify(&path(candidate))
+    }
+
+    #[test]
+    fn public_outbound_port_classifies_workspace_relative_paths_through_an_object_safe_trait() {
+        let port: Box<dyn PathExclusionPort> =
+            Box::new(InMemoryPathExclusion::new(PathExclusionFixture::default()));
+
+        assert_eq!(
+            port.classify(&path("src/lib.rs")),
+            Ok(PathExclusionDecision::Allowed)
+        );
+    }
+
+    #[test]
+    fn public_decisions_reasons_and_errors_preserve_the_exact_policy_vocabulary() {
+        let decisions = [
+            PathExclusionDecision::Allowed,
+            PathExclusionDecision::Excluded(PathExclusionReason::IgnoreRule),
+            PathExclusionDecision::Excluded(PathExclusionReason::Hidden),
+            PathExclusionDecision::Excluded(PathExclusionReason::GitMetadata),
+            PathExclusionDecision::Excluded(PathExclusionReason::AtomicWriteArtifact),
+            PathExclusionDecision::Excluded(PathExclusionReason::FormatterTemporary),
+        ];
+        let errors = [
+            PathExclusionError::OutsideWorkspace,
+            PathExclusionError::SymlinkEscape,
+            PathExclusionError::PolicyEvaluation,
+        ];
+
+        assert_eq!(decisions.len(), 6);
+        assert_eq!(errors.len(), 3);
+        assert_eq!(
+            classify(PathExclusionFixture::default(), ".git/config"),
+            Ok(PathExclusionDecision::Excluded(
+                PathExclusionReason::GitMetadata
+            ))
+        );
+    }
+
+    #[test]
+    fn classify_returns_precise_exclusions_and_keeps_containment_failures_as_errors() {
+        let cases = [
+            (
+                "src/.cache/data.bin",
+                Ok(PathExclusionDecision::Excluded(PathExclusionReason::Hidden)),
+            ),
+            (
+                "src/main.rs.tmp_write",
+                Ok(PathExclusionDecision::Excluded(
+                    PathExclusionReason::AtomicWriteArtifact,
+                )),
+            ),
+            (
+                "src/main.rs.~tmp",
+                Ok(PathExclusionDecision::Excluded(
+                    PathExclusionReason::FormatterTemporary,
+                )),
+            ),
+            ("../outside.rs", Err(PathExclusionError::OutsideWorkspace)),
+        ];
+
+        for (candidate, expected) in cases {
+            assert_eq!(
+                classify(PathExclusionFixture::default(), candidate),
+                expected,
+                "classification for {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_returns_policy_evaluation_for_invalid_ignore_policy() {
+        let fixture = PathExclusionFixture {
+            files: vec![(path(".towerignore"), vec![0xff])],
+            ..PathExclusionFixture::default()
+        };
+
+        assert_eq!(
+            classify(fixture, "src/lib.rs"),
+            Err(PathExclusionError::PolicyEvaluation)
+        );
+    }
+
+    #[test]
+    fn configurable_in_memory_fake_runs_the_shared_path_exclusion_contract() {
+        path_exclusion_contract(|fixture| Box::new(InMemoryPathExclusion::new(fixture)));
+    }
+
+    #[test]
+    fn contract_covers_nested_towerignore_negation_hidden_git_and_temporary_paths() {
+        let fixture = PathExclusionFixture {
+            files: vec![
+                (path(".towerignore"), b"target/\n*.generated.rs\n".to_vec()),
+                (
+                    path("src/.towerignore"),
+                    b"ignored/*\n!ignored/keep.rs\n".to_vec(),
+                ),
+            ],
+            directories: vec![path("target"), path("src/ignored")],
+        };
+        let cases = [
+            ("src/lib.rs", PathExclusionDecision::Allowed),
+            (
+                "target/debug/app",
+                PathExclusionDecision::Excluded(PathExclusionReason::IgnoreRule),
+            ),
+            (
+                "src/ignored/drop.rs",
+                PathExclusionDecision::Excluded(PathExclusionReason::IgnoreRule),
+            ),
+            ("src/ignored/keep.rs", PathExclusionDecision::Allowed),
+            (
+                "src/.private/config",
+                PathExclusionDecision::Excluded(PathExclusionReason::Hidden),
+            ),
+            (
+                ".git/index",
+                PathExclusionDecision::Excluded(PathExclusionReason::GitMetadata),
+            ),
+            (
+                "src/lib.rs.tmp_write",
+                PathExclusionDecision::Excluded(PathExclusionReason::AtomicWriteArtifact),
+            ),
+            (
+                "src/lib.rs.~tmp",
+                PathExclusionDecision::Excluded(PathExclusionReason::FormatterTemporary),
+            ),
+        ];
+
+        let port = InMemoryPathExclusion::new(fixture);
+        for (candidate, expected) in cases {
+            assert_eq!(
+                port.classify(&path(candidate)),
+                Ok(expected),
+                "classification for {candidate}"
+            );
+        }
+        assert_eq!(
+            port.classify(&path("../../escape")),
+            Err(PathExclusionError::OutsideWorkspace)
+        );
+    }
+
+    #[test]
+    fn classify_allows_an_ordinary_workspace_file() {
+        assert_eq!(
+            classify(PathExclusionFixture::default(), "README.md"),
+            Ok(PathExclusionDecision::Allowed)
+        );
+    }
+}
+
 #[test]
 fn reconciliation_delta_contract_shape_is_stable() {
     use crate::domain::{ContentHash, FileId, VirtualFile};
@@ -115,6 +485,25 @@ macro_rules! storage_contract_tests {
             use $crate::test_support::{make_virtual_file, sample_content_hash};
 
             $crate::__storage_reconciliation_contract_test!($($reconciliation_test)?);
+
+            #[test]
+            fn reconciliation_delta_replaces_a_path_without_changing_identity() {
+                use $crate::ports::ReconciliationDelta;
+
+                let mut store = ($make)();
+                let source = make_virtual_file(7, 3, "src/old.rs");
+                let destination = make_virtual_file(7, 3, "src/new.rs");
+                store.put(source.clone()).unwrap();
+
+                store
+                    .apply_reconciliation_delta(&ReconciliationDelta {
+                        additions: vec![destination.clone()],
+                        removals: vec![source.id],
+                    })
+                    .unwrap();
+
+                assert_eq!(store.get(source.id).unwrap(), destination);
+            }
 
             #[test]
             fn put_then_get_returns_same_file() {

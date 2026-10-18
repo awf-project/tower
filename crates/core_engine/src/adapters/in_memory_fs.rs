@@ -68,11 +68,26 @@ impl FileSystemPort for InMemoryFs {
     /// After this method returns the caller cannot observe any intermediate
     /// state where `from` still exists alongside `to`.
     fn rename(&mut self, from: &RelativePath, to: RelativePath) -> Result<(), PortError> {
-        let bytes = self
+        if let Some(bytes) = self.files.remove(from.as_str()) {
+            self.files.insert(to.as_str().to_owned(), bytes);
+            return Ok(());
+        }
+
+        let prefix = format!("{}/", from.as_str());
+        let descendants: Vec<_> = self
             .files
-            .remove(from.as_str())
-            .ok_or(PortError::NotFound)?;
-        self.files.insert(to.as_str().to_owned(), bytes);
+            .keys()
+            .filter(|path| path.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if descendants.is_empty() {
+            return Err(PortError::NotFound);
+        }
+        for source in descendants {
+            let suffix = source.strip_prefix(from.as_str()).expect("matched prefix");
+            let bytes = self.files.remove(&source).expect("key was collected");
+            self.files.insert(format!("{}{suffix}", to.as_str()), bytes);
+        }
         Ok(())
     }
 
