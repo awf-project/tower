@@ -54,6 +54,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use core_engine::adapters::config::lsp::{LspInitializeError, decode_lsp_initialize_config};
+use extension_protocol::messages::PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON;
 use extension_protocol::{
     Capability, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response, ToolDecl,
 };
@@ -248,6 +249,11 @@ fn main() {
                             description: "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}"#.to_owned(),
                         },
+                        ToolDecl {
+                            name: "planPathRename".to_owned(),
+                            description: "Plan semantic source edits for workspace path moves without applying filesystem mutations.".to_owned(),
+                            schema_json: PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON.to_owned(),
+                        },
                     ],
                     events: vec![
                         "event/fileChanged".to_owned(),
@@ -293,6 +299,9 @@ fn main() {
                 match result {
                     Ok(value) => {
                         protocol::send_response(&stdout_lock, &id, &Response::ToolResult(value));
+                    }
+                    Err(tools::ToolDispatchError::InvalidParams(err_msg)) => {
+                        protocol::send_error(&stdout_lock, &id, -32602, &err_msg);
                     }
                     Err(tools::ToolDispatchError::Legacy(err_msg)) => {
                         protocol::send_error(&stdout_lock, &id, -32000, &err_msg);

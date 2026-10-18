@@ -71,25 +71,36 @@
 #![forbid(unsafe_code)]
 
 use std::num::NonZeroUsize;
-use std::sync::{Arc, RwLock};
+use std::path::{Component, Path};
+use std::sync::{Arc, Mutex, RwLock};
 
+use extension_protocol::messages as wire;
 use serde_json::{Value, json};
 
+use crate::adapters::fs::WorkspacePathExclusion;
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
+use crate::adapters::watcher::RenameCoordinator;
 use crate::domain::index::{FileSearch, InvertedIndex};
 use crate::domain::mutation::{FileMutationService, compute_content_version};
+use crate::domain::refactor::{
+    PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult, PathRenameSemanticPolicy,
+    PathRenameStatus,
+};
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::FileMetadata;
 use crate::domain::workspace::ProjectWorkspace;
-use crate::domain::{DomainError, RelativePath};
+use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::inbound::{
-    DirectoryEntryKind, FileMutationUseCase, ListDirRequest, SearchUseCase,
+    DirectoryEntryKind, FileMutationUseCase, ListDirRequest, SearchUseCase, WorkspaceEditSpan,
 };
-use crate::ports::{ExtensionHostPort, FileSystemPort, NoOpExtensionHost, StoragePort};
+use crate::ports::{
+    ExtensionHostPort, FileSystemPort, NoOpExtensionHost, PathExclusionDecision,
+    PathExclusionError, PathExclusionPort, StoragePort,
+};
 
 /// Canonical ordered native MCP tool surface.
-pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 10] = [
+pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 11] = [
     "tower_find_file",
     "tower_list_dir",
     "tower_search_text",
@@ -100,6 +111,7 @@ pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 10] = [
     "tower_global_replace",
     "tower_edit_range",
     "tower_reindex",
+    "tower_rename_path",
 ];
 
 // ── EngineState ───────────────────────────────────────────────────────────────
@@ -218,13 +230,26 @@ impl EngineState {
 /// ```
 pub struct NativeToolRegistry {
     state: Arc<RwLock<EngineState>>,
+    rename_coordinator: Arc<RenameCoordinator>,
 }
 
 impl NativeToolRegistry {
     /// Construct a registry wrapping the given shared engine state.
     #[must_use]
     pub fn new(state: Arc<RwLock<EngineState>>) -> Self {
-        Self { state }
+        Self::with_rename_coordinator(state, Arc::new(RenameCoordinator::default()))
+    }
+
+    /// Construct a registry sharing the daemon watcher's rename coordinator.
+    #[must_use]
+    pub fn with_rename_coordinator(
+        state: Arc<RwLock<EngineState>>,
+        rename_coordinator: Arc<RenameCoordinator>,
+    ) -> Self {
+        Self {
+            state,
+            rename_coordinator,
+        }
     }
 }
 
@@ -241,6 +266,7 @@ impl ToolRegistry for NativeToolRegistry {
             tool_global_replace_desc(),
             tool_edit_range_desc(),
             tool_reindex_desc(),
+            tool_rename_path_desc(),
         ];
         debug_assert_eq!(
             tools
@@ -264,6 +290,7 @@ impl ToolRegistry for NativeToolRegistry {
             "tower_global_replace" => call_global_replace(&self.state, args),
             "tower_edit_range" => call_edit_range(&self.state, args),
             "tower_reindex" => call_reindex(&self.state),
+            "tower_rename_path" => call_rename_path(&self.state, &self.rename_coordinator, args),
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -509,6 +536,17 @@ fn tool_reindex_desc() -> ToolDesc {
             "properties": {},
             "additionalProperties": false
         }),
+    }
+}
+
+fn tool_rename_path_desc() -> ToolDesc {
+    ToolDesc {
+        name: "tower_rename_path".to_owned(),
+        description:
+            "Rename a workspace-relative file or directory, optionally planning semantic edits."
+                .to_owned(),
+        input_schema: serde_json::from_str(wire::PATH_RENAME_REQUEST_SCHEMA_JSON)
+            .expect("canonical path-rename request schema is valid JSON"),
     }
 }
 
@@ -950,6 +988,440 @@ fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
     Ok(json!({ "files_indexed": files_indexed }))
 }
 
+fn call_rename_path(
+    state: &Arc<RwLock<EngineState>>,
+    rename_coordinator: &RenameCoordinator,
+    args: Value,
+) -> Result<Value, ToolError> {
+    let request: wire::PathRenameRequest = serde_json::from_value(args)
+        .map_err(|_| ToolError::InvalidArgs("invalid tower_rename_path arguments".to_owned()))?;
+    let policy = domain_rename_policy(request.semantic_policy);
+    let domain_request = PathRenameRequest {
+        source: RelativePath::new(request.source),
+        destination: RelativePath::new(request.destination),
+        dry_run: request.dry_run,
+        semantic_policy: policy,
+        expected_versions: request
+            .expected_versions
+            .into_iter()
+            .map(|(path, version)| (RelativePath::new(path), version.to_ascii_lowercase()))
+            .collect(),
+    };
+    let exclusions: Box<dyn PathExclusionPort> = {
+        let guard = state.read().map_err(lock_poisoned)?;
+        match guard.fs.workspace_root() {
+            Some(root) => Box::new(WorkspacePathExclusion::new(root).map_err(|_| {
+                ToolError::ExecutionFailed("failed to load workspace exclusion policy".to_owned())
+            })?),
+            None => Box::new(StructuralPathExclusion),
+        }
+    };
+
+    let extension_host = state
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .extension_host();
+    let native_plan = match with_path_rename_state(state, |locked| {
+        locked
+            .service(extension_host.as_ref())
+            .plan_path_rename(domain_request, exclusions.as_ref())
+    }) {
+        Ok(plan) => plan,
+        Err(error) => return serialize_rename_failure(None, policy, error),
+    };
+
+    let semantic = if policy == PathRenameSemanticPolicy::None {
+        None
+    } else {
+        Some(request_semantic_rename(
+            extension_host.as_ref(),
+            &native_plan,
+        ))
+    };
+
+    let deferred_host = Arc::new(DeferredRenameHost::default());
+    let applied = with_path_rename_state(state, |locked| {
+        let (ready, rename_guard, apply_result) = {
+            let mut service = locked.service(deferred_host.as_ref());
+            let ready = match semantic {
+                Some(semantic) => {
+                    match service.complete_path_rename_plan(native_plan.clone(), semantic) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            return Err(RenameApplyError::Domain(Box::new(native_plan), error));
+                        }
+                    }
+                }
+                None => native_plan,
+            };
+            let rename_guard = if ready.dry_run() {
+                None
+            } else {
+                Some(
+                    rename_coordinator
+                        .register_engine_owned(ready.moves())
+                        .map_err(|_| RenameApplyError::Coordination)?,
+                )
+            };
+            let apply_result = service.apply_path_rename(ready.clone(), exclusions.as_ref());
+            (ready, rename_guard, apply_result)
+        };
+        match apply_result {
+            Ok(result) => {
+                let committed_files = if matches!(
+                    result.status,
+                    PathRenameStatus::Applied | PathRenameStatus::Partial
+                ) {
+                    ready
+                        .moves()
+                        .iter()
+                        .filter_map(|path_move| {
+                            locked
+                                .workspace
+                                .get_by_path(&path_move.destination)
+                                .and_then(|id| locked.workspace.get(id).ok())
+                                .cloned()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok((result, rename_guard, committed_files))
+            }
+            Err(error) => Err(RenameApplyError::Domain(Box::new(ready), error)),
+        }
+    });
+    let (result, mut rename_guard, committed_files) = match applied {
+        Ok(applied) => applied,
+        Err(RenameApplyError::Domain(plan, error)) => {
+            return serialize_rename_failure(Some(&plan), policy, error);
+        }
+        Err(RenameApplyError::Coordination) => {
+            return Err(ToolError::ExecutionFailed(
+                "failed to coordinate path rename".to_owned(),
+            ));
+        }
+    };
+
+    if let Some(rename_guard) = rename_guard.as_mut() {
+        rename_guard.commit(&committed_files);
+    }
+    let mut notifications = deferred_host.drain_changed();
+    for file in &committed_files {
+        if !notifications
+            .iter()
+            .any(|(id, path)| *id == file.id && *path == file.path)
+        {
+            notifications.push((file.id, file.path.clone()));
+        }
+    }
+    for (id, path) in notifications {
+        extension_host.on_file_changed(id, &path);
+    }
+    drop(rename_guard);
+    serialize_rename_result(&result)
+}
+
+enum RenameApplyError {
+    Domain(Box<PathRenamePlan>, PathRenameError),
+    Coordination,
+}
+
+struct LockedRenameState<'a> {
+    fs: &'a mut dyn FileSystemPort,
+    workspace: &'a mut ProjectWorkspace,
+    index: &'a mut InvertedIndex,
+    storage: &'a mut dyn StoragePort,
+}
+
+impl LockedRenameState<'_> {
+    fn service<'a>(&'a mut self, host: &'a dyn ExtensionHostPort) -> FileMutationService<'a> {
+        FileMutationService::new(self.fs, self.workspace, self.index, self.storage, host)
+    }
+}
+
+// The closure owns the complete state -> workspace -> index critical section.
+// Sidecar I/O and extension callbacks must run after this function returns.
+fn with_path_rename_state<T>(
+    state: &Arc<RwLock<EngineState>>,
+    f: impl FnOnce(&mut LockedRenameState<'_>) -> T,
+) -> T {
+    let mut guard = state.write().unwrap_or_else(|poison| poison.into_inner());
+    let workspace = Arc::clone(&guard.workspace);
+    let index = Arc::clone(&guard.index);
+    let mut workspace = workspace
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut index = index.write().unwrap_or_else(|poison| poison.into_inner());
+    let EngineState { fs, storage, .. } = &mut *guard;
+    f(&mut LockedRenameState {
+        fs: fs.as_mut(),
+        workspace: &mut workspace,
+        index: &mut index,
+        storage: storage.as_mut(),
+    })
+}
+
+#[derive(Default)]
+struct DeferredRenameHost {
+    changed: Mutex<Vec<(FileId, RelativePath)>>,
+}
+
+impl DeferredRenameHost {
+    fn drain_changed(&self) -> Vec<(FileId, RelativePath)> {
+        self.changed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .drain(..)
+            .collect()
+    }
+}
+
+impl ExtensionHostPort for DeferredRenameHost {
+    fn on_file_indexed(&self, _id: FileId, _path: &RelativePath) {}
+
+    fn on_file_changed(&self, id: FileId, path: &RelativePath) {
+        self.changed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push((id, path.clone()));
+    }
+
+    fn on_file_deleted(&self, _path: &RelativePath) {}
+
+    fn declared_tools(&self) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
+        Vec::new()
+    }
+
+    fn invoke(&self, tool_name: &str, _params: Value) -> Result<Value, crate::domain::InvokeError> {
+        Err(crate::domain::InvokeError::ToolNotFound(
+            tool_name.to_owned(),
+        ))
+    }
+}
+
+struct StructuralPathExclusion;
+
+impl PathExclusionPort for StructuralPathExclusion {
+    fn classify(&self, path: &RelativePath) -> Result<PathExclusionDecision, PathExclusionError> {
+        if path.as_str().is_empty()
+            || Path::new(path.as_str()).is_absolute()
+            || Path::new(path.as_str()).components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            Err(PathExclusionError::OutsideWorkspace)
+        } else {
+            Ok(PathExclusionDecision::Allowed)
+        }
+    }
+}
+
+fn domain_rename_policy(policy: wire::PathRenameSemanticPolicy) -> PathRenameSemanticPolicy {
+    match policy {
+        wire::PathRenameSemanticPolicy::None => PathRenameSemanticPolicy::None,
+        wire::PathRenameSemanticPolicy::BestEffort => PathRenameSemanticPolicy::BestEffort,
+        wire::PathRenameSemanticPolicy::Required => PathRenameSemanticPolicy::Required,
+    }
+}
+
+fn wire_rename_policy(policy: PathRenameSemanticPolicy) -> wire::PathRenameSemanticPolicy {
+    match policy {
+        PathRenameSemanticPolicy::None => wire::PathRenameSemanticPolicy::None,
+        PathRenameSemanticPolicy::BestEffort => wire::PathRenameSemanticPolicy::BestEffort,
+        PathRenameSemanticPolicy::Required => wire::PathRenameSemanticPolicy::Required,
+    }
+}
+
+fn wire_rename_plan(plan: &PathRenamePlan) -> wire::PathRenamePlan {
+    wire::PathRenamePlan {
+        moves: plan
+            .moves()
+            .iter()
+            .map(|path_move| wire::PathMove {
+                source: path_move.source.as_str().to_owned(),
+                destination: path_move.destination.as_str().to_owned(),
+                kind: match path_move.kind {
+                    DirectoryEntryKind::File => wire::PathMoveKind::File,
+                    DirectoryEntryKind::Dir => wire::PathMoveKind::Directory,
+                },
+            })
+            .collect(),
+        edits: plan
+            .edits()
+            .iter()
+            .map(|edit| wire::WorkspaceEditSpan {
+                path: edit.path.as_str().to_owned(),
+                start_byte: edit.start_byte,
+                end_byte: edit.end_byte,
+                replacement: edit.replacement.clone(),
+                base_hash: edit.base_hash.clone(),
+            })
+            .collect(),
+        semantic_policy: wire_rename_policy(plan.semantic_policy()),
+    }
+}
+
+fn request_semantic_rename(
+    host: &dyn ExtensionHostPort,
+    native_plan: &PathRenamePlan,
+) -> Result<Vec<WorkspaceEditSpan>, PathRenameError> {
+    let request = wire::PathRenamePlanningRequest {
+        moves: wire_rename_plan(native_plan).moves,
+        semantic_policy: wire_rename_policy(native_plan.semantic_policy()),
+    };
+    let params = serde_json::to_value(&request).map_err(|_| PathRenameError::SemanticBackend)?;
+    let value = host
+        .invoke("planPathRename", params)
+        .map_err(|error| match error {
+            crate::domain::extension_host::InvokeError::ToolNotFound(_) => {
+                PathRenameError::SemanticUnsupported
+            }
+            _ => PathRenameError::SemanticBackend,
+        })?;
+    let response: wire::PathRenamePlanningResult =
+        serde_json::from_value(value).map_err(|_| PathRenameError::SemanticBackend)?;
+    if let Some(error) = response.error {
+        return Err(domain_rename_error_code(error.code));
+    }
+    let plan = response.plan.ok_or(PathRenameError::SemanticBackend)?;
+    let expected = wire_rename_plan(native_plan);
+    if plan.moves != expected.moves || plan.semantic_policy != expected.semantic_policy {
+        return Err(PathRenameError::SemanticBackend);
+    }
+    plan.edits
+        .into_iter()
+        .map(|edit| {
+            Ok(WorkspaceEditSpan {
+                path: RelativePath::new(edit.path),
+                start_byte: edit.start_byte,
+                end_byte: edit.end_byte,
+                replacement: edit.replacement,
+                base_hash: edit.base_hash,
+            })
+        })
+        .collect()
+}
+
+fn domain_rename_error_code(code: wire::PathRenameErrorCode) -> PathRenameError {
+    match code {
+        wire::PathRenameErrorCode::SemanticUnsupported => PathRenameError::SemanticUnsupported,
+        wire::PathRenameErrorCode::WorkspaceEscape => PathRenameError::WorkspaceEscape {
+            path: RelativePath::new("semantic-target"),
+        },
+        _ => PathRenameError::SemanticBackend,
+    }
+}
+
+fn serialize_rename_failure(
+    plan: Option<&PathRenamePlan>,
+    policy: PathRenameSemanticPolicy,
+    error: PathRenameError,
+) -> Result<Value, ToolError> {
+    let status = if error == PathRenameError::SemanticUnsupported {
+        wire::PathRenameStatus::Unsupported
+    } else {
+        wire::PathRenameStatus::Rejected
+    };
+    let plan = plan.map_or_else(
+        || wire::PathRenamePlan {
+            moves: Vec::new(),
+            edits: Vec::new(),
+            semantic_policy: wire_rename_policy(policy),
+        },
+        wire_rename_plan,
+    );
+    serde_json::to_value(wire::PathRenameResult {
+        status,
+        plan,
+        edit_result: None,
+        errors: vec![wire_rename_error(&error)],
+    })
+    .map_err(|_| ToolError::ExecutionFailed("failed to serialize path rename result".to_owned()))
+}
+
+fn wire_rename_error(error: &PathRenameError) -> wire::PathRenameError {
+    let (code, path) = match error {
+        PathRenameError::SourceNotFound { path } => {
+            (wire::PathRenameErrorCode::SourceNotFound, Some(path))
+        }
+        PathRenameError::DestinationExists { path } => {
+            (wire::PathRenameErrorCode::DestinationExists, Some(path))
+        }
+        PathRenameError::IdenticalPaths { path } => {
+            (wire::PathRenameErrorCode::IdenticalPaths, Some(path))
+        }
+        PathRenameError::DestinationInsideSource { destination, .. } => (
+            wire::PathRenameErrorCode::DestinationInsideSource,
+            Some(destination),
+        ),
+        PathRenameError::DestinationExcluded { path, .. } => {
+            (wire::PathRenameErrorCode::DestinationExcluded, Some(path))
+        }
+        PathRenameError::WorkspaceEscape { path } => {
+            (wire::PathRenameErrorCode::WorkspaceEscape, Some(path))
+        }
+        PathRenameError::DuplicateDestination { path } => {
+            (wire::PathRenameErrorCode::DuplicateDestination, Some(path))
+        }
+        PathRenameError::InvalidExpectedVersion { path } => (
+            wire::PathRenameErrorCode::InvalidExpectedVersion,
+            Some(path),
+        ),
+        PathRenameError::SemanticUnsupported => {
+            (wire::PathRenameErrorCode::SemanticUnsupported, None)
+        }
+        PathRenameError::SemanticBackend => (wire::PathRenameErrorCode::SemanticBackend, None),
+        PathRenameError::Filesystem => (wire::PathRenameErrorCode::FilesystemError, None),
+        PathRenameError::Persistence => (wire::PathRenameErrorCode::PersistenceError, None),
+        PathRenameError::VersionConflict { path, .. } => {
+            (wire::PathRenameErrorCode::CasConflict, Some(path))
+        }
+    };
+    wire::PathRenameError {
+        code,
+        path: path.map(|path| path.as_str().to_owned()),
+        message: String::new(),
+    }
+}
+
+fn serialize_rename_result(result: &PathRenameResult) -> Result<Value, ToolError> {
+    let status = match result.status {
+        PathRenameStatus::Preview => wire::PathRenameStatus::Preview,
+        PathRenameStatus::Applied => wire::PathRenameStatus::Applied,
+        PathRenameStatus::Partial => wire::PathRenameStatus::Partial,
+        PathRenameStatus::Unsupported => wire::PathRenameStatus::Unsupported,
+        PathRenameStatus::Rejected => wire::PathRenameStatus::Rejected,
+    };
+    serde_json::to_value(wire::PathRenameResult {
+        status,
+        plan: wire_rename_plan(&result.plan),
+        edit_result: result.edit_result.as_ref().map(|edit_result| {
+            wire::WorkspaceApplyEditsResult {
+                files_changed: edit_result.files_changed,
+                per_file: edit_result
+                    .per_file
+                    .iter()
+                    .map(|file| wire::PerFileEditResult {
+                        path: file.path.as_str().to_owned(),
+                        applied: file.applied,
+                        edits_applied: file.edits_applied,
+                        edits_skipped: file.edits_skipped,
+                        new_version: file.new_version.clone(),
+                        preview: file.preview.clone(),
+                        error: None,
+                    })
+                    .collect(),
+            }
+        }),
+        errors: result.errors.iter().map(wire_rename_error).collect(),
+    })
+    .map_err(|_| ToolError::ExecutionFailed("failed to serialize path rename result".to_owned()))
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 /// Extract a required string field from a JSON args object.
@@ -1245,7 +1717,7 @@ mod tests {
     fn t009_expected_native_tool_names_include_list_dir() {
         let expected = EXPECTED_NATIVE_TOOL_NAMES;
 
-        assert_eq!(expected.len(), 10);
+        assert_eq!(expected.len(), 11);
         assert!(
             expected.contains(&"tower_list_dir"),
             "expected native tool names must include tower_list_dir; got {expected:?}"

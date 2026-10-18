@@ -19,7 +19,9 @@
 //! - `{"type":"DeliverEvent","data":{"type":"FileIndexed","file_id":1,"path":"/x"}}`
 //! - `{"type":"Shutdown"}`  ← unit variant: no `data` key emitted
 
-use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::fault::ProtocolError;
@@ -399,6 +401,383 @@ pub struct WorkspaceEditSpan {
 pub struct WorkspaceApplyEditsResult {
     pub files_changed: usize,
     pub per_file: Vec<PerFileEditResult>,
+}
+
+/// JSON Schema for the public path-rename request exposed by the native tool.
+pub const PATH_RENAME_REQUEST_SCHEMA_JSON: &str = r#"{
+  "type":"object",
+  "properties":{
+    "source":{"type":"string"},
+    "destination":{"type":"string"},
+    "dry_run":{"type":"boolean","default":false},
+    "semantic_policy":{"type":"string","enum":["none","best_effort","required"]},
+    "expected_versions":{"type":"object","additionalProperties":{"type":"string","pattern":"^[0-9A-Fa-f]{64}$"},"default":{}}
+  },
+  "required":["source","destination","semantic_policy"],
+  "additionalProperties":false
+}"#;
+
+/// JSON Schema for the internal sidecar path-planning request.
+pub const PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON: &str = r#"{"type":"object","properties":{"moves":{"type":"array","items":{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"kind":{"type":"string","enum":["file","directory"]}},"required":["source","destination","kind"],"additionalProperties":false}},"semantic_policy":{"type":"string","enum":["none","best_effort","required"]}},"required":["moves","semantic_policy"],"additionalProperties":false}"#;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PathRenameRequest {
+    pub source: String,
+    pub destination: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    pub semantic_policy: PathRenameSemanticPolicy,
+    #[serde(default)]
+    pub expected_versions: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathRenameRequestWire {
+    source: String,
+    destination: String,
+    #[serde(default)]
+    dry_run: bool,
+    semantic_policy: PathRenameSemanticPolicy,
+    #[serde(default)]
+    expected_versions: HashMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for PathRenameRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PathRenameRequestWire::deserialize(deserializer)?;
+        if wire
+            .expected_versions
+            .values()
+            .any(|version| !is_sha256(version))
+        {
+            return Err(serde::de::Error::custom(
+                "expected versions must be 64-character hexadecimal SHA-256 values",
+            ));
+        }
+        Ok(Self {
+            source: wire.source,
+            destination: wire.destination,
+            dry_run: wire.dry_run,
+            semantic_policy: wire.semantic_policy,
+            expected_versions: wire.expected_versions,
+        })
+    }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMove {
+    pub source: String,
+    pub destination: String,
+    pub kind: PathMoveKind,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathMoveWire {
+    source: String,
+    destination: String,
+    kind: PathMoveKind,
+}
+
+impl Serialize for PathMove {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if !is_workspace_relative(&self.source) || !is_workspace_relative(&self.destination) {
+            return Err(serde::ser::Error::custom(
+                "path rename moves require workspace-relative paths",
+            ));
+        }
+        PathMoveWire {
+            source: self.source.clone(),
+            destination: self.destination.clone(),
+            kind: self.kind,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PathMove {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PathMoveWire::deserialize(deserializer)?;
+        if !is_workspace_relative(&wire.source) || !is_workspace_relative(&wire.destination) {
+            return Err(serde::de::Error::custom(
+                "path rename moves require workspace-relative paths",
+            ));
+        }
+        Ok(Self {
+            source: wire.source,
+            destination: wire.destination,
+            kind: wire.kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathMoveKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathRenameSemanticPolicy {
+    None,
+    BestEffort,
+    Required,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRenamePlan {
+    pub moves: Vec<PathMove>,
+    pub edits: Vec<WorkspaceEditSpan>,
+    pub semantic_policy: PathRenameSemanticPolicy,
+}
+
+impl Serialize for PathRenamePlan {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.edits.iter().any(|edit| {
+            !is_workspace_relative(&edit.path)
+                || edit
+                    .base_hash
+                    .as_deref()
+                    .is_none_or(|hash| !is_sha256(hash))
+        }) {
+            return Err(serde::ser::Error::custom(
+                "path rename plan edits require workspace-relative paths and valid base_hash values",
+            ));
+        }
+        PathRenamePlanWireRef {
+            moves: &self.moves,
+            edits: &self.edits,
+            semantic_policy: self.semantic_policy,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+struct PathRenamePlanWireRef<'a> {
+    moves: &'a [PathMove],
+    edits: &'a [WorkspaceEditSpan],
+    semantic_policy: PathRenameSemanticPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathRenamePlanWire {
+    moves: Vec<PathMove>,
+    edits: Vec<WorkspaceEditSpan>,
+    semantic_policy: PathRenameSemanticPolicy,
+}
+
+impl<'de> Deserialize<'de> for PathRenamePlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PathRenamePlanWire::deserialize(deserializer)?;
+        if wire.edits.iter().any(|edit| {
+            !is_workspace_relative(&edit.path)
+                || edit
+                    .base_hash
+                    .as_deref()
+                    .is_none_or(|hash| !is_sha256(hash))
+        }) {
+            return Err(serde::de::Error::custom(
+                "path rename plan edits require workspace-relative paths and valid base_hash values",
+            ));
+        }
+        Ok(Self {
+            moves: wire.moves,
+            edits: wire.edits,
+            semantic_policy: wire.semantic_policy,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathRenameStatus {
+    Preview,
+    Applied,
+    Partial,
+    Unsupported,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRenameResult {
+    pub status: PathRenameStatus,
+    pub plan: PathRenamePlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_result: Option<WorkspaceApplyEditsResult>,
+    #[serde(default)]
+    pub errors: Vec<PathRenameError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRenamePlanningRequest {
+    pub moves: Vec<PathMove>,
+    pub semantic_policy: PathRenameSemanticPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRenamePlanningResult {
+    pub plan: Option<PathRenamePlan>,
+    pub error: Option<PathRenameError>,
+}
+
+impl Serialize for PathRenamePlanningResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.plan.is_some() == self.error.is_some() {
+            return Err(serde::ser::Error::custom(
+                "path rename planning result requires exactly one of plan or error",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            plan: Option<&'a PathRenamePlan>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a PathRenameError>,
+        }
+        Wire {
+            plan: self.plan.as_ref(),
+            error: self.error.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathRenamePlanningResultWire {
+    plan: Option<PathRenamePlan>,
+    error: Option<PathRenameError>,
+}
+
+impl<'de> Deserialize<'de> for PathRenamePlanningResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PathRenamePlanningResultWire::deserialize(deserializer)?;
+        if wire.plan.is_some() == wire.error.is_some() {
+            return Err(serde::de::Error::custom(
+                "path rename planning result requires exactly one of plan or error",
+            ));
+        }
+        Ok(Self {
+            plan: wire.plan,
+            error: wire.error,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRenameError {
+    pub code: PathRenameErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub message: String,
+}
+
+impl Serialize for PathRenameError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            code: PathRenameErrorCode,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            path: Option<&'a str>,
+            message: &'a str,
+        }
+
+        let path = self
+            .path
+            .as_deref()
+            .filter(|path| is_workspace_relative(path));
+        let message = self.code.public_message();
+        Wire {
+            code: self.code,
+            path,
+            message,
+        }
+        .serialize(serializer)
+    }
+}
+
+fn is_workspace_relative(path: &str) -> bool {
+    !path.is_empty()
+        && std::path::Path::new(path).components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathRenameErrorCode {
+    SourceNotFound,
+    DestinationExists,
+    IdenticalPaths,
+    DestinationInsideSource,
+    DestinationExcluded,
+    WorkspaceEscape,
+    DuplicateDestination,
+    InvalidExpectedVersion,
+    SemanticUnsupported,
+    SemanticBackend,
+    FilesystemError,
+    PersistenceError,
+    CasConflict,
+}
+
+impl PathRenameErrorCode {
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::SourceNotFound => "Source path was not found",
+            Self::DestinationExists => "Destination path already exists",
+            Self::IdenticalPaths => "Source and destination paths are identical",
+            Self::DestinationInsideSource => "Destination is inside the source path",
+            Self::DestinationExcluded => "Destination path is excluded",
+            Self::WorkspaceEscape => "Path is outside the workspace",
+            Self::DuplicateDestination => "Multiple moves have the same destination",
+            Self::InvalidExpectedVersion => "Expected version is invalid",
+            Self::SemanticUnsupported => "Semantic rename is unavailable",
+            Self::SemanticBackend => "Semantic planning failed",
+            Self::FilesystemError => "Filesystem operation failed",
+            Self::PersistenceError => "Persistence operation failed",
+            Self::CasConflict => "File changed before semantic edits were applied",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

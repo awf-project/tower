@@ -50,3 +50,8 @@ schema_json = '{"type":"object","properties":{"path":{"type":"string","descripti
 name        = "rename"
 description = "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability."
 schema_json = '{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}'
+
+[[tools]]
+name        = "planPathRename"
+description = "Plan semantic source edits for workspace path moves without applying filesystem mutations."
+schema_json = '{"type":"object","properties":{"moves":{"type":"array","items":{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"kind":{"type":"string","enum":["file","directory"]}},"required":["source","destination","kind"],"additionalProperties":false}},"semantic_policy":{"type":"string","enum":["none","best_effort","required"]}},"required":["moves","semantic_policy"],"additionalProperties":false}'

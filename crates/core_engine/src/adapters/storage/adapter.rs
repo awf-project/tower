@@ -726,7 +726,12 @@ impl StoragePort for SledStorageAdapter {
 
         result
             .map_err(map_tx_abort_error)
-            .map_err(reconciliation_port_error)
+            .map_err(reconciliation_port_error)?;
+        self.files
+            .flush()
+            .map_err(StorageError::Sled)
+            .map_err(reconciliation_port_error)?;
+        Ok(())
     }
 
     /// Retrieve a `VirtualFile` by `FileId`.

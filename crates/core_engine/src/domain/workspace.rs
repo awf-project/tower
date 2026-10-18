@@ -1,10 +1,12 @@
 //! `ProjectWorkspace` — aggregate root over a generational slotmap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::error::DomainError;
 use super::file_id::FileId;
+use super::refactor::{PathMove, PathRenameError};
 use super::virtual_file::{FileMetadata, RelativePath, VirtualFile};
+use crate::ports::inbound::DirectoryEntryKind;
 
 /// Snapshot of the allocator state used when persisting and restoring a
 /// `ProjectWorkspace` across restarts (spec 04a EV1/AC2).
@@ -54,9 +56,9 @@ impl ProjectWorkspace {
             // Reuse a freed slot, bumping its generation so old handles go stale.
             Some(index) => {
                 let slot = &mut self.slots[index as usize];
-                // checked_add turns generation exhaustion (unreachable in practice:
-                // 4B reuses of one slot) into a panic instead of silently wrapping
-                // to 0, which would let a stale FileId alias a new file (spec UN1).
+                // Checked arithmetic makes generation exhaustion explicit after
+                // 4B reuses of one slot. Silent wrapping to zero could let a
+                // stale FileId alias a new file (spec UN1).
                 slot.generation = slot
                     .generation
                     .checked_add(1)
@@ -96,6 +98,128 @@ impl ProjectWorkspace {
 
     pub fn get_by_path(&self, path: &RelativePath) -> Option<FileId> {
         self.path_index.get(path).copied()
+    }
+
+    pub fn remap_paths(&mut self, moves: &[PathMove]) -> Result<(), PathRenameError> {
+        let mut destinations = HashSet::with_capacity(moves.len());
+        let mut file_moves = HashMap::with_capacity(moves.len());
+        let mut directory_move = None;
+
+        for path_move in moves {
+            if path_move.source == path_move.destination {
+                return Err(PathRenameError::IdenticalPaths {
+                    path: path_move.source.clone(),
+                });
+            }
+            if !destinations.insert(path_move.destination.clone()) {
+                return Err(PathRenameError::DuplicateDestination {
+                    path: path_move.destination.clone(),
+                });
+            }
+
+            match path_move.kind {
+                DirectoryEntryKind::File => {
+                    if !self.path_index.contains_key(&path_move.source) {
+                        return Err(PathRenameError::SourceNotFound {
+                            path: path_move.source.clone(),
+                        });
+                    }
+                    if file_moves
+                        .insert(path_move.source.clone(), path_move.destination.clone())
+                        .is_some()
+                    {
+                        return Err(PathRenameError::SemanticBackend);
+                    }
+                }
+                DirectoryEntryKind::Dir => {
+                    if descendant_suffix(&path_move.destination, &path_move.source).is_some() {
+                        return Err(PathRenameError::DestinationInsideSource {
+                            source: path_move.source.clone(),
+                            destination: path_move.destination.clone(),
+                        });
+                    }
+                    if directory_move.replace(path_move).is_some() {
+                        return Err(PathRenameError::SemanticBackend);
+                    }
+                }
+            }
+        }
+
+        if let Some(root) = directory_move {
+            for path_move in moves
+                .iter()
+                .filter(|path_move| path_move.kind == DirectoryEntryKind::File)
+            {
+                let Some(source_suffix) = descendant_suffix(&path_move.source, &root.source) else {
+                    return Err(PathRenameError::SemanticBackend);
+                };
+                let Some(destination_suffix) =
+                    descendant_suffix(&path_move.destination, &root.destination)
+                else {
+                    return Err(PathRenameError::SemanticBackend);
+                };
+                if source_suffix != destination_suffix {
+                    return Err(PathRenameError::SemanticBackend);
+                }
+            }
+        }
+
+        let mut changes = Vec::new();
+        for slot in &self.slots {
+            let Some(file) = slot.occupant.as_ref() else {
+                continue;
+            };
+            let destination = file_moves.get(&file.path).cloned().or_else(|| {
+                directory_move.and_then(|root| {
+                    descendant_suffix(&file.path, &root.source).map(|suffix| {
+                        RelativePath::new(format!("{}{suffix}", root.destination.as_str()))
+                    })
+                })
+            });
+            if let Some(destination) = destination {
+                changes.push((file.id, file.path.clone(), destination));
+            }
+        }
+
+        let mut staged_index = self.path_index.clone();
+        for (_, source, _) in &changes {
+            staged_index.remove(source);
+        }
+        if let Some(root) = directory_move
+            && staged_index.contains_key(&root.destination)
+        {
+            return Err(PathRenameError::DestinationExists {
+                path: root.destination.clone(),
+            });
+        }
+        for (id, _, destination) in &changes {
+            if let Some(existing_id) = staged_index.insert(destination.clone(), *id) {
+                return Err(
+                    if changes
+                        .iter()
+                        .any(|(moved_id, _, _)| *moved_id == existing_id)
+                    {
+                        PathRenameError::DuplicateDestination {
+                            path: destination.clone(),
+                        }
+                    } else {
+                        PathRenameError::DestinationExists {
+                            path: destination.clone(),
+                        }
+                    },
+                );
+            }
+        }
+
+        for (id, _, destination) in changes {
+            self.slots[id.index() as usize]
+                .occupant
+                .as_mut()
+                .expect("remap candidates come from live slots")
+                .path = destination;
+        }
+        self.path_index = staged_index;
+        Ok(())
     }
 
     pub fn remove(&mut self, id: FileId) -> Result<VirtualFile, DomainError> {
@@ -231,6 +355,12 @@ impl ProjectWorkspace {
         }
         Ok(index)
     }
+}
+
+fn descendant_suffix<'a>(path: &'a RelativePath, root: &RelativePath) -> Option<&'a str> {
+    path.as_str()
+        .strip_prefix(root.as_str())
+        .filter(|suffix| suffix.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -408,5 +538,230 @@ mod tests {
             ws.update(id, FileMetadata::default()).unwrap_err(),
             DomainError::StaleHandle
         );
+    }
+
+    mod path_remap {
+        use crate::ports::inbound::DirectoryEntryKind;
+
+        use super::*;
+
+        fn file_move(source: &str, destination: &str) -> PathMove {
+            PathMove {
+                source: RelativePath::new(source),
+                destination: RelativePath::new(destination),
+                kind: DirectoryEntryKind::File,
+            }
+        }
+
+        fn directory_move(source: &str, destination: &str) -> PathMove {
+            PathMove {
+                source: RelativePath::new(source),
+                destination: RelativePath::new(destination),
+                kind: DirectoryEntryKind::Dir,
+            }
+        }
+
+        fn workspace(paths: &[&str]) -> ProjectWorkspace {
+            let mut workspace = ProjectWorkspace::new();
+            for path in paths {
+                workspace
+                    .insert(RelativePath::new(*path), FileMetadata::default())
+                    .unwrap();
+            }
+            workspace
+        }
+
+        fn indexed_paths(workspace: &ProjectWorkspace) -> Vec<(RelativePath, FileId)> {
+            let mut paths = workspace
+                .all_file_ids()
+                .into_iter()
+                .map(|id| (workspace.get(id).unwrap().path.clone(), id))
+                .collect::<Vec<_>>();
+            paths.sort_by(|left, right| left.0.cmp(&right.0));
+            paths
+        }
+
+        fn assert_path_index_unchanged(
+            workspace: &ProjectWorkspace,
+            before: &[(RelativePath, FileId)],
+            moves: &[PathMove],
+        ) {
+            for (path, id) in before {
+                assert_eq!(
+                    workspace.get_by_path(path),
+                    Some(*id),
+                    "original path {path:?} must retain its FileId"
+                );
+            }
+
+            for path in moves
+                .iter()
+                .map(|path_move| &path_move.destination)
+                .filter(|destination| !before.iter().any(|(path, _)| path == *destination))
+            {
+                assert_eq!(
+                    workspace.get_by_path(path),
+                    None,
+                    "new destination {path:?} must not be indexed after rejection"
+                );
+            }
+        }
+
+        #[test]
+        fn remap_paths_is_all_or_nothing_over_validated_moves() {
+            let mut workspace = workspace(&["src/a.rs", "src/b.rs"]);
+            let a_id = workspace
+                .get_by_path(&RelativePath::new("src/a.rs"))
+                .unwrap();
+            let b_id = workspace
+                .get_by_path(&RelativePath::new("src/b.rs"))
+                .unwrap();
+
+            workspace
+                .remap_paths(&[
+                    file_move("src/a.rs", "lib/a.rs"),
+                    file_move("src/b.rs", "lib/b.rs"),
+                ])
+                .unwrap();
+
+            assert_eq!(
+                workspace.get_by_path(&RelativePath::new("lib/a.rs")),
+                Some(a_id)
+            );
+            assert_eq!(
+                workspace.get_by_path(&RelativePath::new("lib/b.rs")),
+                Some(b_id)
+            );
+            assert!(
+                workspace
+                    .get_by_path(&RelativePath::new("src/a.rs"))
+                    .is_none()
+            );
+            assert!(
+                workspace
+                    .get_by_path(&RelativePath::new("src/b.rs"))
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn preserves_exact_file_identity_and_rewrites_directory_descendants_by_prefix() {
+            let mut workspace = workspace(&["src/nested/a.rs", "src/nested/b.rs", "README.md"]);
+            let before = indexed_paths(&workspace);
+
+            workspace
+                .remap_paths(&[
+                    directory_move("src", "lib"),
+                    file_move("src/nested/a.rs", "lib/nested/a.rs"),
+                    file_move("src/nested/b.rs", "lib/nested/b.rs"),
+                ])
+                .unwrap();
+
+            for (old_path, id) in before {
+                let expected_path = match old_path.as_str() {
+                    "src/nested/a.rs" => "lib/nested/a.rs",
+                    "src/nested/b.rs" => "lib/nested/b.rs",
+                    path => path,
+                };
+                assert_eq!(
+                    workspace.get_by_path(&RelativePath::new(expected_path)),
+                    Some(id)
+                );
+                assert_eq!(workspace.get(id).unwrap().path.as_str(), expected_path);
+            }
+        }
+
+        #[test]
+        fn rejects_collisions_duplicates_missing_sources_and_invalid_prefixes_without_mutation() {
+            let cases = [
+                (
+                    vec![file_move("src/a.rs", "src/existing.rs")],
+                    PathRenameError::DestinationExists {
+                        path: RelativePath::new("src/existing.rs"),
+                    },
+                ),
+                (
+                    vec![
+                        file_move("src/a.rs", "lib/shared.rs"),
+                        file_move("src/b.rs", "lib/shared.rs"),
+                    ],
+                    PathRenameError::DuplicateDestination {
+                        path: RelativePath::new("lib/shared.rs"),
+                    },
+                ),
+                (
+                    vec![file_move("src/missing.rs", "lib/missing.rs")],
+                    PathRenameError::SourceNotFound {
+                        path: RelativePath::new("src/missing.rs"),
+                    },
+                ),
+                (
+                    vec![
+                        directory_move("src", "lib"),
+                        file_move("src/a.rs", "other/a.rs"),
+                    ],
+                    PathRenameError::SemanticBackend,
+                ),
+            ];
+
+            for (moves, expected_error) in cases {
+                let mut workspace = workspace(&["src/a.rs", "src/b.rs", "src/existing.rs"]);
+                let before = indexed_paths(&workspace);
+
+                assert_eq!(workspace.remap_paths(&moves), Err(expected_error));
+                assert_eq!(indexed_paths(&workspace), before);
+                assert_path_index_unchanged(&workspace, &before, &moves);
+            }
+        }
+
+        #[test]
+        fn conflict_rejection_rolls_back_every_path_and_identity() {
+            let mut workspace = workspace(&["src/a.rs", "src/b.rs", "lib/b.rs"]);
+            let before = indexed_paths(&workspace);
+            let moves = [
+                file_move("src/a.rs", "lib/a.rs"),
+                file_move("src/b.rs", "lib/b.rs"),
+            ];
+
+            assert_eq!(
+                workspace.remap_paths(&moves),
+                Err(PathRenameError::DestinationExists {
+                    path: RelativePath::new("lib/b.rs"),
+                })
+            );
+
+            assert_eq!(indexed_paths(&workspace), before);
+            assert_path_index_unchanged(&workspace, &before, &moves);
+            assert_eq!(
+                workspace.get_by_path(&RelativePath::new("lib/a.rs")),
+                None,
+                "late conflict must not leave the earlier destination indexed"
+            );
+        }
+
+        #[test]
+        fn directory_destination_file_collision_rolls_back_every_path_and_identity() {
+            let mut workspace = workspace(&["src/a.rs", "lib"]);
+            let before = indexed_paths(&workspace);
+            let moves = [
+                directory_move("src", "lib"),
+                file_move("src/a.rs", "lib/a.rs"),
+            ];
+
+            assert_eq!(
+                workspace.remap_paths(&moves),
+                Err(PathRenameError::DestinationExists {
+                    path: RelativePath::new("lib"),
+                })
+            );
+
+            assert_eq!(indexed_paths(&workspace), before);
+            assert_path_index_unchanged(&workspace, &before, &moves);
+            assert_eq!(
+                workspace.get_by_path(&RelativePath::new("lib/a.rs")),
+                None,
+                "directory-root conflict must not publish descendant destinations"
+            );
+        }
     }
 }

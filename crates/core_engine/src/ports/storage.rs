@@ -45,7 +45,7 @@ pub trait StoragePort {
     ///
     /// A successful return guarantees that file records, path mappings,
     /// allocator metadata, and path-token search postings became visible
-    /// together. The default fails closed until an adapter provides that
+    /// together and were synchronously flushed to durable storage. The default fails closed until an adapter provides that
     /// guarantee.
     fn apply_reconciliation_delta(&mut self, delta: &ReconciliationDelta) -> Result<(), PortError> {
         Err(PortError::ReconciliationFailed {

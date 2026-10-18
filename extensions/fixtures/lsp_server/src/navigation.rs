@@ -8,6 +8,31 @@ fn range() -> Value {
 }
 
 impl Server {
+    pub(super) fn path_rename_semantic(&self, id: &Value, params: &Value) -> io::Result<()> {
+        let old_uri = params["files"][0]["oldUri"]
+            .as_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing old URI"))?;
+        let consumer_uri = old_uri
+            .strip_suffix("src/old.rs")
+            .map(|root| format!("{root}src/consumer.rs"))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "unexpected rename source")
+            })?;
+
+        wire::reply(
+            id,
+            json!({"changes": {
+                consumer_uri: [{
+                    "range": {
+                        "start": {"line": 0, "character": 11},
+                        "end": {"line": 0, "character": 14}
+                    },
+                    "newText": "new"
+                }]
+            }}),
+        )
+    }
+
     pub(super) fn navigation(
         &self,
         method: &str,

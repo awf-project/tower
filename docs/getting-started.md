@@ -208,6 +208,13 @@ The response lists the native `tower_*` tools plus any tools contributed by disc
 when the `lint` extension is present). Extension tools are always namespaced as
 `tower_<ext>_<tool_name>`.
 
+The native `tower_rename_path` tool is available without an extension. It moves
+workspace-relative files or directories and accepts `semantic_policy` values
+`none`, `best_effort`, and `required`; use `dry_run:true` to inspect the move
+and any proposed reference edits before changing the workspace. See the
+[path rename how-to](user-guide/path-rename.md) for a complete request
+and the [MCP tool reference](mcp-tools.md) for the wire contract.
+
 Extensions are native sidecar binaries discovered from an extension scope by their `extension.toml`
 manifest. Install one (its binary + manifest) into a scope and restart `tower` — no recompile of the
 host:

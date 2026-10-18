@@ -124,6 +124,11 @@ fn map_io_error(err: io::Error, is_write: bool) -> PortError {
 }
 
 impl FileSystemPort for RealFs {
+    fn exists(&self, path: &RelativePath) -> bool {
+        self.resolve(path, false)
+            .is_ok_and(|resolved| resolved.exists())
+    }
+
     /// Read the full content of `path` as raw bytes.
     ///
     /// Binary and non-UTF-8 files are returned verbatim — no decoding is

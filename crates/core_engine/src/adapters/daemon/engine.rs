@@ -33,7 +33,7 @@ use crate::adapters::fs::scan::{
 use crate::adapters::mcp::PushEvent;
 use crate::adapters::mcp::diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader};
 use crate::adapters::mcp::native_tools::EngineState;
-use crate::adapters::watcher::{NotifyWatcherAdapter, WatcherError};
+use crate::adapters::watcher::{NotifyWatcherAdapter, RenameCoordinator, WatcherError};
 use crate::domain::DomainError;
 use crate::domain::extension_host::{ExtensionRegistry, RegistrationError};
 use crate::domain::index::InvertedIndex;
@@ -249,6 +249,8 @@ pub struct EngineHandle {
     pub ext_registry: Arc<RwLock<ExtensionRegistry>>,
     pub push_rx: std::sync::mpsc::Receiver<PushEvent>,
     pub diag_reader: Arc<dyn DiagnosticsReader>,
+    /// Shared ordering boundary for native renames and filesystem events.
+    pub rename_coordinator: Arc<RenameCoordinator>,
     /// Kept alive: dropping the watcher stops live sync.
     pub _watcher: NotifyWatcherAdapter,
 }
@@ -585,6 +587,7 @@ fn start_watcher(
     storage_for_watcher: SledStorageAdapter,
     ext_registry: &Arc<RwLock<ExtensionRegistry>>,
     echo_set: FormatterEchoSet,
+    rename_coordinator: Arc<RenameCoordinator>,
 ) -> Result<NotifyWatcherAdapter, WatcherError> {
     let watcher_workspace = state
         .read()
@@ -599,7 +602,7 @@ fn start_watcher(
     let doc_sync: Arc<dyn crate::ports::DocumentSyncPort + Send + Sync> =
         Arc::new(NoOpDocumentSync);
 
-    let watcher = NotifyWatcherAdapter::with_document_sync(
+    let watcher = NotifyWatcherAdapter::with_coordination(
         workspace_root.to_path_buf(),
         watcher_workspace,
         watcher_index,
@@ -607,6 +610,8 @@ fn start_watcher(
         watcher_ext_host,
         doc_sync,
         echo_set,
+        rename_coordinator,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )?;
 
     eprintln!(
@@ -702,12 +707,14 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
             Box::new(RealFs::new(&workspace_root)),
         )));
         inject_extension_host(&state, &ext_registry)?;
+        let rename_coordinator = Arc::new(RenameCoordinator::default());
         let watcher = start_watcher(
             &workspace_root,
             &state,
             storage_for_watcher,
             &ext_registry,
             echo_set,
+            Arc::clone(&rename_coordinator),
         )
         .map_err(|source| WorkspaceLoadError::Watcher {
             operation: "watcher_registration",
@@ -728,13 +735,13 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
                 source,
             })
             .map_err(|error| error.to_string())?;
-        Ok((state, watcher))
+        Ok((state, watcher, rename_coordinator))
     };
     #[cfg(feature = "startup-test-hooks")]
     let (prepared, mut reconciliation_metrics) = collect_reconciliation_metrics(prepare);
     #[cfg(not(feature = "startup-test-hooks"))]
     let prepared = prepare();
-    let (state, _watcher) = prepared?;
+    let (state, _watcher, rename_coordinator) = prepared?;
     #[cfg(feature = "startup-test-hooks")]
     if startup_test_hooks.emit_reconciliation_metrics {
         reconciliation_metrics = with_storage_rewrite_delta(
@@ -761,6 +768,7 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         ext_registry,
         push_rx,
         diag_reader,
+        rename_coordinator,
         _watcher,
     })
 }

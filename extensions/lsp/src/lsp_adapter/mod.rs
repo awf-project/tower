@@ -92,6 +92,9 @@ use core_engine::ports::{
     CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
     RenameNavigationError,
 };
+use extension_protocol::messages::{
+    PathMoveKind, PathRenameError, PathRenameErrorCode, PathRenamePlanningRequest,
+};
 
 #[allow(dead_code)]
 pub type RawWorkspaceEdit = lsp_types::WorkspaceEdit;
@@ -247,6 +250,7 @@ struct SemanticCapabilities {
     implementation: ProviderCapability,
     type_hierarchy: ProviderCapability,
     rename: RenameCapability,
+    will_rename_files: ProviderCapability,
 }
 
 #[allow(dead_code)]
@@ -264,8 +268,88 @@ impl SemanticCapabilities {
             implementation: parse_provider(capabilities.get("implementationProvider"))?,
             type_hierarchy: parse_provider(capabilities.get("typeHierarchyProvider"))?,
             rename: parse_rename_provider(capabilities.get("renameProvider"))?,
+            will_rename_files: parse_will_rename_files(capabilities.get("workspace"))?,
         })
     }
+}
+
+fn parse_will_rename_files(value: Option<&Value>) -> Result<ProviderCapability, LspSessionError> {
+    let Some(workspace) = value else {
+        return Ok(ProviderCapability::Unavailable);
+    };
+    let workspace = workspace.as_object().ok_or_else(malformed_capabilities)?;
+    let Some(file_operations) = workspace.get("fileOperations") else {
+        return Ok(ProviderCapability::Unavailable);
+    };
+    let file_operations = file_operations
+        .as_object()
+        .ok_or_else(malformed_capabilities)?;
+    parse_provider(file_operations.get("willRename"))
+}
+
+fn path_rename_error(code: PathRenameErrorCode, message: &'static str) -> PathRenameError {
+    PathRenameError {
+        code,
+        path: None,
+        message: message.to_owned(),
+    }
+}
+
+fn validate_path_rename_moves(request: &PathRenamePlanningRequest) -> Result<(), PathRenameError> {
+    let invalid = || {
+        path_rename_error(
+            PathRenameErrorCode::SemanticBackend,
+            "Semantic planning failed",
+        )
+    };
+    let Some(root) = request.moves.first() else {
+        return Err(invalid());
+    };
+    let normalized = |path: &str| {
+        !path.is_empty()
+            && Path::new(path)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+    };
+    if !normalized(&root.source)
+        || !normalized(&root.destination)
+        || root.source == root.destination
+    {
+        return Err(invalid());
+    }
+
+    if root.kind == PathMoveKind::File && request.moves.len() != 1 {
+        return Err(invalid());
+    }
+
+    let mut sources = std::collections::HashSet::with_capacity(request.moves.len());
+    let mut destinations = std::collections::HashSet::with_capacity(request.moves.len());
+    let mut previous_source: Option<&str> = None;
+    for (index, path_move) in request.moves.iter().enumerate() {
+        if !normalized(&path_move.source)
+            || !normalized(&path_move.destination)
+            || !sources.insert(path_move.source.as_str())
+            || !destinations.insert(path_move.destination.as_str())
+            || previous_source.is_some_and(|previous| previous >= path_move.source.as_str())
+        {
+            return Err(invalid());
+        }
+        if index > 0 {
+            if root.kind != PathMoveKind::Directory || path_move.kind != PathMoveKind::File {
+                return Err(invalid());
+            }
+            let Ok(suffix) = Path::new(&path_move.source).strip_prefix(&root.source) else {
+                return Err(invalid());
+            };
+            if suffix.as_os_str().is_empty()
+                || Path::new(&root.destination).join(suffix) != Path::new(&path_move.destination)
+            {
+                return Err(invalid());
+            }
+        }
+        previous_source = Some(&path_move.source);
+    }
+    Ok(())
 }
 
 fn malformed_capabilities() -> LspSessionError {
@@ -703,6 +787,58 @@ fn is_bad_executable_format(_error: &std::io::Error) -> bool {
 }
 
 impl LspClientAdapter {
+    #[allow(dead_code)]
+    pub(crate) fn plan_path_rename(
+        &self,
+        request: &PathRenamePlanningRequest,
+    ) -> Result<RawWorkspaceEdit, PathRenameError> {
+        if self
+            .semantic_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .will_rename_files
+            == ProviderCapability::Unavailable
+        {
+            return Err(path_rename_error(
+                PathRenameErrorCode::SemanticUnsupported,
+                "Semantic rename is unavailable",
+            ));
+        }
+        validate_path_rename_moves(request)?;
+
+        let files = request
+            .moves
+            .iter()
+            .map(|path_move| {
+                json!({
+                    "oldUri": path_to_uri(&self.workspace_root.join(&path_move.source)),
+                    "newUri": path_to_uri(&self.workspace_root.join(&path_move.destination)),
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = self
+            .send_request("workspace/willRenameFiles", json!({ "files": files }))
+            .map_err(|_| {
+                path_rename_error(
+                    PathRenameErrorCode::SemanticBackend,
+                    "Semantic planning failed",
+                )
+            })?;
+        if response.is_null() {
+            return Ok(RawWorkspaceEdit::default());
+        }
+        let mut edit = decode_workspace_edit_typed(response).map_err(|_| {
+            path_rename_error(
+                PathRenameErrorCode::SemanticBackend,
+                "Semantic planning failed",
+            )
+        })?;
+        if edit.changes.as_ref().is_some_and(HashMap::is_empty) {
+            edit.changes = None;
+        }
+        Ok(edit)
+    }
+
     /// Spawn `command` with `args` rooted at `workspace_root`, perform the LSP
     /// handshake, and start the reader thread.
     ///
@@ -820,6 +956,7 @@ impl LspClientAdapter {
                 implementation: ProviderCapability::Unavailable,
                 type_hierarchy: ProviderCapability::Unavailable,
                 rename: RenameCapability::Unavailable,
+                will_rename_files: ProviderCapability::Unavailable,
             }),
             ignore,
             next_id: AtomicI64::new(1),
@@ -844,6 +981,9 @@ impl LspClientAdapter {
             "rootUri": root_uri,
             "capabilities": {
                 "textDocument": { "publishDiagnostics": {} },
+                "workspace": {
+                    "fileOperations": { "willRename": true }
+                },
                 "window": { "workDoneProgress": true },
                 // rust-analyzer reads serverStatus capability at
                 // params.capabilities.experimental.serverStatusNotification,
@@ -1544,6 +1684,13 @@ impl pool::PooledSession for LspClientAdapter {
         text: &str,
     ) -> Result<extension_protocol::TypeHierarchyResult, LspSessionError> {
         LspClientAdapter::type_hierarchy_lsp(self, query, text)
+    }
+
+    fn plan_path_rename(
+        &self,
+        request: &PathRenamePlanningRequest,
+    ) -> Result<RawWorkspaceEdit, PathRenameError> {
+        LspClientAdapter::plan_path_rename(self, request)
     }
 
     fn check_lsp(
@@ -2355,6 +2502,7 @@ mod tests {
                 implementation: ProviderCapability::Available,
                 type_hierarchy: ProviderCapability::Unavailable,
                 rename: RenameCapability::RenameWithPrepare,
+                will_rename_files: ProviderCapability::Unavailable,
             }),
             ignore: empty_ignore(),
             next_id: AtomicI64::new(1),
@@ -3497,6 +3645,7 @@ mod tests {
                     implementation: ProviderCapability::Available,
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::RenameOnly,
+                    will_rename_files: ProviderCapability::Unavailable,
                 },
             ),
             (
@@ -3516,6 +3665,7 @@ mod tests {
                     implementation: ProviderCapability::Available,
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::RenameWithPrepare,
+                    will_rename_files: ProviderCapability::Unavailable,
                 },
             ),
             (
@@ -3535,6 +3685,7 @@ mod tests {
                     implementation: ProviderCapability::Unavailable,
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::Unavailable,
+                    will_rename_files: ProviderCapability::Unavailable,
                 },
             ),
             (
@@ -3546,6 +3697,7 @@ mod tests {
                     implementation: ProviderCapability::Unavailable,
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::Unavailable,
+                    will_rename_files: ProviderCapability::Unavailable,
                 },
             ),
         ];

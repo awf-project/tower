@@ -47,18 +47,23 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
-use ignore::Match;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-
+use crate::adapters::fs::WorkspacePathExclusion;
 use crate::adapters::fs::scan::{self, ReconciliationReport, ScanError, TOWERIGNORE_FILE_NAME};
+use crate::adapters::watcher::{
+    RenameCoordinationError, RenameCoordinator, RenameEventDisposition,
+};
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::is_tmp_artifact;
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::{FileMetadata, RelativePath, Timestamp};
 use crate::domain::workspace::ProjectWorkspace;
-use crate::ports::{DocumentSyncPort, ExtensionHostPort, NoOpDocumentSync, StoragePort};
+use crate::ports::{
+    DocumentSyncPort, ExtensionHostPort, NoOpDocumentSync, PathExclusionDecision,
+    PathExclusionPort, StoragePort,
+};
 
 // ── WatchEvent ────────────────────────────────────────────────────────────────
 
@@ -93,11 +98,6 @@ pub struct EventProcessor {
     index: Arc<RwLock<InvertedIndex>>,
     storage: Box<dyn StoragePort + Send>,
     extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
-    /// Compiled matcher for the ROOT `.towerignore` (the canonical location
-    /// `tower init` writes). Rebuilt whenever an event touches that file so
-    /// subsequent events honor the latest rules. Falls back to
-    /// [`Gitignore::empty`] when the file is absent or fails to parse.
-    ignore_matcher: Gitignore,
     /// Mirrors file lifecycle into a resident language server (spec 14b).
     /// Defaults to [`NoOpDocumentSync`] when no server is configured.
     doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
@@ -106,6 +106,9 @@ pub struct EventProcessor {
     /// is suppressed (UN1) so formatter output never churns diagnostics. Peeked
     /// here (non-consuming); the plugin host's `fan_out` consumes the entry.
     echo_set: Arc<Mutex<HashMap<String, ()>>>,
+    path_exclusion: Option<Arc<dyn PathExclusionPort>>,
+    rename_coordinator: Option<Arc<RenameCoordinator>>,
+    watcher_cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for EventProcessor {
@@ -134,16 +137,20 @@ impl EventProcessor {
         storage: Box<dyn StoragePort + Send>,
         extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
     ) -> Self {
-        let ignore_matcher = build_ignore_matcher(&root);
+        let path_exclusion = WorkspacePathExclusion::new(root.clone())
+            .ok()
+            .map(|adapter| Arc::new(adapter) as Arc<dyn PathExclusionPort>);
         Self {
             root,
             workspace,
             index,
             storage,
             extension_host,
-            ignore_matcher,
             doc_sync: Arc::new(NoOpDocumentSync),
             echo_set: Arc::new(Mutex::new(HashMap::new())),
+            path_exclusion,
+            rename_coordinator: None,
+            watcher_cancelled: None,
         }
     }
 
@@ -158,6 +165,19 @@ impl EventProcessor {
     ) -> Self {
         self.doc_sync = doc_sync;
         self.echo_set = echo_set;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rename_coordination(
+        mut self,
+        path_exclusion: Arc<dyn PathExclusionPort>,
+        rename_coordinator: Arc<RenameCoordinator>,
+        watcher_cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        self.path_exclusion = Some(path_exclusion);
+        self.rename_coordinator = Some(rename_coordinator);
+        self.watcher_cancelled = Some(watcher_cancelled);
         self
     }
 
@@ -182,11 +202,59 @@ impl EventProcessor {
     /// Errors from storage are returned but do not corrupt the in-memory state
     /// (the domain mutation has already committed).
     pub fn process_event(&mut self, event: WatchEvent) -> Result<(), crate::ports::PortError> {
+        if !self.coordinate_event(&event)? {
+            return Ok(());
+        }
+
         match event {
             WatchEvent::Create(path) => self.handle_create(path),
             WatchEvent::Modify(path) => self.handle_modify(path),
             WatchEvent::Delete(path) => self.handle_delete(path),
             WatchEvent::Rename { from, to } => self.handle_rename(from, to),
+        }
+    }
+
+    /// Wait for overlapping explicit renames before any filesystem or VFS read.
+    /// A complete native rename pair may be consumed exactly once; decomposed
+    /// events only wait and then continue through ordinary idempotent handling.
+    fn coordinate_event(&self, event: &WatchEvent) -> Result<bool, crate::ports::PortError> {
+        let (Some(coordinator), Some(cancelled)) =
+            (&self.rename_coordinator, &self.watcher_cancelled)
+        else {
+            return Ok(true);
+        };
+
+        let result: Result<bool, RenameCoordinationError> = (|| match event {
+            WatchEvent::Rename { from, to } => {
+                let (Some(source), Some(destination)) =
+                    (self.to_relative(from), self.to_relative(to))
+                else {
+                    return Ok(true);
+                };
+
+                coordinator.wait_until_released(&source, &destination, cancelled)?;
+                let Some(observed) = read_identity_metadata(to) else {
+                    return Ok(true);
+                };
+                Ok(!matches!(
+                    coordinator.classify_verified_event(&source, &destination, &observed)?,
+                    RenameEventDisposition::ConsumeEcho
+                ))
+            }
+            WatchEvent::Create(path) | WatchEvent::Modify(path) | WatchEvent::Delete(path) => {
+                if let Some(path) = self.to_relative(path) {
+                    coordinator.wait_for_path(&path, cancelled)?;
+                }
+                Ok(true)
+            }
+        })();
+
+        match result {
+            Ok(process) => Ok(process),
+            Err(RenameCoordinationError::Cancelled) => Ok(false),
+            Err(error) => Err(crate::ports::PortError::ReadFailed(format!(
+                "rename coordination failed: {error:?}"
+            ))),
         }
     }
 
@@ -226,7 +294,6 @@ impl EventProcessor {
         // An event on the root .towerignore rebuilds the matcher so subsequent
         // events honor the new rules. The file itself is hidden — never indexed.
         if Self::is_root_towerignore(&rel_path) {
-            self.rebuild_ignore_matcher();
             return Ok(());
         }
 
@@ -320,7 +387,6 @@ impl EventProcessor {
         // An event on the root .towerignore rebuilds the matcher so subsequent
         // events honor the new rules. The file itself is hidden — never indexed.
         if Self::is_root_towerignore(&rel_path) {
-            self.rebuild_ignore_matcher();
             return Ok(());
         }
 
@@ -404,7 +470,6 @@ impl EventProcessor {
         // nothing). The file is hidden, so it was never tracked — nothing to
         // remove from the VFS.
         if Self::is_root_towerignore(&rel_path) {
-            self.rebuild_ignore_matcher();
             return Ok(());
         }
 
@@ -478,10 +543,6 @@ impl EventProcessor {
         // If the source is the root .towerignore, its rules are moving away —
         // rebuild the matcher from disk so subsequent events stop honoring the
         // removed file. Destination handling below still applies to `to`.
-        if from_rel.as_ref().is_some_and(Self::is_root_towerignore) {
-            self.rebuild_ignore_matcher();
-        }
-
         // If the destination is outside the root, fall back to a plain delete.
         let Some(to_rel_path) = to_rel else {
             if from_rel.is_some() {
@@ -503,7 +564,6 @@ impl EventProcessor {
         // treat the source as moved away (delete it if it was tracked). The
         // .towerignore file itself is hidden and never indexed.
         if Self::is_root_towerignore(&to_rel_path) {
-            self.rebuild_ignore_matcher();
             if from_rel.is_some() {
                 return self.handle_delete(from);
             }
@@ -546,9 +606,16 @@ impl EventProcessor {
             let to_file_id = match ws.insert(to_rel_path.clone(), to_metadata) {
                 Ok(id) => id,
                 Err(crate::domain::DomainError::DuplicatePath) => {
-                    // Destination already tracked — treat as a no-op for insert.
-                    ws.get_by_path(&to_rel_path)
-                        .expect("DuplicatePath implies get_by_path succeeds")
+                    // The path can already exist when an external rename
+                    // overwrites the destination of a retained engine-owned
+                    // rename. Refresh its metadata instead of preserving the
+                    // stale committed destination state.
+                    let id = ws
+                        .get_by_path(&to_rel_path)
+                        .expect("DuplicatePath implies get_by_path succeeds");
+                    ws.update(id, to_metadata)
+                        .expect("get_by_path returned a valid id");
+                    id
                 }
                 Err(e) => return Err(crate::ports::PortError::WriteFailed(e.to_string())),
             };
@@ -610,38 +677,25 @@ impl EventProcessor {
         rel_path.as_str() == TOWERIGNORE_FILE_NAME
     }
 
-    /// Rebuild the ignore matcher from the current on-disk root `.towerignore`.
-    fn rebuild_ignore_matcher(&mut self) {
-        self.ignore_matcher = build_ignore_matcher(&self.root);
-    }
-
-    /// `true` if any component of `rel_path` starts with '.', mirroring the
-    /// scan walker's `hidden(true)`. Covers `.git/`, dotfiles, `.env`/`.env.*`
-    /// and the `.towerignore` file itself.
-    fn is_hidden(rel_path: &RelativePath) -> bool {
-        rel_path
-            .as_str()
-            .split('/')
-            .any(|component| component.starts_with('.'))
-    }
-
-    /// `true` if `rel_path` is excluded by the root `.towerignore`, honoring
-    /// `!` negation. A file under an ignored directory is caught via
-    /// `matched_path_or_any_parents`. Un-anchored globs (e.g. `*.key`) match at
-    /// any depth, which is why a root-only matcher closes the secret hole.
-    fn is_ignored(&self, rel_path: &RelativePath) -> bool {
-        match self
-            .ignore_matcher
-            .matched_path_or_any_parents(rel_path.as_str(), false)
-        {
-            Match::Ignore(_) => true,
-            Match::Whitelist(_) | Match::None => false,
-        }
-    }
-
     /// `true` if `rel_path` must be excluded from the index (hidden OR ignored).
     fn is_excluded(&self, rel_path: &RelativePath) -> bool {
-        Self::is_hidden(rel_path) || self.is_ignored(rel_path)
+        // Formatter workers use an extension-preserving `.fmt.tmp` infix
+        // (`file.fmt.tmp.rs`) as well as a terminal suffix (`file.fmt.tmp`).
+        // These files must never reach the format queue again.
+        let formatter_temporary = rel_path
+            .as_str()
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.ends_with(".fmt.tmp") || name.contains(".fmt.tmp."));
+        if formatter_temporary {
+            return true;
+        }
+        self.path_exclusion.as_ref().is_none_or(|path_exclusion| {
+            !matches!(
+                path_exclusion.classify(rel_path),
+                Ok(PathExclusionDecision::Allowed)
+            )
+        })
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -666,22 +720,6 @@ impl EventProcessor {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build a [`Gitignore`] matcher from the ROOT `.towerignore` only — the
-/// canonical location `tower init` writes.
-///
-/// Falls back to [`Gitignore::empty`] when the file is absent or fails to
-/// parse, so a malformed ignore file never causes the watcher to index nothing
-/// (or to panic). Nested per-directory `.towerignore` files are intentionally
-/// out of scope (the un-anchored-glob behaviour makes a root-only matcher
-/// sufficient to close the secret hole).
-fn build_ignore_matcher(root: &Path) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(root);
-    // `add` returns Some(err) on a parse error; the file simply contributes no
-    // globs in that case. A None return means success (or absent file).
-    let _ = builder.add(root.join(TOWERIGNORE_FILE_NAME));
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
-}
-
 /// Read filesystem metadata for an absolute path.
 ///
 /// Falls back to default metadata (size=0, mtime=0) on any I/O error so that
@@ -705,21 +743,32 @@ fn read_metadata(abs: &Path) -> FileMetadata {
     }
 }
 
+fn read_identity_metadata(abs: &Path) -> Option<FileMetadata> {
+    let bytes = std::fs::read(abs).ok()?;
+    let mut metadata = read_metadata(abs);
+    metadata.content_hash = Some(scan::content_hash_of(&bytes));
+    Some(metadata)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, RwLock, mpsc};
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::adapters::fs::scan::{ScanError, collect_reconciliation_metrics};
     use crate::adapters::in_memory_storage::InMemoryStorage;
     use crate::domain::index::{FileSearch, InvertedIndex};
+    use crate::domain::refactor::PathMove;
     use crate::domain::token::Token;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::domain::{ContentHash, FileId, VirtualFile};
-    use crate::ports::inbound::SearchUseCase as _;
+    use crate::domain::{ContentHash, FileId, RelativePath, VirtualFile};
+    use crate::ports::inbound::{DirectoryEntryKind, SearchUseCase as _};
     use crate::ports::{NoOpExtensionHost, PortError, ReconciliationDelta, StoragePort};
+    use crate::test_support::{InMemoryPathExclusion, PathExclusionFixture};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -783,6 +832,566 @@ mod tests {
         Arc<RwLock<InvertedIndex>>,
     ) {
         make_processor_with_extension_host(root, Box::new(NoOpExtensionHost))
+    }
+
+    fn file_move(source: &str, destination: &str) -> PathMove {
+        PathMove {
+            source: RelativePath::new(source),
+            destination: RelativePath::new(destination),
+            kind: DirectoryEntryKind::File,
+        }
+    }
+
+    fn configured_processor(
+        root: PathBuf,
+        host: Box<dyn ExtensionHostPort + Send + Sync>,
+        exclusion: InMemoryPathExclusion,
+        coordinator: Arc<RenameCoordinator>,
+    ) -> (
+        EventProcessor,
+        Arc<RwLock<ProjectWorkspace>>,
+        Arc<RwLock<InvertedIndex>>,
+    ) {
+        let (processor, workspace, index) = make_processor_with_extension_host(root, host);
+        let processor = processor.with_rename_coordination(
+            Arc::new(exclusion),
+            coordinator,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (processor, workspace, index)
+    }
+
+    #[test]
+    fn engine_owned_rename_uses_shared_workspace_path_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let excluded = root.join("src/private.rs");
+        std::fs::create_dir_all(excluded.parent().unwrap()).unwrap();
+        std::fs::write(&excluded, b"secret").unwrap();
+        let fixture = PathExclusionFixture {
+            files: vec![(
+                RelativePath::new("src/.towerignore"),
+                b"private.rs\n".to_vec(),
+            )],
+            directories: Vec::new(),
+        };
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(NoOpExtensionHost),
+            InMemoryPathExclusion::new(fixture),
+            coordinator,
+        );
+
+        processor
+            .process_event(WatchEvent::Create(excluded))
+            .unwrap();
+
+        assert!(workspace.read().unwrap().snapshot().files.is_empty());
+    }
+
+    #[test]
+    fn engine_owned_rename_exact_native_pair_is_consumed_once_without_duplicate_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let source = root.join("old.rs");
+        let destination = root.join("new.rs");
+        std::fs::write(&source, b"fn renamed() {}").unwrap();
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let coordinator = Arc::new(RenameCoordinator::default());
+        coordinator.set_watcher_active(true);
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(ArcExtHost(Arc::clone(&recording))),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source.clone(),
+                to: destination.clone(),
+            })
+            .unwrap();
+        recording.changed.lock().unwrap().clear();
+
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let committed = {
+            let workspace = workspace.read().unwrap();
+            let id = workspace.get_by_path(&RelativePath::new("new.rs")).unwrap();
+            workspace.get(id).unwrap().clone()
+        };
+        guard.commit(&[committed]);
+        drop(guard);
+
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source.clone(),
+                to: destination.clone(),
+            })
+            .unwrap();
+        assert!(recording.changed.lock().unwrap().is_empty());
+
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: destination,
+            })
+            .unwrap();
+        assert_eq!(recording.changed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn engine_owned_rename_does_not_consume_external_pair_with_different_destination_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let source = root.join("old.rs");
+        let destination = root.join("new.rs");
+        std::fs::write(&source, b"original").unwrap();
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let coordinator = Arc::new(RenameCoordinator::default());
+        coordinator.set_watcher_active(true);
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(ArcExtHost(Arc::clone(&recording))),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source.clone(),
+                to: destination.clone(),
+            })
+            .unwrap();
+
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let committed = {
+            let workspace = workspace.read().unwrap();
+            let id = workspace.get_by_path(&RelativePath::new("new.rs")).unwrap();
+            workspace.get(id).unwrap().clone()
+        };
+        guard.commit(&[committed]);
+        drop(guard);
+        recording.changed.lock().unwrap().clear();
+
+        std::fs::write(&source, b"different external contents").unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: destination,
+            })
+            .unwrap();
+
+        assert_eq!(recording.changed.lock().unwrap().len(), 1);
+        let workspace = workspace.read().unwrap();
+        let id = workspace.get_by_path(&RelativePath::new("new.rs")).unwrap();
+        assert_eq!(workspace.get(id).unwrap().size, 27);
+    }
+
+    #[test]
+    fn engine_owned_rename_decomposed_event_waits_then_reconciles_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let destination = root.join("new.rs");
+        std::fs::write(&destination, b"fn renamed() {}").unwrap();
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        guard.commit(&[crate::test_support::make_virtual_file(0, 0, "new.rs")]);
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(NoOpExtensionHost),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let result = processor.process_event(WatchEvent::Create(destination));
+            done_tx.send(result).unwrap();
+        });
+        entered_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        drop(guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("decomposed event did not resume after commit release")
+            .unwrap();
+        worker.join().unwrap();
+        assert!(
+            workspace
+                .read()
+                .unwrap()
+                .get_by_path(&RelativePath::new("new.rs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_owned_rename_completes_with_inactive_watcher_and_reconciles_external_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let source = root.join("old.rs");
+        let destination = root.join("new.rs");
+        std::fs::write(&source, b"x").unwrap();
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(NoOpExtensionHost),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        guard.commit(&[crate::test_support::make_virtual_file(0, 0, "new.rs")]);
+        drop(guard);
+        std::fs::rename(&source, &destination).unwrap();
+
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: destination,
+            })
+            .unwrap();
+
+        assert!(
+            workspace
+                .read()
+                .unwrap()
+                .get_by_path(&RelativePath::new("new.rs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_owned_rename_keeps_unrelated_external_events_reconciling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let unrelated = root.join("external.rs");
+        std::fs::write(&unrelated, b"external").unwrap();
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let _guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(NoOpExtensionHost),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            coordinator,
+        );
+
+        processor
+            .process_event(WatchEvent::Create(unrelated))
+            .unwrap();
+
+        assert!(
+            workspace
+                .read()
+                .unwrap()
+                .get_by_path(&RelativePath::new("external.rs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_owned_rename_cancellation_returns_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let _guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let (processor, workspace, index) = make_processor(root);
+        let _processor = processor.with_rename_coordination(
+            Arc::new(InMemoryPathExclusion::new(PathExclusionFixture::default())),
+            Arc::clone(&coordinator),
+            Arc::clone(&cancelled),
+        );
+
+        let result = coordinator.wait_for_path(&RelativePath::new("new.rs"), &cancelled);
+        assert_eq!(
+            result,
+            Err(crate::adapters::watcher::RenameCoordinationError::Cancelled)
+        );
+        assert!(workspace.read().unwrap().snapshot().files.is_empty());
+        assert!(
+            workspace.try_write().is_ok(),
+            "cancellation must not retain the workspace lock"
+        );
+        assert!(
+            index.try_write().is_ok(),
+            "cancellation must not retain the index lock"
+        );
+    }
+
+    #[test]
+    fn engine_owned_rename_retained_echo_allows_later_source_recreation_and_destination_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let source = root.join("old.rs");
+        let destination = root.join("new.rs");
+        std::fs::write(&source, b"old").unwrap();
+        let coordinator = Arc::new(RenameCoordinator::default());
+        coordinator.set_watcher_active(true);
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(NoOpExtensionHost),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source.clone(),
+                to: destination.clone(),
+            })
+            .unwrap();
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let committed = {
+            let workspace = workspace.read().unwrap();
+            let id = workspace.get_by_path(&RelativePath::new("new.rs")).unwrap();
+            workspace.get(id).unwrap().clone()
+        };
+        guard.commit(&[committed]);
+        drop(guard);
+
+        std::fs::write(&source, b"recreated").unwrap();
+        processor.process_event(WatchEvent::Create(source)).unwrap();
+        std::fs::remove_file(&destination).unwrap();
+        processor
+            .process_event(WatchEvent::Delete(destination))
+            .unwrap();
+
+        let workspace = workspace.read().unwrap();
+        assert!(
+            workspace
+                .get_by_path(&RelativePath::new("old.rs"))
+                .is_some()
+        );
+        assert!(
+            workspace
+                .get_by_path(&RelativePath::new("new.rs"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn engine_owned_rename_expired_echo_reconciles_as_external_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let source = root.join("old.rs");
+        let destination = root.join("new.rs");
+        std::fs::write(&source, b"old").unwrap();
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let coordinator = Arc::new(RenameCoordinator::default());
+        coordinator.set_watcher_active(true);
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(ArcExtHost(Arc::clone(&recording))),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source.clone(),
+                to: destination.clone(),
+            })
+            .unwrap();
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let committed = {
+            let workspace = workspace.read().unwrap();
+            let id = workspace.get_by_path(&RelativePath::new("new.rs")).unwrap();
+            workspace.get(id).unwrap().clone()
+        };
+        guard.commit(&[committed]);
+        drop(guard);
+        recording.changed.lock().unwrap().clear();
+
+        assert_eq!(
+            coordinator.classify_event_at(
+                &RelativePath::new("old.rs"),
+                &RelativePath::new("new.rs"),
+                Instant::now() + Duration::from_secs(2),
+            ),
+            Ok(crate::adapters::watcher::RenameEventDisposition::External)
+        );
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: destination,
+            })
+            .unwrap();
+
+        assert_eq!(recording.changed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn engine_owned_rename_evicted_echo_reconciles_as_external_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let source = root.join("old.rs");
+        let destination = root.join("new.rs");
+        std::fs::write(&source, b"old").unwrap();
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let coordinator = Arc::new(RenameCoordinator::default());
+        coordinator.set_watcher_active(true);
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(ArcExtHost(Arc::clone(&recording))),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source.clone(),
+                to: destination.clone(),
+            })
+            .unwrap();
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        let committed = {
+            let workspace = workspace.read().unwrap();
+            let id = workspace.get_by_path(&RelativePath::new("new.rs")).unwrap();
+            workspace.get(id).unwrap().clone()
+        };
+        guard.commit(&[committed]);
+        drop(guard);
+        for index in 0..1_024 {
+            let mut guard = coordinator
+                .register_engine_owned(&[file_move(
+                    &format!("old-{index}.rs"),
+                    &format!("new-{index}.rs"),
+                )])
+                .unwrap();
+            guard.commit(&[crate::test_support::make_virtual_file(
+                index + 1,
+                0,
+                &format!("new-{index}.rs"),
+            )]);
+            drop(guard);
+        }
+        recording.changed.lock().unwrap().clear();
+
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: destination,
+            })
+            .unwrap();
+
+        assert_eq!(recording.changed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn engine_owned_rename_preserves_decomposed_missing_delete_and_duplicate_create_idempotence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let destination = root.join("new.rs");
+        std::fs::write(&destination, b"new").unwrap();
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let (mut processor, workspace, _) = configured_processor(
+            root.clone(),
+            Box::new(NoOpExtensionHost),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            Arc::clone(&coordinator),
+        );
+        let mut guard = coordinator
+            .register_engine_owned(&[file_move("old.rs", "new.rs")])
+            .unwrap();
+        guard.commit(&[crate::test_support::make_virtual_file(0, 0, "new.rs")]);
+        drop(guard);
+
+        processor
+            .process_event(WatchEvent::Delete(root.join("old.rs")))
+            .unwrap();
+        processor
+            .process_event(WatchEvent::Create(destination.clone()))
+            .unwrap();
+        processor
+            .process_event(WatchEvent::Create(destination))
+            .unwrap();
+
+        assert_eq!(workspace.read().unwrap().snapshot().files.len(), 1);
+        assert!(
+            workspace
+                .read()
+                .unwrap()
+                .get_by_path(&RelativePath::new("new.rs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn engine_owned_rename_preserves_missing_modify_delete_and_formatter_temp_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let tracked = root.join("tracked.rs");
+        let formatter_temp = root.join("tracked.rs.fmt.tmp");
+        std::fs::write(&tracked, b"x").unwrap();
+        std::fs::write(&formatter_temp, b"formatted").unwrap();
+        let recording = Arc::new(RecordingExtensionHost::default());
+        let coordinator = Arc::new(RenameCoordinator::default());
+        let (mut processor, workspace, _) = configured_processor(
+            root,
+            Box::new(ArcExtHost(Arc::clone(&recording))),
+            InMemoryPathExclusion::new(PathExclusionFixture::default()),
+            coordinator,
+        );
+        processor
+            .process_event(WatchEvent::Create(tracked.clone()))
+            .unwrap();
+        recording.changed.lock().unwrap().clear();
+        std::fs::remove_file(&tracked).unwrap();
+
+        processor
+            .process_event(WatchEvent::Modify(tracked))
+            .unwrap();
+        processor
+            .process_event(WatchEvent::Create(formatter_temp))
+            .unwrap();
+
+        assert!(workspace.read().unwrap().snapshot().files.is_empty());
+        assert_eq!(
+            recording.deleted.lock().unwrap().as_slice(),
+            &[RelativePath::new("tracked.rs")]
+        );
+        assert!(recording.changed.lock().unwrap().is_empty());
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]

@@ -39,6 +39,7 @@ pub mod error;
 pub mod extension_host;
 pub mod filesystem;
 pub mod navigation;
+pub mod path_exclusion;
 pub mod storage;
 
 // Inbound ports — use-case contracts called by external drivers.
@@ -52,4 +53,7 @@ pub use extension_host::{ExtensionHostPort, NoOpExtensionHost};
 pub use filesystem::FileSystemPort;
 pub use inbound::{FileMutationUseCase, FileReplaceError, Match, SearchUseCase, TxReport};
 pub use navigation::{NavigationPort, PrepareRenameResult, RenameNavigationError};
+pub use path_exclusion::{
+    PathExclusionDecision, PathExclusionError, PathExclusionPort, PathExclusionReason,
+};
 pub use storage::{ReconciliationDelta, StoragePort};

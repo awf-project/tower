@@ -30,6 +30,18 @@ use crate::ports::PortError;
 /// All paths are workspace-relative [`RelativePath`] values so the domain
 /// never constructs OS-level absolute paths (U1).
 pub trait FileSystemPort {
+    /// Return whether a file or directory currently exists at `path`.
+    fn exists(&self, path: &RelativePath) -> bool {
+        self.read(path).is_ok()
+            || self.scan().iter().any(|candidate| {
+                candidate == path
+                    || candidate
+                        .as_str()
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+    }
+
     /// Read the full content of the file at `path`.
     ///
     /// # Errors

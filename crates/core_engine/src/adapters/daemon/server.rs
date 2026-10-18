@@ -24,6 +24,7 @@ use crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use crate::adapters::mcp::native_tools::EngineState;
 use crate::adapters::mcp::rmcp_server::TowerMcpHandler;
+use crate::adapters::watcher::RenameCoordinator;
 use crate::domain::extension_host::ExtensionRegistry;
 
 /// Shared context for every accepted connection.
@@ -32,6 +33,7 @@ struct DaemonCtx {
     registry: Arc<SessionRegistry>,
     state: Arc<RwLock<EngineState>>,
     ext_registry: Arc<RwLock<ExtensionRegistry>>,
+    rename_coordinator: Arc<RenameCoordinator>,
     diag_reader: Arc<dyn DiagnosticsReader>,
     shutdown: Arc<Notify>,
 }
@@ -67,8 +69,11 @@ impl DaemonCtx {
 /// Build a fresh per-connection MCP handler over the shared engine state.
 fn build_handler(ctx: &DaemonCtx) -> (TowerMcpHandler, Arc<Mutex<SubscriptionRegistry>>) {
     let sub = Arc::new(Mutex::new(SubscriptionRegistry::new()));
-    let registry =
-        ExtensionMergedRegistry::new(Arc::clone(&ctx.state), Arc::clone(&ctx.ext_registry));
+    let registry = ExtensionMergedRegistry::with_rename_coordinator(
+        Arc::clone(&ctx.state),
+        Arc::clone(&ctx.ext_registry),
+        Arc::clone(&ctx.rename_coordinator),
+    );
     let handler = TowerMcpHandler::new(
         registry,
         Arc::clone(&ctx.diag_reader),
@@ -193,6 +198,7 @@ pub fn run_daemon(opts: &GlobalOpts, config: TowerConfig, detach: bool) -> Resul
         registry: Arc::clone(&registry),
         state: Arc::clone(&handle.state),
         ext_registry: Arc::clone(&handle.ext_registry),
+        rename_coordinator: Arc::clone(&handle.rename_coordinator),
         diag_reader: Arc::clone(&handle.diag_reader),
         shutdown: Arc::clone(&shutdown),
     });

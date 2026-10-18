@@ -12,6 +12,7 @@ use core_engine::adapters::config::lsp::LspConfig;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position};
 use core_engine::ports::DocumentSyncPort;
+use extension_protocol::messages::{PathRenameError, PathRenamePlanningRequest};
 use extension_protocol::{TypeHierarchyQuery, TypeHierarchyResult, WorkspaceEditSpan};
 
 /// The sidecar extension's LSP session manager.
@@ -121,6 +122,14 @@ impl LspSessionPool {
         new_name: &str,
     ) -> Result<RawWorkspaceEdit, LspSessionError> {
         self.inner.rename_lsp(path, text, position, new_name)
+    }
+
+    #[allow(dead_code)]
+    pub fn plan_path_rename(
+        &self,
+        request: &PathRenamePlanningRequest,
+    ) -> Result<RawWorkspaceEdit, PathRenameError> {
+        self.inner.plan_path_rename(request)
     }
 
     /// Whether this pool is configured to handle the given path.
