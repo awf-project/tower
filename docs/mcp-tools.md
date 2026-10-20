@@ -198,6 +198,59 @@ Codes `-32001` and `-32002` are in the JSON-RPC 2.0 server-defined range
 The native tools are always available, regardless of which extensions are loaded. Their
 names are undecorated (no namespace prefix).
 
+### tower_safe_delete_symbol
+
+Safely delete one declaration after resolving its references and optional backend cleanup edits.
+This native tool does not replace `tower_ast_delete_symbol`, which remains the explicit span-only
+deletion operation.
+
+| Field         | Type    | Required | Description                                             |
+| ------------- | ------- | -------- | ------------------------------------------------------- |
+| `path`        | string  | yes      | Workspace-relative file containing the declaration     |
+| `symbol_name` | string  | yes      | Nonempty declaration name                               |
+| `kind`        | string  | no       | Declaration kind filter; omit to match any kind         |
+| `dry_run`     | boolean | no       | Preview without mutation; defaults to `false`           |
+
+Valid `kind` values are `function`, `struct`, `enum`, `trait`, `impl`, `method`, `module`,
+`type_alias`, `const`, `static`, `macro_def`, and `class`.
+
+Example request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_safe_delete_symbol",
+    "arguments": {
+      "path": "src/unused.rs",
+      "symbol_name": "obsolete_helper",
+      "kind": "function",
+      "dry_run": true
+    }
+  }
+}
+```
+
+The result contains `status`, optional `blocking_reason`, the resolved `declaration` when
+available, all `references`, proposed cleanup `proposed_edits`, ordered `affected_files`, and an
+optional `mutation_result`. A `previewed` status means the dry-run plan passed validation;
+`applied` means the requested mutation completed. A `blocked` status includes a
+`blocking_reason`, such as `live_references`, `cleanup_incomplete`, `cas_conflict`, or
+`backend_error`. Safe delete fails closed when references remain without complete backend
+cleanup, or when analysis is unavailable, unresolved, malformed, stale, overlapping, or outside
+the workspace. `dry_run:true` does not change file contents, versions, or index state.
+
+`status` is one of `blocked`, `previewed`, `applied`, or `partial_commit`. A blocked report may
+use one of these stable `blocking_reason` values: `not_found`, `ambiguous_symbol`,
+`invalid_declaration`, `capability_unavailable`, `references_unresolved`, `live_references`,
+`cleanup_incomplete`, `invalid_cleanup`, `cas_conflict`, or `backend_error`.
+
+Validation and CAS failures occur before the first write; a later filesystem or persistence failure
+can return `partial_commit` with per-file outcomes identifying committed, failed, and unattempted
+files. Inspect `status` before treating the operation as complete.
+
 ### tower_find_file
 
 Find workspace files whose path matches a query string via the inverted index.
@@ -730,12 +783,18 @@ cross-file rename work is intentionally not a single transaction. See
 
 ## Code-intelligence tools (LSP)
 
-Seven `tower_lsp_*` tools surface language-server intelligence over the same
+The declared planning tools `tower_lsp_plan_path_rename` and
+`tower_lsp_plan_safe_delete` return semantic plans without applying mutations.
+The native `tower_rename_path` and `tower_safe_delete_symbol` tools compose those
+plans with host validation and application. All local and MCP-facing tool names
+use snake_case, including planning operations.
+
+The `tower_lsp_*` tools surface language-server intelligence over the same
 `tools/call` interface. They are contributed by the `lsp` extension (manifest
 `name = "lsp"`) and appear in `tools/list` whenever that extension is discovered.
-When there is no backend, or when the file's language is not supported by the
-configured server, each tool returns a normal result with `"supported": false`
-(and an empty payload) rather than an error — so an agent can branch on that flag
+For read-only queries, when there is no backend or the file's language is not
+supported by the configured server, the tool returns a normal result with
+`"supported": false` (and an empty payload) rather than an error — so an agent can branch on that flag
 and fall back to the structural `tower_ast_*` tools.
 
 Positions use **zero-based** `line` and `character`, where `character` is a
@@ -1671,7 +1730,8 @@ as native tools, with one invariant: **extension tool names are always namespace
   to claim an un-namespaced name.
 
 Extension tools are dispatched through `ExtensionMergedRegistry`, which routes the
-call to the owning extension via `ExtensionHostPort::invoke`. An extension fault
+call to the owning extension via `ExtensionHostPort::invoke_extension`, preserving
+the extension identity and requiring the tool to be declared by that extension. An extension fault
 (timeout, crash, protocol error, or quarantine) maps to `-32603` and does not affect
 the host process or the MCP link. (Previously these were WASM plugin tools dispatched
 to an in-process sandbox; they are now out-of-process native sidecars — see
@@ -1686,6 +1746,14 @@ structural analysis for Rust, Go, and PHP. It also contributes AST-anchored writ
 tools that resolve exactly one symbol and request host-applied edits through
 `workspace/applyEdits`. Its native sidecar binary must be discovered from an
 extension scope for the tools to appear.
+
+The declared `tower_ast_plan_safe_delete_declaration` planning tool accepts `path`,
+`symbol_name`, and optional `kind`. It returns a `planned` declaration with its
+workspace-relative path, symbol identity, UTF-16 position, deletion byte span, and
+base content hash, or `not_found`, `ambiguous_symbol`, or `invalid_declaration`.
+It reads fresh content and never applies edits. The native
+[`tower_safe_delete_symbol`](#tower_safe_delete_symbol) composes this declaration
+plan with semantic reference analysis and host preflight before applying changes.
 
 Supported languages (detected by file extension or language ID):
 
@@ -2059,6 +2127,7 @@ success and stable structured error payloads on resolution failures:
 
 Other stable `code` values are `not_found`, `unsupported_language`,
 `invalid_range`, and `backend_error`.
+
 
 ---
 

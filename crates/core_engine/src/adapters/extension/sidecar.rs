@@ -29,7 +29,7 @@ use extension_protocol::{
 };
 use serde_json::Value;
 
-use super::host_deps::HostDeps;
+use super::host_deps::{FsAdapter, HostDeps};
 use super::path_validation::validate_capability_path;
 use crate::adapters::mcp::PushEvent;
 use crate::domain::extension_host::{ExtensionApplicationError, ExtensionCallError};
@@ -880,6 +880,13 @@ fn dispatch_host_call(
             let path = params["path"].as_str().unwrap_or("").to_owned();
             match validate_capability_path(&path) {
                 Err(e) => encode_response_err(call_id, -32602, e),
+                Ok(()) if read_path_escapes_workspace(deps.fs.as_ref(), &path) => {
+                    encode_response_err(
+                        call_id,
+                        -32602,
+                        "workspace path resolves outside the workspace".to_owned(),
+                    )
+                }
                 Ok(()) => match deps.fs.read_file(&path) {
                     Ok(bytes) => {
                         // Return bytes as a UTF-8 string (lossy) for JSON transport.
@@ -1016,11 +1023,14 @@ fn dispatch_host_call(
                 Err(e) => encode_apply_edits_error(call_id, e),
             }
         }
-        "log" => {
+        "log" | "host/log" => {
             // Log capability: emit to stderr (host-side, structured).
             // No capability check — log is always allowed.
             let level = params["level"].as_str().unwrap_or("info");
-            let msg = params["msg"].as_str().unwrap_or("");
+            let msg = params["message"]
+                .as_str()
+                .or_else(|| params["msg"].as_str())
+                .unwrap_or("");
             eprintln!("[tower/ext] [{level}] {msg}");
             encode_response_ok(call_id, Value::Bool(true))
         }
@@ -1048,6 +1058,19 @@ fn dispatch_host_call(
             format!("unknown host capability method: {other}"),
         ),
     }
+}
+
+fn read_path_escapes_workspace(fs: &dyn FsAdapter, path: &str) -> bool {
+    let Some(workspace_root) = fs.workspace_root() else {
+        return false;
+    };
+    let Ok(canonical_root) = workspace_root.canonicalize() else {
+        return false;
+    };
+    workspace_root
+        .join(path)
+        .canonicalize()
+        .is_ok_and(|candidate| !candidate.starts_with(canonical_root))
 }
 
 struct DecodedWorkspaceApplyEditsRequest {

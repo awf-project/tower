@@ -11,16 +11,17 @@ Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 
 ## Why Tower
 
-| Capability                     | What it gives clients                                                                                      |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| **Persistent workspace index** | Fast file lookup and directory listing from a `sled`-backed VFS.                                           |
-| **Parallel text search**       | Rayon-backed grep across indexed file contents.                                                            |
-| **Safe mutations**             | Atomic writes and CAS-style `expected_version` checks for agent-safe edits.                                |
-| **Path rename**                | Preview or move indexed files and directories, with optional language-server reference updates.            |
-| **Shared daemon**              | One watcher, index, and extension registry per workspace; many MCP clients.                                |
-| **Native sidecar extensions**  | Out-of-process extension binaries that contribute `tower_<ext>_*` MCP tools.                               |
-| **Semantic workflows**         | AST outline/symbol tools, LSP navigation including type hierarchies, lint fixes, and opt-in DAP debugging. |
-| **No runtime VM**              | Native binaries only; no JVM, Node, WASM runtime, or container required at runtime.                        |
+| Capability                      | What it gives clients                                                                                      |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Persistent workspace index**  | Fast file lookup and directory listing from a `sled`-backed VFS.                                           |
+| **Parallel text search**        | Rayon-backed grep across indexed file contents.                                                            |
+| **Safe mutations**              | Atomic writes and CAS-style `expected_version` checks for agent-safe edits.                                |
+| **Path rename**                 | Preview or move indexed files and directories, with optional language-server reference updates.            |
+| **Reference-aware safe delete** | Check references before deleting a declaration and apply validated backend cleanup edits safely.           |
+| **Shared daemon**               | One watcher, index, and extension registry per workspace; many MCP clients.                                |
+| **Native sidecar extensions**   | Out-of-process extension binaries that contribute `tower_<ext>_*` MCP tools.                               |
+| **Semantic workflows**          | AST outline/symbol tools, LSP navigation including type hierarchies, lint fixes, and opt-in DAP debugging. |
+| **No runtime VM**               | Native binaries only; no JVM, Node, WASM runtime, or container required at runtime.                        |
 
 ## Quick Start
 
@@ -139,7 +140,7 @@ enabled.
 | Area             | Examples                                                                                                                                            |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Files and search | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text`                                                                         |
-| Safe mutations   | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`, `tower_rename_path`                                           |
+| Safe mutations   | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`, `tower_rename_path`, `tower_safe_delete_symbol`               |
 | AST              | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol`                                                                          |
 | LSP              | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover`, `tower_lsp_implementations`, `tower_lsp_type_hierarchy` |
 | Lint             | `tower_lint_check`, `tower_lint_fix`                                                                                                                |
@@ -158,7 +159,7 @@ stable error codes.
 | [docs/architecture.md](docs/architecture.md)                           | Hexagonal boundary, ports/adapters, daemon flow, and invariants.                     |
 | [docs/extensions.md](docs/extensions.md)                               | Native sidecar extension protocol, manifests, capabilities, and supervision.         |
 | [docs/mcp-tools.md](docs/mcp-tools.md)                                 | Complete MCP tool reference and JSON-RPC details.                                    |
-| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Safe AST and LSP edit workflows.                                                     |
+| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Semantic rename, reference-aware safe delete, and AST edit workflows.                |
 | [docs/user-guide/path-rename.md](docs/user-guide/path-rename.md)       | Preview and apply file or directory moves with optional reference updates.           |
 | [docs/user-guide/type-hierarchy.md](docs/user-guide/type-hierarchy.md) | Explore supertypes and subtypes through a configured language server.                |
 | [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)         | Previewing and applying structured linter fixes.                                     |
@@ -170,6 +171,7 @@ stable error codes.
 ### v0.1.0
 
 - [x] F011: File and directory rename refactor.
+- [x] F012: Reference-aware safe symbol deletion.
 
 ## Development
 

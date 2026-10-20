@@ -33,19 +33,19 @@ max_traces = 25
 record_timeout_secs = 30
 
 [extensions]
-# Plugin file stems to skip loading, e.g. ["ast"].
-# A disabled extension gets no sandbox, no fuel, no tools, no watcher hooks.
+# Extension manifest names to skip loading, e.g. ["ast"].
+# Disabled extensions are not loaded and expose no tools or event hooks.
 disabled = []
 
-# [plugins.formatter.tools.<id>] — external formatters run by plugin_fmt when a
+# [formatter.tools.<id>] — external formatters run by the host format queue when a
 # file changes. mode = "filter" (default, stdin->stdout) or "inplace".
 # `{path}` is substituted with the file path (filter) or temp copy (inplace).
 # Uninstalled tools are skipped, so unused entries are harmless.
 
-[plugins.formatter.tools.rustfmt]
+[formatter.tools.rustfmt]
 argv = ["rustfmt", "--edition", "2024"]
 extensions = ["rs"]
 
-[plugins.formatter.tools.prettier_markdown]
+[formatter.tools.prettier_markdown]
 argv = ["prettier", "--parser", "markdown"]
 extensions = ["md", "markdown"]

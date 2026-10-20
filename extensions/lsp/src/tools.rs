@@ -17,7 +17,7 @@ use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position, Severity};
 use extension_protocol::messages::{
     PathRenameError, PathRenameErrorCode, PathRenamePlan, PathRenamePlanningRequest,
-    PathRenamePlanningResult,
+    PathRenamePlanningResult, SafeDeleteSemanticOutcome, SafeDeleteSemanticRequest,
 };
 use extension_protocol::{
     HostCall, LspImplementationRequest, LspImplementationResult, LspOperation, LspOutcome,
@@ -145,10 +145,107 @@ where
         "rename" => {
             rename(params, pool, workspace_root, out, lines, next_id, deferred).map_err(Into::into)
         }
-        "planPathRename" => {
+        "plan_path_rename" => {
             plan_path_rename(params, pool, workspace_root, out, lines, next_id, deferred)
         }
+        "plan_safe_delete" => {
+            plan_safe_delete(params, pool, workspace_root, out, lines, next_id, deferred)
+        }
         other => Err(format!("unknown LSP tool: {other}").into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_safe_delete<W, R>(
+    params: Value,
+    pool: &mut LspSessionPool,
+    _workspace_root: &std::path::Path,
+    out: &Arc<Mutex<W>>,
+    lines: &mut R,
+    next_id: &mut HostCallIdAllocator,
+    deferred: &mut VecDeque<QueuedFrame>,
+) -> Result<Value, ToolDispatchError>
+where
+    W: Write,
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let request: SafeDeleteSemanticRequest = serde_json::from_value(params).map_err(|_| {
+        ToolDispatchError::InvalidParams(
+            "invalid_params: plan_safe_delete params must match SafeDeleteSemanticRequest"
+                .to_owned(),
+        )
+    })?;
+    let mut content_cache: HashMap<String, String> = HashMap::new();
+    let mut reader = |path: &str| {
+        let normalized_path = normalize_workspace_read_path(path)?;
+        if let Some(content) = content_cache.get(&normalized_path) {
+            return Ok(content.clone());
+        }
+        let content =
+            read_file(&normalized_path, out, lines, next_id, deferred).map_err(|error| {
+                if error == "workspace path resolves outside the workspace" {
+                    LspSessionError::WorkspaceExternal
+                } else {
+                    LspSessionError::Backend(LspOutcomeCode::ServerError)
+                }
+            })?;
+        content_cache.insert(normalized_path, content.clone());
+        Ok(content)
+    };
+    let outcome = pool
+        .plan_safe_delete(&request, &mut reader)
+        .unwrap_or_else(normalize_safe_delete_pool_error);
+    serde_json::to_value(outcome).map_err(|error| error.to_string().into())
+}
+
+fn normalize_workspace_read_path(requested_path: &str) -> Result<String, LspSessionError> {
+    use std::path::Component;
+
+    let requested = std::path::Path::new(requested_path);
+    let mut normalized = PathBuf::new();
+    for component in requested.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(LspSessionError::WorkspaceExternal);
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(LspSessionError::WorkspaceExternal);
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(LspSessionError::WorkspaceExternal);
+    }
+
+    // The host readFile capability owns canonical/symlink containment. The
+    // sidecar must not inspect workspace paths through ambient filesystem I/O.
+
+    normalized
+        .to_str()
+        .map(|path| path.replace('\\', "/"))
+        .ok_or(LspSessionError::WorkspaceExternal)
+}
+
+fn normalize_safe_delete_pool_error(error: LspSessionError) -> SafeDeleteSemanticOutcome {
+    match error {
+        LspSessionError::Unconfigured
+        | LspSessionError::CapabilityUnavailable
+        | LspSessionError::NotRenameable
+        | LspSessionError::Backend(
+            LspOutcomeCode::LanguageNotConfigured | LspOutcomeCode::CapabilityUnavailable,
+        ) => SafeDeleteSemanticOutcome::CapabilityUnavailable,
+        LspSessionError::Backend(LspOutcomeCode::ServerTimeout) => {
+            SafeDeleteSemanticOutcome::BackendTimeout
+        }
+        LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse) => {
+            SafeDeleteSemanticOutcome::MalformedResponse
+        }
+        LspSessionError::Backend(_) => SafeDeleteSemanticOutcome::BackendCrashed,
+        LspSessionError::WorkspaceExternal => SafeDeleteSemanticOutcome::WorkspaceExternal,
     }
 }
 
@@ -168,7 +265,8 @@ where
 {
     let request: PathRenamePlanningRequest = serde_json::from_value(params).map_err(|_| {
         ToolDispatchError::InvalidParams(
-            "invalid_params: planPathRename params must match PathRenamePlanningRequest".to_owned(),
+            "invalid_params: plan_path_rename params must match PathRenamePlanningRequest"
+                .to_owned(),
         )
     })?;
 
@@ -773,12 +871,14 @@ fn lsp_session_error_value(error: LspSessionError, path: Option<String>) -> Resu
                 error,
             )
         }
-        error @ LspSessionError::Backend(_) => rename_error_value_with_outcome(
-            RenameErrorCode::BackendError,
-            "language server request failed",
-            path,
-            error,
-        ),
+        error @ (LspSessionError::WorkspaceExternal | LspSessionError::Backend(_)) => {
+            rename_error_value_with_outcome(
+                RenameErrorCode::BackendError,
+                "language server request failed",
+                path,
+                error,
+            )
+        }
     }
 }
 
@@ -839,6 +939,9 @@ fn rename_lsp_outcome(
             LspOutcomeCode::CapabilityUnavailable,
         ),
         LspSessionError::Backend(code) => (LspOutcomeStatus::Error, code),
+        LspSessionError::WorkspaceExternal => {
+            (LspOutcomeStatus::Error, LspOutcomeCode::ServerError)
+        }
         LspSessionError::NotRenameable => return None,
     };
     Some(LspOutcome {
@@ -1094,7 +1197,7 @@ mod tests {
         let mut next_id = HostCallIdAllocator::new(10_000);
         let mut deferred = VecDeque::new();
         let result = dispatch(
-            "planPathRename",
+            "plan_path_rename",
             params,
             &mut pool,
             &workspace_root,
@@ -1115,7 +1218,7 @@ mod tests {
         let tools = manifest["tools"].as_array().expect("manifest tools array");
         let declaration = tools
             .iter()
-            .find(|tool| tool["name"].as_str() == Some("planPathRename"))
+            .find(|tool| tool["name"].as_str() == Some("plan_path_rename"))
             .expect("internal path-rename planner is advertised");
         let schema: Value = serde_json::from_str(
             declaration["schema_json"]
@@ -1133,7 +1236,7 @@ mod tests {
             json!(["none", "best_effort", "required"])
         );
         assert!(
-            include_str!("main.rs").contains("name: \"planPathRename\".to_owned()"),
+            include_str!("main.rs").contains("name: \"plan_path_rename\".to_owned()"),
             "initialize must advertise the same internal planning tool"
         );
     }
@@ -1162,7 +1265,7 @@ mod tests {
         match invalid {
             Err(ToolDispatchError::InvalidParams(message)) => assert_eq!(
                 message,
-                "invalid_params: planPathRename params must match PathRenamePlanningRequest",
+                "invalid_params: plan_path_rename params must match PathRenamePlanningRequest",
                 "malformed planner arguments must retain the invocation invalid-params classification"
             ),
             other => panic!("expected an invalid-params invocation error, got {other:?}"),
@@ -1237,7 +1340,7 @@ mod tests {
         let mut deferred = VecDeque::new();
 
         let result = dispatch(
-            "planPathRename",
+            "plan_path_rename",
             path_rename_params(),
             &mut pool,
             &workspace.path().to_path_buf(),
@@ -1297,7 +1400,7 @@ mod tests {
         let mut ids = HostCallIdAllocator::new(10_000);
         let mut deferred = VecDeque::new();
         let result = dispatch(
-            "planPathRename",
+            "plan_path_rename",
             path_rename_params(),
             &mut pool,
             &workspace.to_path_buf(),
@@ -1488,7 +1591,7 @@ mod tests {
                 .as_array()
                 .expect("initialized tools")
                 .iter()
-                .any(|tool| tool["name"] == "planPathRename")
+                .any(|tool| tool["name"] == "plan_path_rename")
         );
         let _ = child.kill();
         let _ = child.wait();

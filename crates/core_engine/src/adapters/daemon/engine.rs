@@ -239,6 +239,16 @@ impl ExtensionHostPort for SharedExtensionHost {
         let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
         guard.invoke(tool_name, params)
     }
+
+    fn invoke_extension(
+        &self,
+        extension_id: &crate::domain::ExtensionId,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::domain::InvokeError> {
+        let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
+        guard.invoke_extension(extension_id, tool_name, params)
+    }
 }
 
 // ── EngineHandle ──────────────────────────────────────────────────────────────

@@ -19,12 +19,17 @@ use crate::index::{SymbolEntry, SymbolIndex};
 use crate::outline::{self, OutlineResult};
 use crate::protocol;
 use crate::symbols::{self, SupportedLanguage, SymbolKind, SymbolMatch, SymbolResult};
+use extension_protocol::messages::{
+    SafeDeleteByteSpan, SafeDeleteDeclarationOutcome, SafeDeleteDeclarationPlan,
+    SafeDeleteDeclarationRequest, SafeDeletePosition,
+};
 use extension_protocol::{
     AnchoredSymbolEditError, AnchoredSymbolEditErrorCode, AnchoredSymbolEditRequest,
     AnchoredSymbolEditResult, SymbolCandidate, WorkspaceApplyEditsRequest,
     WorkspaceApplyEditsResult, WorkspaceEditSpan,
 };
 use sha2::{Digest, Sha256};
+use tree_sitter::{Node, Parser};
 
 // ── Dispatch entry point ──────────────────────────────────────────────────────
 
@@ -62,6 +67,9 @@ where
             tool_insert_after_symbol(params, index, content_hashes, out, lines, next_id)
         }
         "delete_symbol" => tool_delete_symbol(params, index, content_hashes, out, lines, next_id),
+        "plan_safe_delete_declaration" => {
+            tool_plan_safe_delete_declaration(params, index, content_hashes, out, lines, next_id)
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -414,6 +422,159 @@ where
         lines,
         next_id,
     )
+}
+
+fn tool_plan_safe_delete_declaration<W, R>(
+    params: serde_json::Value,
+    _index: &Mutex<SymbolIndex>,
+    _content_hashes: &Mutex<HashMap<String, u64>>,
+    out: &mut W,
+    lines: &mut R,
+    next_id: &mut u64,
+) -> Result<serde_json::Value, String>
+where
+    W: Write,
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let request = serde_json::from_value::<SafeDeleteDeclarationRequest>(params)
+        .map_err(|error| format!("invalid SafeDeleteDeclarationRequest: {error}"))?;
+    let content = match protocol::host_call_read_file(out, lines, next_id, &request.path) {
+        Ok(content) => content,
+        Err(_) => {
+            let _ = protocol::host_call_log(
+                out,
+                lines,
+                next_id,
+                "warn",
+                "safe-delete declaration planning failed",
+            );
+            return Err("safe-delete declaration planning failed".to_owned());
+        }
+    };
+    serde_json::to_value(plan_safe_delete_declaration(request, &content))
+        .map_err(|error| format!("serialize SafeDeleteDeclarationOutcome failed: {error}"))
+}
+
+fn plan_safe_delete_declaration(
+    request: SafeDeleteDeclarationRequest,
+    content: &[u8],
+) -> SafeDeleteDeclarationOutcome {
+    let kind = match parse_optional_kind(request.kind.as_deref()) {
+        Ok(kind) => kind,
+        Err(_) => return SafeDeleteDeclarationOutcome::InvalidDeclaration,
+    };
+    let matches =
+        match symbols::resolve_symbol_spans(content, &request.path, &request.symbol_name, kind) {
+            SymbolResult::Found(matches) => matches,
+            SymbolResult::Unsupported { .. } | SymbolResult::NotApplicable => {
+                return SafeDeleteDeclarationOutcome::InvalidDeclaration;
+            }
+        };
+    let symbol = match matches.as_slice() {
+        [] if source_has_parse_error(&request.path, content) => {
+            return SafeDeleteDeclarationOutcome::InvalidDeclaration;
+        }
+        [] => return SafeDeleteDeclarationOutcome::NotFound,
+        [resolved] => resolved,
+        _ => return SafeDeleteDeclarationOutcome::AmbiguousSymbol,
+    };
+    let Some(position) = symbol_name_position(&request.path, content, symbol) else {
+        return SafeDeleteDeclarationOutcome::InvalidDeclaration;
+    };
+    let end_byte = declaration_end_with_owned_newline(content, symbol.end_byte);
+    if symbol.start_byte >= symbol.end_byte || end_byte > content.len() {
+        return SafeDeleteDeclarationOutcome::InvalidDeclaration;
+    }
+
+    SafeDeleteDeclarationOutcome::Planned {
+        plan: SafeDeleteDeclarationPlan {
+            path: request.path,
+            symbol_name: symbol.name.clone(),
+            kind: symbol.kind.as_str().to_owned(),
+            position,
+            deletion_span: SafeDeleteByteSpan {
+                start_byte: symbol.start_byte,
+                end_byte,
+            },
+            base_hash: sha256_hex(content),
+        },
+    }
+}
+
+fn source_has_parse_error(path: &str, content: &[u8]) -> bool {
+    let Some(language) = SupportedLanguage::from_hint(path) else {
+        return true;
+    };
+    let grammar = match language {
+        SupportedLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+        SupportedLanguage::Go => tree_sitter_go::LANGUAGE.into(),
+        SupportedLanguage::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return true;
+    }
+    parser
+        .parse(content, None)
+        .is_none_or(|tree| tree.root_node().has_error())
+}
+
+fn symbol_name_position(
+    path: &str,
+    content: &[u8],
+    symbol: &SymbolMatch,
+) -> Option<SafeDeletePosition> {
+    let language = SupportedLanguage::from_hint(path)?;
+    let name_byte = declaration_name_start_byte(content, symbol, language)?;
+    let name_end = name_byte.checked_add(symbol.name.len())?;
+    if content.get(name_byte..name_end)? != symbol.name.as_bytes() {
+        return None;
+    }
+    let prefix = std::str::from_utf8(content.get(..name_byte)?).ok()?;
+    let line = u32::try_from(prefix.bytes().filter(|byte| *byte == b'\n').count()).ok()?;
+    let line_start = prefix.rfind('\n').map_or(0, |offset| offset + 1);
+    let character = u32::try_from(prefix.get(line_start..)?.encode_utf16().count()).ok()?;
+    Some(SafeDeletePosition { line, character })
+}
+
+fn declaration_name_start_byte(
+    content: &[u8],
+    symbol: &SymbolMatch,
+    language: SupportedLanguage,
+) -> Option<usize> {
+    let grammar = match language {
+        SupportedLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
+        SupportedLanguage::Go => tree_sitter_go::LANGUAGE.into(),
+        SupportedLanguage::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+    };
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content, None)?;
+    declaration_name_node_start(tree.root_node(), content, symbol)
+}
+
+fn declaration_name_node_start(
+    node: Node<'_>,
+    content: &[u8],
+    symbol: &SymbolMatch,
+) -> Option<usize> {
+    if node.start_byte() == symbol.start_byte && node.end_byte() == symbol.end_byte {
+        let field = if symbol.kind == SymbolKind::Impl {
+            "type"
+        } else {
+            "name"
+        };
+        let mut cursor = node.walk();
+        for name_node in node.children_by_field_name(field, &mut cursor) {
+            if content.get(name_node.byte_range()) == Some(symbol.name.as_bytes()) {
+                return Some(name_node.start_byte());
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| declaration_name_node_start(child, content, symbol))
 }
 
 #[derive(Clone, Copy)]

@@ -215,6 +215,12 @@ and any proposed reference edits before changing the workspace. See the
 [path rename how-to](user-guide/path-rename.md) for a complete request
 and the [MCP tool reference](mcp-tools.md) for the wire contract.
 
+The native `tower_safe_delete_symbol` tool is listed even when extensions are unavailable. Planning
+requires the AST extension and a configured semantic backend. It resolves a declaration, checks
+references, and either returns a blocking report or applies a validated declaration and cleanup
+plan. Use `dry_run:true` to inspect the report without changing files. See
+[Safe-delete a symbol](user-guide/semantic-edits.md#safe-delete-a-symbol).
+
 Extensions are native sidecar binaries discovered from an extension scope by their `extension.toml`
 manifest. Install one (its binary + manifest) into a scope and restart `tower` — no recompile of the
 host:

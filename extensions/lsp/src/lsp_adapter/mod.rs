@@ -81,19 +81,25 @@ use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::{Value, json};
 
-use crate::lsp_adapter::decode::{RawLocation, UriAccessPolicy, UriClassification};
+use crate::lsp_adapter::decode::{
+    RawLocation, UriAccessPolicy, UriClassification, WorkspaceEditDecodeError,
+    decode_workspace_edit as decode_workspace_edit_spans,
+};
 use crate::lsp_adapter::documents::{DocSync, DocumentTracker};
 use core_engine::adapters::fs::scan::TOWERIGNORE_FILE_NAME;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{
     Diagnostic, Hover, Location, Position, Range, Severity, Symbol,
 };
+use core_engine::domain::mutation::compute_content_version;
 use core_engine::ports::{
     CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
     RenameNavigationError,
 };
 use extension_protocol::messages::{
-    PathMoveKind, PathRenameError, PathRenameErrorCode, PathRenamePlanningRequest,
+    CleanupCoverage, LspOutcomeCode, PathMoveKind, PathRenameError, PathRenameErrorCode,
+    PathRenamePlanningRequest, SafeDeleteCleanupEdit, SafeDeletePosition, SafeDeleteReference,
+    SafeDeleteSemanticOutcome, SafeDeleteSemanticPlan, SafeDeleteSemanticRequest,
 };
 
 #[allow(dead_code)]
@@ -104,6 +110,7 @@ pub(crate) enum LspSessionError {
     Unconfigured,
     CapabilityUnavailable,
     NotRenameable,
+    WorkspaceExternal,
     Backend(extension_protocol::LspOutcomeCode),
 }
 
@@ -113,6 +120,7 @@ impl core::fmt::Display for LspSessionError {
             Self::Unconfigured => "language is not configured",
             Self::CapabilityUnavailable => "language server capability is unavailable",
             Self::NotRenameable => "symbol is not renameable",
+            Self::WorkspaceExternal => "workspace path is external",
             Self::Backend(_) => "language server request failed",
         };
         f.write_str(description)
@@ -211,9 +219,9 @@ fn session_to_code_intel_error(error: LspSessionError) -> CodeIntelError {
         LspSessionError::Unconfigured | LspSessionError::CapabilityUnavailable => {
             CodeIntelError::Unsupported
         }
-        LspSessionError::NotRenameable | LspSessionError::Backend(_) => {
-            CodeIntelError::Backend(error.to_string())
-        }
+        LspSessionError::NotRenameable
+        | LspSessionError::WorkspaceExternal
+        | LspSessionError::Backend(_) => CodeIntelError::Backend(error.to_string()),
     }
 }
 
@@ -223,7 +231,9 @@ fn session_to_rename_error(error: LspSessionError) -> RenameNavigationError {
             RenameNavigationError::UnsupportedLanguage
         }
         LspSessionError::NotRenameable => RenameNavigationError::NotRenameable,
-        LspSessionError::Backend(_) => RenameNavigationError::Backend(error.to_string()),
+        LspSessionError::WorkspaceExternal | LspSessionError::Backend(_) => {
+            RenameNavigationError::Backend(error.to_string())
+        }
     }
 }
 
@@ -251,6 +261,7 @@ struct SemanticCapabilities {
     type_hierarchy: ProviderCapability,
     rename: RenameCapability,
     will_rename_files: ProviderCapability,
+    safe_delete: ProviderCapability,
 }
 
 #[allow(dead_code)]
@@ -269,8 +280,19 @@ impl SemanticCapabilities {
             type_hierarchy: parse_provider(capabilities.get("typeHierarchyProvider"))?,
             rename: parse_rename_provider(capabilities.get("renameProvider"))?,
             will_rename_files: parse_will_rename_files(capabilities.get("workspace"))?,
+            safe_delete: parse_safe_delete(capabilities.get("experimental"))?,
         })
     }
+}
+
+fn parse_safe_delete(value: Option<&Value>) -> Result<ProviderCapability, LspSessionError> {
+    let Some(experimental) = value else {
+        return Ok(ProviderCapability::Unavailable);
+    };
+    let experimental = experimental
+        .as_object()
+        .ok_or_else(malformed_capabilities)?;
+    parse_provider(experimental.get("towerSafeDelete"))
 }
 
 fn parse_will_rename_files(value: Option<&Value>) -> Result<ProviderCapability, LspSessionError> {
@@ -957,6 +979,7 @@ impl LspClientAdapter {
                 type_hierarchy: ProviderCapability::Unavailable,
                 rename: RenameCapability::Unavailable,
                 will_rename_files: ProviderCapability::Unavailable,
+                safe_delete: ProviderCapability::Unavailable,
             }),
             ignore,
             next_id: AtomicI64::new(1),
@@ -1678,6 +1701,14 @@ impl Drop for LspClientAdapter {
 }
 
 impl pool::PooledSession for LspClientAdapter {
+    fn plan_safe_delete(
+        &self,
+        request: &SafeDeleteSemanticRequest,
+        read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> Result<SafeDeleteSemanticOutcome, LspSessionError> {
+        self.plan_safe_delete_query(request, read_content)
+    }
+
     fn type_hierarchy_lsp(
         &self,
         query: &extension_protocol::TypeHierarchyQuery,
@@ -1918,6 +1949,288 @@ impl pool::PooledSession for LspClientAdapter {
     fn kill_for_test(&self) {
         let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let _ = session.child.kill();
+    }
+}
+
+impl LspClientAdapter {
+    fn plan_safe_delete_query(
+        &self,
+        request: &SafeDeleteSemanticRequest,
+        read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> Result<SafeDeleteSemanticOutcome, LspSessionError> {
+        let declaration = &request.declaration;
+        let declaration_text = match read_content(&declaration.path) {
+            Ok(text) => text,
+            Err(LspSessionError::WorkspaceExternal) => {
+                return Ok(SafeDeleteSemanticOutcome::WorkspaceExternal);
+            }
+            Err(_) => return Ok(SafeDeleteSemanticOutcome::InvalidLocation),
+        };
+        if compute_content_version(declaration_text.as_bytes()) != declaration.base_hash {
+            return Ok(incomplete_safe_delete(Vec::new()));
+        }
+        let declaration_position = lsp_types::Position {
+            line: declaration.position.line,
+            character: declaration.position.character,
+        };
+        let position_map = crate::lsp_adapter::position_map::PositionMap::new(&declaration_text);
+        if declaration.deletion_span.start_byte >= declaration.deletion_span.end_byte
+            || !declaration_text.is_char_boundary(declaration.deletion_span.start_byte)
+            || !declaration_text.is_char_boundary(declaration.deletion_span.end_byte)
+            || position_map
+                .lsp_range_to_byte_range(
+                    &declaration.path,
+                    lsp_types::Range {
+                        start: declaration_position,
+                        end: declaration_position,
+                    },
+                )
+                .is_err()
+        {
+            return Ok(SafeDeleteSemanticOutcome::InvalidLocation);
+        }
+
+        let path = RelativePath::new(declaration.path.clone());
+        if !self.supports(&path) {
+            return Ok(SafeDeleteSemanticOutcome::CapabilityUnavailable);
+        }
+        let capabilities = *self
+            .semantic_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if capabilities.references == ProviderCapability::Unavailable {
+            return Ok(SafeDeleteSemanticOutcome::CapabilityUnavailable);
+        }
+
+        let uri = self.uri_for(&path);
+        if self.acquire_doc(&uri, &declaration_text).is_err() {
+            return Ok(SafeDeleteSemanticOutcome::BackendCrashed);
+        }
+        let outcome = (|| {
+            let params = json!({
+                "textDocument": { "uri": uri },
+                "position": {
+                    "line": declaration.position.line,
+                    "character": declaration.position.character,
+                },
+                "context": { "includeDeclaration": false }
+            });
+            let references = match self.send_request("textDocument/references", params) {
+                Err(error @ LspSessionError::Backend(LspOutcomeCode::ServerError)) => {
+                    return Err(error);
+                }
+                Err(error) => return Ok(safe_delete_error_outcome(error)),
+                Ok(value) => match self.decode_safe_delete_references(value, read_content) {
+                    Ok(references) => references,
+                    Err(outcome) => return Ok(outcome),
+                },
+            };
+            if capabilities.safe_delete == ProviderCapability::Unavailable {
+                // A complete reference lookup needs no cleanup capability when
+                // every usage disappears with the validated declaration span.
+                // Preserve the references for the domain's independent checks.
+                let all_internal = references.iter().all(|reference| {
+                    reference.path == declaration.path
+                        && reference.base_hash == declaration.base_hash
+                        && position_map
+                            .lsp_range_to_byte_range(
+                                &reference.path,
+                                lsp_types::Range {
+                                    start: lsp_types::Position {
+                                        line: reference.start.line,
+                                        character: reference.start.character,
+                                    },
+                                    end: lsp_types::Position {
+                                        line: reference.end.line,
+                                        character: reference.end.character,
+                                    },
+                                },
+                            )
+                            .is_ok_and(|range| {
+                                range.start >= declaration.deletion_span.start_byte
+                                    && range.end <= declaration.deletion_span.end_byte
+                            })
+                });
+                return Ok(if all_internal {
+                    complete_safe_delete(references, Vec::new())
+                } else {
+                    incomplete_safe_delete(references)
+                });
+            }
+            match self.send_request(
+                "experimental/tower/safeDelete",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": declaration.position.line,
+                        "character": declaration.position.character,
+                    }
+                }),
+            ) {
+                Err(error @ LspSessionError::Backend(LspOutcomeCode::ServerError)) => Err(error),
+                Err(error) => Ok(safe_delete_error_outcome(error)),
+                Ok(value) => Ok(self.decode_safe_delete_cleanup(value, references, read_content)),
+            }
+        })();
+        self.release_doc(&uri);
+        outcome
+    }
+
+    fn decode_safe_delete_references(
+        &self,
+        value: Value,
+        read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> Result<Vec<SafeDeleteReference>, SafeDeleteSemanticOutcome> {
+        let locations: Vec<lsp_types::Location> = if value.is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value(value)
+                .map_err(|_| SafeDeleteSemanticOutcome::MalformedResponse)?
+        };
+        locations
+            .into_iter()
+            .map(|location| {
+                let raw_uri = location.uri.to_string();
+                let Some(UriClassification::WorkspacePath(path)) =
+                    decode::classify_uri(&raw_uri, &self.workspace_root, UriAccessPolicy::Writable)
+                else {
+                    return Err(SafeDeleteSemanticOutcome::WorkspaceExternal);
+                };
+                let text = read_content(&path).map_err(|error| match error {
+                    LspSessionError::WorkspaceExternal => {
+                        SafeDeleteSemanticOutcome::WorkspaceExternal
+                    }
+                    _ => SafeDeleteSemanticOutcome::InvalidLocation,
+                })?;
+                crate::lsp_adapter::position_map::PositionMap::new(&text)
+                    .lsp_range_to_byte_range(&path, location.range)
+                    .map_err(|_| SafeDeleteSemanticOutcome::InvalidLocation)?;
+                Ok(SafeDeleteReference {
+                    path,
+                    start: SafeDeletePosition {
+                        line: location.range.start.line,
+                        character: location.range.start.character,
+                    },
+                    end: SafeDeletePosition {
+                        line: location.range.end.line,
+                        character: location.range.end.character,
+                    },
+                    base_hash: compute_content_version(text.as_bytes()),
+                })
+            })
+            .collect()
+    }
+
+    fn decode_safe_delete_cleanup(
+        &self,
+        value: Value,
+        references: Vec<SafeDeleteReference>,
+        read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> SafeDeleteSemanticOutcome {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CleanupResponse {
+            coverage: CleanupCoverage,
+            edit: RawWorkspaceEdit,
+        }
+        let response: CleanupResponse = match serde_json::from_value(value) {
+            Ok(response) => response,
+            Err(_) => return SafeDeleteSemanticOutcome::MalformedResponse,
+        };
+        let edits = match decode_workspace_edit_spans(response.edit, &self.workspace_root, |path| {
+            read_content(path).map_err(|error| match error {
+                LspSessionError::WorkspaceExternal => WorkspaceEditDecodeError::InvalidPath {
+                    uri: "workspace-external path".to_owned(),
+                },
+                _ => WorkspaceEditDecodeError::UnreadableFile {
+                    path: path.to_owned(),
+                    message: "workspace file could not be read".to_owned(),
+                },
+            })
+        }) {
+            Ok(edits) => {
+                let mut cleanup_edits = Vec::with_capacity(edits.len());
+                for edit in edits {
+                    let Some(base_hash) = edit.base_hash else {
+                        return SafeDeleteSemanticOutcome::MalformedResponse;
+                    };
+                    cleanup_edits.push(SafeDeleteCleanupEdit {
+                        path: edit.path,
+                        start_byte: edit.start_byte,
+                        end_byte: edit.end_byte,
+                        replacement: edit.replacement,
+                        base_hash,
+                    });
+                }
+                cleanup_edits
+            }
+            Err(WorkspaceEditDecodeError::InvalidPath { .. }) => {
+                return SafeDeleteSemanticOutcome::WorkspaceExternal;
+            }
+            Err(
+                WorkspaceEditDecodeError::InvalidRange { .. }
+                | WorkspaceEditDecodeError::MissingText { .. }
+                | WorkspaceEditDecodeError::UnreadableFile { .. },
+            ) => {
+                return SafeDeleteSemanticOutcome::InvalidLocation;
+            }
+            Err(WorkspaceEditDecodeError::UnsupportedWorkspaceEdit { .. }) => {
+                return SafeDeleteSemanticOutcome::MalformedResponse;
+            }
+        };
+        match response.coverage {
+            CleanupCoverage::Complete => complete_safe_delete(references, edits),
+            CleanupCoverage::Incomplete => SafeDeleteSemanticOutcome::Incomplete {
+                plan: SafeDeleteSemanticPlan {
+                    references,
+                    cleanup_edits: edits,
+                    coverage: CleanupCoverage::Incomplete,
+                },
+            },
+        }
+    }
+}
+
+fn complete_safe_delete(
+    references: Vec<SafeDeleteReference>,
+    cleanup_edits: Vec<SafeDeleteCleanupEdit>,
+) -> SafeDeleteSemanticOutcome {
+    SafeDeleteSemanticOutcome::Complete {
+        plan: SafeDeleteSemanticPlan {
+            references,
+            cleanup_edits,
+            coverage: CleanupCoverage::Complete,
+        },
+    }
+}
+
+fn incomplete_safe_delete(references: Vec<SafeDeleteReference>) -> SafeDeleteSemanticOutcome {
+    SafeDeleteSemanticOutcome::Incomplete {
+        plan: SafeDeleteSemanticPlan {
+            references,
+            cleanup_edits: Vec::new(),
+            coverage: CleanupCoverage::Incomplete,
+        },
+    }
+}
+
+fn safe_delete_error_outcome(error: LspSessionError) -> SafeDeleteSemanticOutcome {
+    use extension_protocol::LspOutcomeCode;
+    match error {
+        LspSessionError::Unconfigured
+        | LspSessionError::CapabilityUnavailable
+        | LspSessionError::NotRenameable
+        | LspSessionError::Backend(
+            LspOutcomeCode::LanguageNotConfigured | LspOutcomeCode::CapabilityUnavailable,
+        ) => SafeDeleteSemanticOutcome::CapabilityUnavailable,
+        LspSessionError::WorkspaceExternal => SafeDeleteSemanticOutcome::WorkspaceExternal,
+        LspSessionError::Backend(LspOutcomeCode::ServerTimeout) => {
+            SafeDeleteSemanticOutcome::BackendTimeout
+        }
+        LspSessionError::Backend(LspOutcomeCode::ServerMalformedResponse) => {
+            SafeDeleteSemanticOutcome::MalformedResponse
+        }
+        LspSessionError::Backend(_) => SafeDeleteSemanticOutcome::BackendCrashed,
     }
 }
 
@@ -2503,6 +2816,7 @@ mod tests {
                 type_hierarchy: ProviderCapability::Unavailable,
                 rename: RenameCapability::RenameWithPrepare,
                 will_rename_files: ProviderCapability::Unavailable,
+                safe_delete: ProviderCapability::Unavailable,
             }),
             ignore: empty_ignore(),
             next_id: AtomicI64::new(1),
@@ -3646,6 +3960,7 @@ mod tests {
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::RenameOnly,
                     will_rename_files: ProviderCapability::Unavailable,
+                    safe_delete: ProviderCapability::Unavailable,
                 },
             ),
             (
@@ -3666,6 +3981,7 @@ mod tests {
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::RenameWithPrepare,
                     will_rename_files: ProviderCapability::Unavailable,
+                    safe_delete: ProviderCapability::Unavailable,
                 },
             ),
             (
@@ -3686,6 +4002,7 @@ mod tests {
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::Unavailable,
                     will_rename_files: ProviderCapability::Unavailable,
+                    safe_delete: ProviderCapability::Unavailable,
                 },
             ),
             (
@@ -3698,6 +4015,7 @@ mod tests {
                     type_hierarchy: ProviderCapability::Unavailable,
                     rename: RenameCapability::Unavailable,
                     will_rename_files: ProviderCapability::Unavailable,
+                    safe_delete: ProviderCapability::Unavailable,
                 },
             ),
         ];

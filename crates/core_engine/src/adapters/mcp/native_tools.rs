@@ -85,14 +85,15 @@ use crate::domain::index::{FileSearch, InvertedIndex};
 use crate::domain::mutation::{FileMutationService, compute_content_version};
 use crate::domain::refactor::{
     PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult, PathRenameSemanticPolicy,
-    PathRenameStatus,
+    PathRenameStatus, SafeDeleteService, SafeDeleteSnapshot,
 };
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::FileMetadata;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::inbound::{
-    DirectoryEntryKind, FileMutationUseCase, ListDirRequest, SearchUseCase, WorkspaceEditSpan,
+    DirectoryEntryKind, FileMutationUseCase, ListDirRequest, SafeDeleteUseCase, SearchUseCase,
+    WorkspaceEditSpan,
 };
 use crate::ports::{
     ExtensionHostPort, FileSystemPort, NoOpExtensionHost, PathExclusionDecision,
@@ -100,7 +101,7 @@ use crate::ports::{
 };
 
 /// Canonical ordered native MCP tool surface.
-pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 11] = [
+pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 12] = [
     "tower_find_file",
     "tower_list_dir",
     "tower_search_text",
@@ -112,6 +113,7 @@ pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 11] = [
     "tower_edit_range",
     "tower_reindex",
     "tower_rename_path",
+    "tower_safe_delete_symbol",
 ];
 
 // ── EngineState ───────────────────────────────────────────────────────────────
@@ -267,6 +269,7 @@ impl ToolRegistry for NativeToolRegistry {
             tool_edit_range_desc(),
             tool_reindex_desc(),
             tool_rename_path_desc(),
+            tool_safe_delete_symbol_desc(),
         ];
         debug_assert_eq!(
             tools
@@ -291,6 +294,7 @@ impl ToolRegistry for NativeToolRegistry {
             "tower_edit_range" => call_edit_range(&self.state, args),
             "tower_reindex" => call_reindex(&self.state),
             "tower_rename_path" => call_rename_path(&self.state, &self.rename_coordinator, args),
+            "tower_safe_delete_symbol" => call_safe_delete_symbol(&self.state, args),
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -547,6 +551,36 @@ fn tool_rename_path_desc() -> ToolDesc {
                 .to_owned(),
         input_schema: serde_json::from_str(wire::PATH_RENAME_REQUEST_SCHEMA_JSON)
             .expect("canonical path-rename request schema is valid JSON"),
+    }
+}
+
+fn tool_safe_delete_symbol_desc() -> ToolDesc {
+    ToolDesc {
+        name: "tower_safe_delete_symbol".to_owned(),
+        description: "Safely delete a symbol after planning declaration and reference cleanup."
+            .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path containing the declaration."
+                },
+                "symbol_name": {
+                    "type": "string",
+                    "description": "Name of the declaration to delete."
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional declaration kind used to disambiguate the symbol."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "When true, validate and return the plan without applying edits."
+                }
+            },
+            "required": ["path", "symbol_name"]
+        }),
     }
 }
 
@@ -1122,6 +1156,230 @@ fn call_rename_path(
     serialize_rename_result(&result)
 }
 
+fn call_safe_delete_symbol(
+    state: &Arc<RwLock<EngineState>>,
+    args: Value,
+) -> Result<Value, ToolError> {
+    let request: wire::SafeDeleteRequest = serde_json::from_value(args).map_err(|_| {
+        ToolError::InvalidArgs("invalid tower_safe_delete_symbol arguments".to_owned())
+    })?;
+    let extension_host = state
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .extension_host();
+
+    let declaration_request = wire::SafeDeleteDeclarationRequest {
+        path: request.path.clone(),
+        symbol_name: request.symbol_name.clone(),
+        kind: request.kind.clone(),
+    };
+    let declaration = match invoke_safe_delete_declaration_planner(
+        extension_host.as_ref(),
+        &declaration_request,
+    )? {
+        Ok(declaration) => declaration,
+        Err(blocking_reason) => return serialize_safe_delete_block(blocking_reason),
+    };
+
+    let declaration_plan = match &declaration {
+        wire::SafeDeleteDeclarationOutcome::Planned { plan } => plan.clone(),
+        _ => {
+            return run_safe_delete(
+                state,
+                extension_host.as_ref(),
+                request,
+                declaration,
+                wire::SafeDeleteSemanticOutcome::CapabilityUnavailable,
+                &[],
+            );
+        }
+    };
+    let declaration_path = declaration_plan.path.clone();
+    let initial = run_safe_delete(
+        state,
+        extension_host.as_ref(),
+        request.clone(),
+        declaration.clone(),
+        wire::SafeDeleteSemanticOutcome::CapabilityUnavailable,
+        &[declaration_path],
+    )?;
+    if initial["blocking_reason"] != "capability_unavailable" {
+        return Ok(initial);
+    }
+
+    let semantic_request = wire::SafeDeleteSemanticRequest {
+        declaration: declaration_plan,
+    };
+    let semantic = invoke_safe_delete_semantic_planner(extension_host.as_ref(), &semantic_request)?;
+    let snapshot_paths = safe_delete_snapshot_paths(&declaration, &semantic);
+    run_safe_delete(
+        state,
+        extension_host.as_ref(),
+        request,
+        declaration,
+        semantic,
+        &snapshot_paths,
+    )
+}
+
+fn invoke_safe_delete_declaration_planner(
+    host: &dyn ExtensionHostPort,
+    request: &wire::SafeDeleteDeclarationRequest,
+) -> Result<Result<wire::SafeDeleteDeclarationOutcome, wire::SafeDeleteBlockingReason>, ToolError> {
+    let params = serde_json::to_value(request)
+        .map_err(|_| ToolError::ExecutionFailed("safe-delete planning failed".to_owned()))?;
+    let value = match host.invoke_extension(
+        &crate::domain::extension_host::ExtensionId::new("ast"),
+        "plan_safe_delete_declaration",
+        params,
+    ) {
+        Ok(value) => value,
+        Err(crate::domain::extension_host::InvokeError::ToolNotFound(_)) => {
+            return Ok(Err(wire::SafeDeleteBlockingReason::CapabilityUnavailable));
+        }
+        Err(
+            crate::domain::extension_host::InvokeError::Fault(_)
+            | crate::domain::extension_host::InvokeError::Application(_),
+        ) => {
+            return Ok(Err(wire::SafeDeleteBlockingReason::BackendError));
+        }
+    };
+    Ok(serde_json::from_value(value).map_err(|_| wire::SafeDeleteBlockingReason::BackendError))
+}
+
+fn serialize_safe_delete_block(
+    blocking_reason: wire::SafeDeleteBlockingReason,
+) -> Result<Value, ToolError> {
+    let blocking_reason = serde_json::to_value(blocking_reason)
+        .map_err(|_| ToolError::ExecutionFailed("safe-delete planning failed".to_owned()))?;
+    Ok(json!({
+        "status": "blocked",
+        "blocking_reason": blocking_reason,
+        "references": [],
+        "proposed_edits": [],
+        "affected_files": []
+    }))
+}
+
+fn invoke_safe_delete_semantic_planner(
+    host: &dyn ExtensionHostPort,
+    request: &wire::SafeDeleteSemanticRequest,
+) -> Result<wire::SafeDeleteSemanticOutcome, ToolError> {
+    let params = serde_json::to_value(request)
+        .map_err(|_| ToolError::ExecutionFailed("safe-delete planning failed".to_owned()))?;
+    let value = match host.invoke_extension(
+        &crate::domain::extension_host::ExtensionId::new("lsp"),
+        "plan_safe_delete",
+        params,
+    ) {
+        Ok(value) => value,
+        Err(crate::domain::extension_host::InvokeError::Fault(fault)) => {
+            return Ok(match fault {
+                extension_protocol::ExtensionFault::Timeout => {
+                    wire::SafeDeleteSemanticOutcome::BackendTimeout
+                }
+                extension_protocol::ExtensionFault::Crashed { .. } => {
+                    wire::SafeDeleteSemanticOutcome::BackendCrashed
+                }
+                extension_protocol::ExtensionFault::ProtocolError { .. }
+                | extension_protocol::ExtensionFault::Quarantined => {
+                    wire::SafeDeleteSemanticOutcome::MalformedResponse
+                }
+            });
+        }
+        Err(crate::domain::extension_host::InvokeError::Application(_)) => {
+            return Ok(wire::SafeDeleteSemanticOutcome::MalformedResponse);
+        }
+        Err(crate::domain::extension_host::InvokeError::ToolNotFound(_)) => {
+            return Ok(wire::SafeDeleteSemanticOutcome::CapabilityUnavailable);
+        }
+    };
+    Ok(serde_json::from_value(value).unwrap_or(wire::SafeDeleteSemanticOutcome::MalformedResponse))
+}
+
+fn safe_delete_snapshot_paths(
+    declaration: &wire::SafeDeleteDeclarationOutcome,
+    semantic: &wire::SafeDeleteSemanticOutcome,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let wire::SafeDeleteDeclarationOutcome::Planned { plan } = declaration {
+        paths.push(plan.path.clone());
+    }
+    if let wire::SafeDeleteSemanticOutcome::Complete { plan }
+    | wire::SafeDeleteSemanticOutcome::Incomplete { plan } = semantic
+    {
+        for path in plan
+            .references
+            .iter()
+            .map(|reference| &reference.path)
+            .chain(plan.cleanup_edits.iter().map(|edit| &edit.path))
+        {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
+fn run_safe_delete(
+    state: &Arc<RwLock<EngineState>>,
+    extension_host: &dyn ExtensionHostPort,
+    request: wire::SafeDeleteRequest,
+    declaration: wire::SafeDeleteDeclarationOutcome,
+    semantic: wire::SafeDeleteSemanticOutcome,
+    snapshot_paths: &[String],
+) -> Result<Value, ToolError> {
+    let deferred_host = DeferredRenameHost::default();
+    let mut report = with_path_rename_state(state, |locked| {
+        let snapshots = snapshot_paths
+            .iter()
+            .map(|path| {
+                let path = RelativePath::new(path.clone());
+                locked
+                    .fs
+                    .read(&path)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .map(|content| SafeDeleteSnapshot { path, content })
+            })
+            .collect::<Option<Vec<_>>>();
+        let snapshots = match snapshots {
+            Some(snapshots) => snapshots,
+            None => {
+                return Ok(wire::SafeDeleteReport {
+                    status: wire::SafeDeleteStatus::Blocked,
+                    blocking_reason: Some(wire::SafeDeleteBlockingReason::ReferencesUnresolved),
+                    declaration: match declaration {
+                        wire::SafeDeleteDeclarationOutcome::Planned { plan } => Some(plan),
+                        _ => None,
+                    },
+                    references: Vec::new(),
+                    proposed_edits: Vec::new(),
+                    affected_files: Vec::new(),
+                    mutation_result: None,
+                });
+            }
+        };
+        let mut mutation = locked.service(&deferred_host);
+        SafeDeleteService::new(&mut mutation).safe_delete(request, declaration, semantic, snapshots)
+    })
+    .map_err(domain_err_to_tool_error)?;
+
+    if report.status == wire::SafeDeleteStatus::Blocked {
+        for edit in &mut report.proposed_edits {
+            edit.replacement.clear();
+        }
+    }
+
+    for (id, path) in deferred_host.drain_changed() {
+        extension_host.on_file_changed(id, &path);
+    }
+    serde_json::to_value(report).map_err(|_| {
+        ToolError::ExecutionFailed("failed to serialize safe-delete result".to_owned())
+    })
+}
+
 enum RenameApplyError {
     Domain(Box<PathRenamePlan>, PathRenameError),
     Coordination,
@@ -1275,7 +1533,7 @@ fn request_semantic_rename(
     };
     let params = serde_json::to_value(&request).map_err(|_| PathRenameError::SemanticBackend)?;
     let value = host
-        .invoke("planPathRename", params)
+        .invoke("plan_path_rename", params)
         .map_err(|error| match error {
             crate::domain::extension_host::InvokeError::ToolNotFound(_) => {
                 PathRenameError::SemanticUnsupported
@@ -1717,7 +1975,6 @@ mod tests {
     fn t009_expected_native_tool_names_include_list_dir() {
         let expected = EXPECTED_NATIVE_TOOL_NAMES;
 
-        assert_eq!(expected.len(), 11);
         assert!(
             expected.contains(&"tower_list_dir"),
             "expected native tool names must include tower_list_dir; got {expected:?}"

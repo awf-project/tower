@@ -18,6 +18,7 @@ struct Server {
     dispatch_profile: bool,
     log: Option<PathBuf>,
     documents: HashMap<String, String>,
+    safe_delete_requests: usize,
 }
 
 impl Server {
@@ -59,6 +60,23 @@ impl Server {
         }
         if self.mode.starts_with("path_rename_") && self.mode != "path_rename_unsupported" {
             capabilities["workspace"] = json!({"fileOperations": {"willRename": true}});
+        }
+        if self.mode.starts_with("safe_delete_")
+            && !self.mode.starts_with("safe_delete_no_cleanup_")
+            && !matches!(
+                self.mode.as_str(),
+                "safe_delete_no_cleanup_with_references"
+                    | "safe_delete_no_cleanup_reference_free"
+                    | "safe_delete_reference_lookup_unavailable"
+            )
+        {
+            capabilities["experimental"] = json!({"towerSafeDelete": true});
+        }
+        if matches!(
+            self.mode.as_str(),
+            "safe_delete_reference_lookup_unavailable" | "safe_delete_capability_unavailable"
+        ) {
+            capabilities["referencesProvider"] = json!(false);
         }
         capabilities
     }
@@ -189,12 +207,227 @@ impl Server {
                     "path_rename_semantic" => self.path_rename_semantic(id, params)?,
                     _ => wire::reply(id, json!({"changes": {}}))?,
                 }
+            } else if method == "textDocument/references" && self.mode.starts_with("safe_delete_") {
+                self.safe_delete_references(id, uri)?;
+            } else if method == "experimental/tower/safeDelete" {
+                self.safe_delete_cleanup(id, uri)?;
             } else {
                 self.navigation(method, id, params, uri)?;
             }
         }
         Ok(())
     }
+
+    fn safe_delete_references(&mut self, id: &Value, uri: &str) -> io::Result<()> {
+        self.safe_delete_requests += 1;
+        let first = self.safe_delete_requests == 1;
+        if self.mode == "safe_delete_backend_timeout" {
+            std::thread::sleep(Duration::from_secs(30));
+            return Ok(());
+        }
+        if self.mode == "safe_delete_backend_crashed" {
+            std::process::exit(71);
+        }
+        if self.mode == "safe_delete_backend_text_sentinel" {
+            return wire::error(id, -32603, "BACKEND_TEXT_SENTINEL_0a42");
+        }
+        if self.mode == "safe_delete_backend_credential_sentinel" {
+            return wire::error(
+                id,
+                -32603,
+                "RAW_SIDECAR_ERROR_SENTINEL CREDENTIAL_SENTINEL_7d91",
+            );
+        }
+        if self.mode == "safe_delete_absolute_path_sentinel" {
+            return wire::reply(
+                id,
+                json!([location(
+                    "file:///private/ABSOLUTE_PATH_SENTINEL_5f14.rs",
+                    0,
+                    3,
+                    11
+                )]),
+            );
+        }
+        if self.mode == "safe_delete_external_uri_sentinel" {
+            return wire::reply(
+                id,
+                json!([location("file:///external/URI_SENTINEL_39c1.rs", 0, 3, 11)]),
+            );
+        }
+        if self.mode == "safe_delete_workspace_external" {
+            return wire::reply(
+                id,
+                json!([location("file:///outside/workspace.rs", 0, 3, 11)]),
+            );
+        }
+        if self.mode == "safe_delete_symlink_escape" {
+            return wire::reply(
+                id,
+                json!([location(&replace_file_name(uri, "escape.rs"), 0, 3, 11)]),
+            );
+        }
+        if self.mode == "safe_delete_invalid_location"
+            || self.mode == "safe_delete_invalid_utf16_position"
+        {
+            return wire::reply(id, json!([location(uri, 99, 0, 1)]));
+        }
+        if self.mode == "safe_delete_split_surrogate_position" {
+            return wire::reply(id, json!([location(uri, 0, 999, 1000)]));
+        }
+        if self.mode.ends_with("_once") && first {
+            if self.mode == "safe_delete_malformed_once" {
+                return wire::reply(id, json!({"not": "locations"}));
+            }
+            if matches!(
+                self.mode.as_str(),
+                "safe_delete_unconfigured_once"
+                    | "safe_delete_not_renameable_once"
+                    | "safe_delete_language_not_configured_once"
+            ) {
+                return wire::error(id, -32601, "safe-delete fixture capability unavailable");
+            }
+            return wire::error(id, -32603, "safe-delete fixture failure");
+        }
+        if matches!(
+            self.mode.as_str(),
+            "safe_delete_no_cleanup_reference_free" | "safe_delete_reference_free"
+        ) {
+            return wire::reply(id, json!([]));
+        }
+        if self.mode == "safe_delete_null_references" {
+            return wire::reply(id, Value::Null);
+        }
+        if matches!(
+            self.mode.as_str(),
+            "safe_delete_no_cleanup_internal"
+                | "safe_delete_no_cleanup_mixed"
+                | "safe_delete_no_cleanup_external_same_file"
+                | "safe_delete_no_cleanup_crossing"
+        ) {
+            let text = &self.documents[uri];
+            let offset = text.rfind("old_name").expect("fixture has a reference");
+            let prefix = &text[..offset];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+            let column = prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32;
+            let internal = if self.mode == "safe_delete_no_cleanup_crossing" {
+                json!({"uri": uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 1, "character": 4}}})
+            } else {
+                location(uri, line, column, column + 8)
+            };
+            let mut references = vec![internal];
+            if self.mode == "safe_delete_no_cleanup_mixed" {
+                references.push(location(&replace_file_name(uri, "consumer.rs"), 0, 0, 8));
+            }
+            return wire::reply(id, json!(references));
+        }
+        if self.mode == "safe_delete_no_cleanup_with_references" {
+            return wire::reply(
+                id,
+                json!([location(&replace_file_name(uri, "consumer.rs"), 0, 0, 8)]),
+            );
+        }
+        let reference = if matches!(
+            self.mode.as_str(),
+            "safe_delete_complete"
+                | "safe_delete_complete_triple"
+                | "safe_delete_private_replacement"
+        ) {
+            location(
+                &replace_file_name(
+                    uri,
+                    if self.mode == "safe_delete_complete_triple" {
+                        "b.rs"
+                    } else {
+                        "consumer.rs"
+                    },
+                ),
+                0,
+                14,
+                22,
+            )
+        } else if self.mode == "safe_delete_unicode" {
+            location(&replace_file_name(uri, "consumer.rs"), 0, 29, 37)
+        } else {
+            location(uri, 0, 3, 11)
+        };
+        if self.mode == "safe_delete_complete_triple" {
+            return wire::reply(
+                id,
+                json!([
+                    reference,
+                    location(&replace_file_name(uri, "c.rs"), 0, 13, 19)
+                ]),
+            );
+        }
+        wire::reply(id, json!([reference]))
+    }
+
+    fn safe_delete_cleanup(&mut self, id: &Value, uri: &str) -> io::Result<()> {
+        if self.mode == "safe_delete_malformed_response" {
+            return wire::reply(
+                id,
+                json!({"coverage": "complete", "edit": [], "extra": true}),
+            );
+        }
+        let coverage = if matches!(
+            self.mode.as_str(),
+            "safe_delete_incomplete" | "safe_delete_private_replacement"
+        ) {
+            "incomplete"
+        } else {
+            "complete"
+        };
+        let changes = if self.mode == "safe_delete_complete" {
+            json!({replace_file_name(uri, "consumer.rs"): [{
+                "range": {"start": {"line": 0, "character": 14}, "end": {"line": 0, "character": 22}},
+                "newText": ""
+            }]})
+        } else if self.mode == "safe_delete_complete_triple" {
+            json!({
+                replace_file_name(uri, "b.rs"): [{
+                    "range": {"start": {"line": 0, "character": 14}, "end": {"line": 0, "character": 22}},
+                    "newText": ""
+                }],
+                replace_file_name(uri, "c.rs"): [{
+                    "range": {"start": {"line": 0, "character": 13}, "end": {"line": 0, "character": 19}},
+                    "newText": ""
+                }]
+            })
+        } else if self.mode == "safe_delete_private_replacement" {
+            json!({replace_file_name(uri, "consumer.rs"): [{
+                "range": {"start": {"line": 0, "character": 14}, "end": {"line": 0, "character": 22}},
+                "newText": "REPLACEMENT_SENTINEL_fa81"
+            }]})
+        } else if self.mode == "safe_delete_unicode" {
+            json!({replace_file_name(uri, "consumer.rs"): [{
+                "range": {"start": {"line": 0, "character": 29}, "end": {"line": 0, "character": 37}},
+                "newText": ""
+            }]})
+        } else {
+            json!({})
+        };
+        wire::reply(
+            id,
+            json!({"coverage": coverage, "edit": {"changes": changes}}),
+        )
+    }
+}
+
+fn location(uri: &str, line: u32, start: u32, end: u32) -> Value {
+    json!({
+        "uri": uri,
+        "range": {
+            "start": {"line": line, "character": start},
+            "end": {"line": line, "character": end}
+        }
+    })
+}
+
+fn replace_file_name(uri: &str, name: &str) -> String {
+    uri.rsplit_once('/')
+        .map(|(parent, _)| format!("{parent}/{name}"))
+        .unwrap_or_else(|| uri.to_owned())
 }
 
 // Emit a complete record in one write so concurrent test readers never observe
@@ -238,6 +471,7 @@ fn run() -> io::Result<()> {
         dispatch_profile,
         log,
         documents: HashMap::new(),
+        safe_delete_requests: 0,
     }
     .run()
 }

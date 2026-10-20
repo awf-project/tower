@@ -13,10 +13,14 @@
 
 use std::num::NonZeroUsize;
 
+use extension_protocol::messages::{
+    SafeDeleteDeclarationOutcome, SafeDeleteMutationRequest, SafeDeleteMutationResult,
+    SafeDeleteReport, SafeDeleteRequest, SafeDeleteSemanticOutcome,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::refactor::{
-    PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult,
+    PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult, SafeDeleteSnapshot,
 };
 use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::PathExclusionPort;
@@ -263,6 +267,16 @@ pub trait SearchUseCase {
     }
 }
 
+pub trait SafeDeleteUseCase {
+    fn safe_delete(
+        &mut self,
+        request: SafeDeleteRequest,
+        declaration: SafeDeleteDeclarationOutcome,
+        semantic: SafeDeleteSemanticOutcome,
+        snapshots: Vec<SafeDeleteSnapshot>,
+    ) -> Result<SafeDeleteReport, DomainError>;
+}
+
 /// Mutation operations over the workspace.
 ///
 /// # Object safety
@@ -476,6 +490,11 @@ pub trait FileMutationUseCase {
         &mut self,
         request: WorkspaceApplyEditsRequest,
     ) -> Result<WorkspaceApplyEditsResult, DomainError>;
+
+    fn apply_safe_delete_edits(
+        &mut self,
+        request: SafeDeleteMutationRequest,
+    ) -> Result<SafeDeleteMutationResult, DomainError>;
 
     /// Global find-and-replace with per-file optimistic concurrency guards
     /// (spec 18, AC6).

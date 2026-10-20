@@ -12,7 +12,10 @@ use core_engine::adapters::config::lsp::LspConfig;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position};
 use core_engine::ports::DocumentSyncPort;
-use extension_protocol::messages::{PathRenameError, PathRenamePlanningRequest};
+use extension_protocol::messages::{
+    PathRenameError, PathRenamePlanningRequest, SafeDeleteSemanticOutcome,
+    SafeDeleteSemanticRequest,
+};
 use extension_protocol::{TypeHierarchyQuery, TypeHierarchyResult, WorkspaceEditSpan};
 
 /// The sidecar extension's LSP session manager.
@@ -130,6 +133,14 @@ impl LspSessionPool {
         request: &PathRenamePlanningRequest,
     ) -> Result<RawWorkspaceEdit, PathRenameError> {
         self.inner.plan_path_rename(request)
+    }
+
+    pub fn plan_safe_delete(
+        &self,
+        request: &SafeDeleteSemanticRequest,
+        read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> Result<SafeDeleteSemanticOutcome, LspSessionError> {
+        self.inner.plan_safe_delete(request, read_content)
     }
 
     /// Whether this pool is configured to handle the given path.

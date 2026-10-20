@@ -3,6 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use extension_protocol::messages::{
+    SafeDeleteFileError, SafeDeleteFileOutcome, SafeDeleteFileOutcomeStatus,
+    SafeDeleteMutationRequest, SafeDeleteMutationResult, SafeDeleteMutationStatus,
+    SafeDeleteRejectionCode, is_safe_delete_path,
+};
+
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::compute_content_version;
 use crate::domain::refactor::GlobalReplaceService;
@@ -1013,6 +1019,133 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         })
     }
 
+    fn apply_safe_delete_edits(
+        &mut self,
+        request: SafeDeleteMutationRequest,
+    ) -> Result<SafeDeleteMutationResult, DomainError> {
+        let groups = group_safe_delete_edits(request.edits);
+        let unattempted =
+            || safe_delete_outcomes(&groups, SafeDeleteFileOutcomeStatus::Unattempted);
+
+        let mut plans = Vec::with_capacity(groups.len());
+        for group in &groups {
+            if !is_safe_delete_path(&group.path) {
+                return Ok(safe_delete_rejection(
+                    SafeDeleteRejectionCode::InvalidPath,
+                    unattempted(),
+                ));
+            }
+
+            let path = RelativePath::new(group.path.clone());
+            let Some(file_id) = self.workspace.get_by_path(&path) else {
+                return Ok(safe_delete_rejection(
+                    SafeDeleteRejectionCode::InvalidPath,
+                    unattempted(),
+                ));
+            };
+            let bytes = match self.fs.read(&path) {
+                Ok(bytes) => bytes,
+                Err(PortError::NotFound) => {
+                    return Ok(safe_delete_rejection(
+                        SafeDeleteRejectionCode::InvalidPath,
+                        unattempted(),
+                    ));
+                }
+                Err(error) => return Err(port_err_to_domain(error)),
+            };
+            let actual = compute_content_version(&bytes);
+            if group.edits.iter().any(|edit| edit.base_hash != actual) {
+                return Ok(safe_delete_rejection(
+                    SafeDeleteRejectionCode::CasConflict,
+                    unattempted(),
+                ));
+            }
+
+            let edits: Vec<TextEdit> = group
+                .edits
+                .iter()
+                .map(|edit| TextEdit {
+                    start_byte: edit.start_byte,
+                    end_byte: edit.end_byte,
+                    replacement: edit.replacement.clone(),
+                })
+                .collect();
+            if has_overlapping_text_edits(&edits) {
+                return Ok(safe_delete_rejection(
+                    SafeDeleteRejectionCode::OverlappingEdits,
+                    unattempted(),
+                ));
+            }
+            let text = match validate_apply_edits(&path, &bytes, &edits) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Ok(safe_delete_rejection(
+                        SafeDeleteRejectionCode::InvalidRange,
+                        unattempted(),
+                    ));
+                }
+            };
+            let planned = edits
+                .into_iter()
+                .map(|edit| PlannedTextEdit { edit })
+                .collect::<Vec<_>>();
+            plans.push(SafeDeleteFilePlan {
+                path,
+                file_id,
+                content: splice_text_edits(text, &planned).into_bytes(),
+            });
+        }
+
+        if request.dry_run {
+            return Ok(SafeDeleteMutationResult {
+                status: SafeDeleteMutationStatus::Previewed,
+                rejection: None,
+                per_file: unattempted(),
+            });
+        }
+
+        let mut per_file = unattempted();
+        for (index, plan) in plans.into_iter().enumerate() {
+            if super::atomic_write(self.fs, &plan.path, plan.content).is_err() {
+                per_file[index].outcome = SafeDeleteFileOutcomeStatus::Failed;
+                per_file[index].error = Some(SafeDeleteFileError::FilesystemError);
+                return Ok(safe_delete_partial_commit(per_file));
+            }
+
+            let metadata = FileMetadata {
+                size: 0,
+                modified: Timestamp(0),
+                content_hash: None,
+            };
+            self.workspace
+                .update(plan.file_id, metadata)
+                .expect("safe-delete preflight retained a live file identity");
+            self.index.remove(plan.file_id);
+            self.index
+                .insert(plan.file_id, &tokenize(plan.path.as_str()));
+            let virtual_file = self
+                .workspace
+                .get(plan.file_id)
+                .expect("safe-delete update retained a live file identity")
+                .clone();
+            if self.storage.put(virtual_file).is_err() {
+                per_file[index].outcome = SafeDeleteFileOutcomeStatus::Failed;
+                per_file[index].error = Some(SafeDeleteFileError::PersistenceError);
+                return Ok(safe_delete_partial_commit(per_file));
+            }
+
+            self.extension_host
+                .on_file_changed(plan.file_id, &plan.path);
+            per_file[index].outcome = SafeDeleteFileOutcomeStatus::Committed;
+        }
+
+        Ok(SafeDeleteMutationResult {
+            status: SafeDeleteMutationStatus::Applied,
+            rejection: None,
+            per_file,
+        })
+    }
+
     fn global_replace_cas(
         &mut self,
         target: &str,
@@ -1184,6 +1317,67 @@ struct WorkspaceEditGroup {
     base_hashes: Vec<String>,
     edits: Vec<TextEdit>,
     edit_count: usize,
+}
+
+struct SafeDeleteEditGroup {
+    path: String,
+    edits: Vec<extension_protocol::messages::SafeDeleteCleanupEdit>,
+}
+
+struct SafeDeleteFilePlan {
+    path: RelativePath,
+    file_id: crate::domain::FileId,
+    content: Vec<u8>,
+}
+
+fn group_safe_delete_edits(
+    edits: Vec<extension_protocol::messages::SafeDeleteCleanupEdit>,
+) -> Vec<SafeDeleteEditGroup> {
+    let mut groups: Vec<SafeDeleteEditGroup> = Vec::new();
+    for edit in edits {
+        if let Some(group) = groups.iter_mut().find(|group| group.path == edit.path) {
+            group.edits.push(edit);
+        } else {
+            groups.push(SafeDeleteEditGroup {
+                path: edit.path.clone(),
+                edits: vec![edit],
+            });
+        }
+    }
+    groups
+}
+
+fn safe_delete_outcomes(
+    groups: &[SafeDeleteEditGroup],
+    outcome: SafeDeleteFileOutcomeStatus,
+) -> Vec<SafeDeleteFileOutcome> {
+    groups
+        .iter()
+        .map(|group| SafeDeleteFileOutcome {
+            path: group.path.clone(),
+            outcome,
+            error: None,
+        })
+        .collect()
+}
+
+fn safe_delete_rejection(
+    rejection: SafeDeleteRejectionCode,
+    per_file: Vec<SafeDeleteFileOutcome>,
+) -> SafeDeleteMutationResult {
+    SafeDeleteMutationResult {
+        status: SafeDeleteMutationStatus::Rejected,
+        rejection: Some(rejection),
+        per_file,
+    }
+}
+
+fn safe_delete_partial_commit(per_file: Vec<SafeDeleteFileOutcome>) -> SafeDeleteMutationResult {
+    SafeDeleteMutationResult {
+        status: SafeDeleteMutationStatus::PartialCommit,
+        rejection: None,
+        per_file,
+    }
 }
 
 fn group_workspace_edit_spans(spans: Vec<WorkspaceEditSpan>) -> Vec<WorkspaceEditGroup> {

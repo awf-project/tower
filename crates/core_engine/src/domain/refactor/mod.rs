@@ -25,11 +25,17 @@ mod global_replace;
 mod path_rename;
 #[cfg(test)]
 mod path_rename_tests;
+mod safe_delete;
+#[cfg(test)]
+mod safe_delete_tests;
 
 pub use global_replace::GlobalReplaceService;
 pub use path_rename::{
     PathMove, PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult,
     PathRenameSemanticOutcome, PathRenameSemanticPolicy, PathRenameStatus,
+};
+pub use safe_delete::{
+    ResolvedDeclaration, SafeDeleteAnalysis, SafeDeletePlan, SafeDeleteService, SafeDeleteSnapshot,
 };
 
 #[cfg(test)]

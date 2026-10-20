@@ -30,7 +30,7 @@ use crate::adapters::daemon::engine::build_engine;
 use crate::adapters::formatter::NoOpFormatQueue;
 use crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use crate::adapters::mcp::registry::ToolRegistry;
-use crate::adapters::{InMemoryAstIndex, InMemoryFs};
+use crate::adapters::{InMemoryAstIndex, InMemoryFs, RealFs};
 use crate::domain::extension_host::{ExtensionApplicationError, ExtensionCallError};
 use crate::domain::mutation::compute_content_version;
 use crate::domain::{DomainError, RelativePath};
@@ -876,6 +876,32 @@ fn ac2_read_file_capability_through_filesystem_port() {
         "hello world",
         "tool must return file content via FileSystemPort"
     );
+    instance.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn read_file_capability_rejects_a_symlink_escape_at_the_host_boundary() {
+    let bin = test_helper_bin();
+    let manifest = make_manifest(&bin, vec!["read_file".to_owned()]);
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("secret.txt");
+    fs::write(&outside_file, "secret").unwrap();
+    std::os::unix::fs::symlink(&outside_file, workspace.path().join("escape.txt")).unwrap();
+    let deps = HostDeps {
+        fs: Arc::new(Mutex::new(RealFs::new(workspace.path()))),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
+        push_tx: None,
+    };
+
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
+    let result = instance.call_tool("read_file", json!({"path": "escape.txt"}));
+
+    assert!(result.is_err(), "symlink escape must be denied");
     instance.shutdown();
 }
 

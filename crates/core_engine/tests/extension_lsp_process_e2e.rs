@@ -58,6 +58,890 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn safe_delete_tool_advertises_the_exact_internal_name_and_request_schema() {
+    let mut child = RawLspChild::spawn();
+    let initialized = initialized_raw_lsp_child(&mut child);
+    let tools = initialized["result"]["data"]["tools"]
+        .as_array()
+        .expect("initialized tools must be an array");
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "plan_safe_delete")
+        .expect("plan_safe_delete must be advertised");
+    let schema: serde_json::Value = serde_json::from_str(
+        tool["schema_json"]
+            .as_str()
+            .expect("plan_safe_delete schema_json must be a string"),
+    )
+    .expect("plan_safe_delete schema must be valid JSON");
+
+    assert_eq!(
+        schema,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "declaration": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "symbol_name": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "position": {
+                            "type": "object",
+                            "properties": {
+                                "line": {"type": "integer", "minimum": 0},
+                                "character": {"type": "integer", "minimum": 0}
+                            },
+                            "required": ["line", "character"],
+                            "additionalProperties": false
+                        },
+                        "deletion_span": {
+                            "type": "object",
+                            "properties": {
+                                "start_byte": {"type": "integer", "minimum": 0},
+                                "end_byte": {"type": "integer", "minimum": 0}
+                            },
+                            "required": ["start_byte", "end_byte"],
+                            "additionalProperties": false
+                        },
+                        "base_hash": {"type": "string"}
+                    },
+                    "required": ["path", "symbol_name", "kind", "position", "deletion_span", "base_hash"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["declaration"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[test]
+fn safe_delete_tool_dispatches_to_the_pool_and_serializes_the_exact_complete_payload() {
+    let declaration = "fn old_name() {}\n";
+    let consumer = "fn caller() { old_name(); }\n";
+    let workspace = fake_lsp_workspace("safe_delete_complete");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    fs::write(workspace.path().join("src/consumer.rs"), consumer).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let (response, host_calls) = invoke_safe_delete(
+        &mut child,
+        4900,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration), ("src/consumer.rs", consumer)],
+    );
+
+    assert_eq!(
+        response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4900,
+            "result": {
+                "type": "ToolResult",
+                "data": {
+                    "status": "complete",
+                    "plan": {
+                        "references": [{
+                            "path": "src/consumer.rs",
+                            "start": {"line": 0, "character": 14},
+                            "end": {"line": 0, "character": 22},
+                            "base_hash": compute_content_version(consumer.as_bytes())
+                        }],
+                        "cleanup_edits": [{
+                            "path": "src/consumer.rs",
+                            "start_byte": 14,
+                            "end_byte": 22,
+                            "replacement": "",
+                            "base_hash": compute_content_version(consumer.as_bytes())
+                        }],
+                        "coverage": "complete"
+                    }
+                }
+            }
+        })
+    );
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_tool_maps_missing_wrong_and_unknown_fields_to_invalid_params() {
+    let mut child = RawLspChild::spawn();
+    initialize_raw_lsp_child_bounded(&mut child);
+    for (offset, params) in [
+        serde_json::json!({}),
+        serde_json::json!({"declaration": "wrong"}),
+        serde_json::json!({"declaration": {
+            "path": "src/lib.rs",
+            "symbol_name": "old_name",
+            "kind": "function",
+            "position": {"line": 0, "character": 3},
+            "deletion_span": {"start_byte": 0, "end_byte": 17},
+            "base_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "unknown": true
+        }}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 4910 + offset as u64;
+        child.write_frame(serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "invokeTool",
+            "params": {"name": "plan_safe_delete", "params": params}
+        }));
+        assert_eq!(
+            child.read_frame_bounded()["error"]["code"],
+            -32602,
+            "invalid request case {offset} must use InvalidParams"
+        );
+    }
+}
+
+#[test]
+fn safe_delete_tool_serializes_every_blocked_backend_outcome_without_private_text() {
+    let declaration = "fn old_name() {}\n";
+    let incomplete_plan = serde_json::json!({
+        "status": "incomplete",
+        "plan": {
+            "references": [{
+                "path": "src/lib.rs",
+                "start": {"line": 0, "character": 3},
+                "end": {"line": 0, "character": 11},
+                "base_hash": compute_content_version(declaration.as_bytes()),
+            }],
+            "cleanup_edits": [],
+            "coverage": "incomplete",
+        },
+    });
+    for (offset, (mode, expected_data)) in [
+        (
+            "safe_delete_capability_unavailable",
+            serde_json::json!({"status": "capability_unavailable"}),
+        ),
+        (
+            "safe_delete_backend_timeout",
+            serde_json::json!({"status": "backend_timeout"}),
+        ),
+        (
+            "safe_delete_backend_crashed",
+            serde_json::json!({"status": "backend_crashed"}),
+        ),
+        (
+            "safe_delete_malformed_response",
+            serde_json::json!({"status": "malformed_response"}),
+        ),
+        ("safe_delete_incomplete", incomplete_plan),
+        (
+            "safe_delete_invalid_location",
+            serde_json::json!({"status": "invalid_location"}),
+        ),
+        (
+            "safe_delete_workspace_external",
+            serde_json::json!({"status": "workspace_external"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            4920 + offset as u64,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration)],
+        );
+        assert_eq!(
+            safe_delete_data(&response),
+            &expected_data,
+            "mode {mode} must serialize the exact SafeDeleteSemanticOutcome DTO"
+        );
+        let rendered = response.to_string();
+        for private in [
+            "BACKEND_TEXT_SENTINEL",
+            "/private/",
+            "file:///external/",
+            "credential",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "{mode} leaked {private}: {rendered}"
+            );
+        }
+        assert!(host_calls.iter().all(|call| call["method"] != "host/log"));
+        assert_no_mutation_host_calls(&host_calls);
+    }
+}
+
+#[test]
+fn safe_delete_tool_does_not_mutate_workspace_content_or_versions() {
+    let declaration = "fn old_name() {}\n";
+    let consumer = "fn caller() { old_name(); }\n";
+    let workspace = fake_lsp_workspace("safe_delete_complete");
+    let declaration_path = workspace.path().join("src/lib.rs");
+    let consumer_path = workspace.path().join("src/consumer.rs");
+    fs::write(&declaration_path, declaration).unwrap();
+    fs::write(&consumer_path, consumer).unwrap();
+    let before = [
+        (
+            fs::read(&declaration_path).unwrap(),
+            compute_content_version(declaration.as_bytes()),
+        ),
+        (
+            fs::read(&consumer_path).unwrap(),
+            compute_content_version(consumer.as_bytes()),
+        ),
+    ];
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let (_, host_calls) = invoke_safe_delete(
+        &mut child,
+        4930,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration), ("src/consumer.rs", consumer)],
+    );
+
+    let after_declaration = fs::read(&declaration_path).unwrap();
+    let after_consumer = fs::read(&consumer_path).unwrap();
+    assert_eq!(after_declaration, before[0].0);
+    assert_eq!(after_consumer, before[1].0);
+    assert_eq!(compute_content_version(&after_declaration), before[0].1);
+    assert_eq!(compute_content_version(&after_consumer), before[1].1);
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_tool_does_not_log_a_backend_server_error() {
+    // Each value below is injected through a real producer: the source-content
+    // HostCall and the fixture's unexpected backend fault.  The request sentinel
+    // is carried by the actual public request, not constructed for assertion only.
+    let source_sentinel = "SOURCE_CONTENT_SENTINEL_7b88";
+    let absolute_path_sentinel = "/private/ABSOLUTE_PATH_SENTINEL_5f14.rs";
+    let external_uri_sentinel = "file:///external/URI_SENTINEL_39c1.rs";
+    let credential_sentinel = "credential=SECRET_CREDENTIAL_SENTINEL";
+    let replacement_sentinel = "REPLACEMENT_CONTENT_SENTINEL_52de";
+    let request_sentinel = "SERIALIZED_REQUEST_RESULT_SENTINEL_91af";
+    let backend_sentinel = "safe-delete fixture failure";
+    let declaration = format!(
+        "fn old_name() {{ /* {source_sentinel} {absolute_path_sentinel} {external_uri_sentinel} {credential_sentinel} {replacement_sentinel} */ }}\n"
+    );
+    let workspace = fake_lsp_workspace("safe_delete_pool_error_once");
+    fs::write(workspace.path().join("src/lib.rs"), &declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let mut request = safe_delete_request(&declaration);
+    request["declaration"]["symbol_name"] = serde_json::json!(request_sentinel);
+    let (response, host_calls) =
+        invoke_safe_delete(&mut child, 4940, request, &[("src/lib.rs", &declaration)]);
+    assert_eq!(safe_delete_data(&response)["status"], "backend_crashed");
+    let logs: Vec<_> = host_calls
+        .iter()
+        .filter(|call| call["method"] == "host/log")
+        .collect();
+    assert!(
+        logs.is_empty(),
+        "an expected backend server error must not emit host/log: {logs:?}"
+    );
+    let public_response = response.to_string();
+    for private in [
+        source_sentinel,
+        absolute_path_sentinel,
+        external_uri_sentinel,
+        credential_sentinel,
+        replacement_sentinel,
+        request_sentinel,
+        backend_sentinel,
+    ] {
+        assert!(
+            !public_response.contains(private),
+            "public response leaked {private}: {public_response}"
+        );
+    }
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_tool_queues_inbound_requests_and_emits_no_late_mutation_frame() {
+    let declaration = "fn old_name() {}\n";
+    let workspace = fake_lsp_workspace("safe_delete_reference_free");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0", "id": 4950, "method": "invokeTool",
+        "params": {"name": "plan_safe_delete", "params": safe_delete_request(declaration)}
+    }));
+    let read = child.read_frame_bounded();
+    assert_eq!(read["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0", "id": 4951, "method": "invokeTool",
+        "params": {"name": "plan_safe_delete", "params": {}}
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0", "id": 4952, "method": "shutdown", "params": {}
+    }));
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0", "id": read["id"], "result": declaration
+    }));
+
+    let first = child.read_frame_bounded();
+    assert_eq!(first["id"], 4950);
+    assert_eq!(safe_delete_data(&first)["status"], "complete");
+    let queued = child.read_frame_bounded();
+    assert_eq!(queued["id"], 4951);
+    assert_eq!(queued["error"]["code"], -32602);
+    let shutdown = child.read_frame_bounded();
+    assert_eq!(shutdown["id"], 4952);
+    assert!(shutdown.get("result").is_some());
+    assert!(
+        child
+            .stdout
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "no protocol frame, especially a mutation HostCall, may arrive after shutdown"
+    );
+}
+
+#[test]
+fn safe_delete_pool_facade_returns_strict_reference_plan_without_mutation_host_calls() {
+    let declaration = "fn old_name() {}\n";
+    let consumer = "fn caller() { old_name(); }\n";
+    let workspace = fake_lsp_workspace("safe_delete_complete");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    fs::write(workspace.path().join("src/consumer.rs"), consumer).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let (response, host_calls) = invoke_safe_delete(
+        &mut child,
+        5001,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration), ("src/consumer.rs", consumer)],
+    );
+    assert_eq!(safe_delete_data(&response)["status"], "complete");
+    assert_eq!(safe_delete_data(&response)["plan"]["coverage"], "complete");
+    assert_eq!(
+        safe_delete_data(&response)["plan"]["references"][0]["path"],
+        "src/consumer.rs"
+    );
+    assert_eq!(
+        safe_delete_data(&response)["plan"]["cleanup_edits"][0]["base_hash"],
+        compute_content_version(consumer.as_bytes())
+    );
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_session_facades_preserve_resident_session_lifecycle() {
+    let declaration = "fn old_name() {}\n";
+    let workspace = fake_lsp_workspace("safe_delete_reference_free");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    for id in [5010, 5011] {
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            id,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration)],
+        );
+        assert_eq!(safe_delete_data(&response)["status"], "complete");
+        assert_eq!(
+            safe_delete_data(&response)["plan"]["references"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            safe_delete_data(&response)["plan"]["cleanup_edits"],
+            serde_json::json!([])
+        );
+        assert_no_mutation_host_calls(&host_calls);
+    }
+    let pids = fs::read_to_string(workspace.path().join("fake_lsp.pids")).unwrap();
+    assert_eq!(pids.lines().count(), 1, "resident session must be reused");
+}
+
+#[test]
+fn safe_delete_reference_lookup_checks_unicode_positions_against_versioned_content() {
+    let declaration = "fn old_name() {}\n";
+    let consumer = "fn caller() { let _ = \"😀\"; old_name(); }\n";
+    let workspace = fake_lsp_workspace("safe_delete_unicode");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    fs::write(workspace.path().join("src/consumer.rs"), consumer).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let (response, host_calls) = invoke_safe_delete(
+        &mut child,
+        5020,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration), ("src/consumer.rs", consumer)],
+    );
+    let reference = &safe_delete_data(&response)["plan"]["references"][0];
+    assert_eq!(reference["path"], "src/consumer.rs");
+    assert_eq!(
+        reference["start"],
+        serde_json::json!({"line": 0, "character": 29})
+    );
+    assert_eq!(
+        reference["end"],
+        serde_json::json!({"line": 0, "character": 37})
+    );
+    assert_eq!(
+        reference["base_hash"],
+        compute_content_version(consumer.as_bytes())
+    );
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_native_fixture_produces_deterministic_structured_outcomes() {
+    let declaration = "fn old_name() {}\n";
+    for (offset, (mode, status)) in [
+        ("safe_delete_incomplete", "incomplete"),
+        (
+            "safe_delete_capability_unavailable",
+            "capability_unavailable",
+        ),
+        ("safe_delete_backend_timeout", "backend_timeout"),
+        ("safe_delete_backend_crashed", "backend_crashed"),
+        ("safe_delete_malformed_response", "malformed_response"),
+        ("safe_delete_invalid_location", "invalid_location"),
+        ("safe_delete_workspace_external", "workspace_external"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            5030 + offset as u64,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration)],
+        );
+        assert_eq!(safe_delete_data(&response)["status"], status, "mode {mode}");
+        assert_no_mutation_host_calls(&host_calls);
+    }
+}
+
+#[test]
+fn safe_delete_real_backends_never_infer_complete_coverage_from_unsupported_lookup_or_cleanup() {
+    let declaration = "fn old_name() {}\n";
+    let consumer = "old_name();\n";
+    for (offset, (mode, status, plan)) in [
+        (
+            "safe_delete_no_cleanup_with_references",
+            "incomplete",
+            Some(serde_json::json!({
+                "coverage": "incomplete",
+                "references": [{
+                    "path": "src/consumer.rs",
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 8},
+                    "base_hash": compute_content_version(consumer.as_bytes()),
+                }],
+                "cleanup_edits": [],
+            })),
+        ),
+        (
+            "safe_delete_no_cleanup_reference_free",
+            "complete",
+            Some(serde_json::json!({
+                "coverage": "complete",
+                "references": [],
+                "cleanup_edits": [],
+            })),
+        ),
+        (
+            "safe_delete_reference_lookup_unavailable",
+            "capability_unavailable",
+            None,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            5050 + offset as u64,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration), ("src/consumer.rs", consumer)],
+        );
+        let data = safe_delete_data(&response);
+        assert_eq!(data["status"], status, "mode {mode}");
+        match plan {
+            Some(plan) => assert_eq!(data["plan"], plan, "mode {mode}"),
+            None => assert!(data.get("plan").is_none(), "mode {mode}"),
+        }
+        assert_no_mutation_host_calls(&host_calls);
+    }
+}
+
+#[test]
+fn safe_delete_treats_a_null_reference_result_as_a_complete_empty_lookup() {
+    let declaration = "fn old_name() {}\n";
+    let workspace = fake_lsp_workspace("safe_delete_null_references");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let (response, host_calls) = invoke_safe_delete(
+        &mut child,
+        5070,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration)],
+    );
+
+    assert_eq!(
+        safe_delete_data(&response),
+        &serde_json::json!({
+            "status": "complete",
+            "plan": {
+                "coverage": "complete",
+                "references": [],
+                "cleanup_edits": [],
+            },
+        })
+    );
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_normalizes_every_expected_backend_error_and_recovers_the_session() {
+    let declaration = "fn old_name() {}\n";
+    for (offset, (mode, expected_status)) in [
+        ("safe_delete_unconfigured_once", "capability_unavailable"),
+        ("safe_delete_not_renameable_once", "capability_unavailable"),
+        ("safe_delete_server_missing_once", "backend_crashed"),
+        ("safe_delete_invalid_command_once", "backend_crashed"),
+        ("safe_delete_server_not_executable_once", "backend_crashed"),
+        ("safe_delete_server_launch_failed_once", "backend_crashed"),
+        ("safe_delete_server_transport_error_once", "backend_crashed"),
+        ("safe_delete_server_error_once", "backend_crashed"),
+        (
+            "safe_delete_language_not_configured_once",
+            "capability_unavailable",
+        ),
+        ("safe_delete_pool_error_once", "backend_crashed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+
+        let (failure, failure_calls) = invoke_safe_delete(
+            &mut child,
+            5080 + offset as u64 * 2,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration)],
+        );
+        assert_eq!(
+            safe_delete_data(&failure)["status"],
+            expected_status,
+            "mode {mode}"
+        );
+        assert!(
+            failure_calls
+                .iter()
+                .all(|call| call["method"] != "host/log"),
+            "expected backend mode {mode} emitted host/log: {failure_calls:?}"
+        );
+        assert_no_mutation_host_calls(&failure_calls);
+
+        let (recovery, recovery_calls) = invoke_safe_delete(
+            &mut child,
+            5081 + offset as u64 * 2,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration)],
+        );
+        assert_eq!(
+            safe_delete_data(&recovery)["status"],
+            "complete",
+            "mode {mode}"
+        );
+        assert_no_mutation_host_calls(&recovery_calls);
+    }
+}
+
+#[test]
+fn safe_delete_rejects_stale_declarations_before_backend_lookup() {
+    let declaration = "fn old_name() {}\n";
+    let fresh = "fn old_name() { /* changed */ }\n";
+    let workspace = fake_lsp_workspace("safe_delete_complete");
+    fs::write(workspace.path().join("src/lib.rs"), fresh).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let (response, host_calls) = invoke_safe_delete(
+        &mut child,
+        5100,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", fresh)],
+    );
+
+    let data = safe_delete_data(&response);
+    assert_eq!(data["status"], "incomplete");
+    assert_eq!(data["plan"]["coverage"], "incomplete");
+    assert_eq!(data["plan"]["references"], serde_json::json!([]));
+    assert_eq!(data["plan"]["cleanup_edits"], serde_json::json!([]));
+    assert_no_mutation_host_calls(&host_calls);
+    let backend_log = fs::read_to_string(workspace.path().join("fake_lsp.log")).unwrap_or_default();
+    assert!(
+        !backend_log.contains("textDocument/references"),
+        "a stale declaration must stop before reference lookup: {backend_log}"
+    );
+}
+
+#[test]
+fn safe_delete_normalizes_unreadable_content_and_invalid_coordinates_without_mutation() {
+    let declaration = "fn old_name() {}\n";
+
+    let workspace = fake_lsp_workspace("safe_delete_complete");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let mut unreadable =
+        |_path: &str| Err(serde_json::json!({"code": -32001, "message": "READ_CONTENT_SENTINEL"}));
+    let (response, host_calls) = invoke_safe_delete_with_read_file(
+        &mut child,
+        5110,
+        safe_delete_request(declaration),
+        &mut unreadable,
+    );
+    assert_eq!(safe_delete_data(&response)["status"], "invalid_location");
+    assert_no_mutation_host_calls(&host_calls);
+
+    for (offset, mode) in [
+        "safe_delete_invalid_utf16_position",
+        "safe_delete_split_surrogate_position",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            5111 + offset as u64,
+            safe_delete_request(declaration),
+            &[("src/lib.rs", declaration)],
+        );
+        assert_eq!(
+            safe_delete_data(&response)["status"],
+            "invalid_location",
+            "mode {mode}"
+        );
+        assert_no_mutation_host_calls(&host_calls);
+    }
+}
+
+#[test]
+fn safe_delete_rejects_invalid_declaration_positions_before_backend_lookup() {
+    for (offset, (declaration, position)) in [
+        (
+            "fn old_name() {}\n".to_owned(),
+            serde_json::json!({"line": 99, "character": 0}),
+        ),
+        (
+            "fn 😀old_name() {}\n".to_owned(),
+            serde_json::json!({"line": 0, "character": 4}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace("safe_delete_complete");
+        fs::write(workspace.path().join("src/lib.rs"), &declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let mut request = safe_delete_request(&declaration);
+        request["declaration"]["position"] = position;
+
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            5115 + offset as u64,
+            request,
+            &[("src/lib.rs", &declaration)],
+        );
+
+        assert_eq!(safe_delete_data(&response)["status"], "invalid_location");
+        assert_no_mutation_host_calls(&host_calls);
+        let backend_log =
+            fs::read_to_string(workspace.path().join("fake_lsp.log")).unwrap_or_default();
+        assert!(
+            !backend_log.contains("textDocument/references"),
+            "invalid declaration position must stop before lookup: {backend_log}"
+        );
+    }
+}
+
+#[test]
+fn safe_delete_rejects_a_symlink_escape_without_mutation() {
+    let declaration = "fn old_name() {}\n";
+    let workspace = fake_lsp_workspace("safe_delete_symlink_escape");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let mut read_file = |path: &str| {
+        if path == "src/escape.rs" {
+            Err(serde_json::json!({
+                "code": -32602,
+                "message": "workspace path resolves outside the workspace"
+            }))
+        } else {
+            Ok(serde_json::json!(declaration))
+        }
+    };
+    let (response, host_calls) = invoke_safe_delete_with_read_file(
+        &mut child,
+        5120,
+        safe_delete_request(declaration),
+        &mut read_file,
+    );
+    assert_eq!(safe_delete_data(&response)["status"], "workspace_external");
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[test]
+fn safe_delete_never_leaks_real_producer_sentinels_to_results_or_host_logs() {
+    let source_sentinel = "SOURCE_CONTENT_SENTINEL_7b88";
+    let backend_sentinel = "BACKEND_TEXT_SENTINEL_0a42";
+    let absolute_path_sentinel = "/private/ABSOLUTE_PATH_SENTINEL_5f14.rs";
+    let external_uri_sentinel = "file:///external/URI_SENTINEL_39c1.rs";
+    let declaration = format!("fn old_name() {{ /* {source_sentinel} */ }}\n");
+
+    for (offset, (mode, producer_sentinel)) in [
+        ("safe_delete_backend_text_sentinel", backend_sentinel),
+        ("safe_delete_absolute_path_sentinel", absolute_path_sentinel),
+        ("safe_delete_external_uri_sentinel", external_uri_sentinel),
+        ("safe_delete_source_content_sentinel", source_sentinel),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let workspace = fake_lsp_workspace(mode);
+        fs::write(workspace.path().join("src/lib.rs"), &declaration).unwrap();
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            5130 + offset as u64,
+            safe_delete_request(&declaration),
+            &[("src/lib.rs", &declaration)],
+        );
+        let public_response = response.to_string();
+        let captured_logs: Vec<_> = host_calls
+            .iter()
+            .filter(|call| call["method"] == "host/log")
+            .collect();
+        assert!(
+            !public_response.contains(producer_sentinel),
+            "public response leaked {producer_sentinel}: {public_response}"
+        );
+        assert!(
+            captured_logs
+                .iter()
+                .all(|call| !call.to_string().contains(producer_sentinel)),
+            "captured host/log call leaked {producer_sentinel}: {captured_logs:?}"
+        );
+        assert_no_mutation_host_calls(&host_calls);
+    }
+}
+
+#[test]
+fn safe_delete_expected_backend_failures_are_non_transport_and_the_session_remains_usable() {
+    let declaration = "fn old_name() {}\n";
+    let workspace = fake_lsp_workspace("safe_delete_malformed_once");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let (failure, failure_calls) = invoke_safe_delete(
+        &mut child,
+        5060,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration)],
+    );
+    assert_eq!(safe_delete_data(&failure)["status"], "malformed_response");
+    assert_no_mutation_host_calls(&failure_calls);
+    let (recovery, recovery_calls) = invoke_safe_delete(
+        &mut child,
+        5061,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration)],
+    );
+    assert_eq!(safe_delete_data(&recovery)["status"], "complete");
+    assert_no_mutation_host_calls(&recovery_calls);
+}
+
+#[test]
+fn safe_delete_process_contract_rejects_external_results_and_emits_zero_mutations() {
+    let declaration = "fn old_name() {}\n";
+    let workspace = fake_lsp_workspace("safe_delete_workspace_external");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let (response, host_calls) = invoke_safe_delete(
+        &mut child,
+        5070,
+        safe_delete_request(declaration),
+        &[("src/lib.rs", declaration)],
+    );
+    assert_eq!(safe_delete_data(&response)["status"], "workspace_external");
+    assert_no_mutation_host_calls(&host_calls);
+}
+
+#[cfg(unix)]
+#[test]
+fn safe_delete_tool_defers_symlink_containment_to_the_read_file_host_call() {
+    use std::os::unix::fs::symlink;
+
+    let declaration = "fn old_name() {}\n";
+    let external = tempfile::tempdir().expect("create external directory");
+    let external_file = external.path().join("outside.rs");
+    fs::write(&external_file, "old_name();\n").expect("write external source");
+
+    let workspace = fake_lsp_workspace("safe_delete_symlink_escape");
+    fs::write(workspace.path().join("src/lib.rs"), declaration).unwrap();
+    symlink(&external_file, workspace.path().join("src/escape.rs"))
+        .expect("create workspace symlink escape");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let mut read_file = |path: &str| match path {
+        "src/lib.rs" => Ok(serde_json::json!(declaration)),
+        "src/escape.rs" => Err(serde_json::json!({
+            "code": -32602,
+            "message": "workspace path resolves outside the workspace"
+        })),
+        unexpected => panic!("planner requested unexpected path {unexpected}"),
+    };
+    let (response, host_calls) = invoke_safe_delete_with_read_file(
+        &mut child,
+        5071,
+        safe_delete_request(declaration),
+        &mut read_file,
+    );
+
+    assert_eq!(safe_delete_data(&response)["status"], "workspace_external");
+    assert!(host_calls.iter().any(|call| {
+        call["method"] == "workspace/readFile" && call["params"]["path"] == "src/escape.rs"
+    }));
+    assert_no_mutation_host_calls(&host_calls);
+}
+
 fn lsp_extension_bin() -> String {
     workspace_root()
         .join("target")
@@ -349,6 +1233,108 @@ fn wait_for_trace_event(workspace: &tempfile::TempDir, expected: &str) -> Vec<se
         );
         std::thread::yield_now();
     }
+}
+
+fn safe_delete_request(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "declaration": {
+            "path": "src/lib.rs",
+            "symbol_name": "old_name",
+            "kind": "function",
+            "position": {"line": 0, "character": 3},
+            "deletion_span": {"start_byte": 0, "end_byte": content.len()},
+            "base_hash": compute_content_version(content.as_bytes()),
+        }
+    })
+}
+
+fn invoke_safe_delete(
+    child: &mut RawLspChild,
+    id: u64,
+    request: serde_json::Value,
+    files: &[(&str, &str)],
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let mut read_file = |path: &str| {
+        Ok(serde_json::json!(
+            files
+                .iter()
+                .find_map(|(candidate, content)| (*candidate == path).then_some(*content))
+                .expect("planner requested an unexpected fixture path")
+        ))
+    };
+    invoke_safe_delete_with_read_file(child, id, request, &mut read_file)
+}
+
+fn invoke_safe_delete_with_read_file(
+    child: &mut RawLspChild,
+    id: u64,
+    request: serde_json::Value,
+    read_file: &mut dyn FnMut(&str) -> Result<serde_json::Value, serde_json::Value>,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "invokeTool",
+        "params": {"name": "plan_safe_delete", "params": request},
+    }));
+
+    let mut host_calls = Vec::new();
+    loop {
+        let frame = child.read_frame_bounded();
+        if frame["id"] == id {
+            return (frame, host_calls);
+        }
+        let method = frame["method"]
+            .as_str()
+            .expect("non-response frame must be a HostCall");
+        host_calls.push(frame.clone());
+        let reply = match method {
+            "workspace/readFile" => {
+                let path = frame["params"]["path"]
+                    .as_str()
+                    .expect("readFile path must be a string");
+                match read_file(path) {
+                    Ok(result) => serde_json::json!({"result": result}),
+                    Err(error) => serde_json::json!({"error": error}),
+                }
+            }
+            "host/log" | "notify/resourceUpdated" => serde_json::json!({"result": null}),
+            _ => serde_json::json!({"result": null}),
+        };
+        let mut response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": frame["id"].clone(),
+        });
+        response
+            .as_object_mut()
+            .expect("JSON-RPC reply must be an object")
+            .extend(
+                reply
+                    .as_object()
+                    .expect("HostCall reply must be an object")
+                    .clone(),
+            );
+        child.write_frame(response);
+    }
+}
+
+fn safe_delete_data(response: &serde_json::Value) -> &serde_json::Value {
+    response["result"]["data"]
+        .as_object()
+        .map(|_| &response["result"]["data"])
+        .unwrap_or_else(|| panic!("safe-delete planning must return ToolResult data: {response}"))
+}
+
+fn assert_no_mutation_host_calls(host_calls: &[serde_json::Value]) {
+    assert!(
+        host_calls.iter().all(|frame| {
+            !matches!(
+                frame["method"].as_str(),
+                Some("workspace/applyEdits" | "workspace/writeFile" | "workspace/deleteFile")
+            )
+        }),
+        "semantic planning emitted a mutation HostCall: {host_calls:?}"
+    );
 }
 
 fn unsupported_read_envelope(
@@ -1278,8 +2264,8 @@ fn f007_t015_lsp_process_spawns_and_declares_implementations_and_rename_tools() 
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         tool_names.len(),
-        8,
-        "must declare exactly 8 tools; got: {tool_names:?}"
+        9,
+        "must declare exactly 9 tools; got: {tool_names:?}"
     );
     assert!(
         tool_names.contains(&"diagnostics"),
@@ -1289,7 +2275,8 @@ fn f007_t015_lsp_process_spawns_and_declares_implementations_and_rename_tools() 
         tool_names.contains(&"definition"),
         "must declare 'definition'; got: {tool_names:?}"
     );
-    assert!(tool_names.contains(&"planPathRename"));
+    assert!(tool_names.contains(&"plan_path_rename"));
+    assert!(tool_names.contains(&"plan_safe_delete"));
     assert!(
         tool_names.contains(&"references"),
         "must declare 'references'; got: {tool_names:?}"
@@ -1330,6 +2317,11 @@ fn f007_t015_lsp_runtime_initresult_tool_metadata_matches_extension_toml() {
     let init: InitResult = serde_json::from_value(initialized["result"]["data"].clone())
         .expect("runtime InitResult must deserialize");
     let mut runtime_tools = init.tools;
+    let internal_safe_delete = runtime_tools
+        .iter()
+        .find(|tool| tool.name == "plan_safe_delete")
+        .expect("runtime must advertise the internal plan_safe_delete tool");
+    assert!(internal_safe_delete.schema_json.contains("declaration"));
     runtime_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
     assert_eq!(
@@ -1788,7 +2780,7 @@ fn path_rename_malformed_params_use_invalid_params_error_at_process_boundary() {
         "id": 650,
         "method": "invokeTool",
         "params": {
-            "name": "planPathRename",
+            "name": "plan_path_rename",
             "params": {"moves": "not-an-array", "semantic_policy": "required"},
         },
     }));
@@ -1810,7 +2802,7 @@ fn path_rename_replays_deferred_host_requests_fifo_after_tool_result() {
         "id": 651,
         "method": "invokeTool",
         "params": {
-            "name": "planPathRename",
+            "name": "plan_path_rename",
             "params": {
                 "moves": [{
                     "source": "src/lib.rs",
@@ -2605,13 +3597,14 @@ fn lsp_process_push_response_frame_during_idle_is_discarded() {
         .collect::<Vec<_>>();
     assert_eq!(
         tool_names.len(),
-        8,
-        "must declare 8 tools; got: {tool_names:?} (full resp: {init_resp})"
+        9,
+        "must declare 9 tools; got: {tool_names:?} (full resp: {init_resp})"
     );
     assert!(tool_names.contains(&"implementations"));
     assert!(tool_names.contains(&"type_hierarchy"));
     assert!(tool_names.contains(&"rename"));
-    assert!(tool_names.contains(&"planPathRename"));
+    assert!(tool_names.contains(&"plan_path_rename"));
+    assert!(tool_names.contains(&"plan_safe_delete"));
 
     // ── 2. Inject a push-response frame (simulates host ACK of notify/resourceUpdated) ──
     //
@@ -2955,5 +3948,137 @@ fn lsp_process_concurrent_spawn_stress_20_with_push_response_injection() {
     for (i, h) in handles.into_iter().enumerate() {
         h.join()
             .unwrap_or_else(|_| panic!("stress thread #{i} panicked"));
+    }
+}
+
+#[test]
+fn safe_delete_without_cleanup_completes_only_for_wholly_internal_references() {
+    let consumer = "old_name();\n";
+    for (mode, content, expected) in [
+        (
+            "safe_delete_no_cleanup_internal",
+            "fn old_name() { old_name(); }\n",
+            "complete",
+        ),
+        (
+            "safe_delete_no_cleanup_internal",
+            "fn old_name() { /*😀*/ old_name(); }\r\n",
+            "complete",
+        ),
+        (
+            "safe_delete_no_cleanup_mixed",
+            "fn old_name() { old_name(); }\n",
+            "incomplete",
+        ),
+        (
+            "safe_delete_no_cleanup_external_same_file",
+            "fn old_name() {}\nfn keep() { old_name(); }\n",
+            "incomplete",
+        ),
+        (
+            "safe_delete_no_cleanup_crossing",
+            "fn old_name() {}\nfn keep() {}\n",
+            "incomplete",
+        ),
+    ] {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let mut request = safe_delete_request(content);
+        request["declaration"]["deletion_span"]["end_byte"] =
+            serde_json::json!(content.find('\n').unwrap() + 1);
+        let (response, host_calls) = invoke_safe_delete(
+            &mut child,
+            5201,
+            request,
+            &[("src/lib.rs", content), ("src/consumer.rs", consumer)],
+        );
+        let data = safe_delete_data(&response);
+        assert_eq!(data["status"], expected, "{mode}: {data}");
+        assert_eq!(data["plan"]["coverage"], expected);
+        assert!(!data["plan"]["references"].as_array().unwrap().is_empty());
+        assert!(data["plan"]["cleanup_edits"].as_array().unwrap().is_empty());
+        assert_no_mutation_host_calls(&host_calls);
+    }
+}
+
+#[test]
+fn safe_delete_rejects_invalid_deletion_span_boundaries_before_backend_lookup() {
+    let content = "fn old_name() { /*😀*/ old_name(); }\n";
+    let split = content.find('😀').unwrap() + 1;
+    for (start, end) in [(0, content.len() + 1), (split, content.len()), (0, split)] {
+        let workspace = fake_lsp_workspace("safe_delete_no_cleanup_internal");
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let mut request = safe_delete_request(content);
+        request["declaration"]["deletion_span"] =
+            serde_json::json!({"start_byte": start, "end_byte": end});
+        let (response, host_calls) =
+            invoke_safe_delete(&mut child, 5202, request, &[("src/lib.rs", content)]);
+        assert_eq!(
+            safe_delete_data(&response)["status"],
+            "invalid_location",
+            "{response}"
+        );
+        assert_no_mutation_host_calls(&host_calls);
+        let log = fs::read_to_string(workspace.path().join("fake_lsp.log")).unwrap_or_default();
+        assert!(
+            !log.contains("textDocument/references"),
+            "invalid span reached backend: {log}"
+        );
+    }
+}
+
+#[test]
+fn safe_delete_tool_names_use_snake_case_and_match_the_static_manifests() {
+    let mut child = RawLspChild::spawn();
+    let initialized = initialized_raw_lsp_child(&mut child);
+    let runtime: Vec<extension_protocol::ToolDecl> =
+        serde_json::from_value(initialized["result"]["data"]["tools"].clone()).unwrap();
+    let mut runtime_names = runtime
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    runtime_names.sort();
+    for extension in ["ast", "lsp"] {
+        let source = fs::read_to_string(
+            workspace_root().join(format!("extensions/{extension}/extension.toml")),
+        )
+        .unwrap();
+        let manifest: ExtensionManifest = toml::from_str(&source).unwrap();
+        for tool in &manifest.tools {
+            assert!(
+                !tool.name.is_empty()
+                    && tool.name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{extension} tool must use snake_case: {}",
+                tool.name
+            );
+        }
+        if extension == "lsp" {
+            let mut declared_names = manifest
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            declared_names.sort();
+            assert_eq!(
+                runtime_names, declared_names,
+                "static and runtime LSP names must agree"
+            );
+            for name in ["plan_path_rename", "plan_safe_delete"] {
+                let declared = manifest
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap();
+                let actual = runtime.iter().find(|tool| tool.name == name).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&actual.schema_json).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(&declared.schema_json).unwrap()
+                );
+            }
+        }
     }
 }
