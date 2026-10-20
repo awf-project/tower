@@ -579,7 +579,7 @@ fn concurrent_spawn_and_request_handles_queued_frames_twenty_times_with_fresh_na
                 );
                 sidecar.send(json!({
                     "jsonrpc": "2.0", "id": 1, "method": "invokeTool",
-                    "params": {"name": "planPathRename", "params": {
+                    "params": {"name": "plan_path_rename", "params": {
                         "moves": [{"source": "src/old.rs", "destination": "src/new.rs", "kind": "file"}],
                         "semantic_policy": "required"
                     }}

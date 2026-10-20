@@ -51,6 +51,14 @@ where
     Option::deserialize(deserializer)
 }
 
+fn deserialize_non_null_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LspOutcomeStatus {
@@ -401,6 +409,1041 @@ pub struct WorkspaceEditSpan {
 pub struct WorkspaceApplyEditsResult {
     pub files_changed: usize,
     pub per_file: Vec<PerFileEditResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteRequest {
+    pub path: String,
+    pub symbol_name: String,
+    pub kind: Option<String>,
+    pub dry_run: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteRequestWire {
+    path: String,
+    symbol_name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    kind: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+impl Serialize for SafeDeleteRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_safe_delete_identity(&self.path, &self.symbol_name, self.kind.as_deref())
+            .map_err(serde::ser::Error::custom)?;
+        SafeDeleteRequestWire {
+            path: self.path.clone(),
+            symbol_name: self.symbol_name.clone(),
+            kind: self.kind.clone(),
+            dry_run: self.dry_run,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteRequestWire::deserialize(deserializer)?;
+        validate_safe_delete_identity(&wire.path, &wire.symbol_name, wire.kind.as_deref())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            path: wire.path,
+            symbol_name: wire.symbol_name,
+            kind: wire.kind,
+            dry_run: wire.dry_run,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeDeleteStatus {
+    Blocked,
+    Previewed,
+    Applied,
+    PartialCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeDeleteBlockingReason {
+    NotFound,
+    AmbiguousSymbol,
+    InvalidDeclaration,
+    CapabilityUnavailable,
+    ReferencesUnresolved,
+    LiveReferences,
+    CleanupIncomplete,
+    InvalidCleanup,
+    CasConflict,
+    BackendError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeDeletePosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteByteSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteByteSpanWire {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl Serialize for SafeDeleteByteSpan {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_byte_range(self.start_byte, self.end_byte).map_err(serde::ser::Error::custom)?;
+        SafeDeleteByteSpanWire {
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteByteSpan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteByteSpanWire::deserialize(deserializer)?;
+        validate_byte_range(wire.start_byte, wire.end_byte).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            start_byte: wire.start_byte,
+            end_byte: wire.end_byte,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteDeclarationRequest {
+    pub path: String,
+    pub symbol_name: String,
+    pub kind: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteDeclarationRequestWire {
+    path: String,
+    symbol_name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    kind: Option<String>,
+}
+
+impl Serialize for SafeDeleteDeclarationRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_safe_delete_identity(&self.path, &self.symbol_name, self.kind.as_deref())
+            .map_err(serde::ser::Error::custom)?;
+        SafeDeleteDeclarationRequestWire {
+            path: self.path.clone(),
+            symbol_name: self.symbol_name.clone(),
+            kind: self.kind.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteDeclarationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteDeclarationRequestWire::deserialize(deserializer)?;
+        validate_safe_delete_identity(&wire.path, &wire.symbol_name, wire.kind.as_deref())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            path: wire.path,
+            symbol_name: wire.symbol_name,
+            kind: wire.kind,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteDeclarationPlan {
+    pub path: String,
+    pub symbol_name: String,
+    pub kind: String,
+    pub position: SafeDeletePosition,
+    pub deletion_span: SafeDeleteByteSpan,
+    pub base_hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteDeclarationPlanWire {
+    path: String,
+    symbol_name: String,
+    kind: String,
+    position: SafeDeletePosition,
+    deletion_span: SafeDeleteByteSpan,
+    base_hash: String,
+}
+
+impl Serialize for SafeDeleteDeclarationPlan {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_safe_delete_identity(&self.path, &self.symbol_name, Some(&self.kind))
+            .map_err(serde::ser::Error::custom)?;
+        validate_hash(&self.base_hash).map_err(serde::ser::Error::custom)?;
+        SafeDeleteDeclarationPlanWire {
+            path: self.path.clone(),
+            symbol_name: self.symbol_name.clone(),
+            kind: self.kind.clone(),
+            position: self.position.clone(),
+            deletion_span: self.deletion_span.clone(),
+            base_hash: self.base_hash.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteDeclarationPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteDeclarationPlanWire::deserialize(deserializer)?;
+        validate_safe_delete_identity(&wire.path, &wire.symbol_name, Some(&wire.kind))
+            .map_err(serde::de::Error::custom)?;
+        validate_hash(&wire.base_hash).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            path: wire.path,
+            symbol_name: wire.symbol_name,
+            kind: wire.kind,
+            position: wire.position,
+            deletion_span: wire.deletion_span,
+            base_hash: wire.base_hash,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SafeDeleteDeclarationOutcome {
+    Planned { plan: SafeDeleteDeclarationPlan },
+    NotFound,
+    AmbiguousSymbol,
+    InvalidDeclaration,
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteDeclarationOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            status: String,
+            plan: Option<Option<SafeDeleteDeclarationPlan>>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match (wire.status.as_str(), wire.plan) {
+            ("planned", Some(Some(plan))) => Ok(Self::Planned { plan }),
+            ("not_found", None) => Ok(Self::NotFound),
+            ("ambiguous_symbol", None) => Ok(Self::AmbiguousSymbol),
+            ("invalid_declaration", None) => Ok(Self::InvalidDeclaration),
+            _ => Err(serde::de::Error::custom(
+                "invalid safe-delete declaration outcome",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeDeleteSemanticRequest {
+    pub declaration: SafeDeleteDeclarationPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupCoverage {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteReference {
+    pub path: String,
+    pub start: SafeDeletePosition,
+    pub end: SafeDeletePosition,
+    pub base_hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteReferenceWire {
+    path: String,
+    start: SafeDeletePosition,
+    end: SafeDeletePosition,
+    base_hash: String,
+}
+
+impl Serialize for SafeDeleteReference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_reference(self).map_err(serde::ser::Error::custom)?;
+        SafeDeleteReferenceWire {
+            path: self.path.clone(),
+            start: self.start.clone(),
+            end: self.end.clone(),
+            base_hash: self.base_hash.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteReferenceWire::deserialize(deserializer)?;
+        let value = Self {
+            path: wire.path,
+            start: wire.start,
+            end: wire.end,
+            base_hash: wire.base_hash,
+        };
+        validate_reference(&value).map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteCleanupEdit {
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub replacement: String,
+    pub base_hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteCleanupEditWire {
+    path: String,
+    start_byte: usize,
+    end_byte: usize,
+    replacement: String,
+    base_hash: String,
+}
+
+impl Serialize for SafeDeleteCleanupEdit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_cleanup_edit(self).map_err(serde::ser::Error::custom)?;
+        SafeDeleteCleanupEditWire {
+            path: self.path.clone(),
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+            replacement: self.replacement.clone(),
+            base_hash: self.base_hash.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteCleanupEdit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteCleanupEditWire::deserialize(deserializer)?;
+        let value = Self {
+            path: wire.path,
+            start_byte: wire.start_byte,
+            end_byte: wire.end_byte,
+            replacement: wire.replacement,
+            base_hash: wire.base_hash,
+        };
+        validate_cleanup_edit(&value).map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeDeleteSemanticPlan {
+    pub references: Vec<SafeDeleteReference>,
+    pub cleanup_edits: Vec<SafeDeleteCleanupEdit>,
+    pub coverage: CleanupCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafeDeleteSemanticOutcome {
+    Complete { plan: SafeDeleteSemanticPlan },
+    Incomplete { plan: SafeDeleteSemanticPlan },
+    CapabilityUnavailable,
+    BackendTimeout,
+    BackendCrashed,
+    MalformedResponse,
+    InvalidLocation,
+    WorkspaceExternal,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SafeDeleteSemanticOutcomeWire {
+    Complete { plan: SafeDeleteSemanticPlan },
+    Incomplete { plan: SafeDeleteSemanticPlan },
+    CapabilityUnavailable,
+    BackendTimeout,
+    BackendCrashed,
+    MalformedResponse,
+    InvalidLocation,
+    WorkspaceExternal,
+}
+
+impl From<SafeDeleteSemanticOutcomeWire> for SafeDeleteSemanticOutcome {
+    fn from(value: SafeDeleteSemanticOutcomeWire) -> Self {
+        match value {
+            SafeDeleteSemanticOutcomeWire::Complete { plan } => Self::Complete { plan },
+            SafeDeleteSemanticOutcomeWire::Incomplete { plan } => Self::Incomplete { plan },
+            SafeDeleteSemanticOutcomeWire::CapabilityUnavailable => Self::CapabilityUnavailable,
+            SafeDeleteSemanticOutcomeWire::BackendTimeout => Self::BackendTimeout,
+            SafeDeleteSemanticOutcomeWire::BackendCrashed => Self::BackendCrashed,
+            SafeDeleteSemanticOutcomeWire::MalformedResponse => Self::MalformedResponse,
+            SafeDeleteSemanticOutcomeWire::InvalidLocation => Self::InvalidLocation,
+            SafeDeleteSemanticOutcomeWire::WorkspaceExternal => Self::WorkspaceExternal,
+        }
+    }
+}
+
+impl Serialize for SafeDeleteSemanticOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Complete { plan } if plan.coverage != CleanupCoverage::Complete => Err(
+                serde::ser::Error::custom("complete outcome requires complete coverage"),
+            ),
+            Self::Incomplete { plan } if plan.coverage != CleanupCoverage::Incomplete => Err(
+                serde::ser::Error::custom("incomplete outcome requires incomplete coverage"),
+            ),
+            Self::Complete { plan } => {
+                SafeDeleteSemanticOutcomeWire::Complete { plan: plan.clone() }.serialize(serializer)
+            }
+            Self::Incomplete { plan } => {
+                SafeDeleteSemanticOutcomeWire::Incomplete { plan: plan.clone() }
+                    .serialize(serializer)
+            }
+            Self::CapabilityUnavailable => {
+                SafeDeleteSemanticOutcomeWire::CapabilityUnavailable.serialize(serializer)
+            }
+            Self::BackendTimeout => {
+                SafeDeleteSemanticOutcomeWire::BackendTimeout.serialize(serializer)
+            }
+            Self::BackendCrashed => {
+                SafeDeleteSemanticOutcomeWire::BackendCrashed.serialize(serializer)
+            }
+            Self::MalformedResponse => {
+                SafeDeleteSemanticOutcomeWire::MalformedResponse.serialize(serializer)
+            }
+            Self::InvalidLocation => {
+                SafeDeleteSemanticOutcomeWire::InvalidLocation.serialize(serializer)
+            }
+            Self::WorkspaceExternal => {
+                SafeDeleteSemanticOutcomeWire::WorkspaceExternal.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteSemanticOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            status: String,
+            plan: Option<Option<SafeDeleteSemanticPlan>>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let value = match (wire.status.as_str(), wire.plan) {
+            ("complete", Some(Some(plan))) => Self::Complete { plan },
+            ("incomplete", Some(Some(plan))) => Self::Incomplete { plan },
+            ("capability_unavailable", None) => Self::CapabilityUnavailable,
+            ("backend_timeout", None) => Self::BackendTimeout,
+            ("backend_crashed", None) => Self::BackendCrashed,
+            ("malformed_response", None) => Self::MalformedResponse,
+            ("invalid_location", None) => Self::InvalidLocation,
+            ("workspace_external", None) => Self::WorkspaceExternal,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "invalid safe-delete semantic outcome",
+                ));
+            }
+        };
+        match &value {
+            Self::Complete { plan } if plan.coverage != CleanupCoverage::Complete => Err(
+                serde::de::Error::custom("complete outcome requires complete coverage"),
+            ),
+            Self::Incomplete { plan } if plan.coverage != CleanupCoverage::Incomplete => Err(
+                serde::de::Error::custom("incomplete outcome requires incomplete coverage"),
+            ),
+            _ => Ok(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteMutationRequest {
+    pub edits: Vec<SafeDeleteCleanupEdit>,
+    pub dry_run: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteMutationRequestWire {
+    edits: Vec<SafeDeleteCleanupEdit>,
+    dry_run: bool,
+}
+
+impl Serialize for SafeDeleteMutationRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.edits.is_empty() {
+            return Err(serde::ser::Error::custom(
+                "safe-delete mutation requires at least one edit",
+            ));
+        }
+        SafeDeleteMutationRequestWire {
+            edits: self.edits.clone(),
+            dry_run: self.dry_run,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteMutationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteMutationRequestWire::deserialize(deserializer)?;
+        if wire.edits.is_empty() {
+            return Err(serde::de::Error::custom(
+                "safe-delete mutation requires at least one edit",
+            ));
+        }
+        Ok(Self {
+            edits: wire.edits,
+            dry_run: wire.dry_run,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeDeleteMutationStatus {
+    Previewed,
+    Applied,
+    Rejected,
+    PartialCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeDeleteFileOutcomeStatus {
+    Committed,
+    Failed,
+    Unattempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeDeleteFileError {
+    FilesystemError,
+    PersistenceError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafeDeleteRejectionCode {
+    InvalidPath,
+    InvalidRange,
+    OverlappingEdits,
+    CasConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteFileOutcome {
+    pub path: String,
+    pub outcome: SafeDeleteFileOutcomeStatus,
+    pub error: Option<SafeDeleteFileError>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteFileOutcomeWire {
+    path: String,
+    outcome: SafeDeleteFileOutcomeStatus,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    error: Option<SafeDeleteFileError>,
+}
+
+impl Serialize for SafeDeleteFileOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_file_outcome(self).map_err(serde::ser::Error::custom)?;
+        SafeDeleteFileOutcomeWire {
+            path: self.path.clone(),
+            outcome: self.outcome,
+            error: self.error,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteFileOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteFileOutcomeWire::deserialize(deserializer)?;
+        let value = Self {
+            path: wire.path,
+            outcome: wire.outcome,
+            error: wire.error,
+        };
+        validate_file_outcome(&value).map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteMutationResult {
+    pub status: SafeDeleteMutationStatus,
+    pub rejection: Option<SafeDeleteRejectionCode>,
+    pub per_file: Vec<SafeDeleteFileOutcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteMutationResultWire {
+    status: SafeDeleteMutationStatus,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    rejection: Option<SafeDeleteRejectionCode>,
+    per_file: Vec<SafeDeleteFileOutcome>,
+}
+
+impl Serialize for SafeDeleteMutationResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_mutation_result(self).map_err(serde::ser::Error::custom)?;
+        SafeDeleteMutationResultWire {
+            status: self.status,
+            rejection: self.rejection,
+            per_file: self.per_file.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteMutationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteMutationResultWire::deserialize(deserializer)?;
+        let value = Self {
+            status: wire.status,
+            rejection: wire.rejection,
+            per_file: wire.per_file,
+        };
+        validate_mutation_result(&value).map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeDeleteReport {
+    pub status: SafeDeleteStatus,
+    pub blocking_reason: Option<SafeDeleteBlockingReason>,
+    pub declaration: Option<SafeDeleteDeclarationPlan>,
+    pub references: Vec<SafeDeleteReference>,
+    pub proposed_edits: Vec<SafeDeleteCleanupEdit>,
+    pub affected_files: Vec<String>,
+    pub mutation_result: Option<SafeDeleteMutationResult>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeDeleteReportWire {
+    status: SafeDeleteStatus,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    blocking_reason: Option<SafeDeleteBlockingReason>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    declaration: Option<SafeDeleteDeclarationPlan>,
+    references: Vec<SafeDeleteReference>,
+    proposed_edits: Vec<SafeDeleteCleanupEdit>,
+    affected_files: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    mutation_result: Option<SafeDeleteMutationResult>,
+}
+
+impl Serialize for SafeDeleteReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        validate_safe_delete_report(self).map_err(serde::ser::Error::custom)?;
+        SafeDeleteReportWire {
+            status: self.status,
+            blocking_reason: self.blocking_reason,
+            declaration: self.declaration.clone(),
+            references: self.references.clone(),
+            proposed_edits: self.proposed_edits.clone(),
+            affected_files: self.affected_files.clone(),
+            mutation_result: self.mutation_result.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SafeDeleteReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SafeDeleteReportWire::deserialize(deserializer)?;
+        let value = Self {
+            status: wire.status,
+            blocking_reason: wire.blocking_reason,
+            declaration: wire.declaration,
+            references: wire.references,
+            proposed_edits: wire.proposed_edits,
+            affected_files: wire.affected_files,
+            mutation_result: wire.mutation_result,
+        };
+        validate_safe_delete_report(&value).map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+pub fn is_safe_delete_path(path: &str) -> bool {
+    if path.is_empty() || path.contains(['\\', '\0']) || path.starts_with('/') {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    path.split('/')
+        .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn is_safe_delete_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "impl"
+            | "method"
+            | "module"
+            | "type_alias"
+            | "const"
+            | "static"
+            | "macro_def"
+            | "class"
+    )
+}
+
+fn validate_safe_delete_identity(
+    path: &str,
+    symbol_name: &str,
+    kind: Option<&str>,
+) -> Result<(), &'static str> {
+    if !is_safe_delete_path(path) {
+        return Err("safe-delete paths must be workspace-relative");
+    }
+    if symbol_name.is_empty() {
+        return Err("safe-delete symbol names must not be empty");
+    }
+    if kind.is_some_and(|value| !is_safe_delete_kind(value)) {
+        return Err("safe-delete symbol kind is not supported");
+    }
+    Ok(())
+}
+
+fn validate_hash(hash: &str) -> Result<(), &'static str> {
+    if !is_sha256(hash) {
+        return Err("safe-delete base_hash must be a 64-character hexadecimal SHA-256 value");
+    }
+    Ok(())
+}
+
+fn validate_byte_range(start: usize, end: usize) -> Result<(), &'static str> {
+    if start > end {
+        return Err("safe-delete byte range start must not exceed end");
+    }
+    Ok(())
+}
+
+fn validate_reference(reference: &SafeDeleteReference) -> Result<(), &'static str> {
+    if !is_safe_delete_path(&reference.path) {
+        return Err("safe-delete reference path must be workspace-relative");
+    }
+    if (reference.start.line, reference.start.character)
+        > (reference.end.line, reference.end.character)
+    {
+        return Err("safe-delete reference start must not follow end");
+    }
+    validate_hash(&reference.base_hash)
+}
+
+fn validate_cleanup_edit(edit: &SafeDeleteCleanupEdit) -> Result<(), &'static str> {
+    if !is_safe_delete_path(&edit.path) {
+        return Err("safe-delete edit path must be workspace-relative");
+    }
+    validate_byte_range(edit.start_byte, edit.end_byte)?;
+    validate_hash(&edit.base_hash)
+}
+
+fn validate_file_outcome(file: &SafeDeleteFileOutcome) -> Result<(), &'static str> {
+    if !is_safe_delete_path(&file.path) {
+        return Err("safe-delete mutation paths must be workspace-relative");
+    }
+    match (file.outcome, file.error) {
+        (SafeDeleteFileOutcomeStatus::Failed, Some(_)) => Ok(()),
+        (SafeDeleteFileOutcomeStatus::Failed, None) => {
+            Err("failed safe-delete mutation outcome requires an error")
+        }
+        (_, Some(_)) => Err("only failed safe-delete mutation outcomes may contain an error"),
+        (_, None) => Ok(()),
+    }
+}
+
+fn validate_mutation_result(result: &SafeDeleteMutationResult) -> Result<(), &'static str> {
+    let mut paths = std::collections::HashSet::new();
+    for file in &result.per_file {
+        validate_file_outcome(file)?;
+        if !paths.insert(&file.path) {
+            return Err("safe-delete mutation paths must be unique");
+        }
+    }
+    match result.status {
+        SafeDeleteMutationStatus::Previewed
+            if result.rejection.is_none()
+                && result
+                    .per_file
+                    .iter()
+                    .all(|file| file.outcome == SafeDeleteFileOutcomeStatus::Unattempted) =>
+        {
+            Ok(())
+        }
+        SafeDeleteMutationStatus::Applied
+            if result.rejection.is_none()
+                && result
+                    .per_file
+                    .iter()
+                    .all(|file| file.outcome == SafeDeleteFileOutcomeStatus::Committed) =>
+        {
+            Ok(())
+        }
+        SafeDeleteMutationStatus::Rejected
+            if result.rejection.is_some()
+                && result.per_file.iter().all(|file| {
+                    file.outcome == SafeDeleteFileOutcomeStatus::Unattempted && file.error.is_none()
+                }) =>
+        {
+            Ok(())
+        }
+        SafeDeleteMutationStatus::PartialCommit if result.rejection.is_none() => {
+            let failures: Vec<_> = result
+                .per_file
+                .iter()
+                .enumerate()
+                .filter(|(_, file)| file.outcome == SafeDeleteFileOutcomeStatus::Failed)
+                .collect();
+            if failures.len() != 1 {
+                return Err("partial-commit safe-delete result requires exactly one failed file");
+            }
+            let failed_index = failures[0].0;
+            if result.per_file[..failed_index]
+                .iter()
+                .any(|file| file.outcome != SafeDeleteFileOutcomeStatus::Committed)
+                || result.per_file[failed_index + 1..]
+                    .iter()
+                    .any(|file| file.outcome != SafeDeleteFileOutcomeStatus::Unattempted)
+            {
+                return Err(
+                    "partial-commit safe-delete outcomes must be committed, failed, then unattempted",
+                );
+            }
+            Ok(())
+        }
+        _ => Err("safe-delete mutation status and outcomes are contradictory"),
+    }
+}
+
+fn validate_safe_delete_report(report: &SafeDeleteReport) -> Result<(), &'static str> {
+    let mut affected = Vec::new();
+    for edit in &report.proposed_edits {
+        if !affected.contains(&edit.path) {
+            affected.push(edit.path.clone());
+        }
+    }
+    if affected != report.affected_files {
+        return Err("safe-delete affected_files must equal ordered unique proposal paths");
+    }
+    if report
+        .affected_files
+        .iter()
+        .any(|path| !is_safe_delete_path(path))
+    {
+        return Err("safe-delete affected paths must be workspace-relative");
+    }
+    if let Some(mutation) = &report.mutation_result {
+        let mutation_paths: Vec<_> = mutation
+            .per_file
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        let affected_paths: Vec<_> = report.affected_files.iter().map(String::as_str).collect();
+        if mutation_paths != affected_paths {
+            return Err("safe-delete mutation paths must equal affected_files");
+        }
+    }
+    match report.status {
+        SafeDeleteStatus::Blocked => {
+            let reason = report
+                .blocking_reason
+                .ok_or("blocked safe-delete report requires a blocking reason")?;
+            if report
+                .mutation_result
+                .as_ref()
+                .is_some_and(|result| result.status != SafeDeleteMutationStatus::Rejected)
+            {
+                return Err("blocked safe-delete report permits only a rejected mutation result");
+            }
+            let resolution_failure = matches!(
+                reason,
+                SafeDeleteBlockingReason::NotFound
+                    | SafeDeleteBlockingReason::AmbiguousSymbol
+                    | SafeDeleteBlockingReason::InvalidDeclaration
+            );
+            if resolution_failure == report.declaration.is_some() {
+                return Err("blocked safe-delete declaration presence contradicts its reason");
+            }
+            if let Some(result) = &report.mutation_result {
+                let expected_reason = match result.rejection {
+                    Some(SafeDeleteRejectionCode::CasConflict) => {
+                        SafeDeleteBlockingReason::CasConflict
+                    }
+                    Some(_) => SafeDeleteBlockingReason::InvalidCleanup,
+                    None => return Err("rejected safe-delete mutation requires a rejection code"),
+                };
+                if reason != expected_reason {
+                    return Err(
+                        "safe-delete mutation rejection and blocking reason must correspond",
+                    );
+                }
+            }
+            Ok(())
+        }
+        SafeDeleteStatus::Previewed => {
+            validate_successful_safe_delete_report(report, SafeDeleteMutationStatus::Previewed)
+        }
+        SafeDeleteStatus::Applied => {
+            validate_successful_safe_delete_report(report, SafeDeleteMutationStatus::Applied)
+        }
+        SafeDeleteStatus::PartialCommit => {
+            validate_successful_safe_delete_report(report, SafeDeleteMutationStatus::PartialCommit)
+        }
+    }
+}
+
+fn validate_successful_safe_delete_report(
+    report: &SafeDeleteReport,
+    required_status: SafeDeleteMutationStatus,
+) -> Result<(), &'static str> {
+    if report.blocking_reason.is_some() || report.declaration.is_none() {
+        return Err("successful safe-delete report requires a declaration and no blocking reason");
+    }
+    if report
+        .mutation_result
+        .as_ref()
+        .is_none_or(|result| result.status != required_status)
+    {
+        return Err("safe-delete report and mutation statuses must match");
+    }
+    Ok(())
 }
 
 /// JSON Schema for the public path-rename request exposed by the native tool.

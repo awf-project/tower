@@ -75,6 +75,20 @@ pub trait ExtensionHostPort {
     /// - [`InvokeError::ToolNotFound`] — no extension owns `tool_name`.
     /// - [`InvokeError::Fault`] — the owning extension returned a fault or is quarantined.
     fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError>;
+
+    /// Invoke a declared tool on a specific extension instance.
+    ///
+    /// Implementations must preserve both extension identity and declared-tool
+    /// ownership. Hosts without targeted routing fail closed; delegating to
+    /// `invoke` could select another extension with the same local tool name.
+    fn invoke_extension(
+        &self,
+        _extension_id: &ExtensionId,
+        tool_name: &str,
+        _params: Value,
+    ) -> Result<Value, InvokeError> {
+        Err(InvokeError::ToolNotFound(tool_name.to_owned()))
+    }
 }
 
 /// A no-op [`ExtensionHostPort`] that discards all calls (OP1 / AC6).
@@ -113,5 +127,39 @@ impl ExtensionHostPort for NoOpExtensionHost {
     #[inline]
     fn invoke(&self, tool_name: &str, _params: Value) -> Result<Value, InvokeError> {
         Err(InvokeError::ToolNotFound(tool_name.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct UntargetedHost;
+
+    impl ExtensionHostPort for UntargetedHost {
+        fn on_file_indexed(&self, _: FileId, _: &RelativePath) {}
+        fn on_file_changed(&self, _: FileId, _: &RelativePath) {}
+        fn on_file_deleted(&self, _: &RelativePath) {}
+        fn declared_tools(&self) -> Vec<(ExtensionId, ToolDecl)> {
+            Vec::new()
+        }
+        fn invoke(&self, _: &str, _: Value) -> Result<Value, InvokeError> {
+            panic!("targeted calls must never fall back to bare-name routing")
+        }
+    }
+
+    #[test]
+    fn targeted_invocation_defaults_to_unavailable_without_bare_name_fallback() {
+        let host: &dyn ExtensionHostPort = &UntargetedHost;
+        assert_eq!(
+            host.invoke_extension(
+                &ExtensionId::new("ast"),
+                "plan_safe_delete_declaration",
+                Value::Null
+            ),
+            Err(InvokeError::ToolNotFound(
+                "plan_safe_delete_declaration".to_owned()
+            ))
+        );
     }
 }

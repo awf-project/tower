@@ -167,6 +167,11 @@ fn main() {
                             description: "Delete the declaration span of one uniquely resolved symbol through host-applied workspace edits.".to_owned(),
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the source file"},"symbol_name":{"type":"string","description":"Name of the symbol to delete"},"kind":{"type":"string","description":"Optional symbol kind filter: function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class"},"dry_run":{"type":"boolean","description":"Preview the edit without modifying files"}},"required":["path","symbol_name"]}"#.to_owned(),
                         },
+                        ToolDecl {
+                            name: "plan_safe_delete_declaration".to_owned(),
+                            description: "Plan the versioned deletion span of one freshly resolved declaration without applying edits. Used by tower_safe_delete_symbol.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string"},"symbol_name":{"type":"string"},"kind":{"type":"string"}},"required":["path","symbol_name"],"additionalProperties":false}"#.to_owned(),
+                        },
                     ],
                     events: vec![
                         "event/fileIndexed".to_owned(),

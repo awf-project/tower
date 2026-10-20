@@ -250,9 +250,14 @@ fn main() {
                             schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}"#.to_owned(),
                         },
                         ToolDecl {
-                            name: "planPathRename".to_owned(),
+                            name: "plan_path_rename".to_owned(),
                             description: "Plan semantic source edits for workspace path moves without applying filesystem mutations.".to_owned(),
                             schema_json: PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "plan_safe_delete".to_owned(),
+                            description: "Plan semantic reference cleanup for a declaration without applying workspace mutations.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"declaration":{"type":"object","properties":{"path":{"type":"string"},"symbol_name":{"type":"string"},"kind":{"type":"string"},"position":{"type":"object","properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}},"required":["line","character"],"additionalProperties":false},"deletion_span":{"type":"object","properties":{"start_byte":{"type":"integer","minimum":0},"end_byte":{"type":"integer","minimum":0}},"required":["start_byte","end_byte"],"additionalProperties":false},"base_hash":{"type":"string"}},"required":["path","symbol_name","kind","position","deletion_span","base_hash"],"additionalProperties":false}},"required":["declaration"],"additionalProperties":false}"#.to_owned(),
                         },
                     ],
                     events: vec![

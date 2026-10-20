@@ -711,6 +711,15 @@ impl ExtensionHostPort for ExtensionRegistry {
     fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError> {
         Self::invoke(self, tool_name, params)
     }
+
+    fn invoke_extension(
+        &self,
+        extension_id: &ExtensionId,
+        tool_name: &str,
+        params: Value,
+    ) -> Result<Value, InvokeError> {
+        Self::invoke_extension(self, extension_id, tool_name, params)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1192,6 +1201,60 @@ mod tests {
             .expect("lint/check");
 
         assert_eq!(result, Value::String("lint".to_owned()));
+    }
+
+    #[test]
+    fn invoke_extension_rejects_undeclared_tools_without_calling_the_instance() {
+        let extension = SequencedExtension::new(
+            "ast",
+            vec![make_tool("outline")],
+            vec![Ok(Value::String("first call".to_owned()))],
+        );
+        let mut registry = ExtensionRegistry::new();
+        registry
+            .register(Box::new(extension))
+            .expect("register ast");
+        for id in ["ast", "missing"] {
+            assert_eq!(
+                registry.invoke_extension(&ExtensionId::new(id), "undeclared", Value::Null),
+                Err(InvokeError::ToolNotFound("undeclared".to_owned()))
+            );
+        }
+        assert_eq!(
+            registry.invoke_extension(&ExtensionId::new("ast"), "outline", Value::Null),
+            Ok(Value::String("first call".to_owned()))
+        );
+    }
+
+    #[test]
+    fn invoke_extension_pins_both_safe_delete_planners_despite_name_collisions() {
+        let mut registry = ExtensionRegistry::new();
+        registry
+            .register(Box::new(SequencedExtension::new(
+                "unrelated",
+                vec![
+                    make_tool("plan_safe_delete_declaration"),
+                    make_tool("plan_safe_delete"),
+                ],
+                vec![],
+            )))
+            .expect("register collision first");
+        for (id, tool) in [
+            ("ast", "plan_safe_delete_declaration"),
+            ("lsp", "plan_safe_delete"),
+        ] {
+            registry
+                .register(Box::new(IdentifyingExtension::new(
+                    id,
+                    vec![make_tool(tool)],
+                )))
+                .expect("register planner");
+            let host: &dyn ExtensionHostPort = &registry;
+            assert_eq!(
+                host.invoke_extension(&ExtensionId::new(id), tool, Value::Null),
+                Ok(Value::String(id.to_owned()))
+            );
+        }
     }
 
     #[test]

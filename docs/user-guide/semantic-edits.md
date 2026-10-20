@@ -17,7 +17,7 @@ existing CAS-guarded workspace-edit path. The sidecar never moves files itself.
 
 ## Before You Start
 
-For rename and implementation lookup, configure a language server in
+For rename, implementation lookup, and reference-aware safe delete, configure a language server in
 `<workspace>/.tower/config.toml`:
 
 ```toml
@@ -26,6 +26,10 @@ command = "rust-analyzer"
 args = []
 extensions = ["rs"]
 ```
+
+Safe delete requires a backend that can resolve references. If no suitable backend is available,
+Tower returns a blocked report and leaves the declaration unchanged; it never silently falls back
+to span-only deletion.
 
 For AST edits, build or install the `ast` extension and make sure the file has
 been indexed. If you changed many files outside Tower, run `tower_ast_reindex`
@@ -172,6 +176,59 @@ The four AST write tools are:
 - `tower_ast_insert_after_symbol`
 - `tower_ast_delete_symbol`
 
+## Safe-delete a symbol
+
+Use `tower_safe_delete_symbol` when deleting a declaration must account for references. The native
+tool resolves the declaration from fresh file content, asks the configured semantic backend for
+references and optional cleanup edits, and applies the complete validated plan through the host's
+CAS-guarded mutation path.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "method": "tools/call",
+  "params": {
+    "name": "tower_safe_delete_symbol",
+    "arguments": {
+      "path": "src/unused.rs",
+      "symbol_name": "obsolete_helper",
+      "kind": "function",
+      "dry_run": true
+    }
+  }
+}
+```
+
+Set `dry_run` to `true` to receive the declaration, resolved references, proposed cleanup edits,
+affected files, and whether the operation is blocked without mutating contents, versions, or the
+index. A live reference without complete backend cleanup blocks the operation; unresolved,
+unavailable, timed-out, malformed, stale, overlapping, or workspace-external plans also fail closed.
+
+A successful complete reference lookup also permits deleting a recursive function
+when all its usages are wholly inside the declaration being removed. This needs
+no backend cleanup edits. A usage elsewhere, even in the same file, still blocks
+when the backend cannot provide complete cleanup; uncertain or explicitly
+incomplete analysis always blocks.
+
+If the result has `status: "previewed"`, inspect `proposed_edits` and `affected_files`, then repeat
+the request with `dry_run: false` to apply it. The tool defaults `dry_run` to `false` when omitted.
+A `blocked` result includes `blocking_reason`; resolve the reported references or backend issue
+before retrying. A dry run does not reserve file versions, so a later apply can still report
+`cas_conflict` if a target file changes.
+
+Successful application reports `status: "applied"`. A commit-time filesystem or persistence failure
+may report `status: "partial_commit"` with per-file outcomes; validation and CAS failures are
+rejected before the first write. The public blocking reasons include `live_references`,
+`references_unresolved`, `cleanup_incomplete`, `cas_conflict`, and `backend_error`.
+
+Other stable blocking reasons are `not_found`, `ambiguous_symbol`, `invalid_declaration`,
+`capability_unavailable`, and `invalid_cleanup`. These values are safe for agents to branch on;
+backend diagnostics and external paths are not exposed in the public report.
+
+Use `tower_ast_delete_symbol` only when declaration-bounded, span-only deletion is intentional. It
+remains available for compatibility and does not remove references or call sites.
+
 ## Handle Resolution Failures
 
 AST edits require exactly one resolved symbol. Two common payload errors are:
@@ -212,6 +269,8 @@ scopes.
   you want structural insertion without hand-computing offsets.
 - Use `tower_ast_delete_symbol` when you want declaration-bounded deletion only.
   It does not remove references or call sites.
+- Use `tower_safe_delete_symbol` when deletion must be reference-aware and fail closed when the
+  semantic backend cannot account for remaining usages.
 
 ## Related Pages
 

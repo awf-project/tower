@@ -42,7 +42,10 @@ use core_engine::ports::{
     CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
     RenameNavigationError,
 };
-use extension_protocol::messages::{PathRenameError, PathRenamePlanningRequest};
+use extension_protocol::messages::{
+    PathRenameError, PathRenamePlanningRequest, SafeDeleteSemanticOutcome,
+    SafeDeleteSemanticRequest,
+};
 use extension_protocol::{TypeHierarchyQuery, TypeHierarchyResult};
 
 // ── PooledSession trait ───────────────────────────────────────────────────────
@@ -87,6 +90,15 @@ pub trait PooledSession:
         &self,
         request: &PathRenamePlanningRequest,
     ) -> Result<RawWorkspaceEdit, PathRenameError>;
+
+    #[allow(dead_code)]
+    fn plan_safe_delete(
+        &self,
+        _request: &SafeDeleteSemanticRequest,
+        _read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> Result<SafeDeleteSemanticOutcome, LspSessionError> {
+        Ok(SafeDeleteSemanticOutcome::CapabilityUnavailable)
+    }
 
     fn check_lsp(
         &self,
@@ -266,6 +278,16 @@ pub struct SessionPool {
 }
 
 impl SessionPool {
+    pub fn plan_safe_delete(
+        &self,
+        request: &SafeDeleteSemanticRequest,
+        read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+    ) -> Result<SafeDeleteSemanticOutcome, LspSessionError> {
+        let path = RelativePath::new(request.declaration.path.clone());
+        self.session_for_lsp(&path)?
+            .plan_safe_delete(request, read_content)
+    }
+
     pub fn plan_path_rename(
         &self,
         request: &PathRenamePlanningRequest,
@@ -710,7 +732,9 @@ fn lsp_session_to_rename_error(error: LspSessionError) -> RenameNavigationError 
             RenameNavigationError::UnsupportedLanguage
         }
         LspSessionError::NotRenameable => RenameNavigationError::NotRenameable,
-        error @ LspSessionError::Backend(_) => RenameNavigationError::Backend(error.to_string()),
+        error @ (LspSessionError::WorkspaceExternal | LspSessionError::Backend(_)) => {
+            RenameNavigationError::Backend(error.to_string())
+        }
     }
 }
 
@@ -1230,6 +1254,15 @@ mod tests {
     }
 
     impl PooledSession for FakeSession {
+        fn plan_safe_delete(
+            &self,
+            request: &SafeDeleteSemanticRequest,
+            read_content: &mut dyn FnMut(&str) -> Result<String, LspSessionError>,
+        ) -> Result<SafeDeleteSemanticOutcome, LspSessionError> {
+            let _ = read_content(&request.declaration.path)?;
+            Ok(SafeDeleteSemanticOutcome::CapabilityUnavailable)
+        }
+
         fn plan_path_rename(
             &self,
             _request: &PathRenamePlanningRequest,

@@ -29,7 +29,9 @@ mod process_binary;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -45,7 +47,7 @@ use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegist
 use core_engine::adapters::mcp::native_tools::EngineState;
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use core_engine::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage};
-use core_engine::domain::extension_host::ExtensionRegistry;
+use core_engine::domain::extension_host::{ExtensionInstance, ExtensionRegistry};
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::mutation::compute_content_version;
 use core_engine::domain::workspace::ProjectWorkspace;
@@ -81,6 +83,138 @@ fn ast_extension_bin() -> String {
         .to_str()
         .unwrap()
         .to_owned()
+}
+
+/// A direct protocol host used only where the test must observe every HostCall
+/// emitted by the AST sidecar. `SidecarHostAdapter` intentionally consumes log
+/// HostCalls, so it cannot prove the sidecar did not emit one.
+struct RawAstChild {
+    child: Child,
+    stdin: ChildStdin,
+    frames: Receiver<serde_json::Value>,
+}
+
+impl RawAstChild {
+    fn spawn() -> Self {
+        let mut child = Command::new(ast_extension_bin())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn AST extension");
+        let stdin = child.stdin.take().expect("AST stdin");
+        let stdout = child.stdout.take().expect("AST stdout");
+        let (frame_tx, frames) = mpsc::channel();
+        thread::spawn(move || collect_ast_frames(stdout, frame_tx));
+
+        Self {
+            child,
+            stdin,
+            frames,
+        }
+    }
+
+    fn write_frame(&mut self, frame: serde_json::Value) {
+        writeln!(self.stdin, "{frame}").expect("write AST protocol frame");
+        self.stdin.flush().expect("flush AST protocol frame");
+    }
+
+    fn read_frame(&self) -> serde_json::Value {
+        self.frames
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("AST sidecar must emit a protocol frame")
+    }
+
+    fn assert_no_additional_host_call(&self) {
+        assert!(
+            self.frames
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "planner emitted an unexpected HostCall after its terminal response"
+        );
+    }
+
+    fn initialize(&mut self) {
+        self.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocol_version": extension_protocol::PROTOCOL_VERSION,
+                "client_info": "safe-delete-log-test"
+            }
+        }));
+        let warm_start = self.read_frame();
+        assert_eq!(warm_start["method"], "index/get");
+        self.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": warm_start["id"].clone(),
+            "result": []
+        }));
+        let initialized = self.read_frame();
+        assert_eq!(initialized["id"], 1);
+        assert_eq!(initialized["result"]["type"], "Initialized");
+    }
+
+    fn invoke_planner_with_content(
+        &mut self,
+        request_id: u64,
+        content: &[u8],
+        symbol_name: &str,
+    ) -> serde_json::Value {
+        self.invoke_planner(request_id, symbol_name);
+        let read_file = self.read_frame();
+        assert_eq!(read_file["method"], "workspace/readFile");
+        self.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": read_file["id"].clone(),
+            "result": std::str::from_utf8(content).expect("test content is UTF-8")
+        }));
+        let response = self.read_frame();
+        assert_eq!(response["id"], request_id, "planner must not log normally");
+        assert_eq!(response["result"]["type"], "ToolResult");
+        self.assert_no_additional_host_call();
+        response["result"]["data"].clone()
+    }
+
+    fn invoke_planner(&mut self, request_id: u64, symbol_name: &str) {
+        self.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "invokeTool",
+            "params": {
+                "name": "plan_safe_delete_declaration",
+                "params": {
+                    "path": "src/lib.rs",
+                    "symbol_name": symbol_name,
+                    "kind": "function"
+                }
+            }
+        }));
+    }
+}
+
+fn collect_ast_frames(stdout: ChildStdout, frame_tx: mpsc::Sender<serde_json::Value>) {
+    let mut stdout = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        match stdout.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let frame = serde_json::from_str(line.trim()).expect("AST frame is valid JSON");
+                if frame_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RawAstChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn hello_extension_bin() -> String {
@@ -266,6 +400,72 @@ fn make_deps_with_apply_edits(fs: Arc<Mutex<InMemoryFs>>) -> HostDeps {
 
 struct InMemoryApplyEditsHost {
     fs: Arc<Mutex<InMemoryFs>>,
+}
+
+struct CountingApplyEditsHost {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ApplyEditsHostPort for CountingApplyEditsHost {
+    fn apply_batch_edits(
+        &self,
+        _request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(DomainError::UnsupportedOperation(
+            "safe-delete declaration planning must not apply edits".to_owned(),
+        ))
+    }
+}
+
+fn safe_delete_planner(
+    content: &[u8],
+) -> (
+    Box<dyn ExtensionInstance>,
+    Arc<Mutex<InMemoryFs>>,
+    Arc<AtomicUsize>,
+) {
+    let mut initial_fs = InMemoryFs::new();
+    initial_fs
+        .write(RelativePath::new("src/lib.rs"), content.to_vec())
+        .expect("write planner fixture");
+    let fs = Arc::new(Mutex::new(initial_fs));
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let deps = HostDeps {
+        fs: fs.clone(),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(CountingApplyEditsHost {
+            calls: apply_calls.clone(),
+        }),
+        push_tx: None,
+    };
+    let mut adapter =
+        SidecarHostAdapter::spawn(ast_manifest(&ast_extension_bin()), deps, TEST_TIMEOUT, None)
+            .expect("ast must spawn");
+    adapter
+        .deliver_event(Event::FileIndexed {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileIndexed must seed AST index");
+    (adapter, fs, apply_calls)
+}
+
+fn plan_safe_delete(
+    adapter: &mut Box<dyn ExtensionInstance>,
+    symbol_name: &str,
+) -> serde_json::Value {
+    adapter
+        .call_tool(
+            "plan_safe_delete_declaration",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": symbol_name,
+                "kind": "function"
+            }),
+        )
+        .expect("safe-delete declaration planning must return a structured result")
 }
 
 impl ApplyEditsHostPort for InMemoryApplyEditsHost {
@@ -485,6 +685,252 @@ interface MyInterface {
 function topLevelFn() {}
 "#;
 
+#[test]
+fn safe_delete_declaration_declares_and_dispatches_the_exact_internal_tool() {
+    let (mut adapter, _fs, apply_calls) = safe_delete_planner(b"pub fn target() {}\n");
+    assert!(
+        adapter
+            .manifest()
+            .tools
+            .iter()
+            .any(|tool| tool.name == "plan_safe_delete_declaration"),
+        "the planner must declare its ownership for targeted orchestration"
+    );
+
+    let result = plan_safe_delete(&mut adapter, "target");
+    assert_eq!(result["status"], "planned");
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+    adapter.shutdown();
+}
+
+#[test]
+fn safe_delete_declaration_unique_resolution_returns_the_exact_plan_payload() {
+    let content = b"pub fn target() {}\n";
+    let mut child = RawAstChild::spawn();
+    child.initialize();
+
+    let result = child.invoke_planner_with_content(2, content, "target");
+
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "status": "planned",
+            "plan": {
+                "path": "src/lib.rs",
+                "symbol_name": "target",
+                "kind": "function",
+                "position": { "line": 0, "character": 7 },
+                "deletion_span": { "start_byte": 0, "end_byte": 19 },
+                "base_hash": compute_content_version(content)
+            }
+        })
+    );
+}
+
+#[test]
+fn safe_delete_declaration_uses_the_declaration_name_node_for_position() {
+    let content = b"pub(in crate::target_scope) fn target() {}\n";
+    let mut child = RawAstChild::spawn();
+    child.initialize();
+
+    let result = child.invoke_planner_with_content(2, content, "target");
+
+    assert_eq!(result["status"], "planned");
+    assert_eq!(
+        result["plan"]["position"],
+        serde_json::json!({ "line": 0, "character": 31 })
+    );
+}
+
+#[test]
+fn safe_delete_declaration_missing_target_returns_not_found_without_mutation() {
+    let mut child = RawAstChild::spawn();
+    child.initialize();
+
+    let result = child.invoke_planner_with_content(2, b"pub fn present() {}\n", "missing");
+
+    assert_eq!(result, serde_json::json!({ "status": "not_found" }));
+}
+
+#[test]
+fn safe_delete_declaration_multiple_matches_return_ambiguous_symbol_without_mutation() {
+    let content = b"pub fn duplicate() {}\nmod inner { pub fn duplicate() {} }\n";
+    let mut child = RawAstChild::spawn();
+    child.initialize();
+
+    let result = child.invoke_planner_with_content(2, content, "duplicate");
+
+    assert_eq!(result, serde_json::json!({ "status": "ambiguous_symbol" }));
+}
+
+#[test]
+fn safe_delete_declaration_invalid_source_span_returns_invalid_declaration_without_mutation() {
+    let mut child = RawAstChild::spawn();
+    child.initialize();
+
+    let result = child.invoke_planner_with_content(2, b"pub fn target() {", "target");
+
+    assert_eq!(
+        result,
+        serde_json::json!({ "status": "invalid_declaration" })
+    );
+
+    // A real HostCall error can contain source, paths, hashes, and backend
+    // details. The sidecar's public log payload must be the fixed safe string.
+    const SECRET_SOURCE: &str = "source=top-secret-safe-delete-source";
+    const SECRET_PATH: &str = "path=/private/safe-delete.rs";
+    const SECRET_HASH: &str = "hash=deadbeef-safe-delete";
+    const BACKEND_DETAIL: &str = "backend=fixture-read-failure";
+    let mut faulting_child = RawAstChild::spawn();
+    faulting_child.initialize();
+    faulting_child.invoke_planner(2, "target");
+    let read_file = faulting_child.read_frame();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    let fault = format!("{SECRET_SOURCE}; {SECRET_PATH}; {SECRET_HASH}; {BACKEND_DETAIL}");
+    faulting_child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"].clone(),
+        "error": { "code": -32603, "message": fault }
+    }));
+    let log = faulting_child.read_frame();
+    assert_eq!(log["method"], "log");
+    assert_eq!(
+        log["params"]["msg"],
+        "safe-delete declaration planning failed"
+    );
+    let log_json = log.to_string();
+    for secret in [SECRET_SOURCE, SECRET_PATH, SECRET_HASH, BACKEND_DETAIL] {
+        assert!(
+            !log_json.contains(secret),
+            "safe planner log must not disclose {secret}: {log_json}"
+        );
+    }
+    faulting_child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": log["id"].clone(),
+        "result": true
+    }));
+    let terminal = faulting_child.read_frame();
+    assert_eq!(terminal["id"], 2);
+    assert_eq!(
+        terminal["result"]["data"]["message"],
+        "safe-delete declaration planning failed"
+    );
+    let terminal_json = terminal.to_string();
+    for secret in [SECRET_SOURCE, SECRET_PATH, SECRET_HASH, BACKEND_DETAIL] {
+        assert!(
+            !terminal_json.contains(secret),
+            "safe planner terminal response must not disclose {secret}: {terminal_json}"
+        );
+    }
+}
+
+#[test]
+fn safe_delete_declaration_resolves_span_position_and_hash_from_fresh_content() {
+    let stale = b"pub fn target() {}\n";
+    let fresh = "// shifted 🦀\npub fn target() -> u8 { 1 }\n".as_bytes();
+    let (mut adapter, fs, apply_calls) = safe_delete_planner(stale);
+    fs.lock()
+        .expect("fs lock")
+        .write(RelativePath::new("src/lib.rs"), fresh.to_vec())
+        .expect("replace indexed content");
+
+    let result = plan_safe_delete(&mut adapter, "target");
+
+    let start = fresh
+        .windows(b"pub fn target".len())
+        .position(|window| window == b"pub fn target")
+        .expect("fresh declaration start");
+    assert_eq!(result["status"], "planned");
+    assert_eq!(
+        result["plan"]["position"],
+        serde_json::json!({"line": 1, "character": 7})
+    );
+    assert_eq!(result["plan"]["deletion_span"]["start_byte"], start);
+    assert_eq!(result["plan"]["deletion_span"]["end_byte"], fresh.len());
+    assert_eq!(result["plan"]["base_hash"], compute_content_version(fresh));
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+    adapter.shutdown();
+}
+
+#[test]
+fn safe_delete_declaration_owns_only_one_immediately_trailing_newline() {
+    let fixtures: &[(&[u8], usize)] = &[
+        (b"pub fn target() {}\n", 19),
+        (b"pub fn target() {}\r\n", 20),
+        (b"pub fn target() {}", 18),
+        (b"pub fn target() {}\npub fn next() {}\n", 19),
+        (b"pub fn target() {}\n\npub fn next() {}\n", 19),
+        (b"pub fn target() {} // trailing\n", 18),
+    ];
+
+    for &(content, expected_end) in fixtures {
+        let (mut adapter, _fs, apply_calls) = safe_delete_planner(content);
+        let result = plan_safe_delete(&mut adapter, "target");
+        assert_eq!(result["status"], "planned", "fixture: {content:?}");
+        assert_eq!(
+            result["plan"]["deletion_span"],
+            serde_json::json!({ "start_byte": 0, "end_byte": expected_end }),
+            "fixture: {content:?}"
+        );
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+        adapter.shutdown();
+    }
+}
+
+#[test]
+fn safe_delete_declaration_preserves_existing_delete_symbol_process_behavior() {
+    let content = b"pub fn delete_me() {}\npub fn keep_me() {}\n";
+    let mut initial_fs = InMemoryFs::new();
+    initial_fs
+        .write(RelativePath::new("src/lib.rs"), content.to_vec())
+        .expect("write fixture");
+    let fs = Arc::new(Mutex::new(initial_fs));
+    let mut adapter = SidecarHostAdapter::spawn(
+        ast_manifest(&ast_extension_bin()),
+        make_deps_with_apply_edits(fs.clone()),
+        TEST_TIMEOUT,
+        None,
+    )
+    .expect("ast must spawn");
+    adapter
+        .deliver_event(Event::FileIndexed {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("fileIndexed must seed AST index");
+
+    let plan = plan_safe_delete(&mut adapter, "delete_me");
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(
+        fs.lock()
+            .expect("fs lock")
+            .read(&RelativePath::new("src/lib.rs"))
+            .expect("read fixture"),
+        content
+    );
+
+    let delete = adapter
+        .call_tool(
+            "delete_symbol",
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "symbol_name": "delete_me",
+                "kind": "function"
+            }),
+        )
+        .expect("existing delete_symbol process contract must still succeed");
+    assert_eq!(delete["applied"], true);
+    assert_eq!(
+        fs.lock()
+            .expect("fs lock")
+            .read(&RelativePath::new("src/lib.rs"))
+            .expect("read edited fixture"),
+        b"pub fn keep_me() {}\n"
+    );
+    adapter.shutdown();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // F007/T016: AST anchored symbol edit tools
 // ─────────────────────────────────────────────────────────────────────────────
@@ -508,9 +954,15 @@ fn t016_runtime_init_advertises_bare_ast_write_tools_and_request_apply_edits() {
     runtime_tools.sort_by(|a, b| a.name.cmp(&b.name));
     let mut manifest_tools = static_manifest.tools;
     manifest_tools.sort_by(|a, b| a.name.cmp(&b.name));
+    assert!(
+        runtime_tools
+            .iter()
+            .any(|tool| tool.name == "plan_safe_delete_declaration"),
+        "InitResult must advertise the declared planning tool"
+    );
     assert_eq!(
         runtime_tools, manifest_tools,
-        "InitResult tool metadata must match extension.toml"
+        "public InitResult tool metadata must match extension.toml"
     );
     let tool_names: Vec<&str> = runtime_tools
         .iter()
@@ -559,6 +1011,13 @@ fn t016_mcp_tool_discovery_exposes_prefixed_ast_write_tools_through_merge_layer(
         .into_iter()
         .map(|tool| tool.name)
         .collect::<Vec<_>>();
+
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "tower_ast_plan_safe_delete_declaration"),
+        "tools/list must expose the declared safe-delete planner; got {names:?}"
+    );
 
     for expected in [
         "tower_ast_replace_symbol_body",
