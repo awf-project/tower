@@ -1561,6 +1561,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slow_start_extension"
+version = "0.1.0"
+dependencies = [
+ "extension_protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

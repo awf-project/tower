@@ -341,7 +341,29 @@ impl SledStorageAdapter {
     /// - [`StorageError::Sled`] — a Sled I/O error occurred.
     /// - [`StorageError::Codec`] — a serialisation round-trip failed.
     pub fn open(path: &Path) -> Result<(Self, ProjectWorkspace, InvertedIndex), StorageError> {
+        Self::open_with_checkpoint(path, &|| Ok(()))
+    }
+
+    pub(crate) fn open_cancellable(
+        path: &Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Self, ProjectWorkspace, InvertedIndex), StorageError> {
+        Self::open_with_checkpoint(path, &|| {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                Err(StorageError::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn open_with_checkpoint(
+        path: &Path,
+        checkpoint: &dyn Fn() -> Result<(), StorageError>,
+    ) -> Result<(Self, ProjectWorkspace, InvertedIndex), StorageError> {
+        checkpoint()?;
         let db = Self::open_db_with_retry(path)?;
+        checkpoint()?;
         let files = db.open_tree("files")?;
         let paths = db.open_tree("paths")?;
         let blobs = db.open_tree("blobs")?;
@@ -366,8 +388,8 @@ impl SledStorageAdapter {
         // builds both the ProjectWorkspace and the live-ids set in one iteration,
         // avoiding the double full-scan that the original rebuild_workspace +
         // collect_live_ids pair required.
-        let (workspace, live_ids) = adapter.rebuild_workspace_and_ids()?;
-        let inverted = adapter.rehydrate_index(&live_ids)?;
+        let (workspace, live_ids) = adapter.rebuild_workspace_and_ids(checkpoint)?;
+        let inverted = adapter.rehydrate_index(&live_ids, checkpoint)?;
 
         Ok((adapter, workspace, inverted))
     }
@@ -406,9 +428,11 @@ impl SledStorageAdapter {
     /// twice on every `open()`.
     fn rebuild_workspace_and_ids(
         &self,
+        checkpoint: &dyn Fn() -> Result<(), StorageError>,
     ) -> Result<(ProjectWorkspace, HashSet<FileId>), StorageError> {
         let mut live_files: Vec<VirtualFile> = Vec::new();
         for entry in self.files.iter() {
+            checkpoint()?;
             let (_key, value) = entry?;
             let file: VirtualFile = postcard::from_bytes(&value)?;
             live_files.push(file);
@@ -449,10 +473,15 @@ impl SledStorageAdapter {
     /// (self-healing reconciliation, spec UN2/AC4).  Entries with corrupt value
     /// bytes (non-postcard) are also dropped — they are treated as irrecoverable
     /// dangling state and skipped rather than aborting startup.
-    fn rehydrate_index(&self, live_ids: &HashSet<FileId>) -> Result<InvertedIndex, StorageError> {
+    fn rehydrate_index(
+        &self,
+        live_ids: &HashSet<FileId>,
+        checkpoint: &dyn Fn() -> Result<(), StorageError>,
+    ) -> Result<InvertedIndex, StorageError> {
         let mut inverted = InvertedIndex::new();
 
         for entry in self.index.iter() {
+            checkpoint()?;
             let (key_bytes, value_bytes) = entry?;
 
             // Key is raw token UTF-8 bytes.
@@ -477,6 +506,7 @@ impl SledStorageAdapter {
 
             // Filter out dangling FileIds (reconciliation, AC4).
             for id in posting {
+                checkpoint()?;
                 if live_ids.contains(&id) {
                     inverted.insert(id, std::slice::from_ref(&token));
                 }
@@ -1244,5 +1274,37 @@ fn map_tx_abort_error(e: sled::transaction::TransactionError<TxAbort>) -> Storag
         sled::transaction::TransactionError::Abort(TxAbort::ForcedAbort) => {
             StorageError::CorruptMetadata("forced abort for test".to_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn reload_cancellation_stops_before_all_records_and_allows_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut storage, _, _) = SledStorageAdapter::open(root.path()).unwrap();
+        for n in 0..30 {
+            storage
+                .put(crate::test_support::make_virtual_file(
+                    n,
+                    0,
+                    &format!("file{n}.rs"),
+                ))
+                .unwrap();
+        }
+        drop(storage);
+        let steps = std::sync::atomic::AtomicUsize::new(0);
+        let result = SledStorageAdapter::open_with_checkpoint(root.path(), &|| {
+            if steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 7 {
+                Err(StorageError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(StorageError::Cancelled)));
+        assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst), 8);
+        let (_, workspace, _) = SledStorageAdapter::open(root.path()).unwrap();
+        assert_eq!(workspace.snapshot().files.len(), 30);
     }
 }

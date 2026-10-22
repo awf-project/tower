@@ -218,7 +218,33 @@ impl NotifyWatcherAdapter {
         rename_coordinator: Arc<RenameCoordinator>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, WatcherError> {
-        cancelled.store(false, Ordering::Release);
+        Self::with_publication(
+            root,
+            workspace,
+            index,
+            storage,
+            extension_host,
+            doc_sync,
+            echo_set,
+            rename_coordinator,
+            cancelled,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_publication(
+        root: PathBuf,
+        workspace: Arc<RwLock<ProjectWorkspace>>,
+        index: Arc<RwLock<InvertedIndex>>,
+        storage: Box<dyn StoragePort + Send>,
+        extension_host: Box<dyn ExtensionHostPort + Send + Sync>,
+        doc_sync: Arc<dyn DocumentSyncPort + Send + Sync>,
+        echo_set: Arc<Mutex<HashMap<String, ()>>>,
+        rename_coordinator: Arc<RenameCoordinator>,
+        cancelled: Arc<AtomicBool>,
+        publication: Option<Arc<crate::adapters::daemon::CommittedEventPublisher>>,
+    ) -> Result<Self, WatcherError> {
         let path_exclusion =
             Arc::new(WorkspacePathExclusion::new(root.clone()).map_err(|error| {
                 WatcherError::Storage(crate::ports::PortError::ReadFailed(format!(
@@ -272,6 +298,7 @@ impl NotifyWatcherAdapter {
 
         // Spawn the worker thread that drains the channel.
         let mut processor = EventProcessor::new(root, workspace, index, storage, extension_host)
+            .with_publication(publication)
             .with_document_sync(doc_sync, echo_set)
             .with_rename_coordination(
                 path_exclusion,
@@ -297,11 +324,13 @@ impl NotifyWatcherAdapter {
         //      will themselves panic — those panics are also caught here.
         //
         // A caught panic is logged; the worker then moves on to the next event.
+        let worker_cancelled = Arc::clone(&cancelled);
         let worker = thread::Builder::new()
             .name("tower-watcher".to_owned())
             .spawn(move || {
                 // `rx.into_iter()` blocks until the Sender is dropped.
                 for message in rx.into_iter() {
+                    if worker_cancelled.load(Ordering::Acquire) { break; }
                     match message {
                         WorkerMessage::Event(event) => {
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -365,7 +394,18 @@ impl NotifyWatcherAdapter {
             .ok_or(WatcherError::ChannelClosed)?
             .send(WorkerMessage::CatchUp(acknowledgement))
             .map_err(|_| WatcherError::ChannelClosed)?;
-        result.recv().map_err(|_| WatcherError::ChannelClosed)?
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(WatcherError::ChannelClosed);
+            }
+            match result.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(WatcherError::ChannelClosed);
+                }
+            }
+        }
     }
 
     pub fn barrier(&self) -> Result<(), WatcherError> {
@@ -375,7 +415,18 @@ impl NotifyWatcherAdapter {
             .ok_or(WatcherError::ChannelClosed)?
             .send(WorkerMessage::Barrier(acknowledgement))
             .map_err(|_| WatcherError::ChannelClosed)?;
-        result.recv().map_err(|_| WatcherError::ChannelClosed)?
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(WatcherError::ChannelClosed);
+            }
+            match result.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(WatcherError::ChannelClosed);
+                }
+            }
+        }
     }
 }
 

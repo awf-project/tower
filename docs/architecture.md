@@ -241,11 +241,31 @@ OS inotify/kqueue/FSEvents
                                                   calls ExtensionHostPort::on_file_changed
 ```
 
+Startup is staged so client connection is independent of workspace preparation:
+
+```
+daemon start
+  ├─ acquire workspace lifetime ownership
+  ├─ bind transport and accept MCP/control clients
+  └─ prepare in the joined daemon worker
+       ├─ open Sled and reconcile the eligible filesystem inventory
+       ├─ catch up the watcher and publish committed events in order
+       ├─ discover extensions and complete their snapshot/live handoff
+       └─ publish workspace, AST, and LSP readiness independently
+```
+
 Startup reconciliation runs regardless of any historical scan-completion marker. It preserves
 surviving `FileId` generations, removes only paths confirmed absent or newly excluded, and leaves
 unverified records intact when enumeration or metadata access fails. Watcher activation is ordered
 with reconciliation so events observed during startup are replayed and converge the index with the
-filesystem before the daemon reports a successful startup.
+filesystem before the affected capability reports `ready`. A client disconnect does not cancel the
+joined preparation worker; ownership and cleanup remain daemon-scoped.
+
+The daemon exposes explicit `starting`, `ready`, `degraded`, `failed`, and `stopping` lifecycle
+states. Workspace, AST, and LSP dependencies have independent readiness states, so a slow or failed
+extension does not make unrelated native tools unavailable. Calls that require a preparing family
+use the configured bounded preparation deadline and return stable application errors when the family
+is pending, failed, stopping, or unavailable.
 
 ### Configuration boundary
 

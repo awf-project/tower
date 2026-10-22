@@ -154,11 +154,17 @@ impl ExtensionSupervisor {
     /// lazy: the first `call_tool` or `deliver_event` triggers it.
     #[must_use]
     pub fn new(
-        manifest: ExtensionManifest,
+        mut manifest: ExtensionManifest,
         deps: HostDeps,
         request_timeout: Duration,
         extension_config: Option<Value>,
     ) -> Self {
+        let rr_enabled = extension_config
+            .as_ref()
+            .and_then(|config| config.pointer("/record/backend"))
+            .and_then(Value::as_str)
+            == Some("rr");
+        super::discovery::filter_debug_tools(&mut manifest, rr_enabled);
         Self {
             manifest,
             deps,

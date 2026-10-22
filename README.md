@@ -101,6 +101,12 @@ The `mcp` subcommand connects to the workspace daemon, spawning it if needed. Th
 index, watcher, storage, and loaded extensions, then exits after its configured idle timeout when no
 clients remain.
 
+On a cold start, MCP initialization can complete while workspace preparation and extension catch-up
+continue. Use `tower status` to inspect workspace, AST, and LSP readiness. Workspace-dependent
+calls wait up to the configured preparation deadline; see
+[configuration](docs/user-guide/configuration.md) and
+[MCP readiness errors](docs/mcp-tools.md#daemon-startup-and-readiness).
+
 Useful local checks:
 
 ```bash
@@ -151,20 +157,21 @@ stable error codes.
 
 ## Documentation
 
-| Page                                                                   | Contents                                                                             |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| [docs/getting-started.md](docs/getting-started.md)                     | Build, first MCP session, quality gate, and copy-paste examples.                     |
-| [docs/towerignore.md](docs/towerignore.md)                             | `.towerignore` behavior, defaults, migration notes, and watcher limits.              |
-| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)   | Canonical configuration, formatter tools, extension disabling, and legacy migration. |
-| [docs/architecture.md](docs/architecture.md)                           | Hexagonal boundary, ports/adapters, daemon flow, and invariants.                     |
-| [docs/extensions.md](docs/extensions.md)                               | Native sidecar extension protocol, manifests, capabilities, and supervision.         |
-| [docs/mcp-tools.md](docs/mcp-tools.md)                                 | Complete MCP tool reference and JSON-RPC details.                                    |
-| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md) | Semantic rename, reference-aware safe delete, and AST edit workflows.                |
-| [docs/user-guide/path-rename.md](docs/user-guide/path-rename.md)       | Preview and apply file or directory moves with optional reference updates.           |
-| [docs/user-guide/type-hierarchy.md](docs/user-guide/type-hierarchy.md) | Explore supertypes and subtypes through a configured language server.                |
-| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)         | Previewing and applying structured linter fixes.                                     |
-| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md) | Interactive DAP sessions and rr-backed reverse-debug workflows.                      |
-| [docs/development.md](docs/development.md)                             | Contribution workflow, CI checks, tests, and project conventions.                    |
+| Page                                                                                                                             | Contents                                                                             |
+| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [docs/getting-started.md](docs/getting-started.md)                                                                               | Build, first MCP session, quality gate, and copy-paste examples.                     |
+| [docs/towerignore.md](docs/towerignore.md)                                                                                       | `.towerignore` behavior, defaults, migration notes, and watcher limits.              |
+| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)                                                             | Canonical configuration, formatter tools, extension disabling, and legacy migration. |
+| [docs/architecture.md](docs/architecture.md)                                                                                     | Hexagonal boundary, staged daemon startup, readiness gates, and invariants.          |
+| [docs/extensions.md](docs/extensions.md)                                                                                         | Native sidecar extension protocol, manifests, capabilities, and supervision.         |
+| [docs/mcp-tools.md](docs/mcp-tools.md)                                                                                           | Complete MCP tool reference and JSON-RPC details.                                    |
+| [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md)                                                           | Semantic rename, reference-aware safe delete, and AST edit workflows.                |
+| [docs/user-guide/path-rename.md](docs/user-guide/path-rename.md)                                                                 | Preview and apply file or directory moves with optional reference updates.           |
+| [docs/user-guide/type-hierarchy.md](docs/user-guide/type-hierarchy.md)                                                           | Explore supertypes and subtypes through a configured language server.                |
+| [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)                                                                   | Previewing and applying structured linter fixes.                                     |
+| [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md)                                                           | Interactive DAP sessions and rr-backed reverse-debug workflows.                      |
+| [docs/development.md](docs/development.md)                                                                                       | Contribution workflow, CI checks, tests, and project conventions.                    |
+| [docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md](docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md) | B001 startup ownership and capability-readiness decision.                            |
 
 ## Roadmap
 
@@ -172,6 +179,7 @@ stable error codes.
 
 - [x] F011: File and directory rename refactor.
 - [x] F012: Reference-aware safe symbol deletion.
+- [ ] B001: Reliable MCP startup and independent capability readiness.
 
 ## Development
 

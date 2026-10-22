@@ -43,7 +43,6 @@ use serde_json::Value;
 
 use crate::adapters::mcp::diagnostics::{DiagnosticsReader, PushEvent};
 use crate::adapters::mcp::diagnostics_json::{DiagnosticJson, diagnostics_response_json};
-use crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
@@ -64,7 +63,7 @@ use crate::adapters::mcp::types::{ToolDesc, ToolError};
 pub struct TowerMcpHandler {
     /// The unified tool registry (native tower_* + sidecar extension tools).
     /// Wrapped in a plain Mutex: registry calls are sync/non-blocking.
-    registry: Mutex<ExtensionMergedRegistry>,
+    registry: Mutex<Box<dyn ToolRegistry + Send>>,
 
     /// Diagnostics provider for resources/read. No-op in the extension model.
     diag_reader: Arc<dyn DiagnosticsReader>,
@@ -85,14 +84,17 @@ impl TowerMcpHandler {
     /// - `sub_reg`       — shared subscription state.
     /// - `resource_uris` — static list of resource URIs for `resources/list`.
     #[must_use]
-    pub fn new(
-        registry: ExtensionMergedRegistry,
+    pub fn new<R>(
+        registry: R,
         diag_reader: Arc<dyn DiagnosticsReader>,
         sub_reg: Arc<Mutex<SubscriptionRegistry>>,
         resource_uris: Vec<String>,
-    ) -> Self {
+    ) -> Self
+    where
+        R: ToolRegistry + Send + 'static,
+    {
         Self {
-            registry: Mutex::new(registry),
+            registry: Mutex::new(Box::new(registry)),
             diag_reader,
             sub_reg,
             resource_uris,

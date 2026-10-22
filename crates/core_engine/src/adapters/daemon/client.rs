@@ -10,8 +10,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use crate::adapters::cli::{GlobalOpts, resolve_workspace_root};
+use crate::adapters::config;
 use crate::adapters::daemon::socket::{
-    acquire_spawn_lock, log_path, socket_path, try_connect, wait_for_socket,
+    OwnershipError, lock_path, log_path, socket_path, try_connect,
 };
 use crate::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, Handshake, read_line_capped, write_line,
@@ -20,6 +21,37 @@ use crate::adapters::daemon::wire::{
 /// Override storage for the daemon executable path, used only in tests.
 /// Production code never sets this; `daemon_exe()` falls through to `current_exe()`.
 static TEST_DAEMON_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[derive(Debug)]
+pub struct SpawnAttemptGuard {
+    _lock: std::fs::File,
+}
+
+impl SpawnAttemptGuard {
+    pub fn acquire(workspace_root: &Path) -> Result<Self, OwnershipError> {
+        let path = lock_path(workspace_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(OwnershipError::Lock)?;
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(OwnershipError::Lock)?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| OwnershipError::Lock(std::io::Error::from_raw_os_error(error.raw_os_error())),
+        )?;
+        Ok(Self { _lock: lock })
+    }
+}
+
+impl Drop for SpawnAttemptGuard {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self._lock, rustix::fs::FlockOperation::Unlock);
+    }
+}
 
 /// Allow tests to register the `tower` binary path without touching the process
 /// environment (avoids the `unsafe` `set_var` requirement in `#![forbid(unsafe_code)]`
@@ -73,26 +105,53 @@ fn spawn_daemon(workspace_root: &Path) -> std::io::Result<()> {
 
 /// Connect to the daemon, spawning one (under a flock) if absent/stale.
 pub async fn connect_or_spawn(workspace_root: &Path) -> std::io::Result<UnixStream> {
+    let timeout = config::load(workspace_root)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?
+        .daemon
+        .connection_timeout();
+    let deadline = tokio::time::Instant::now() + timeout;
     let sock = socket_path(workspace_root);
-    if let Some(s) = try_connect(&sock).await {
+    if let Some(s) = try_connect(&sock).await? {
         return Ok(s);
     }
 
-    // Serialize the spawn race on a blocking thread (flock is blocking).
-    let root = workspace_root.to_path_buf();
-    let lock = tokio::task::spawn_blocking(move || acquire_spawn_lock(&root))
-        .await
-        .map_err(std::io::Error::other)??;
+    let guard = loop {
+        match SpawnAttemptGuard::acquire(workspace_root) {
+            Ok(guard) => break guard,
+            Err(OwnershipError::Lock(error))
+                if error.raw_os_error() == Some(rustix::io::Errno::WOULDBLOCK.raw_os_error()) => {}
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(connection_timeout_error());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
 
     // Re-check: another client may have spawned while we waited for the lock.
-    let stream = if let Some(s) = try_connect(&sock).await {
+    let stream = if let Some(s) = try_connect(&sock).await? {
         s
     } else {
         spawn_daemon(workspace_root)?;
-        wait_for_socket(&sock, Duration::from_secs(10)).await?
+        loop {
+            if let Some(stream) = try_connect(&sock).await? {
+                break stream;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(connection_timeout_error());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     };
-    drop(lock); // release only after the socket is live
+    drop(guard);
     Ok(stream)
+}
+
+fn connection_timeout_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out connecting to workspace daemon",
+    )
 }
 
 /// Relay this process's stdin/stdout to the connected socket, after sending the
@@ -152,6 +211,7 @@ pub async fn send_control_async(
     let sock = socket_path(&workspace_root);
     let mut conn = try_connect(&sock)
         .await
+        .map_err(|error| error.to_string())?
         .ok_or_else(|| "no running tower daemon for this workspace".to_string())?;
     conn.write_all(Handshake::new(ClientRole::Control).to_line().as_bytes())
         .await
@@ -177,4 +237,28 @@ pub fn send_control(opts: &GlobalOpts, req: ControlRequest) -> Result<ControlRes
         .build()
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
     rt.block_on(send_control_async(opts, req))
+}
+
+#[cfg(test)]
+mod connection_error_tests {
+    #[test]
+    fn connection_timeout_has_stable_kind_and_message() {
+        let error = super::connection_timeout_error();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "timed out connecting to workspace daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_socket_probe_does_not_spawn_a_daemon() {
+        // The invalid name cannot denote an absent/refused Unix socket. A
+        // spawn attempt would create .tower/daemon.log under this workspace.
+        let workspace = tempfile::tempdir().unwrap();
+        let invalid = workspace.path().join("x".repeat(200));
+        assert!(super::connect_or_spawn(&invalid).await.is_err());
+        assert!(!invalid.join(".tower/daemon.log").exists());
+        assert!(!invalid.join(".tower/daemon.lock").exists());
+    }
 }

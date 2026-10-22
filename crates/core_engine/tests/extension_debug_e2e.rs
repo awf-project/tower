@@ -31,11 +31,17 @@ struct RawDebugChild {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    _workspace: tempfile::TempDir,
 }
 
 impl RawDebugChild {
     fn spawn() -> Self {
+        // A sidecar owns its workspace and trace retention policy. Parallel
+        // fixtures must not prune one another's traces in the checkout.
+        let workspace = tempfile::tempdir().expect("isolated debug workspace");
         let mut child = Command::new(debug_extension_bin())
+            .current_dir(workspace.path())
+            .env("TOWER_WORKSPACE", workspace.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -48,6 +54,7 @@ impl RawDebugChild {
             child,
             stdin,
             stdout,
+            _workspace: workspace,
         }
     }
 
@@ -524,7 +531,7 @@ fn merged_tool_names(config: TowerConfig) -> Vec<String> {
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(&opts, config).expect("engine builds");
 
@@ -555,7 +562,7 @@ fn reverse_debug_fixture_registry(
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(&opts, rr_fixture_tower_config_with_args(&arg_refs))
         .expect("engine builds with fixture-backed reverse debug config");
@@ -568,7 +575,7 @@ fn reverse_debug_fixture_registry(
 fn reverse_debug_record_request(token: &str, scenario: &str) -> serde_json::Value {
     json!({
         "language": "rust",
-        "program": "fixture-program",
+        "program": fixture_debug_adapter_bin(),
         "args": [scenario],
         "cwd": null,
         "env": {
@@ -820,7 +827,7 @@ fn assert_quarantine_cleans_fixture_process(token: &str) {
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(
         &opts,
@@ -2231,7 +2238,7 @@ fn reverse_debug_gated_real_rr_native_fixture_records_and_replays_tiny_program_w
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(&opts, real_rr_native_fixture_tower_config())
         .expect("engine builds with real rr native fixture config");
@@ -2353,7 +2360,7 @@ fn mcp_registry_exposes_debug_tools_as_extension_contributed_runtime_capabilitie
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(&opts, native_fixture_tower_config(&[], 5))
         .expect("engine builds with fixture debug config");
@@ -2449,7 +2456,7 @@ fn daemon_engine_wires_tower_config_debug_into_extension_loading_without_domain_
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle =
         build_engine(&opts, debug_config()).expect("engine builds with parsed debug config");
@@ -2514,7 +2521,7 @@ fn eval_at_fixture_hit_returns_stack_output_expression_and_no_session_id() {
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(&opts, native_fixture_tower_config(&["--token", &token], 5))
         .expect("engine builds with fixture debug config");
@@ -2561,7 +2568,7 @@ fn eval_at_fixture_no_hit_exit_returns_successful_exited_payload_and_no_leaked_p
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(
         &opts,
@@ -2604,7 +2611,7 @@ fn eval_at_fixture_timeout_returns_successful_timeout_payload_and_no_leaked_proc
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(
         &opts,
@@ -2633,4 +2640,50 @@ fn eval_at_fixture_timeout_returns_successful_timeout_payload_and_no_leaked_proc
     );
     assert_object_has_no_key_recursively(&result, "session_id");
     assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn discovered_lazy_debug_manifest_gates_rr_tools_before_first_spawn() {
+    for (config, expect_rr) in [(debug_config(), false), (rr_fixture_tower_config(), true)] {
+        let workspace = tempfile::tempdir().unwrap();
+        let extensions = workspace.path().join(".tower/extensions");
+        let debug = extensions.join("debug");
+        fs::create_dir_all(&debug).unwrap();
+        // A nonexistent command proves discovery remains lazy. This manifest
+        // declares all tools, just like a globally installed debug extension.
+        let manifest = fs::read_to_string(workspace_root().join("extensions/debug/extension.toml"))
+            .unwrap()
+            .replace(
+                "command    = [\"debug_extension\"]",
+                "command    = [\"must-not-spawn\"]",
+            );
+        fs::write(debug.join("extension.toml"), manifest).unwrap();
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: Some(extensions),
+        };
+        let handle = build_engine(&opts, config).unwrap();
+        let mut merged =
+            ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+        let names = merged
+            .list()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "tower_debug_launch"));
+        for tool in expected_rr_specific_manifest_tool_names() {
+            let name = format!("tower_debug_{tool}");
+            assert_eq!(
+                names.contains(&name),
+                expect_rr,
+                "discovered manifest gate for {name}"
+            );
+            if !expect_rr {
+                assert!(matches!(
+                    merged.call(&name, json!({})),
+                    Err(core_engine::adapters::mcp::types::ToolError::NotFound(_))
+                ));
+            }
+        }
+    }
 }

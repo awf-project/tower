@@ -13,6 +13,62 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::adapters::daemon::{CapabilityDependency, StartupFailureClass, StartupPhase};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InitializationPending {
+    pub dependency: CapabilityDependency,
+    pub phase: StartupPhase,
+    pub wait_expired: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CapabilityInitializationFailed {
+    pub dependency: CapabilityDependency,
+    pub failure_class: StartupFailureClass,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CapabilityStopping {
+    pub dependency: CapabilityDependency,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CapabilityUnavailable {
+    pub dependency: CapabilityDependency,
+}
+
+pub fn initialization_pending_error(data: InitializationPending) -> ToolError {
+    application_error(
+        -32004,
+        "capability initialization is still in progress",
+        data,
+    )
+}
+
+pub fn capability_initialization_failed_error(data: CapabilityInitializationFailed) -> ToolError {
+    application_error(-32005, "capability initialization failed", data)
+}
+
+pub fn capability_stopping_error(data: CapabilityStopping) -> ToolError {
+    application_error(-32006, "daemon is stopping", data)
+}
+
+pub fn capability_unavailable_error(data: CapabilityUnavailable) -> ToolError {
+    application_error(-32007, "capability is not configured", data)
+}
+
+fn application_error(code: i32, message: &'static str, data: impl Serialize) -> ToolError {
+    ToolError::Application {
+        code,
+        message: message.to_owned(),
+        data: Some(
+            serde_json::to_value(data)
+                .expect("readiness application-error DTOs must always serialize"),
+        ),
+    }
+}
+
 // ── Tool registry surface types ───────────────────────────────────────────────
 
 /// Description of a single tool exposed via `tools/list`.

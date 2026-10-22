@@ -1,4 +1,5 @@
 //! Spec 27 — LSP extension **process-level** e2e tests.
+// Feature: B001
 //!
 //! These tests spawn the actual `lsp_extension` binary via stdio and drive it
 //! through the JSON-RPC protocol. They do NOT require a real language server.
@@ -2264,8 +2265,8 @@ fn f007_t015_lsp_process_spawns_and_declares_implementations_and_rename_tools() 
     let tool_names: Vec<&str> = m.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         tool_names.len(),
-        9,
-        "must declare exactly 9 tools; got: {tool_names:?}"
+        10,
+        "must declare 9 tools plus the host-internal fence; got: {tool_names:?}"
     );
     assert!(
         tool_names.contains(&"diagnostics"),
@@ -2317,11 +2318,17 @@ fn f007_t015_lsp_runtime_initresult_tool_metadata_matches_extension_toml() {
     let init: InitResult = serde_json::from_value(initialized["result"]["data"].clone())
         .expect("runtime InitResult must deserialize");
     let mut runtime_tools = init.tools;
+    let catch_up_fence = runtime_tools
+        .iter()
+        .find(|tool| tool.name == "_tower_catch_up_fence")
+        .expect("runtime must advertise the host-internal catch-up fence");
+    assert!(catch_up_fence.schema_json.contains("delivered_events"));
     let internal_safe_delete = runtime_tools
         .iter()
         .find(|tool| tool.name == "plan_safe_delete")
         .expect("runtime must advertise the internal plan_safe_delete tool");
     assert!(internal_safe_delete.schema_json.contains("declaration"));
+    runtime_tools.retain(|tool| tool.name != "_tower_catch_up_fence");
     runtime_tools.sort_by(|a, b| a.name.cmp(&b.name));
 
     assert_eq!(
@@ -3526,6 +3533,159 @@ fn lsp_process_file_deleted_event_completes() {
     adapter.shutdown();
 }
 
+#[test]
+fn catch_up_lsp_query_cannot_overtake_document_sync() {
+    let workspace = fake_lsp_workspace("delayed_sync");
+    fs::write(
+        workspace.path().join("src/lib.rs"),
+        "fn current_after_catch_up() {}\n",
+    )
+    .expect("commit current LSP document");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    let initialized = initialized_raw_lsp_child(&mut child);
+    let tools = initialized["result"]["data"]["tools"]
+        .as_array()
+        .expect("initialized LSP tools must be an array");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "_tower_catch_up_fence"),
+        "the private fence must be declared by the real LSP sidecar so the daemon can synchronize it"
+    );
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 701,
+        "method": "deliverEvent",
+        "params": {
+            "type": "fileIndexed",
+            "file_id": 1,
+            "path": "src/lib.rs"
+        }
+    }));
+    let event_ack = child.read_frame_bounded();
+    assert_eq!(event_ack["id"], 701);
+    assert!(
+        event_ack.get("result").is_some(),
+        "indexed event failed: {event_ack}"
+    );
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 702,
+        "method": "invokeTool",
+        "params": {
+            "name": "_tower_catch_up_fence",
+            "params": {"epoch": 19, "delivered_events": 1}
+        }
+    }));
+    let fence = child.read_frame_bounded();
+    assert_eq!(
+        fence["result"]["data"],
+        serde_json::json!({"epoch": 19, "processed_events": 1, "ready": true}),
+        "LSP fence must wait for document synchronization: {fence}"
+    );
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 703,
+        "method": "invokeTool",
+        "params": {
+            "name": "definition",
+            "params": {"path": "src/lib.rs", "line": 0, "character": 3}
+        }
+    }));
+    let read_file = child.read_frame_bounded();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"].clone(),
+        "result": "fn current_after_catch_up() {}\n"
+    }));
+    let definition = child.read_frame_bounded();
+    assert_eq!(definition["id"], 703);
+    assert!(
+        definition.to_string().contains("current_after_catch_up"),
+        "semantic query overtook synchronized document state: {definition}"
+    );
+
+    // A sidecar without a configured language server has no backend barrier to
+    // acknowledge.  It must fail closed instead of claiming that its capability
+    // is ready merely because it received a file event.
+    let mut unsupported = RawLspChild::spawn();
+    let initialized = initialized_raw_lsp_child(&mut unsupported);
+    assert!(
+        initialized["result"]["data"]["tools"]
+            .as_array()
+            .expect("initialized LSP tools must be an array")
+            .iter()
+            .any(|tool| tool["name"] == "_tower_catch_up_fence"),
+        "fence support is declared independently from backend availability"
+    );
+    unsupported.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 704,
+        "method": "invokeTool",
+        "params": {
+            "name": "_tower_catch_up_fence",
+            "params": {"epoch": 20, "delivered_events": 0}
+        }
+    }));
+    let unsupported_fence = unsupported.read_frame_bounded();
+    assert_eq!(unsupported_fence["id"], 704);
+    assert!(
+        unsupported_fence.get("error").is_some()
+            || unsupported_fence["result"]["data"]["ready"] == serde_json::json!(false),
+        "an unconfigured LSP backend must not acknowledge readiness: {unsupported_fence}"
+    );
+}
+
+#[test]
+fn configured_lazy_lsp_session_synchronizes_document_before_first_query() {
+    let workspace = fake_lsp_workspace("delayed_sync");
+    fs::write(
+        workspace.path().join("src/lib.rs"),
+        "fn first_query_document() {}\n",
+    )
+    .expect("commit document before the first semantic query");
+    let backend_log = workspace.path().join("fake_lsp.log");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    assert!(
+        !backend_log.exists(),
+        "configured language server must remain lazy until the first query"
+    );
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 705,
+        "method": "invokeTool",
+        "params": {
+            "name": "definition",
+            "params": {"path": "src/lib.rs", "line": 0, "character": 3}
+        }
+    }));
+    let read_file = child.read_frame_bounded();
+    assert_eq!(read_file["method"], "workspace/readFile");
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": read_file["id"].clone(),
+        "result": "fn first_query_document() {}\n"
+    }));
+
+    let definition = child.read_frame_bounded();
+    assert_eq!(definition["id"], 705);
+    assert!(
+        definition.to_string().contains("first_query_document.rs"),
+        "first lazy semantic query ran before its document was synchronized: {definition}"
+    );
+    assert!(
+        backend_log.exists(),
+        "the first semantic query must activate the configured language server"
+    );
+}
+
 // ── Push-response frame hazard regression ─────────────────────────────────────
 
 /// Regression: KNOWN PROTOCOL HAZARDS §1 — push-response frames injected during
@@ -3595,10 +3755,14 @@ fn lsp_process_push_response_frame_during_idle_is_discarded() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"_tower_catch_up_fence"));
+    let public_tool_count = tool_names
+        .iter()
+        .filter(|name| **name != "_tower_catch_up_fence")
+        .count();
     assert_eq!(
-        tool_names.len(),
-        9,
-        "must declare 9 tools; got: {tool_names:?} (full resp: {init_resp})"
+        public_tool_count, 9,
+        "must declare 9 public tools plus the internal fence; got: {tool_names:?} (full resp: {init_resp})"
     );
     assert!(tool_names.contains(&"implementations"));
     assert!(tool_names.contains(&"type_hierarchy"));
@@ -4037,6 +4201,7 @@ fn safe_delete_tool_names_use_snake_case_and_match_the_static_manifests() {
         serde_json::from_value(initialized["result"]["data"]["tools"].clone()).unwrap();
     let mut runtime_names = runtime
         .iter()
+        .filter(|tool| tool.name != "_tower_catch_up_fence")
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
     runtime_names.sort();

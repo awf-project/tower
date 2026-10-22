@@ -37,6 +37,7 @@ pub mod debounce;
 pub mod error;
 pub mod event_processor;
 mod notify_watcher;
+mod staged_storage;
 
 pub use error::WatcherError;
 pub use event_processor::{EventProcessor, WatchEvent};

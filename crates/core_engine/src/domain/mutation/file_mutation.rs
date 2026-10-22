@@ -242,33 +242,25 @@ impl<'ws> FileMutationService<'ws> {
         content: Vec<u8>,
     ) -> Result<(), DomainError> {
         // Step A: shadow-file write + atomic rename.
+        let metadata = committed_content_metadata(&content);
         super::atomic_write(self.fs, path, content).map_err(DomainError::IoError)?;
 
-        // Step B: VFS — update metadata in-place (stable FileId; the slot is
-        // already live for both create_file's overwrite branch and edit_range).
-        let metadata = FileMetadata {
-            size: 0,
-            modified: Timestamp(0),
-            content_hash: None,
-        };
-        self.workspace
-            .update(file_id, metadata)
-            .expect("file_id is live — update must succeed");
-
-        // Step C: delta-reindex.
-        let tokens = tokenize(path.as_str());
-        self.index.remove(file_id);
-        self.index.insert(file_id, &tokens);
-
-        // Step D: persist the updated VirtualFile record.
-        let virtual_file = self
+        // Persist the staged record before making it snapshot-visible. A
+        // failed persistence operation leaves the committed VFS projection intact.
+        let mut virtual_file = self
             .workspace
             .get(file_id)
-            .expect("just updated — slot must be live")
+            .expect("live file identity")
             .clone();
+        virtual_file.size = metadata.size;
+        virtual_file.modified = metadata.modified;
+        virtual_file.content_hash = metadata.content_hash;
         self.storage.put(virtual_file).map_err(port_err_to_domain)?;
-
-        // Step E: broadcast.
+        self.workspace
+            .update(file_id, metadata)
+            .expect("live file identity");
+        self.index.remove(file_id);
+        self.index.insert(file_id, &tokenize(path.as_str()));
         self.extension_host.on_file_changed(file_id, path);
 
         Ok(())
@@ -593,20 +585,15 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
         // fsync + rename. This "double-shadow" is intentional: the inner
         // `.~tmp` ensures the `.tmp_write` file itself is durably written
         // before the domain renames it over the destination.
+        let metadata = committed_content_metadata(&content);
         super::atomic_write(self.fs, &path, content).map_err(DomainError::IoError)?;
 
         // ── Step 3: VFS + index + storage ─────────────────────────────────────
         //
-        // Size is derived from what the FS just accepted. We use 0 here because
-        // the domain must not re-read the FS for metadata (that would introduce
-        // an unnecessary round-trip and a potential TOCTOU race). The watcher
-        // will update the size via a Modify event with real metadata.
-        let metadata = FileMetadata {
-            size: 0,
-            modified: Timestamp(0),
-            content_hash: None,
-        };
+        // Size and content identity come from the accepted bytes, without a
+        // filesystem round trip. The watcher can recognize the write's echo.
 
+        let before = self.workspace.snapshot();
         let tokens = tokenize(path.as_str());
 
         let file_id = match self.workspace.insert(path.clone(), metadata) {
@@ -638,7 +625,15 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
             .expect("just inserted/updated — slot must be live")
             .clone();
 
-        self.storage.put(virtual_file).map_err(port_err_to_domain)?;
+        if let Err(error) = self.storage.put(virtual_file) {
+            *self.workspace = ProjectWorkspace::from_snapshot(before)
+                .expect("valid committed workspace snapshot");
+            *self.index = InvertedIndex::new();
+            for file in self.workspace.snapshot().files {
+                self.index.insert(file.id, &tokenize(file.path.as_str()));
+            }
+            return Err(port_err_to_domain(error));
+        }
 
         // ── Step 4: broadcast ─────────────────────────────────────────────────
         self.extension_host.on_file_changed(file_id, &path);
@@ -692,12 +687,6 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
             .get_by_path(path)
             .ok_or(DomainError::NotFound)?;
 
-        // Step 2: remove from VFS + index (in-memory; always succeeds).
-        self.workspace
-            .remove(file_id)
-            .expect("get_by_path returned a valid id — slot must be live");
-        self.index.remove(file_id);
-
         // Step 3: physical removal first (crash-safe ordering — see doc above).
         // A NotFound from the FS is tolerated — if the file was already removed
         // from disk we still want to clean up the domain state.
@@ -714,6 +703,8 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
             Err(e) => return Err(port_err_to_domain(e)),
         }
 
+        self.workspace.remove(file_id).expect("live file identity");
+        self.index.remove(file_id);
         // Step 5: broadcast.
         self.extension_host.on_file_changed(file_id, path);
 
@@ -1106,34 +1097,33 @@ impl<'ws> FileMutationUseCase for FileMutationService<'ws> {
 
         let mut per_file = unattempted();
         for (index, plan) in plans.into_iter().enumerate() {
+            let metadata = committed_content_metadata(&plan.content);
             if super::atomic_write(self.fs, &plan.path, plan.content).is_err() {
                 per_file[index].outcome = SafeDeleteFileOutcomeStatus::Failed;
                 per_file[index].error = Some(SafeDeleteFileError::FilesystemError);
                 return Ok(safe_delete_partial_commit(per_file));
             }
 
-            let metadata = FileMetadata {
-                size: 0,
-                modified: Timestamp(0),
-                content_hash: None,
-            };
-            self.workspace
-                .update(plan.file_id, metadata)
-                .expect("safe-delete preflight retained a live file identity");
-            self.index.remove(plan.file_id);
-            self.index
-                .insert(plan.file_id, &tokenize(plan.path.as_str()));
-            let virtual_file = self
+            let mut virtual_file = self
                 .workspace
                 .get(plan.file_id)
-                .expect("safe-delete update retained a live file identity")
+                .expect("live file identity")
                 .clone();
+            virtual_file.size = metadata.size;
+            virtual_file.modified = metadata.modified;
+            virtual_file.content_hash = metadata.content_hash;
             if self.storage.put(virtual_file).is_err() {
                 per_file[index].outcome = SafeDeleteFileOutcomeStatus::Failed;
                 per_file[index].error = Some(SafeDeleteFileError::PersistenceError);
                 return Ok(safe_delete_partial_commit(per_file));
             }
 
+            self.workspace
+                .update(plan.file_id, metadata)
+                .expect("live file identity");
+            self.index.remove(plan.file_id);
+            self.index
+                .insert(plan.file_id, &tokenize(plan.path.as_str()));
             self.extension_host
                 .on_file_changed(plan.file_id, &plan.path);
             per_file[index].outcome = SafeDeleteFileOutcomeStatus::Committed;
@@ -1706,4 +1696,15 @@ fn splice_text_edits(text: &str, applied: &[PlannedTextEdit]) -> String {
     }
 
     spliced
+}
+
+fn committed_content_metadata(content: &[u8]) -> FileMetadata {
+    use sha2::{Digest, Sha256};
+    FileMetadata {
+        size: content.len() as u64,
+        modified: Timestamp(0),
+        content_hash: Some(crate::domain::ContentHash::new(
+            Sha256::digest(content).into(),
+        )),
+    }
 }

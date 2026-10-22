@@ -1,0 +1,17 @@
+[package]
+publish = false  # internal crate; never published to a registry
+name = "slow_start_extension"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "B001 deterministic slow-start fixture for daemon readiness tests"
+
+[[bin]]
+name = "slow_start_extension"
+path = "src/main.rs"
+
+[dependencies]
+extension_protocol = { path = "../../../crates/extension_protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

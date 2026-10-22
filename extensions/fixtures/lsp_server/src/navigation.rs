@@ -56,7 +56,24 @@ impl Server {
                     "empty" => return wire::reply(id, json!([])),
                     _ => {}
                 }
-                let (uri, range) = if self.dispatch_profile {
+                let (uri, range) = if self.mode == "delayed_sync" {
+                    let synchronized = self
+                        .documents
+                        .get(uri)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let symbol = synchronized
+                        .split("fn ")
+                        .nth(1)
+                        .and_then(|tail| tail.split('(').next())
+                        .unwrap_or("missing_synchronized_document");
+                    (
+                        uri.rsplit_once('/')
+                            .map(|(parent, _)| format!("{parent}/{symbol}.rs"))
+                            .unwrap_or_else(|| uri.to_owned()),
+                        range(),
+                    )
+                } else if self.dispatch_profile {
                     (
                         uri.replace("main.rs", "answer.rs"),
                         json!({"start": {"line": 7, "character": 2}, "end": {"line": 7, "character": 8}}),

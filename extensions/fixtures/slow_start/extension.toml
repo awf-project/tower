@@ -1,0 +1,15 @@
+name       = "slow_start"
+version    = "0.1.0"
+command    = ["slow_start_extension"]
+activation = "eager"
+
+[events]
+subscribe = ["event/fileIndexed", "event/fileChanged", "event/fileDeleted"]
+
+[capabilities]
+required = []
+
+[[tools]]
+name        = "probe_catch_up"
+description = "Release or observe deterministic slow-start catch-up."
+schema_json = '{"type":"object","properties":{"release":{"type":"boolean"}},"additionalProperties":false}'

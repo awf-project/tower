@@ -21,6 +21,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadinessFamily {
+    Ast,
+    Lsp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionConfigurationReason {
+    ConflictingBuiltinFamily,
+    InvalidControlName,
+    DuplicateControl,
+    BuiltinExhaustiveControl,
+    ReservedInitializeIdentity,
+    NonJsonInitializeValue,
+}
 
 /// Parsed `.tower/config.toml`. Unknown top-level keys are rejected.
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +91,15 @@ pub struct ExtensionConfig {
     ///
     #[serde(default)]
     pub disabled: Vec<String>,
+
+    #[serde(default)]
+    pub readiness: BTreeMap<String, ReadinessFamily>,
+
+    #[serde(default)]
+    pub readiness_controls: BTreeMap<String, Vec<String>>,
+
+    #[serde(default)]
+    pub initialize: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ExtensionConfig {
@@ -92,6 +119,9 @@ impl Default for ExtensionConfig {
         Self {
             request_timeout_secs: Self::default_request_timeout_secs(),
             disabled: Vec::new(),
+            readiness: BTreeMap::new(),
+            readiness_controls: BTreeMap::new(),
+            initialize: BTreeMap::new(),
         }
     }
 }
@@ -104,6 +134,10 @@ pub struct DaemonConfig {
     /// Only `mcp`/`observer` connections count; `control` connections do not.
     #[serde(default = "DaemonConfig::default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    #[serde(default = "DaemonConfig::default_connection_timeout_secs")]
+    pub connection_timeout_secs: u64,
+    #[serde(default = "DaemonConfig::default_preparation_timeout_secs")]
+    pub preparation_timeout_secs: u64,
 }
 
 impl DaemonConfig {
@@ -111,10 +145,28 @@ impl DaemonConfig {
         30
     }
 
+    const fn default_connection_timeout_secs() -> u64 {
+        10
+    }
+
+    const fn default_preparation_timeout_secs() -> u64 {
+        10
+    }
+
     /// Idle timeout as a [`std::time::Duration`].
     #[must_use]
     pub fn idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.idle_timeout_secs)
+    }
+
+    #[must_use]
+    pub fn connection_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.connection_timeout_secs)
+    }
+
+    #[must_use]
+    pub fn preparation_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.preparation_timeout_secs)
     }
 }
 
@@ -122,6 +174,8 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: Self::default_idle_timeout_secs(),
+            connection_timeout_secs: Self::default_connection_timeout_secs(),
+            preparation_timeout_secs: Self::default_preparation_timeout_secs(),
         }
     }
 }
@@ -214,11 +268,22 @@ pub enum FormatterMode {
 #[derive(Debug)]
 pub enum ConfigError {
     /// The file exists but could not be read (any IO error except NotFound).
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     /// The file is not valid TOML, or contains an unknown key.
     Parse {
         path: PathBuf,
         source: toml::de::Error,
+    },
+    InvalidDaemonDeadline {
+        field: &'static str,
+        value: u64,
+    },
+    InvalidExtensionConfiguration {
+        field: &'static str,
+        reason: ExtensionConfigurationReason,
     },
     LegacySection {
         path: PathBuf,
@@ -235,6 +300,12 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::Parse { path, source } => {
                 write!(f, "invalid config {}: {source}", path.display())
+            }
+            ConfigError::InvalidDaemonDeadline { field, value } => {
+                write!(f, "invalid daemon deadline {field}: {value}")
+            }
+            ConfigError::InvalidExtensionConfiguration { field, reason } => {
+                write!(f, "invalid extension configuration {field}: {reason:?}")
             }
             ConfigError::LegacySection {
                 path,
@@ -286,7 +357,100 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         });
     }
 
-    toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })
+    if raw
+        .get("extensions")
+        .and_then(|extensions| extensions.get("initialize"))
+        .is_some_and(contains_non_json_toml_value)
+    {
+        return Err(ConfigError::InvalidExtensionConfiguration {
+            field: "initialize",
+            reason: ExtensionConfigurationReason::NonJsonInitializeValue,
+        });
+    }
+
+    let config: TowerConfig =
+        toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })?;
+    validate_daemon_deadlines(&config.daemon)?;
+    validate_extension_configuration(&config.extensions)?;
+    Ok(config)
+}
+
+fn contains_non_json_toml_value(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Float(value) => !value.is_finite(),
+        toml::Value::Datetime(_) => true,
+        toml::Value::Array(values) => values.iter().any(contains_non_json_toml_value),
+        toml::Value::Table(values) => values.values().any(contains_non_json_toml_value),
+        toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_) => false,
+    }
+}
+
+fn validate_daemon_deadlines(config: &DaemonConfig) -> Result<(), ConfigError> {
+    for (field, value) in [
+        ("connection_timeout_secs", config.connection_timeout_secs),
+        ("preparation_timeout_secs", config.preparation_timeout_secs),
+    ] {
+        if value == 0 {
+            return Err(ConfigError::InvalidDaemonDeadline { field, value });
+        }
+    }
+    Ok(())
+}
+
+fn validate_extension_configuration(config: &ExtensionConfig) -> Result<(), ConfigError> {
+    for (identity, expected_family) in
+        [("ast", ReadinessFamily::Ast), ("lsp", ReadinessFamily::Lsp)]
+    {
+        if config
+            .readiness
+            .get(identity)
+            .is_some_and(|family| *family != expected_family)
+        {
+            return Err(ConfigError::InvalidExtensionConfiguration {
+                field: "readiness",
+                reason: ExtensionConfigurationReason::ConflictingBuiltinFamily,
+            });
+        }
+    }
+
+    for (identity, controls) in &config.readiness_controls {
+        if identity == "ast" || identity == "lsp" {
+            return Err(ConfigError::InvalidExtensionConfiguration {
+                field: "readiness_controls",
+                reason: ExtensionConfigurationReason::BuiltinExhaustiveControl,
+            });
+        }
+        if !config.readiness.contains_key(identity)
+            || controls.is_empty()
+            || controls.iter().any(|control| control.trim().is_empty())
+        {
+            return Err(ConfigError::InvalidExtensionConfiguration {
+                field: "readiness_controls",
+                reason: ExtensionConfigurationReason::InvalidControlName,
+            });
+        }
+
+        let mut unique = std::collections::BTreeSet::new();
+        if controls.iter().any(|control| !unique.insert(control)) {
+            return Err(ConfigError::InvalidExtensionConfiguration {
+                field: "readiness_controls",
+                reason: ExtensionConfigurationReason::DuplicateControl,
+            });
+        }
+    }
+
+    if config
+        .initialize
+        .keys()
+        .any(|identity| identity == "lsp" || identity == "debug")
+    {
+        return Err(ConfigError::InvalidExtensionConfiguration {
+            field: "initialize",
+            reason: ExtensionConfigurationReason::ReservedInitializeIdentity,
+        });
+    }
+
+    Ok(())
 }
 
 /// Default `.tower/config.toml` body seeded by `tower init`.
@@ -840,5 +1004,245 @@ extensions = ["rs"]
     fn daemon_unknown_key_is_rejected() {
         let src = "[daemon]\nidle_timeoutt_secs = 5\n";
         assert!(toml::from_str::<TowerConfig>(src).is_err());
+    }
+
+    #[test]
+    fn daemon_config_deadline_defaults_are_ten_seconds() {
+        let cfg = TowerConfig::default();
+
+        assert_eq!(cfg.daemon.connection_timeout_secs, 10);
+        assert_eq!(cfg.daemon.preparation_timeout_secs, 10);
+        assert_eq!(
+            cfg.daemon.connection_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            cfg.daemon.preparation_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn daemon_config_deadline_accessors_use_independent_values() {
+        let cfg: TowerConfig = toml::from_str(
+            "[daemon]\nconnection_timeout_secs = 3\npreparation_timeout_secs = 17\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.daemon.connection_timeout(),
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(
+            cfg.daemon.preparation_timeout(),
+            std::time::Duration::from_secs(17)
+        );
+    }
+
+    #[test]
+    fn daemon_config_deadline_rejects_zero_connection_timeout() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[daemon]\nconnection_timeout_secs = 0\n");
+
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigError::InvalidDaemonDeadline {
+                field: "connection_timeout_secs",
+                value: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn daemon_config_deadline_rejects_zero_preparation_timeout() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[daemon]\npreparation_timeout_secs = 0\n");
+
+        assert!(matches!(
+            load(tmp.path()),
+            Err(ConfigError::InvalidDaemonDeadline {
+                field: "preparation_timeout_secs",
+                value: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn daemon_config_deadline_preserves_strict_parse_failures() {
+        for body in [
+            "[daemon]\nconnection_timeout_secs = \"ten\"\n",
+            "[daemon]\npreparation_timeout_sec = 10\n",
+        ] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), body);
+            assert!(matches!(load(tmp.path()), Err(ConfigError::Parse { .. })));
+        }
+    }
+
+    #[test]
+    fn extension_readiness_mapping_is_strict_and_preserves_builtin_families() {
+        let default = TowerConfig::default();
+        assert!(default.extensions.readiness.is_empty());
+        assert!(default.extensions.readiness_controls.is_empty());
+
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[extensions]\ndisabled = [\"slow_start\"]\n[extensions.readiness]\nslow_start = \"ast\"\nsemantic = \"lsp\"\n",
+        );
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.extensions.readiness["slow_start"], ReadinessFamily::Ast);
+        assert_eq!(cfg.extensions.readiness["semantic"], ReadinessFamily::Lsp);
+        assert!(
+            cfg.extensions
+                .disabled
+                .iter()
+                .any(|name| name == "slow_start")
+        );
+
+        for body in [
+            "[extensions.readiness]\nslow_start = \"workspace\"\n",
+            "[extensions.readiness]\nslow_start = 1\n",
+        ] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), body);
+            assert!(matches!(load(tmp.path()), Err(ConfigError::Parse { .. })));
+        }
+
+        for (identity, family) in [("ast", "lsp"), ("lsp", "ast")] {
+            let tmp = tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!("[extensions.readiness]\n{identity} = \"{family}\"\n"),
+            );
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigError::InvalidExtensionConfiguration {
+                    field: "readiness",
+                    reason: ExtensionConfigurationReason::ConflictingBuiltinFamily,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn extension_initialize_configuration_is_identity_scoped_and_json_compatible() {
+        assert!(TowerConfig::default().extensions.initialize.is_empty());
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[extensions.initialize.alpha]\nmode = \"block\"\nnested = { enabled = true, count = 2 }\n[extensions.initialize.beta]\nmode = \"resume\"\n",
+        );
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.extensions.initialize["alpha"],
+            serde_json::Map::from_iter([
+                ("mode".to_owned(), serde_json::json!("block")),
+                (
+                    "nested".to_owned(),
+                    serde_json::json!({"enabled": true, "count": 2})
+                ),
+            ])
+        );
+        assert_eq!(cfg.extensions.initialize["beta"]["mode"], "resume");
+
+        for body in [
+            "[extensions.initialize]\nalpha = \"not-an-object\"\n",
+            "[extensions.initialize.alpha]\nvalue = nan\n",
+        ] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), body);
+            assert!(load(tmp.path()).is_err());
+        }
+
+        for identity in ["lsp", "debug"] {
+            let tmp = tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!("[extensions.initialize.{identity}]\nmode = \"secret\"\n"),
+            );
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigError::InvalidExtensionConfiguration {
+                    field: "initialize",
+                    reason: ExtensionConfigurationReason::ReservedInitializeIdentity,
+                })
+            ));
+        }
+
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[lsp.rust]\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\n[debug.rust]\ncommand = \"lldb-dap\"\nextensions = [\"rs\"]\nadapter_type = \"lldb\"\ndefault_timeout_secs = 10\nidle_ttl_secs = 30\n",
+        );
+        let cfg = load(tmp.path()).unwrap();
+        assert!(cfg.lsp.for_extension("rs").is_some());
+        assert!(cfg.debug.languages.contains_key("rust"));
+    }
+
+    #[test]
+    fn extension_readiness_configuration_reports_fixed_validation_reasons() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[extensions.readiness]\nslow = \"ast\"\n[extensions.readiness_controls]\nslow = [\"probe\"]\n",
+        );
+        let cfg = load(tmp.path()).expect("valid identity-scoped controls must be preserved");
+        assert_eq!(cfg.extensions.readiness_controls["slow"], ["probe"]);
+
+        let cases = [
+            (
+                "[extensions.readiness]\nast = \"lsp\"\n",
+                "readiness",
+                ExtensionConfigurationReason::ConflictingBuiltinFamily,
+            ),
+            (
+                "[extensions.readiness_controls]\nmissing = [\"probe\"]\n",
+                "readiness_controls",
+                ExtensionConfigurationReason::InvalidControlName,
+            ),
+            (
+                "[extensions.readiness]\nslow = \"ast\"\n[extensions.readiness_controls]\nslow = []\n",
+                "readiness_controls",
+                ExtensionConfigurationReason::InvalidControlName,
+            ),
+            (
+                "[extensions.readiness]\nslow = \"ast\"\n[extensions.readiness_controls]\nslow = [\"\"]\n",
+                "readiness_controls",
+                ExtensionConfigurationReason::InvalidControlName,
+            ),
+            (
+                "[extensions.readiness]\nslow = \"ast\"\n[extensions.readiness_controls]\nslow = [\"probe\", \"probe\"]\n",
+                "readiness_controls",
+                ExtensionConfigurationReason::DuplicateControl,
+            ),
+            (
+                "[extensions.readiness_controls]\nast = [\"tower_ast_get_outline\"]\n",
+                "readiness_controls",
+                ExtensionConfigurationReason::BuiltinExhaustiveControl,
+            ),
+            (
+                "[extensions.initialize.lsp]\nmode = \"override\"\n",
+                "initialize",
+                ExtensionConfigurationReason::ReservedInitializeIdentity,
+            ),
+            (
+                "[extensions.initialize.slow]\nvalue = nan\n",
+                "initialize",
+                ExtensionConfigurationReason::NonJsonInitializeValue,
+            ),
+        ];
+
+        for (body, field, reason) in cases {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), body);
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigError::InvalidExtensionConfiguration {
+                    field: actual_field,
+                    reason: actual_reason,
+                }) if actual_field == field && actual_reason == reason
+            ));
+        }
     }
 }

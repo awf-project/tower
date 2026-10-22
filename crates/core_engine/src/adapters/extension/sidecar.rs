@@ -239,6 +239,11 @@ impl SidecarHostAdapter {
         request_timeout: Duration,
         extension_config: Option<Value>,
     ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault> {
+        let rr_enabled = extension_config
+            .as_ref()
+            .and_then(|config| config.pointer("/record/backend"))
+            .and_then(Value::as_str)
+            == Some("rr");
         let argv = &manifest.command;
         if argv.is_empty() {
             return Err(ExtensionFault::ProtocolError {
@@ -296,12 +301,15 @@ impl SidecarHostAdapter {
         };
 
         // Reconstruct the manifest using the extension's declared tools/events/capabilities.
-        let final_manifest = ExtensionManifest {
+        // Keep internal declarations for identity-checked host dispatch. The
+        // MCP presentation layer hides and rejects the reserved operation.
+        let public_tools = init_result.tools;
+        let mut final_manifest = ExtensionManifest {
             name: manifest.name.clone(),
             version: manifest.version.clone(),
             command: manifest.command.clone(),
             activation: manifest.activation.clone(),
-            tools: init_result.tools,
+            tools: public_tools,
             events: extension_protocol::manifest::EventsSection {
                 subscribe: init_result.events,
             },
@@ -315,6 +323,8 @@ impl SidecarHostAdapter {
                     .collect(),
             },
         };
+
+        super::discovery::filter_debug_tools(&mut final_manifest, rr_enabled);
 
         Ok(Box::new(Self {
             manifest: final_manifest,

@@ -58,6 +58,27 @@ pub const XDG_EXTENSIONS_SUBDIR: &str = "tower/extensions";
 
 pub type ExtensionInitConfigMap = BTreeMap<String, Value>;
 
+/// Apply the host's debug capability gate to static and runtime declarations.
+/// Installed extensions follow the same opt-in contract as the bundled sidecar.
+pub(super) fn filter_debug_tools(manifest: &mut ExtensionManifest, rr_enabled: bool) {
+    const RR_TOOLS: &[&str] = &[
+        "record",
+        "replay",
+        "reverse_continue",
+        "step_back",
+        "watchpoint",
+        "traces",
+        "delete_trace",
+        "find_origin",
+        "record_and_find_origin",
+    ];
+    if manifest.name == "debug" && !rr_enabled {
+        manifest
+            .tools
+            .retain(|tool| !RR_TOOLS.contains(&tool.name.as_str()));
+    }
+}
+
 // ── Error / warning types ─────────────────────────────────────────────────────
 
 /// Why a single extension manifest could not be loaded.
@@ -447,12 +468,32 @@ pub fn load_extensions_into_shared_registry(
     );
 }
 
-fn load_extensions_with_register(
+pub(crate) fn load_extensions_with_register(
     dirs: &[PathBuf],
     deps: HostDeps,
     request_timeout: Duration,
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
+    register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
+) {
+    load_extensions_with_register_cancellable(
+        dirs,
+        deps,
+        request_timeout,
+        disabled,
+        init_configs,
+        None,
+        register_instance,
+    );
+}
+
+pub(crate) fn load_extensions_with_register_cancellable(
+    dirs: &[PathBuf],
+    deps: HostDeps,
+    request_timeout: Duration,
+    disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
     mut register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
 ) {
     // ── Phase 1: scan every scope, read manifests. ────────────────────────────
@@ -460,6 +501,9 @@ fn load_extensions_with_register(
     let mut load_errors: Vec<(PathBuf, ManifestLoadError)> = Vec::new();
 
     for (scope_idx, dir) in dirs.iter().enumerate() {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return;
+        }
         let entries = read_manifests_from_dir(dir, &mut load_errors);
         for (ext_dir, manifest) in entries {
             all_entries.push((scope_idx, ext_dir, manifest));
@@ -496,6 +540,9 @@ fn load_extensions_with_register(
 
     // ── Phase 4: activate survivors and register. ─────────────────────────────
     for ((scope_idx, ext_dir, manifest), decision) in after_disable.into_iter().zip(decisions) {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return;
+        }
         let name = manifest.name.clone();
         let init_config = init_configs.get(&name).cloned();
         match decision {
