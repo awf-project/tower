@@ -3,8 +3,8 @@
 //! and self-terminates after the configured idle timeout.
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rmcp::serve_server;
 use tokio::net::UnixStream;
@@ -12,56 +12,95 @@ use tokio::sync::Notify;
 
 use crate::adapters::cli::GlobalOpts;
 use crate::adapters::config::TowerConfig;
-use crate::adapters::daemon::engine::build_engine;
+use crate::adapters::daemon::DaemonLifecycle;
+use crate::adapters::daemon::engine::{
+    EarlyDaemonContext, build_early_context, start_workspace_preparation,
+};
 use crate::adapters::daemon::session::SessionRegistry;
-use crate::adapters::daemon::socket::{bind_listener, socket_path};
+use crate::adapters::daemon::socket::{WorkspaceDaemonOwner, bind_listener, socket_path};
 use crate::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, StatusSnapshot, read_handshake, read_line_capped,
     write_line,
 };
-use crate::adapters::mcp::diagnostics::DiagnosticsReader;
-use crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use crate::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
+use crate::adapters::mcp::extension_merged_registry::ReadinessAwareRegistry;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
-use crate::adapters::mcp::native_tools::EngineState;
 use crate::adapters::mcp::rmcp_server::TowerMcpHandler;
-use crate::adapters::watcher::RenameCoordinator;
-use crate::domain::extension_host::ExtensionRegistry;
+
+/// A sticky broadcast: shutdown cannot be lost between select iterations or
+/// before a newly accepted connection starts waiting.
+#[derive(Default)]
+struct ShutdownSignal {
+    requested: std::sync::atomic::AtomicBool,
+    changed: Notify,
+}
+impl ShutdownSignal {
+    fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.changed.notify_waiters();
+    }
+    async fn wait(&self) {
+        let changed = self.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if !self.requested.load(std::sync::atomic::Ordering::Acquire) {
+            changed.await;
+        }
+    }
+}
 
 /// Shared context for every accepted connection.
 struct DaemonCtx {
+    generation: u64,
     started: Instant,
     registry: Arc<SessionRegistry>,
-    state: Arc<RwLock<EngineState>>,
-    ext_registry: Arc<RwLock<ExtensionRegistry>>,
-    rename_coordinator: Arc<RenameCoordinator>,
-    diag_reader: Arc<dyn DiagnosticsReader>,
-    shutdown: Arc<Notify>,
+    early: Arc<EarlyDaemonContext>,
+    shutdown: Arc<ShutdownSignal>,
 }
 
 impl DaemonCtx {
     fn snapshot(&self) -> StatusSnapshot {
-        let indexed_files = self
-            .state
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .workspace_arc()
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .all_file_ids()
-            .len();
-        let extensions = self
-            .ext_registry
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .declared_tools()
-            .into_iter()
-            .map(|(_, decl)| decl.name)
-            .collect();
+        let prepared = self.early.wait_prepared(Duration::ZERO).ok();
+        let indexed_files = prepared
+            .as_ref()
+            .map(|engine| {
+                engine
+                    .state()
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .workspace_arc()
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .all_file_ids()
+                    .len()
+            })
+            .unwrap_or(0);
+        let extensions = prepared
+            .as_ref()
+            .map(|engine| {
+                engine
+                    .extension_registry()
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .declared_tools()
+                    .into_iter()
+                    .map(|(_, decl)| decl.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let readiness = self.early.readiness().snapshot();
         StatusSnapshot {
             uptime_secs: self.started.elapsed().as_secs(),
             mcp_clients: self.registry.keep_alive_count(),
             indexed_files,
             extensions,
+            instrumentation: self.early.instrumentation_snapshot(),
+            generation: self.generation,
+            lifecycle: readiness.lifecycle,
+            workspace: readiness.workspace,
+            ast: readiness.ast,
+            lsp: readiness.lsp,
         }
     }
 }
@@ -69,24 +108,28 @@ impl DaemonCtx {
 /// Build a fresh per-connection MCP handler over the shared engine state.
 fn build_handler(ctx: &DaemonCtx) -> (TowerMcpHandler, Arc<Mutex<SubscriptionRegistry>>) {
     let sub = Arc::new(Mutex::new(SubscriptionRegistry::new()));
-    let registry = ExtensionMergedRegistry::with_rename_coordinator(
-        Arc::clone(&ctx.state),
-        Arc::clone(&ctx.ext_registry),
-        Arc::clone(&ctx.rename_coordinator),
-    );
+    let registry = ReadinessAwareRegistry::new(Arc::clone(&ctx.early));
     let handler = TowerMcpHandler::new(
         registry,
-        Arc::clone(&ctx.diag_reader),
+        Arc::new(NoOpDiagnosticsReader),
         Arc::clone(&sub),
         Vec::new(),
     );
     (handler, sub)
 }
 
+async fn connection_shutdown(ctx: &DaemonCtx) {
+    ctx.shutdown.wait().await;
+}
+
 /// Serve one accepted connection to completion.
 async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
     let (mut read_half, mut write_half) = stream.into_split();
-    let hs = match read_handshake(&mut read_half).await {
+    let handshake = tokio::select! {
+        result = read_handshake(&mut read_half) => result,
+        () = connection_shutdown(&ctx) => return,
+    };
+    let hs = match handshake {
         Ok(hs) => hs,
         Err(_) => return, // bad handshake: drop the connection silently.
     };
@@ -94,7 +137,11 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
         ClientRole::Mcp => {
             let (handler, sub) = build_handler(&ctx);
             ctx.registry.register_initializing();
-            let running = match serve_server(handler, (read_half, write_half)).await {
+            let initialized = tokio::select! {
+                result = serve_server(handler, (read_half, write_half)) => result,
+                () = connection_shutdown(&ctx) => { ctx.registry.unregister_initializing(); return; },
+            };
+            let running = match initialized {
                 Ok(r) => r,
                 Err(_) => {
                     ctx.registry.unregister_initializing();
@@ -104,7 +151,16 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
             let id = ctx
                 .registry
                 .register_initialized(running.peer().clone(), sub);
-            let _ = running.waiting().await;
+            let cancellation = running.cancellation_token();
+            let waiting = running.waiting();
+            tokio::pin!(waiting);
+            tokio::select! {
+                _ = &mut waiting => {},
+                () = connection_shutdown(&ctx) => {
+                    cancellation.cancel();
+                    let _ = waiting.await;
+                }
+            }
             ctx.registry.unregister(id);
         }
         ClientRole::Observer => {
@@ -112,7 +168,11 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
             let _ = write_line(&mut write_half, &body).await;
         }
         ClientRole::Control => {
-            let line = match read_line_capped(&mut read_half, 4096).await {
+            let request = tokio::select! {
+                result = read_line_capped(&mut read_half, 4096) => result,
+                () = connection_shutdown(&ctx) => return,
+            };
+            let line = match request {
                 Ok(Some(l)) => l,
                 _ => return,
             };
@@ -129,7 +189,7 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
                 ControlRequest::Shutdown => {
                     let body = serde_json::to_string(&ControlResponse::Ok).unwrap();
                     let _ = write_line(&mut write_half, &body).await;
-                    ctx.shutdown.notify_waiters();
+                    ctx.shutdown.request();
                 }
             }
         }
@@ -139,7 +199,7 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
 /// Idle monitor: when keep-alive count is 0 for `idle`, trigger shutdown.
 async fn idle_monitor(
     registry: Arc<SessionRegistry>,
-    shutdown: Arc<Notify>,
+    shutdown: Arc<ShutdownSignal>,
     idle: std::time::Duration,
 ) {
     loop {
@@ -147,7 +207,7 @@ async fn idle_monitor(
             tokio::select! {
                 () = tokio::time::sleep(idle) => {
                     if registry.keep_alive_count() == 0 {
-                        shutdown.notify_waiters();
+                        shutdown.request();
                         return;
                     }
                 }
@@ -169,8 +229,11 @@ pub fn run_daemon(opts: &GlobalOpts, config: TowerConfig, detach: bool) -> Resul
     }
 
     let workspace_root = crate::adapters::cli::resolve_workspace_root(opts);
+    let owner =
+        WorkspaceDaemonOwner::acquire(&workspace_root).map_err(|error| error.to_string())?;
+    pre_bind_test_milestone()?;
     let idle = config.daemon.idle_timeout();
-    let handle = build_engine(opts, config)?;
+    let failure_grace = config.daemon.connection_timeout();
 
     let sock = socket_path(&workspace_root);
 
@@ -183,68 +246,233 @@ pub fn run_daemon(opts: &GlobalOpts, config: TowerConfig, detach: bool) -> Resul
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
     // Bind the listener inside the runtime context.
-    let listener = rt.block_on(async { bind_listener(&sock) }).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            "another daemon already owns this workspace socket".to_string()
-        } else {
-            format!("failed to bind daemon socket {}: {e}", sock.display())
+    let listener = rt
+        .block_on(async { bind_listener(&owner) })
+        .map_err(|error| error.to_string())?;
+
+    // Publish the transport while lifetime ownership is held, before opening
+    // Sled or initializing the rest of the engine. This closes the startup
+    // race without allowing a losing daemon to touch shared engine resources.
+    let early = match build_early_context(opts, config, &owner) {
+        Ok(context) => Arc::new(context),
+        Err(error) => {
+            drop(listener);
+            let _ = std::fs::remove_file(&sock);
+            return Err(error.to_string());
         }
-    })?;
+    };
+    let preparation = match start_workspace_preparation(Arc::clone(&early)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            drop(listener);
+            let _ = std::fs::remove_file(&sock);
+            return Err(error.to_string());
+        }
+    };
+    #[cfg(feature = "startup-test-hooks")]
+    if std::env::var("TOWER_TEST_FAIL_RECONCILIATION").as_deref() == Ok("before_commit")
+        && std::env::var_os("TOWER_TEST_WORKSPACE")
+            .and_then(|path| std::path::PathBuf::from(path).canonicalize().ok())
+            == workspace_root.canonicalize().ok()
+    {
+        let outcome = preparation.join();
+        early.release_prepared();
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        drop(owner);
+        return match outcome {
+            Ok(_) => Err(format!(
+                "injected apply_reconciliation_delta failure at {}",
+                workspace_root.display()
+            )),
+            Err(_) => Err(format!(
+                "workspace reconciliation failed during apply_reconciliation_delta at {}",
+                workspace_root.display()
+            )),
+        };
+    }
 
     let registry = SessionRegistry::new();
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = Arc::new(ShutdownSignal::default());
     let ctx = Arc::new(DaemonCtx {
+        generation: owner.generation(),
         started: Instant::now(),
         registry: Arc::clone(&registry),
-        state: Arc::clone(&handle.state),
-        ext_registry: Arc::clone(&handle.ext_registry),
-        rename_coordinator: Arc::clone(&handle.rename_coordinator),
-        diag_reader: Arc::clone(&handle.diag_reader),
+        early: Arc::clone(&early),
         shutdown: Arc::clone(&shutdown),
     });
 
-    // Push fan-out: drain the single push_rx, broadcast to subscribed sessions.
-    {
+    // The server owns this worker and its stop signal; no detached fan-out
+    // can retain prepared resources beyond workspace ownership release.
+    let fanout_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fanout = {
         let registry = Arc::clone(&registry);
         let rt_handle = rt.handle().clone();
-        let push_rx = handle.push_rx;
+        let early = Arc::clone(&early);
+        let cancelled = Arc::clone(&fanout_cancelled);
         std::thread::Builder::new()
             .name("daemon-push-fanout".to_owned())
             .spawn(move || {
-                while let Ok(event) = push_rx.recv() {
-                    registry.broadcast(&event.uri, &rt_handle);
+                let Ok(prepared) = early.wait_prepared(early.preparation_timeout()) else {
+                    return;
+                };
+                while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Some(push_rx) = prepared.take_push_receiver() {
+                        while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            match push_rx.recv_timeout(Duration::from_millis(25)) {
+                                Ok(event) => registry.broadcast(&event.uri, &rt_handle),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                            }
+                        }
+                        return;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(25));
                 }
             })
-            .map_err(|e| format!("failed to spawn push fan-out thread: {e}"))?;
-    }
+            .map_err(|_| "failed to spawn push fan-out thread".to_owned())?
+    };
 
     let result = rt.block_on(async {
-        tokio::spawn(idle_monitor(
+        let idle_task = tokio::spawn(idle_monitor(
             Arc::clone(&registry),
             Arc::clone(&shutdown),
             idle,
         ));
         eprintln!("tower: daemon listening on {}", sock.display());
-        loop {
+        let failure_shutdown = async {
+            early.readiness().wait_for_workspace_failure().await;
+            // Keep status available briefly, even with a connected client, then
+            // run the same joined teardown as an explicit shutdown.
+            tokio::time::sleep(failure_grace).await;
+        };
+        tokio::pin!(failure_shutdown);
+        let mut connections = tokio::task::JoinSet::new();
+        let result = loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _addr)) => {
                             let ctx = Arc::clone(&ctx);
-                            tokio::spawn(serve_connection(stream, ctx));
+                            connections.spawn(serve_connection(stream, ctx));
                         }
-                        Err(e) => return Err(format!("accept error: {e}")),
+                        Err(e) => break Err(format!("accept error: {e}")),
                     }
                 }
-                () = shutdown.notified() => {
-                    eprintln!("tower: daemon shutting down");
-                    return Ok(());
+                () = &mut failure_shutdown => {
+                    break Err("workspace preparation failed".to_owned());
                 }
+                () = shutdown.wait() => {
+                    eprintln!("tower: daemon shutting down");
+                    break Ok(());
+                }
+                _ = connections.join_next(), if !connections.is_empty() => {},
             }
-        }
+        };
+        let _ = early
+            .readiness()
+            .transition_daemon(DaemonLifecycle::Stopping);
+        preparation.cancel();
+        shutdown.request();
+        idle_task.abort();
+        let _ = idle_task.await;
+        while connections.join_next().await.is_some() {}
+        result
     });
 
+    let _ = early
+        .readiness()
+        .transition_daemon(DaemonLifecycle::Stopping);
+    preparation.cancel();
+    let _ = preparation.join();
+    fanout_cancelled.store(true, std::sync::atomic::Ordering::Release);
+    let _ = fanout.join();
+    // Drop the runtime before engine/owner teardown: any synchronous MCP
+    // dispatch still finishing on a runtime worker must release its permit.
+    drop(rt);
+    debug_assert!(early.readiness().wait_for_dispatch_drain(Duration::ZERO));
+    early.release_prepared();
+    drop(ctx);
+    drop(listener);
     // Best-effort socket cleanup on the way out.
     let _ = std::fs::remove_file(&sock);
+    drop(owner);
+    #[cfg(feature = "startup-test-hooks")]
+    if let Some(trace) = std::env::var_os("TOWER_TEST_CLEANUP_TRACE") {
+        let cleanup = [
+            "watcher",
+            "sidecars",
+            "push_fanout",
+            "sled",
+            "socket",
+            "ownership",
+        ];
+        let _ = std::fs::write(trace, serde_json::to_vec(&cleanup).unwrap_or_default());
+    }
     result
+}
+
+#[cfg(feature = "startup-test-hooks")]
+fn pre_bind_test_milestone() -> Result<(), String> {
+    use std::io::{BufRead as _, Write as _};
+    use std::time::Duration;
+
+    if std::env::var("TOWER_TEST_PRE_BIND_HANDSHAKE").as_deref() != Ok("stdio") {
+        return Ok(());
+    }
+    println!("ownership-acquired");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush pre-bind milestone: {error}"))?;
+    let (command_tx, command_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("pre-bind-test-milestone".to_owned())
+        .spawn(move || {
+            let mut command = String::new();
+            let result = std::io::stdin()
+                .lock()
+                .read_line(&mut command)
+                .map(|_| command);
+            let _ = command_tx.send(result);
+        })
+        .map_err(|error| format!("failed to start pre-bind continuation reader: {error}"))?;
+    let command = command_rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "timed out waiting for pre-bind continuation".to_owned())?
+        .map_err(|error| format!("failed to read pre-bind continuation: {error}"))?;
+    if command == "continue\n" {
+        Ok(())
+    } else {
+        Err("invalid pre-bind continuation".to_owned())
+    }
+}
+
+#[cfg(not(feature = "startup-test-hooks"))]
+fn pre_bind_test_milestone() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod shutdown_signal_tests {
+    use super::*;
+    #[tokio::test]
+    async fn shutdown_before_wait_and_between_accept_iterations_is_not_lost() {
+        let signal = Arc::new(ShutdownSignal::default());
+        signal.request();
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(1), signal.wait())
+                .await
+                .unwrap();
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let signal = Arc::clone(&signal);
+            tasks.spawn(async move {
+                signal.wait().await;
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    }
 }

@@ -49,6 +49,24 @@ The binary name is `tower` (from `[[bin]] name = "tower"` in
 
 ## Session lifecycle
 
+### Daemon startup and readiness
+
+`tower mcp` connects to (or starts) one daemon for the workspace. The daemon keeps its workspace
+ownership for its full lifetime and binds the client transport before storage reconciliation and
+extension catch-up. Consequently, MCP `initialize` can complete while preparation is still in
+progress, and a client-side connection timeout does not release ownership or cause a competing
+daemon to open the same Sled database.
+
+Readiness is tracked independently for the workspace, AST, and LSP families. `tower status` reports
+the daemon generation, lifecycle, each family’s state, and completed startup instrumentation. The
+possible lifecycle states are `starting`, `ready`, `degraded`, `failed`, and `stopping`; a capability
+can additionally be `preparing`, `ready`, `degraded`, `failed`, `unavailable`, or `stopping`.
+
+Native control and tool-description requests remain available during preparation. Workspace, AST,
+and LSP operations are admitted only when their dependencies are ready, or return a bounded
+wait/structured readiness result. Clients must not interpret a tool inventory during catch-up as
+proof that every extension result is exhaustive.
+
 ### 1. initialize
 
 Send one `initialize` request at session start. tower responds with protocol
@@ -173,9 +191,13 @@ result object.
 | -32603  | InternalError    | Tool execution failed at runtime (I/O error, extension fault, etc.)     |
 | -32001  | ToolNotFound     | The named tool does not exist in the registry                           |
 | -32002  | ResourceNotFound | The workspace entity targeted by the tool was not found (stable code — clients may branch on this without parsing the message) |
+| -32004  | InitializationPending | The required capability is still preparing; `data` identifies the dependency and phase. |
+| -32005  | CapabilityInitializationFailed | The required capability failed; `data` includes its failure class. |
+| -32006  | DaemonStopping | The daemon is stopping and will not admit new work. |
+| -32007  | CapabilityUnavailable | The requested capability is not configured or was disabled. |
 
-Codes `-32001` and `-32002` are in the JSON-RPC 2.0 server-defined range
-(`-32000` to `-32099`). `-32001` is for an unknown **tool name** inside
+Codes `-32001`, `-32002`, and `-32004` through `-32007` are in the JSON-RPC 2.0
+server-defined range (`-32000` to `-32099`). `-32001` is for an unknown **tool name** inside
 `tools/call`; `-32601` is reserved for an unknown **RPC method** name.
 
 **Error response shape**

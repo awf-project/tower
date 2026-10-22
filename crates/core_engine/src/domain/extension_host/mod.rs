@@ -578,8 +578,9 @@ impl ExtensionRegistry {
                 Err(fault) => {
                     let count = handle.record_fault();
                     eprintln!(
-                        "[tower] extension '{}' deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {fault}",
-                        handle.manifest.name
+                        "[tower] extension '{}' deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {}",
+                        handle.manifest.name,
+                        event_fault_label(&fault)
                     );
                 }
             }
@@ -628,8 +629,9 @@ impl ExtensionRegistry {
                     Err(fault) => {
                         let count = handle.record_fault();
                         eprintln!(
-                            "[tower] extension '{}' deferred deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {fault}",
-                            handle.manifest.name
+                            "[tower] extension '{}' deferred deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {}",
+                            handle.manifest.name,
+                            event_fault_label(&fault)
                         );
                     }
                 }
@@ -643,6 +645,16 @@ impl ExtensionRegistry {
                 return;
             }
         }
+    }
+}
+
+// Never print sidecar-controlled error payloads to the daemon's public stderr.
+fn event_fault_label(fault: &ExtensionFault) -> &'static str {
+    match fault {
+        ExtensionFault::Timeout => "extension timed out",
+        ExtensionFault::Crashed { .. } => "extension crashed",
+        ExtensionFault::ProtocolError { .. } => "extension protocol error",
+        ExtensionFault::Quarantined => "extension is quarantined",
     }
 }
 

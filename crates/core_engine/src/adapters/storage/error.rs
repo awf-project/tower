@@ -12,6 +12,7 @@ use crate::ports::PortError;
 /// Error returned by `SledStorageAdapter::open()` and internal operations.
 #[derive(Debug)]
 pub enum StorageError {
+    Cancelled,
     /// The on-disk schema version is incompatible with this binary (spec UN2/AC4).
     IncompatibleSchema {
         /// Version found on disk.
@@ -30,6 +31,7 @@ pub enum StorageError {
 impl core::fmt::Display for StorageError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("storage reload cancelled"),
             Self::IncompatibleSchema { on_disk, expected } => write!(
                 f,
                 "incompatible schema version: on-disk={on_disk}, expected={expected}"

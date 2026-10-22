@@ -291,18 +291,49 @@ pub(crate) fn record_reconciliation_file_record_rewrites(count: usize) {
 }
 
 pub(crate) trait ReconciliationOperations {
+    fn checkpoint(&self) -> Result<(), ScanError> {
+        Ok(())
+    }
     fn enumerate(&mut self, root: &Path) -> Result<Vec<PathBuf>, ScanError>;
     fn metadata(&mut self, path: &Path) -> Result<std::fs::Metadata, std::io::Error>;
     fn read_content(&mut self, path: &Path) -> Result<Vec<u8>, std::io::Error>;
     fn hash_content(&mut self, content: &[u8]) -> ContentHash;
+    fn hash_content_checked(&mut self, content: &[u8]) -> Result<ContentHash, ScanError> {
+        self.checkpoint()?;
+        Ok(self.hash_content(content))
+    }
 }
 
-struct RealReconciliationOperations;
+struct RealReconciliationOperations<'a> {
+    cancelled: Option<&'a std::sync::atomic::AtomicBool>,
+}
+impl RealReconciliationOperations<'_> {
+    fn check_io(&self) -> std::io::Result<()> {
+        if self
+            .cancelled
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "reconciliation cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
-impl ReconciliationOperations for RealReconciliationOperations {
+impl ReconciliationOperations for RealReconciliationOperations<'_> {
+    fn checkpoint(&self) -> Result<(), ScanError> {
+        self.check_io().map_err(|_| ScanError::Persistence {
+            operation: "cancelled",
+            source: PortError::ReadFailed("reconciliation cancelled".into()),
+        })
+    }
     fn enumerate(&mut self, root: &Path) -> Result<Vec<PathBuf>, ScanError> {
         let mut paths = Vec::new();
         for entry in WorkspacePathExclusion::walker(root) {
+            self.checkpoint()?;
             let entry = entry.map_err(|source| ScanError::Enumeration {
                 path: ignore_error_path(&source).unwrap_or_else(|| root.to_path_buf()),
                 source,
@@ -315,15 +346,36 @@ impl ReconciliationOperations for RealReconciliationOperations {
     }
 
     fn metadata(&mut self, path: &Path) -> Result<std::fs::Metadata, std::io::Error> {
+        self.check_io()?;
         std::fs::metadata(path)
     }
 
     fn read_content(&mut self, path: &Path) -> Result<Vec<u8>, std::io::Error> {
-        std::fs::read(path)
+        use std::io::Read;
+        self.check_io()?;
+        let mut file = std::fs::File::open(path)?;
+        let mut content = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            self.check_io()?;
+            let count = file.read(&mut chunk)?;
+            if count == 0 {
+                return Ok(content);
+            }
+            content.extend_from_slice(&chunk[..count]);
+        }
     }
 
     fn hash_content(&mut self, content: &[u8]) -> ContentHash {
         content_hash_of(content)
+    }
+    fn hash_content_checked(&mut self, content: &[u8]) -> Result<ContentHash, ScanError> {
+        let mut digest = Sha256::new();
+        for chunk in content.chunks(64 * 1024) {
+            self.checkpoint()?;
+            digest.update(chunk);
+        }
+        Ok(ContentHash::new(digest.finalize().into()))
     }
 }
 
@@ -351,7 +403,33 @@ pub(crate) fn reconcile_workspace_before_commit(
         storage,
         workspace,
         index,
-        &mut RealReconciliationOperations,
+        &mut RealReconciliationOperations { cancelled: None },
+        before_commit,
+    )
+}
+
+/// Cancellable adapter entry point; cancellation never commits a partial inventory.
+pub(crate) fn reconcile_workspace_cancellable(
+    root: &Path,
+    storage: &mut dyn StoragePort,
+    workspace: &mut ProjectWorkspace,
+    index: &mut InvertedIndex,
+    cancelled: &std::sync::atomic::AtomicBool,
+    before_commit: impl FnOnce() -> Result<(), ScanError>,
+) -> Result<ReconciliationReport, ScanError> {
+    let mut operations = RealReconciliationOperations {
+        cancelled: Some(cancelled),
+    };
+    operations.checkpoint()?;
+    storage
+        .is_scan_complete()
+        .map_err(|source| ScanError::MarkerRead { source })?;
+    reconcile_workspace_with_before_commit(
+        root,
+        storage,
+        workspace,
+        index,
+        &mut operations,
         before_commit,
     )
 }
@@ -375,9 +453,13 @@ fn reconcile_workspace_with_before_commit<O: ReconciliationOperations>(
     operations: &mut O,
     before_commit: impl FnOnce() -> Result<(), ScanError>,
 ) -> Result<ReconciliationReport, ScanError> {
+    operations.checkpoint()?;
     let inventory = collect_reconciliation_inventory(root, operations)?;
     let staged = stage_reconciliation(workspace.snapshot(), &inventory, operations)?;
+    operations.checkpoint()?;
+    let staged_index = build_reconciliation_index(&staged.workspace, operations)?;
     before_commit()?;
+    operations.checkpoint()?;
     storage
         .apply_reconciliation_delta(&staged.delta)
         .map_err(|source| ScanError::Persistence {
@@ -385,7 +467,6 @@ fn reconcile_workspace_with_before_commit<O: ReconciliationOperations>(
             source,
         })?;
 
-    let staged_index = build_reconciliation_index(&staged.workspace);
     let report = ReconciliationReport {
         added: staged.delta.additions.len(),
         removed: staged.delta.removals.len(),
@@ -404,6 +485,7 @@ fn collect_reconciliation_inventory<O: ReconciliationOperations>(
 ) -> Result<ReconciliationInventory, ScanError> {
     let mut inventory = BTreeMap::new();
     for absolute_path in operations.enumerate(root)? {
+        operations.checkpoint()?;
         let Some(relative_path) = eligible_relative_path(root, &absolute_path) else {
             continue;
         };
@@ -453,6 +535,7 @@ fn stage_reconciliation<O: ReconciliationOperations>(
             source: PortError::WriteFailed(source.to_string()),
         })?;
     for file in &removed_files {
+        operations.checkpoint()?;
         staged_workspace
             .remove(file.id)
             .expect("reconciliation removals originate from a live workspace snapshot");
@@ -460,6 +543,7 @@ fn stage_reconciliation<O: ReconciliationOperations>(
 
     let mut additions = Vec::with_capacity(added_paths.len());
     for path in added_paths {
+        operations.checkpoint()?;
         let (absolute_path, std_metadata) = inventory
             .get(&path)
             .expect("added paths originate from the completed inventory");
@@ -475,7 +559,7 @@ fn stage_reconciliation<O: ReconciliationOperations>(
         let metadata = FileMetadata {
             size: content.len() as u64,
             modified: modified_from_std(std_metadata),
-            content_hash: Some(operations.hash_content(&content)),
+            content_hash: Some(operations.hash_content_checked(&content)?),
         };
         let id = staged_workspace
             .insert(path, metadata)
@@ -499,12 +583,16 @@ fn stage_reconciliation<O: ReconciliationOperations>(
     })
 }
 
-fn build_reconciliation_index(workspace: &ProjectWorkspace) -> InvertedIndex {
+fn build_reconciliation_index(
+    workspace: &ProjectWorkspace,
+    operations: &impl ReconciliationOperations,
+) -> Result<InvertedIndex, ScanError> {
     let mut staged_index = InvertedIndex::new();
     for file in &workspace.snapshot().files {
+        operations.checkpoint()?;
         staged_index.insert(file.id, &tokenize(file.path.as_str()));
     }
-    staged_index
+    Ok(staged_index)
 }
 
 /// Scan `root`, indexing every eligible file.
@@ -926,4 +1014,94 @@ pub(crate) fn content_hash_of(bytes: &[u8]) -> ContentHash {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     ContentHash::new(out)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn cancellation_during_inventory_leaves_storage_and_workspace_untouched() {
+        struct CancelAfter {
+            steps: AtomicUsize,
+            real: RealReconciliationOperations<'static>,
+        }
+        impl ReconciliationOperations for CancelAfter {
+            fn checkpoint(&self) -> Result<(), ScanError> {
+                if self.steps.fetch_add(1, Ordering::SeqCst) >= 5 {
+                    Err(ScanError::Persistence {
+                        operation: "cancelled",
+                        source: PortError::ReadFailed("cancelled".into()),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            fn enumerate(&mut self, root: &Path) -> Result<Vec<PathBuf>, ScanError> {
+                self.real.enumerate(root)
+            }
+            fn metadata(&mut self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+                self.real.metadata(path)
+            }
+            fn read_content(&mut self, path: &Path) -> std::io::Result<Vec<u8>> {
+                self.real.read_content(path)
+            }
+            fn hash_content(&mut self, content: &[u8]) -> ContentHash {
+                self.real.hash_content(content)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..20 {
+            std::fs::write(root.path().join(format!("file{n}.rs")), "fn f() {}").unwrap();
+        }
+        let mut storage = crate::adapters::InMemoryStorage::new();
+        let mut workspace = ProjectWorkspace::new();
+        let mut index = InvertedIndex::new();
+        let mut operations = CancelAfter {
+            steps: AtomicUsize::new(0),
+            real: RealReconciliationOperations { cancelled: None },
+        };
+        let error = reconcile_workspace_with(
+            root.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+            &mut operations,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ScanError::Persistence {
+                operation: "cancelled",
+                ..
+            }
+        ));
+        assert!(workspace.snapshot().files.is_empty());
+        assert!(!storage.is_scan_complete().unwrap());
+    }
+
+    #[test]
+    fn cancellation_after_staging_prevents_atomic_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("new.rs"), "fn new() {}").unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut storage = crate::adapters::InMemoryStorage::new();
+        let mut workspace = ProjectWorkspace::new();
+        let mut index = InvertedIndex::new();
+        let result = reconcile_workspace_cancellable(
+            root.path(),
+            &mut storage,
+            &mut workspace,
+            &mut index,
+            &cancelled,
+            || {
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(workspace.snapshot().files.is_empty());
+        assert!(!storage.is_scan_complete().unwrap());
+    }
 }

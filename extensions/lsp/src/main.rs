@@ -94,6 +94,8 @@ fn main() {
 
     // Session pool — populated after initialize.
     let mut pool: Option<LspSessionPool> = None;
+    let mut backend_configured = false;
+    let mut processed_events = 0_u64;
 
     // Workspace root — set at initialize time from config.
     let mut workspace_root: PathBuf = PathBuf::from(".");
@@ -186,6 +188,7 @@ fn main() {
                         continue;
                     }
                 };
+                backend_configured = !lsp_config.servers.is_empty();
 
                 // Read workspace root from environment or default to CWD.
                 workspace_root = std::env::var("TOWER_WORKSPACE")
@@ -214,6 +217,11 @@ fn main() {
 
                 let result = InitResult {
                     tools: vec![
+                        ToolDecl {
+                            name: "_tower_catch_up_fence".to_owned(),
+                            description: "Host-internal catch-up ordering fence.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"epoch":{"type":"integer","minimum":0},"delivered_events":{"type":"integer","minimum":0}},"required":["epoch","delivered_events"],"additionalProperties":false}"#.to_owned(),
+                        },
                         ToolDecl {
                             name: "diagnostics".to_owned(),
                             description: "Run the configured language server over a file's current content and return compiler/linter diagnostics (errors and warnings). Use after editing a file to verify the change did not break it.".to_owned(),
@@ -284,7 +292,20 @@ fn main() {
                     .to_owned();
                 let tool_params = params_val.get("params").cloned().unwrap_or(Value::Null);
 
-                let result = if let Some(ref mut p) = pool {
+                let result = if tool_name == "_tower_catch_up_fence" {
+                    let epoch = tool_params.get("epoch").and_then(Value::as_u64);
+                    let delivered = tool_params.get("delivered_events").and_then(Value::as_u64);
+                    match (epoch, delivered) {
+                        (Some(epoch), Some(delivered_events)) => Ok(serde_json::json!({
+                            "epoch": epoch,
+                            "processed_events": processed_events,
+                            "ready": backend_configured && delivered_events == processed_events
+                        })),
+                        _ => Err(tools::ToolDispatchError::InvalidParams(
+                            "invalid catch-up fence parameters".to_owned(),
+                        )),
+                    }
+                } else if let Some(ref mut p) = pool {
                     tools::dispatch(
                         &tool_name,
                         tool_params,
@@ -321,6 +342,7 @@ fn main() {
                 // The host delivers fileChanged or fileDeleted events.
                 if let Some(ref mut p) = pool {
                     handle_event(params_val, p, &workspace_root);
+                    processed_events = processed_events.saturating_add(1);
                 }
                 protocol::send_response(&stdout_lock, &id, &Response::Ack);
             }
@@ -371,7 +393,7 @@ fn handle_event(params: Value, pool: &mut LspSessionPool, workspace_root: &std::
     }
 
     match event_type {
-        "FileChanged" => {
+        "FileIndexed" | "FileChanged" => {
             // Update the document in any session that handles this file's extension.
             pool.on_file_changed(path, workspace_root);
         }

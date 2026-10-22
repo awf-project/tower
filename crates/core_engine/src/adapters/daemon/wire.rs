@@ -9,11 +9,86 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::adapters::daemon::{
+    CapabilityReadiness, DaemonLifecycle, StartupFailureClass, StartupPhase,
+};
+use crate::domain::extension_host::ExtensionId;
+
+fn conservative_preparing() -> CapabilityReadiness {
+    CapabilityReadiness::Preparing {
+        phase: StartupPhase::OwnershipAcquired,
+    }
+}
+
+fn conservative_lifecycle() -> DaemonLifecycle {
+    DaemonLifecycle::Starting {
+        phase: StartupPhase::OwnershipAcquired,
+    }
+}
+
 /// Socket protocol version. Bump on any wire-format change.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Maximum handshake/control line length (bytes) before we give up.
 const MAX_LINE: usize = 4096;
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartupPhaseTiming {
+    pub phase: StartupPhase,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExtensionReplayMetrics {
+    pub extension_id: ExtensionId,
+    pub event_count: u64,
+    pub duration_ms: u64,
+    pub failure_class: Option<StartupFailureClass>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExtensionReplayMetricsWire {
+    extension_id: String,
+    event_count: u64,
+    duration_ms: u64,
+    failure_class: Option<StartupFailureClass>,
+}
+
+impl Serialize for ExtensionReplayMetrics {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ExtensionReplayMetricsWire {
+            extension_id: self.extension_id.as_str().to_owned(),
+            event_count: self.event_count,
+            duration_ms: self.duration_ms,
+            failure_class: self.failure_class,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionReplayMetrics {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ExtensionReplayMetricsWire::deserialize(deserializer)?;
+        Ok(Self {
+            extension_id: ExtensionId::new(wire.extension_id),
+            event_count: wire.event_count,
+            duration_ms: wire.duration_ms,
+            failure_class: wire.failure_class,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StartupInstrumentationSnapshot {
+    pub phases: Vec<StartupPhaseTiming>,
+    pub extension_replays: Vec<ExtensionReplayMetrics>,
+}
 
 /// What a connecting client wants to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +228,18 @@ pub struct StatusSnapshot {
     pub mcp_clients: usize,
     pub indexed_files: usize,
     pub extensions: Vec<String>,
+    #[serde(default)]
+    pub instrumentation: StartupInstrumentationSnapshot,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default = "conservative_lifecycle")]
+    pub lifecycle: DaemonLifecycle,
+    #[serde(default = "conservative_preparing")]
+    pub workspace: CapabilityReadiness,
+    #[serde(default = "conservative_preparing")]
+    pub ast: CapabilityReadiness,
+    #[serde(default = "conservative_preparing")]
+    pub lsp: CapabilityReadiness,
 }
 
 /// Reply to a [`ControlRequest`].

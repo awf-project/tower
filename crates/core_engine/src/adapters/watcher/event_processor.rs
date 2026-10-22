@@ -92,6 +92,8 @@ pub enum WatchEvent {
 /// Constructed once and shared with the watcher thread. Tests drive it
 /// directly by calling [`EventProcessor::process_event`] with synthetic events.
 pub struct EventProcessor {
+    publication: Option<Arc<crate::adapters::daemon::CommittedEventPublisher>>,
+    staged_delta: Arc<Mutex<Option<crate::ports::storage::ReconciliationDelta>>>,
     /// Absolute workspace root; events outside it are silently ignored (UN1/AC5).
     root: PathBuf,
     workspace: Arc<RwLock<ProjectWorkspace>>,
@@ -140,7 +142,14 @@ impl EventProcessor {
         let path_exclusion = WorkspacePathExclusion::new(root.clone())
             .ok()
             .map(|adapter| Arc::new(adapter) as Arc<dyn PathExclusionPort>);
+        let staged_delta = Arc::new(Mutex::new(None));
+        let storage = Box::new(super::staged_storage::StagedStorage::new(
+            storage,
+            Arc::clone(&staged_delta),
+        ));
         Self {
+            publication: None,
+            staged_delta,
             root,
             workspace,
             index,
@@ -201,11 +210,97 @@ impl EventProcessor {
     ///
     /// Errors from storage are returned but do not corrupt the in-memory state
     /// (the domain mutation has already committed).
+    pub(crate) fn with_publication(
+        mut self,
+        publication: Option<Arc<crate::adapters::daemon::CommittedEventPublisher>>,
+    ) -> Self {
+        self.publication = publication;
+        self
+    }
+
     pub fn process_event(&mut self, event: WatchEvent) -> Result<(), crate::ports::PortError> {
         if !self.coordinate_event(&event)? {
             return Ok(());
         }
+        let Some(publisher) = self.publication.clone() else {
+            return self.apply_event(event);
+        };
+        loop {
+            if self
+                .watcher_cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Ok(());
+            }
+            let cut = publisher.capture_cut().map_err(|_| {
+                crate::ports::PortError::WriteFailed("commit publication unavailable".to_owned())
+            })?;
 
+            // Event handlers work on an isolated allocator/index and stage storage
+            // writes. Only the successful atomic delta makes that state visible.
+            let snapshot = self
+                .workspace
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .snapshot();
+            let staged_workspace =
+                ProjectWorkspace::from_snapshot(snapshot).expect("valid live workspace snapshot");
+            let mut staged_index = InvertedIndex::new();
+            for file in staged_workspace.snapshot().files {
+                staged_index.insert(file.id, &tokenize(file.path.as_str()));
+            }
+            let workspace =
+                std::mem::replace(&mut self.workspace, Arc::new(RwLock::new(staged_workspace)));
+            let index = std::mem::replace(&mut self.index, Arc::new(RwLock::new(staged_index)));
+            let callbacks =
+                Arc::new(crate::adapters::daemon::publication::BufferedEvents::default());
+            let host = std::mem::replace(
+                &mut self.extension_host,
+                Box::new(ArcBufferedEvents(Arc::clone(&callbacks))),
+            );
+            *self.staged_delta.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(crate::ports::storage::ReconciliationDelta {
+                    additions: Vec::new(),
+                    removals: Vec::new(),
+                });
+            let result = self.apply_event(event.clone());
+            let delta = self
+                .staged_delta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .expect("active watcher transaction");
+            let staged_workspace = std::mem::replace(&mut self.workspace, workspace);
+            let staged_index = std::mem::replace(&mut self.index, index);
+            self.extension_host = host;
+            // All workspace-size staging and filesystem reads run outside the
+            // publication gate. Revalidate the cut before accepting even an error:
+            // a concurrent successful producer may have invalidated this snapshot.
+            let _commit = publisher.commit_lock();
+            if publisher.capture_cut().ok() != Some(cut) {
+                continue;
+            }
+            publisher.check_capacity().map_err(|_| {
+                crate::ports::PortError::WriteFailed("commit publication unavailable".to_owned())
+            })?;
+            result?;
+            // Only the existing atomic durable delta, state swap and enqueue retain
+            // the gate. Publisher metrics measure this unavoidable commit scope.
+            let mut workspace = self.workspace.write().unwrap_or_else(|p| p.into_inner());
+            let mut index = self.index.write().unwrap_or_else(|p| p.into_inner());
+            self.storage.apply_reconciliation_delta(&delta)?;
+            *workspace =
+                std::mem::take(&mut *staged_workspace.write().unwrap_or_else(|p| p.into_inner()));
+            *index = std::mem::take(&mut *staged_index.write().unwrap_or_else(|p| p.into_inner()));
+            publisher.commit_events(callbacks.take()).map_err(|_| {
+                crate::ports::PortError::WriteFailed("commit publication unavailable".to_owned())
+            })?;
+            return Ok(());
+        }
+    }
+
+    fn apply_event(&mut self, event: WatchEvent) -> Result<(), crate::ports::PortError> {
         match event {
             WatchEvent::Create(path) => self.handle_create(path),
             WatchEvent::Modify(path) => self.handle_modify(path),
@@ -258,8 +353,99 @@ impl EventProcessor {
         }
     }
 
+    fn reconcile_with_publication(
+        &mut self,
+        publisher: &crate::adapters::daemon::CommittedEventPublisher,
+    ) -> Result<ReconciliationReport, ScanError> {
+        let never_cancelled = AtomicBool::new(false);
+        let cancelled = self.watcher_cancelled.clone();
+        let cancelled = cancelled.as_deref().unwrap_or(&never_cancelled);
+        loop {
+            let cut = publisher
+                .capture_cut()
+                .map_err(|_| ScanError::Persistence {
+                    operation: "publication",
+                    source: crate::ports::PortError::ReadFailed("publication closed".into()),
+                })?;
+            let before = self
+                .workspace
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .snapshot();
+            let mut staged =
+                ProjectWorkspace::from_snapshot(before.clone()).expect("valid workspace snapshot");
+            let mut index = InvertedIndex::new();
+            *self.staged_delta.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(crate::ports::storage::ReconciliationDelta {
+                    additions: vec![],
+                    removals: vec![],
+                });
+            let report = scan::reconcile_workspace_cancellable(
+                &self.root,
+                self.storage.as_mut(),
+                &mut staged,
+                &mut index,
+                cancelled,
+                || Ok(()),
+            );
+            let delta = self
+                .staged_delta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .expect("active reconciliation");
+            let events =
+                crate::adapters::daemon::publication::snapshot_events(&before, &staged.snapshot());
+            let _commit = publisher.commit_lock();
+            if publisher.capture_cut().ok() != Some(cut) {
+                continue;
+            }
+            let report = report?;
+            publisher
+                .check_capacity()
+                .map_err(|_| ScanError::Persistence {
+                    operation: "publication",
+                    source: crate::ports::PortError::WriteFailed("publication closed".into()),
+                })?;
+            let mut workspace = self.workspace.write().unwrap_or_else(|p| p.into_inner());
+            let mut live_index = self.index.write().unwrap_or_else(|p| p.into_inner());
+            self.storage
+                .apply_reconciliation_delta(&delta)
+                .map_err(|source| ScanError::Persistence {
+                    operation: "apply_reconciliation_delta",
+                    source,
+                })?;
+            *workspace = staged;
+            *live_index = index;
+            publisher
+                .commit_events(events)
+                .map_err(|_| ScanError::Persistence {
+                    operation: "publication",
+                    source: crate::ports::PortError::WriteFailed("publication closed".into()),
+                })?;
+            return Ok(report);
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn reconcile_workspace(&mut self) -> Result<ReconciliationReport, ScanError> {
+        if let Some(publisher) = self.publication.clone() {
+            return self.reconcile_with_publication(&publisher);
+        }
+        let publication = self.publication.clone();
+        let _commit = publication
+            .as_ref()
+            .map(|publisher| publisher.commit_lock());
+        if let Some(publisher) = &publication {
+            publisher
+                .check_capacity()
+                .map_err(|_| ScanError::Persistence {
+                    operation: "publication",
+                    source: crate::ports::PortError::WriteFailed(
+                        "commit publication unavailable".to_owned(),
+                    ),
+                })?;
+        }
         let mut workspace = self
             .workspace
             .write()
@@ -268,13 +454,34 @@ impl EventProcessor {
             .index
             .write()
             .expect("index lock poisoned — unrecoverable");
-
-        scan::reconcile_workspace(
+        let before = workspace.snapshot();
+        let never_cancelled = AtomicBool::new(false);
+        let cancelled = self
+            .watcher_cancelled
+            .as_deref()
+            .unwrap_or(&never_cancelled);
+        let report = scan::reconcile_workspace_cancellable(
             &self.root,
             self.storage.as_mut(),
             &mut workspace,
             &mut index,
-        )
+            cancelled,
+            || Ok(()),
+        )?;
+        if let Some(publisher) = &publication {
+            publisher
+                .commit_events(crate::adapters::daemon::publication::snapshot_events(
+                    &before,
+                    &workspace.snapshot(),
+                ))
+                .map_err(|_| ScanError::Persistence {
+                    operation: "publication",
+                    source: crate::ports::PortError::WriteFailed(
+                        "commit publication unavailable".to_owned(),
+                    ),
+                })?;
+        }
+        Ok(report)
     }
 
     // ── Event handlers ────────────────────────────────────────────────────────
@@ -302,7 +509,13 @@ impl EventProcessor {
             return Ok(());
         }
 
-        let metadata = read_metadata(&abs_path);
+        // A queued create/modify may outlive a later native delete. Never
+        // resurrect a nonexistent path from default metadata.
+        if !abs_path.is_file() {
+            return self.handle_delete(abs_path);
+        }
+        let metadata =
+            read_identity_metadata(&abs_path).unwrap_or_else(|| read_metadata(&abs_path));
         let tokens = tokenize(rel_path.as_str());
 
         // ── Write lock: minimal critical section ──────────────────────────────
@@ -403,9 +616,24 @@ impl EventProcessor {
             return self.handle_delete(abs_path);
         }
 
-        let metadata = read_metadata(&abs_path);
+        // A queued create/modify may outlive a later native delete. Never
+        // resurrect a nonexistent path from default metadata.
+        if !abs_path.is_file() {
+            return self.handle_delete(abs_path);
+        }
+        let metadata =
+            read_identity_metadata(&abs_path).unwrap_or_else(|| read_metadata(&abs_path));
         let new_tokens = tokenize(rel_path.as_str());
 
+        let content_unchanged = {
+            let workspace = self.workspace.read().unwrap_or_else(|p| p.into_inner());
+            workspace
+                .get_by_path(&rel_path)
+                .and_then(|id| workspace.get(id).ok())
+                .is_some_and(|file| {
+                    file.content_hash.is_some() && file.content_hash == metadata.content_hash
+                })
+        };
         // ── Write lock ────────────────────────────────────────────────────────
         let (file_id, virtual_file) = {
             let mut ws = self
@@ -455,7 +683,9 @@ impl EventProcessor {
         }
 
         // OP1: broadcast after VFS update commits.
-        self.extension_host.on_file_changed(file_id, &rel_path);
+        if !content_unchanged {
+            self.extension_host.on_file_changed(file_id, &rel_path);
+        }
 
         Ok(())
     }
@@ -560,6 +790,13 @@ impl EventProcessor {
             return Ok(());
         }
 
+        // Atomic writes rename an unindexed shadow over an existing target.
+        // Reuse content-aware modify handling so native/formatter echoes are
+        // not published as a second committed content transition.
+        if from_rel.as_ref().is_some_and(is_tmp_artifact) {
+            return self.handle_modify(to);
+        }
+
         // If the destination is the root .towerignore, rebuild the matcher and
         // treat the source as moved away (delete it if it was tracked). The
         // .towerignore file itself is hidden and never indexed.
@@ -584,7 +821,10 @@ impl EventProcessor {
             return self.handle_create(to);
         };
 
-        let to_metadata = read_metadata(&to);
+        if !to.is_file() {
+            return self.handle_delete(from);
+        }
+        let to_metadata = read_identity_metadata(&to).unwrap_or_else(|| read_metadata(&to));
         let to_tokens = tokenize(to_rel_path.as_str());
 
         // ── Single write-lock critical section ────────────────────────────────
@@ -750,6 +990,29 @@ fn read_identity_metadata(abs: &Path) -> Option<FileMetadata> {
     Some(metadata)
 }
 
+struct ArcBufferedEvents(Arc<crate::adapters::daemon::publication::BufferedEvents>);
+impl ExtensionHostPort for ArcBufferedEvents {
+    fn on_file_indexed(&self, id: crate::domain::FileId, path: &RelativePath) {
+        self.0.on_file_indexed(id, path);
+    }
+    fn on_file_changed(&self, id: crate::domain::FileId, path: &RelativePath) {
+        self.0.on_file_changed(id, path);
+    }
+    fn on_file_deleted(&self, path: &RelativePath) {
+        self.0.on_file_deleted(path);
+    }
+    fn declared_tools(&self) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
+        Vec::new()
+    }
+    fn invoke(
+        &self,
+        name: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::domain::InvokeError> {
+        Err(crate::domain::InvokeError::ToolNotFound(name.to_owned()))
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -859,6 +1122,143 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         (processor, workspace, index)
+    }
+
+    #[test]
+    fn staging_does_not_hold_publication_gate_and_retries_concurrent_commits() {
+        struct BlockOnce {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            blocked: AtomicBool,
+        }
+        impl DocumentSyncPort for BlockOnce {
+            fn serves(&self, _: &RelativePath) -> bool {
+                true
+            }
+            fn document_opened(&self, _: &RelativePath, _: &str) {
+                if !self.blocked.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                }
+            }
+            fn document_changed(&self, _: &RelativePath, _: &str) {}
+            fn document_closed(&self, _: &RelativePath) {}
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (storage, ws, idx) =
+            crate::adapters::SledStorageAdapter::open(&root.path().join(".tower/db")).unwrap();
+        let workspace = Arc::new(RwLock::new(ws));
+        let index = Arc::new(RwLock::new(idx));
+        let publisher = Arc::new(crate::adapters::daemon::CommittedEventPublisher::new(1));
+        let (entered, observed) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let mut first = EventProcessor::new(
+            root.path().to_path_buf(),
+            Arc::clone(&workspace),
+            Arc::clone(&index),
+            Box::new(storage.try_clone()),
+            Box::new(NoOpExtensionHost),
+        )
+        .with_publication(Some(Arc::clone(&publisher)))
+        .with_document_sync(
+            Arc::new(BlockOnce {
+                entered,
+                release: Mutex::new(resumed),
+                blocked: AtomicBool::new(false),
+            }),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let mut second = EventProcessor::new(
+            root.path().to_path_buf(),
+            Arc::clone(&workspace),
+            Arc::clone(&index),
+            Box::new(storage),
+            Box::new(NoOpExtensionHost),
+        )
+        .with_publication(Some(Arc::clone(&publisher)));
+        let first_path = root.path().join("first.rs");
+        let second_path = root.path().join("second.rs");
+        std::fs::write(&first_path, "fn first() {}").unwrap();
+        std::fs::write(&second_path, "fn second() {}").unwrap();
+        let worker =
+            std::thread::spawn(move || first.process_event(WatchEvent::Create(first_path)));
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (committed, result) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let result = second.process_event(WatchEvent::Create(second_path));
+            committed.send(result).unwrap();
+        });
+        let concurrent = result.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        other.join().unwrap();
+        concurrent
+            .expect("another commit must finish while staging is blocked")
+            .unwrap();
+        let snapshot = workspace.read().unwrap().snapshot();
+        assert_eq!(snapshot.files.len(), 2, "retry preserves both commits");
+        assert_eq!(publisher.capture_cut().unwrap().sequence, 2);
+    }
+
+    #[test]
+    #[ignore = "manual real-storage publication contention evidence"]
+    fn publication_contention_evidence_on_real_storage() {
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..1396 {
+            std::fs::write(root.path().join(format!("file{n}.rs")), "fn seed() {}\n").unwrap();
+        }
+        let (storage, ws, idx) =
+            crate::adapters::SledStorageAdapter::open(&root.path().join(".tower/db")).unwrap();
+        let workspace = Arc::new(RwLock::new(ws));
+        let index = Arc::new(RwLock::new(idx));
+        let publisher = Arc::new(crate::adapters::daemon::CommittedEventPublisher::new(1));
+        let mut first = EventProcessor::new(
+            root.path().to_path_buf(),
+            Arc::clone(&workspace),
+            Arc::clone(&index),
+            Box::new(storage.try_clone()),
+            Box::new(NoOpExtensionHost),
+        )
+        .with_publication(Some(Arc::clone(&publisher)));
+        assert_eq!(first.reconcile_workspace().unwrap().added, 1396);
+        let mut second = EventProcessor::new(
+            root.path().to_path_buf(),
+            Arc::clone(&workspace),
+            Arc::clone(&index),
+            Box::new(storage),
+            Box::new(NoOpExtensionHost),
+        )
+        .with_publication(Some(Arc::clone(&publisher)));
+        let baseline = publisher.metrics();
+        let started = Instant::now();
+        let root_path = root.path();
+        std::thread::scope(|scope| {
+            for (processor, offset) in [(&mut first, 0), (&mut second, 32)] {
+                scope.spawn(move || {
+                    for n in offset..offset + 32 {
+                        let path = root_path.join(format!("file{n}.rs"));
+                        std::fs::write(&path, format!("fn changed_{n}() {{}}\n")).unwrap();
+                        processor.process_event(WatchEvent::Modify(path)).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(workspace.read().unwrap().snapshot().files.len(), 1396);
+        assert_eq!(publisher.capture_cut().unwrap().sequence, 65);
+        let metrics = publisher.metrics();
+        let evidence = serde_json::json!({"files":1396,"concurrent_producers":2,"successful_changes":64,"elapsed_ms":started.elapsed().as_millis(),"baseline":baseline,"final":metrics});
+        let encoded = serde_json::to_vec_pretty(&evidence).unwrap();
+        assert!(encoded.len() < 4096);
+        assert!(!String::from_utf8_lossy(&encoded).contains(root.path().to_str().unwrap()));
+        let destination = std::env::var_os("TOWER_COMMIT_EVIDENCE")
+            .expect("set TOWER_COMMIT_EVIDENCE to an absolute artifact path");
+        assert!(std::path::Path::new(&destination).is_absolute());
+        std::fs::write(destination, encoded).unwrap();
+        eprintln!("{evidence}");
     }
 
     #[test]
@@ -1392,6 +1792,50 @@ mod tests {
             &[RelativePath::new("tracked.rs")]
         );
         assert!(recording.changed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn journal_watcher_failure_keeps_committed_snapshot_and_watermark_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("failed.rs");
+        std::fs::write(&path, "pub fn failed() {}\n").unwrap();
+        let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
+        let index = Arc::new(RwLock::new(InvertedIndex::new()));
+        let mut storage = InMemoryStorage::new();
+        storage.fail_next_reconciliation_before_commit_for_test();
+        let publisher = Arc::new(crate::adapters::daemon::CommittedEventPublisher::new(11));
+        let mut processor = EventProcessor::new(
+            directory.path().to_path_buf(),
+            Arc::clone(&workspace),
+            Arc::clone(&index),
+            Box::new(storage),
+            Box::new(NoOpExtensionHost),
+        )
+        .with_publication(Some(Arc::clone(&publisher)));
+        assert!(
+            processor
+                .process_event(WatchEvent::Create(path.clone()))
+                .is_err()
+        );
+        assert!(workspace.read().unwrap().snapshot().files.is_empty());
+        assert_eq!(publisher.capture_cut().unwrap().sequence, 0);
+        processor
+            .process_event(WatchEvent::Create(path.clone()))
+            .unwrap();
+        assert_eq!(workspace.read().unwrap().snapshot().files.len(), 1);
+        assert_eq!(publisher.capture_cut().unwrap().sequence, 1);
+        // Duplicate OS notifications do not create duplicate committed events.
+        processor
+            .process_event(WatchEvent::Modify(path.clone()))
+            .unwrap();
+        assert_eq!(publisher.capture_cut().unwrap().sequence, 1);
+        std::fs::remove_file(&path).unwrap();
+        processor
+            .process_event(WatchEvent::Delete(path.clone()))
+            .unwrap();
+        processor.process_event(WatchEvent::Create(path)).unwrap();
+        assert!(workspace.read().unwrap().snapshot().files.is_empty());
+        assert_eq!(publisher.capture_cut().unwrap().sequence, 2);
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]

@@ -408,6 +408,13 @@ impl TraceStore {
     }
 
     fn load_completed_traces(&mut self) -> Result<(), TraceStoreError> {
+        self.load_completed_traces_with_reader(|path| fs::read(path))
+    }
+
+    fn load_completed_traces_with_reader(
+        &mut self,
+        mut read_metadata: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+    ) -> Result<(), TraceStoreError> {
         if !self.policy.trace_root.exists() {
             return Ok(());
         }
@@ -439,11 +446,18 @@ impl TraceStore {
                 continue;
             }
 
-            let metadata_bytes =
-                fs::read(&metadata_path).map_err(|error| TraceStoreError::MetadataReadFailed {
-                    trace_id: fallback_trace_id(),
-                    message: error.to_string(),
-                })?;
+            let metadata_bytes = match read_metadata(&metadata_path) {
+                Ok(bytes) => bytes,
+                // A trace can be pruned or deleted after directory discovery.
+                // Its disappearance is equivalent to an absent/in-progress trace.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(TraceStoreError::MetadataReadFailed {
+                        trace_id: fallback_trace_id(),
+                        message: error.to_string(),
+                    });
+                }
+            };
             if metadata_bytes.is_empty() {
                 continue;
             }
@@ -945,6 +959,38 @@ mod tests {
         let reopened = TraceStore::open(policy(root)).expect("open trace store");
 
         assert_eq!(reopened.list_traces().expect("list traces"), [trace]);
+    }
+
+    #[test]
+    fn traces_open_tolerates_metadata_deleted_between_discovery_and_read() {
+        let root = temp_trace_root("open-deleted-during-read");
+        let mut writer = TraceStore::new(policy(root.clone()));
+        let removed = register_trace(&mut writer, "removed", 100);
+        let survivor = register_trace(&mut writer, "survivor", 110);
+        let mut reopened = TraceStore::new(policy(root));
+        reopened
+            .load_completed_traces_with_reader(|path| {
+                if path.parent() == Some(Path::new(&removed.path)) {
+                    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+                }
+                fs::read(path)
+            })
+            .expect("concurrent deletion must not fail initialization");
+        assert_eq!(reopened.list_traces().unwrap(), [survivor]);
+    }
+
+    #[test]
+    fn traces_open_preserves_metadata_read_errors_other_than_not_found() {
+        let root = temp_trace_root("open-read-denied");
+        let mut writer = TraceStore::new(policy(root.clone()));
+        register_trace(&mut writer, "unreadable", 100);
+        let mut reopened = TraceStore::new(policy(root));
+        let error = reopened
+            .load_completed_traces_with_reader(|_| {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+            .expect_err("non-transient read errors must remain visible");
+        assert!(matches!(error, TraceStoreError::MetadataReadFailed { .. }));
     }
 
     #[test]

@@ -191,7 +191,11 @@ fn tool_search_symbols(
     params: serde_json::Value,
     index: &Mutex<SymbolIndex>,
 ) -> Result<serde_json::Value, String> {
-    let name = extract_str(&params, "name")?;
+    let name = params
+        .get("name")
+        .or_else(|| params.get("query"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing or non-string required field 'name'".to_owned())?;
     // kind is optional; wrong type → error.
     let kind_opt = extract_optional_str(&params, "kind")?;
 

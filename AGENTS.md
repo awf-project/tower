@@ -53,7 +53,8 @@ tower shutdown                               # stop the running daemon
 ```
 
 **Definition of "stable" / done** for any change: `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings`
-+ `cargo build --workspace --bins` + `cargo test --workspace` all green. State it with evidence, never assume.
+
+- `cargo build --workspace --bins` + `cargo test --workspace` all green. State it with evidence, never assume.
 
 ## MCP tool surface (JSON-RPC over stdio)
 
@@ -73,43 +74,43 @@ write is rejected with `PreconditionFailed` if the file changed since it was rea
 
 ### VFS — files & search (host-side)
 
-| Tool | Purpose |
-|------|---------|
-| `tower_read_file` | Read raw UTF-8; `with_version: true` returns a `version` CAS token. |
-| `tower_create_file` | Create/overwrite with `content`; CAS via `expected_version`. |
-| `tower_edit_range` | Splice `replacement` into byte range `[start_byte, end_byte)` (UTF-8 boundaries; empty = delete; equal bytes = insert); atomic commit; CAS. |
-| `tower_global_replace` | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
-| `tower_create_directory` | Recursive `mkdir`. |
-| `tower_delete_file` | Delete a file. |
-| `tower_list_dir` | List indexed files and synthesized directories under a workspace-relative directory path. |
-| `tower_find_file` | Match a substring/fuzzy `query` against file paths. |
-| `tower_search_text` | Grep `pattern` across all indexed file contents. |
-| `tower_reindex` | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete). |
+| Tool                     | Purpose                                                                                                                                                                                                  |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tower_read_file`        | Read raw UTF-8; `with_version: true` returns a `version` CAS token.                                                                                                                                      |
+| `tower_create_file`      | Create/overwrite with `content`; CAS via `expected_version`.                                                                                                                                             |
+| `tower_edit_range`       | Splice `replacement` into byte range `[start_byte, end_byte)` (UTF-8 boundaries; empty = delete; equal bytes = insert); atomic commit; CAS.                                                              |
+| `tower_global_replace`   | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
+| `tower_create_directory` | Recursive `mkdir`.                                                                                                                                                                                       |
+| `tower_delete_file`      | Delete a file.                                                                                                                                                                                           |
+| `tower_list_dir`         | List indexed files and synthesized directories under a workspace-relative directory path.                                                                                                                |
+| `tower_find_file`        | Match a substring/fuzzy `query` against file paths.                                                                                                                                                      |
+| `tower_search_text`      | Grep `pattern` across all indexed file contents.                                                                                                                                                         |
+| `tower_reindex`          | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete).                                                                                                          |
 
 ### AST — structural navigation (`ast` extension, spec 26)
 
 Tree-sitter backed; error-tolerant so comments/strings yield no false positives. Supports `.rs`, `.go`, `.php`.
 Symbol kinds: `function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class`.
 
-| Tool | Purpose |
-|------|---------|
-| `tower_ast_get_outline` | Structural outline (functions, structs, methods, traits, enums, impl blocks) of one file. |
-| `tower_ast_find_symbols` | Precise definition locations of a named symbol of a given `kind` within one file. |
-| `tower_ast_read_symbol` | Read only a named symbol's source span (byte slice + kind + start/end rows), not the whole file. |
+| Tool                       | Purpose                                                                                                  |
+| -------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `tower_ast_get_outline`    | Structural outline (functions, structs, methods, traits, enums, impl blocks) of one file.                |
+| `tower_ast_find_symbols`   | Precise definition locations of a named symbol of a given `kind` within one file.                        |
+| `tower_ast_read_symbol`    | Read only a named symbol's source span (byte slice + kind + start/end rows), not the whole file.         |
 | `tower_ast_search_symbols` | Cross-file lookup against the in-memory symbol index (kept fresh by `fileIndexed`/`fileChanged` events). |
-| `tower_ast_reindex` | Force a full whole-project symbol reindex (cold cache / large external change). |
+| `tower_ast_reindex`        | Force a full whole-project symbol reindex (cold cache / large external change).                          |
 
 ### LSP — semantic queries (`lsp` extension, spec 27)
 
 Require a configured language server for the file extension (`[lsp.<lang>]` in `.tower/config.toml`).
 Positions are **0-based** `line` + **UTF-16** `character` offset.
 
-| Tool | Purpose |
-|------|---------|
-| `tower_lsp_definition` | Go to definition of the symbol at a position. |
-| `tower_lsp_references` | Find all references to the symbol at a position. |
-| `tower_lsp_hover` | Hover info for the symbol at a position. |
-| `tower_lsp_diagnostics` | Errors/warnings for a file. |
+| Tool                    | Purpose                                          |
+| ----------------------- | ------------------------------------------------ |
+| `tower_lsp_definition`  | Go to definition of the symbol at a position.    |
+| `tower_lsp_references`  | Find all references to the symbol at a position. |
+| `tower_lsp_hover`       | Hover info for the symbol at a position.         |
+| `tower_lsp_diagnostics` | Errors/warnings for a file.                      |
 
 ### Debug — interactive sessions and reverse debugging (`debug` extension, spec 33)
 
@@ -119,45 +120,45 @@ enabled. A discovered `debug` extension takes priority; otherwise the bundled si
 `[debug.record] backend = "rr"` is configured; unsupported rr hosts return structured tool payloads
 rather than transport errors.
 
-| Tool | Purpose |
-|------|---------|
-| `tower_debug_launch` | Launch a configured Debug Adapter Protocol session; returns `session_id` and initial stop state. |
-| `tower_debug_set_breakpoints` | Replace the breakpoint set for a source path within a session. |
-| `tower_debug_continue` | Resume execution until stop, termination, or timeout. |
-| `tower_debug_step` | Step execution for a session/thread until the adapter reports a stop. |
-| `tower_debug_pause` | Pause a running session/thread. |
-| `tower_debug_threads` | List threads for a debug session. |
-| `tower_debug_stack` | Read stack frames for a thread. |
-| `tower_debug_variables` | Read variables for a DAP variables reference. |
-| `tower_debug_evaluate` | Evaluate an expression in a stack frame. |
-| `tower_debug_eval_at` | Run a stateless one-shot breakpoint probe and capture bounded stack/variable evidence. |
-| `tower_debug_record` | Record one native execution through rr and register a trace. |
-| `tower_debug_replay` | Open a replay-backed debug session for a recorded trace. |
-| `tower_debug_reverse_continue` | Continue a replay session backward until a stop, trace start, or timeout. |
-| `tower_debug_step_back` | Step a replay session backward by line, instruction, or over granularity. |
-| `tower_debug_watchpoint` | Set a replay-session data watchpoint by expression or address. |
-| `tower_debug_traces` | List recorded debug traces known to the sidecar trace store. |
-| `tower_debug_delete_trace` | Delete a recorded trace by id, contained to the configured trace root. |
-| `tower_debug_find_origin` | Open replay, seek, set a write watchpoint, reverse-continue, capture origin evidence, and clean up. |
-| `tower_debug_record_and_find_origin` | Record a trace and immediately run the origin-finding recipe against it. |
-| `tower_debug_terminate` | Terminate a debug session and clean up the adapter process. |
-| `tower_debug_disconnect` | Disconnect from a debug session. |
-| `tower_debug_sessions` | List active debug sessions and their last known state. |
+| Tool                                 | Purpose                                                                                             |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `tower_debug_launch`                 | Launch a configured Debug Adapter Protocol session; returns `session_id` and initial stop state.    |
+| `tower_debug_set_breakpoints`        | Replace the breakpoint set for a source path within a session.                                      |
+| `tower_debug_continue`               | Resume execution until stop, termination, or timeout.                                               |
+| `tower_debug_step`                   | Step execution for a session/thread until the adapter reports a stop.                               |
+| `tower_debug_pause`                  | Pause a running session/thread.                                                                     |
+| `tower_debug_threads`                | List threads for a debug session.                                                                   |
+| `tower_debug_stack`                  | Read stack frames for a thread.                                                                     |
+| `tower_debug_variables`              | Read variables for a DAP variables reference.                                                       |
+| `tower_debug_evaluate`               | Evaluate an expression in a stack frame.                                                            |
+| `tower_debug_eval_at`                | Run a stateless one-shot breakpoint probe and capture bounded stack/variable evidence.              |
+| `tower_debug_record`                 | Record one native execution through rr and register a trace.                                        |
+| `tower_debug_replay`                 | Open a replay-backed debug session for a recorded trace.                                            |
+| `tower_debug_reverse_continue`       | Continue a replay session backward until a stop, trace start, or timeout.                           |
+| `tower_debug_step_back`              | Step a replay session backward by line, instruction, or over granularity.                           |
+| `tower_debug_watchpoint`             | Set a replay-session data watchpoint by expression or address.                                      |
+| `tower_debug_traces`                 | List recorded debug traces known to the sidecar trace store.                                        |
+| `tower_debug_delete_trace`           | Delete a recorded trace by id, contained to the configured trace root.                              |
+| `tower_debug_find_origin`            | Open replay, seek, set a write watchpoint, reverse-continue, capture origin evidence, and clean up. |
+| `tower_debug_record_and_find_origin` | Record a trace and immediately run the origin-finding recipe against it.                            |
+| `tower_debug_terminate`              | Terminate a debug session and clean up the adapter process.                                         |
+| `tower_debug_disconnect`             | Disconnect from a debug session.                                                                    |
+| `tower_debug_sessions`               | List active debug sessions and their last known state.                                              |
 
 ### Linting (`lint` extension)
 
 Runs configured linters from `.tower/config.toml`; unsupported paths return a successful unsupported
 result rather than a transport error.
 
-| Tool | Purpose |
-|------|---------|
+| Tool               | Purpose                                                                                                        |
+| ------------------ | -------------------------------------------------------------------------------------------------------------- |
 | `tower_lint_check` | Run configured linters for one workspace-relative path, or all supported indexed files when `path` is omitted. |
-| `tower_lint_fix` | Apply structured lint fixes for one path or all supported indexed files; supports `dry_run` and `unsafe`. |
+| `tower_lint_fix`   | Apply structured lint fixes for one path or all supported indexed files; supports `dry_run` and `unsafe`.      |
 
 ### Formatting
 
-| Tool | Purpose |
-|------|---------|
+| Tool               | Purpose                                                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `tower_fmt_format` | Enqueue format jobs; `{path}` formats one file, `{}` formats all indexed files. Returns `{requested, accepted, dropped}` immediately — does **not** wait for completion. |
 
 ## Non-negotiable invariants
@@ -214,17 +215,21 @@ This project uses ZPM memory segments as its knowledge base. **Query ZPM before 
 
 ### Segments
 
-| Segment | Purpose | Mount |
-|---------|---------|-------|
-| `default` | Project knowledge: ADRs, decisions, observations, conventions, architecture facts | auto |
-| `feedback` | Learned rules from past implementations/reviews — queryable by file pattern | auto |
-| `pr_<branch>` | PR tracking: TODOs, stubs, mocks, blocking issues, completion gate | per-implementation |
+| Segment        | Purpose                                                                           | Mount              |
+| -------------- | --------------------------------------------------------------------------------- | ------------------ |
+| `default`      | Project knowledge: ADRs, decisions, observations, conventions, architecture facts | auto               |
+| `feedback`     | Learned rules from past implementations/reviews — queryable by file pattern       | auto               |
+| `architecture` | Durable components, ports, decisions and conventions promoted across PRs          | auto               |
+| `pr_<branch>`  | PR tracking: TODOs, stubs, mocks, blocking issues, completion gate                | per-implementation |
 
 ### Read before acting
 
 ```bash
 # What decisions exist about this area?
-zpm query-logic --goal "decision(Id, What, Why)" --memory default
+zpm query-logic --goal "decision(Id, What, Why, TradeOff)" --memory default
+# What architecture decisions and conventions must be preserved?
+zpm query-logic --goal "arch_decision(Id, Topic, Choice, Rationale, PR)" --memory architecture
+zpm query-logic --goal "arch_convention(Id, Scope, Rule, PR)" --memory architecture
 # What feedback rules apply to files I'm touching?
 zpm query-logic --goal "rule(Id, Cat, Desc, Prio, Src)" --memory feedback
 # What rules apply specifically to a file/directory?
@@ -274,7 +279,6 @@ Query: `zpm query-logic --goal "rule(Id, pitfall, Desc, Prio, Src)" --memory fee
 
 Query: `zpm query-logic --goal "rule(Id, review, Desc, Prio, Src)" --memory feedback`
 
-
 ## Tower MCP Server (code intelligence)
 
 This project is indexed by the [tower](https://github.com/awf-project/tower) MCP server, which
@@ -288,43 +292,43 @@ Mutating tools accept an optional `expected_version` (hex SHA-256 from a prior `
 
 ### VFS — files & search (host-side)
 
-| Tool | Purpose |
-|------|---------|
-| `tower_read_file` | Read raw UTF-8; `with_version: true` returns a `version` CAS token. |
-| `tower_create_file` | Create/overwrite with `content`; CAS via `expected_version`. |
-| `tower_edit_range` | Splice `replacement` into byte range `[start_byte, end_byte)` (UTF-8 boundaries; empty = delete; equal bytes = insert); atomic commit; CAS. |
-| `tower_global_replace` | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
-| `tower_create_directory` | Recursive `mkdir`. |
-| `tower_delete_file` | Delete a file. |
-| `tower_list_dir` | List indexed files and synthesized directories under a workspace-relative directory path. |
-| `tower_find_file` | Match a substring/fuzzy `query` against file paths. |
-| `tower_search_text` | Grep `pattern` across all indexed file contents. |
-| `tower_reindex` | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete). |
+| Tool                     | Purpose                                                                                                                                                                                                  |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tower_read_file`        | Read raw UTF-8; `with_version: true` returns a `version` CAS token.                                                                                                                                      |
+| `tower_create_file`      | Create/overwrite with `content`; CAS via `expected_version`.                                                                                                                                             |
+| `tower_edit_range`       | Splice `replacement` into byte range `[start_byte, end_byte)` (UTF-8 boundaries; empty = delete; equal bytes = insert); atomic commit; CAS.                                                              |
+| `tower_global_replace`   | Replace every `target` with `replacement` across all indexed files; per-file CAS via `expected_versions` map (path → SHA-256) — conflicts land in `TxReport.errors`, non-conflicting files still commit. |
+| `tower_create_directory` | Recursive `mkdir`.                                                                                                                                                                                       |
+| `tower_delete_file`      | Delete a file.                                                                                                                                                                                           |
+| `tower_list_dir`         | List indexed files and synthesized directories under a workspace-relative directory path.                                                                                                                |
+| `tower_find_file`        | Match a substring/fuzzy `query` against file paths.                                                                                                                                                      |
+| `tower_search_text`      | Grep `pattern` across all indexed file contents.                                                                                                                                                         |
+| `tower_reindex`          | Full workspace re-scan; rebuild file + text-search indexes (reconciles external create/delete).                                                                                                          |
 
 ### AST — structural navigation (`ast` extension)
 
 Tree-sitter backed; error-tolerant so comments/strings yield no false positives. Supports `.rs`, `.go`, `.php`.
 Symbol kinds: `function|struct|enum|trait|impl|method|module|type_alias|const|static|macro_def|class`.
 
-| Tool | Purpose |
-|------|---------|
-| `tower_ast_get_outline` | Structural outline (functions, structs, methods, traits, enums, impl blocks) of one file. |
-| `tower_ast_find_symbols` | Precise definition locations of a named symbol of a given `kind` within one file. |
-| `tower_ast_read_symbol` | Read only a named symbol's source span (byte slice + kind + start/end rows), not the whole file. |
+| Tool                       | Purpose                                                                                                  |
+| -------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `tower_ast_get_outline`    | Structural outline (functions, structs, methods, traits, enums, impl blocks) of one file.                |
+| `tower_ast_find_symbols`   | Precise definition locations of a named symbol of a given `kind` within one file.                        |
+| `tower_ast_read_symbol`    | Read only a named symbol's source span (byte slice + kind + start/end rows), not the whole file.         |
 | `tower_ast_search_symbols` | Cross-file lookup against the in-memory symbol index (kept fresh by `fileIndexed`/`fileChanged` events). |
-| `tower_ast_reindex` | Force a full whole-project symbol reindex (cold cache / large external change). |
+| `tower_ast_reindex`        | Force a full whole-project symbol reindex (cold cache / large external change).                          |
 
 ### LSP — semantic queries (`lsp` extension)
 
 Require a configured language server for the file extension (`[lsp.<lang>]` in `.tower/config.toml`).
 Positions are **0-based** `line` + **UTF-16** `character` offset.
 
-| Tool | Purpose |
-|------|---------|
-| `tower_lsp_definition` | Go to definition of the symbol at a position. |
-| `tower_lsp_references` | Find all references to the symbol at a position. |
-| `tower_lsp_hover` | Hover info for the symbol at a position. |
-| `tower_lsp_diagnostics` | Errors/warnings for a file. |
+| Tool                    | Purpose                                          |
+| ----------------------- | ------------------------------------------------ |
+| `tower_lsp_definition`  | Go to definition of the symbol at a position.    |
+| `tower_lsp_references`  | Find all references to the symbol at a position. |
+| `tower_lsp_hover`       | Hover info for the symbol at a position.         |
+| `tower_lsp_diagnostics` | Errors/warnings for a file.                      |
 
 ### Debug — interactive sessions and reverse debugging (`debug` extension)
 
@@ -334,43 +338,43 @@ enabled. A discovered `debug` extension takes priority; otherwise the bundled si
 `[debug.record] backend = "rr"` is configured; unsupported rr hosts return structured tool payloads
 rather than transport errors.
 
-| Tool | Purpose |
-|------|---------|
-| `tower_debug_launch` | Launch a configured Debug Adapter Protocol session; returns `session_id` and initial stop state. |
-| `tower_debug_set_breakpoints` | Replace the breakpoint set for a source path within a session. |
-| `tower_debug_continue` | Resume execution until stop, termination, or timeout. |
-| `tower_debug_step` | Step execution for a session/thread until the adapter reports a stop. |
-| `tower_debug_pause` | Pause a running session/thread. |
-| `tower_debug_threads` | List threads for a debug session. |
-| `tower_debug_stack` | Read stack frames for a thread. |
-| `tower_debug_variables` | Read variables for a DAP variables reference. |
-| `tower_debug_evaluate` | Evaluate an expression in a stack frame. |
-| `tower_debug_eval_at` | Run a stateless one-shot breakpoint probe and capture bounded stack/variable evidence. |
-| `tower_debug_record` | Record one native execution through rr and register a trace. |
-| `tower_debug_replay` | Open a replay-backed debug session for a recorded trace. |
-| `tower_debug_reverse_continue` | Continue a replay session backward until a stop, trace start, or timeout. |
-| `tower_debug_step_back` | Step a replay session backward by line, instruction, or over granularity. |
-| `tower_debug_watchpoint` | Set a replay-session data watchpoint by expression or address. |
-| `tower_debug_traces` | List recorded debug traces known to the sidecar trace store. |
-| `tower_debug_delete_trace` | Delete a recorded trace by id, contained to the configured trace root. |
-| `tower_debug_find_origin` | Open replay, seek, set a write watchpoint, reverse-continue, capture origin evidence, and clean up. |
-| `tower_debug_record_and_find_origin` | Record a trace and immediately run the origin-finding recipe against it. |
-| `tower_debug_terminate` | Terminate a debug session and clean up the adapter process. |
-| `tower_debug_disconnect` | Disconnect from a debug session. |
-| `tower_debug_sessions` | List active debug sessions and their last known state. |
+| Tool                                 | Purpose                                                                                             |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `tower_debug_launch`                 | Launch a configured Debug Adapter Protocol session; returns `session_id` and initial stop state.    |
+| `tower_debug_set_breakpoints`        | Replace the breakpoint set for a source path within a session.                                      |
+| `tower_debug_continue`               | Resume execution until stop, termination, or timeout.                                               |
+| `tower_debug_step`                   | Step execution for a session/thread until the adapter reports a stop.                               |
+| `tower_debug_pause`                  | Pause a running session/thread.                                                                     |
+| `tower_debug_threads`                | List threads for a debug session.                                                                   |
+| `tower_debug_stack`                  | Read stack frames for a thread.                                                                     |
+| `tower_debug_variables`              | Read variables for a DAP variables reference.                                                       |
+| `tower_debug_evaluate`               | Evaluate an expression in a stack frame.                                                            |
+| `tower_debug_eval_at`                | Run a stateless one-shot breakpoint probe and capture bounded stack/variable evidence.              |
+| `tower_debug_record`                 | Record one native execution through rr and register a trace.                                        |
+| `tower_debug_replay`                 | Open a replay-backed debug session for a recorded trace.                                            |
+| `tower_debug_reverse_continue`       | Continue a replay session backward until a stop, trace start, or timeout.                           |
+| `tower_debug_step_back`              | Step a replay session backward by line, instruction, or over granularity.                           |
+| `tower_debug_watchpoint`             | Set a replay-session data watchpoint by expression or address.                                      |
+| `tower_debug_traces`                 | List recorded debug traces known to the sidecar trace store.                                        |
+| `tower_debug_delete_trace`           | Delete a recorded trace by id, contained to the configured trace root.                              |
+| `tower_debug_find_origin`            | Open replay, seek, set a write watchpoint, reverse-continue, capture origin evidence, and clean up. |
+| `tower_debug_record_and_find_origin` | Record a trace and immediately run the origin-finding recipe against it.                            |
+| `tower_debug_terminate`              | Terminate a debug session and clean up the adapter process.                                         |
+| `tower_debug_disconnect`             | Disconnect from a debug session.                                                                    |
+| `tower_debug_sessions`               | List active debug sessions and their last known state.                                              |
 
 ### Linting (`lint` extension)
 
 Runs configured linters from `.tower/config.toml`; unsupported paths return a successful unsupported
 result rather than a transport error.
 
-| Tool | Purpose |
-|------|---------|
+| Tool               | Purpose                                                                                                        |
+| ------------------ | -------------------------------------------------------------------------------------------------------------- |
 | `tower_lint_check` | Run configured linters for one workspace-relative path, or all supported indexed files when `path` is omitted. |
-| `tower_lint_fix` | Apply structured lint fixes for one path or all supported indexed files; supports `dry_run` and `unsafe`. |
+| `tower_lint_fix`   | Apply structured lint fixes for one path or all supported indexed files; supports `dry_run` and `unsafe`.      |
 
 ### Formatting
 
-| Tool | Purpose |
-|------|---------|
+| Tool               | Purpose                                                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `tower_fmt_format` | Enqueue format jobs; `{path}` formats one file, `{}` formats all indexed files. Returns `{requested, accepted, dropped}` immediately — does **not** wait for completion. |

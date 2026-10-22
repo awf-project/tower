@@ -718,9 +718,16 @@ fn mutation_failures_distinguish_preflight_rejection_from_partial_commit() {
     assert_ne!(after["reads"][0]["version"], before["reads"][0]["version"]);
     assert_eq!(after["reads"][1], before["reads"][1]);
     assert_eq!(after["reads"][2], before["reads"][2]);
-    // The persisted VirtualFile record stores stable identity metadata; file
-    // bytes and their versions are verified through the public read above.
-    assert_eq!(after["storage"][0], before["storage"][0]);
+    // A committed edit preserves identity while persisting the new content's
+    // metadata. Failed/unattempted targets retain their complete old records.
+    assert_eq!(after["storage"][0]["id"], before["storage"][0]["id"]);
+    assert_eq!(after["storage"][0]["path"], before["storage"][0]["path"]);
+    assert_eq!(after["storage"][0]["size"], 0);
+    use sha2::Digest as _;
+    assert_eq!(
+        after["storage"][0]["content_hash"],
+        json!(sha2::Sha256::digest(b"").to_vec())
+    );
     assert_eq!(after["storage"][1], before["storage"][1]);
     assert_eq!(after["storage"][2], before["storage"][2]);
     assert_ne!(after["target_search"], before["target_search"]);

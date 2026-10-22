@@ -116,7 +116,13 @@ impl SessionRegistry {
         };
         for peer in targets {
             let params = ResourceUpdatedNotificationParam::new(uri.to_owned());
-            let _ = rt.block_on(peer.notify_resource_updated(params));
+            let _ = rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    peer.notify_resource_updated(params),
+                )
+                .await
+            });
         }
     }
 }

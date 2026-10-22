@@ -44,8 +44,32 @@ temporary file is passed to the command). Use `{path}` where the command needs t
 The generated configuration includes the standard formatter mappings; edit or remove them for a
 project's toolchain.
 
-Other supported top-level sections configure language servers, linters, debugging, and daemon
-behavior. See the relevant reference pages and the generated comments for their fields.
+The daemon has separate connection and preparation deadlines. The connection deadline only covers
+locating or spawning the workspace daemon; it does not cancel preparation already owned by that
+daemon. The preparation deadline bounds a workspace-dependent request while reconciliation or
+capability catch-up is still running.
+
+```toml
+[daemon]
+idle_timeout_secs = 30
+connection_timeout_secs = 10
+preparation_timeout_secs = 10
+```
+
+The built-in `ast` and `lsp` sidecars already have readiness families. Additional sidecars can be
+mapped by manifest name to `ast` or `lsp`:
+
+```toml
+[extensions.readiness]
+my_ast_extension = "ast"
+```
+
+`readiness_controls` is for an extension that implements a non-exhaustive public control callable
+while catch-up is in progress. It cannot be configured for the built-in `ast` or `lsp` sidecars.
+
+Other supported top-level sections configure language servers, linters, and debugging. See the
+relevant reference pages and generated comments for their fields. Configuration is strict: unknown
+keys and zero-valued daemon deadlines fail startup.
 
 ## Migrate legacy configuration manually
 
@@ -58,7 +82,17 @@ Replace extension settings with `[extensions]` (including `disabled`) and format
 user to review and edit the configuration. After replacing the legacy sections, rerun the daemon;
 malformed TOML and unknown keys remain errors.
 
-## Startup recovery
+## Startup and recovery
+
+The daemon acquires workspace lifetime ownership and binds its local transport before opening the
+index or preparing extensions. This lets `tower mcp` initialize promptly while preparation continues;
+a client timeout does not release daemon ownership or start a competing Sled owner. Use
+`tower status` to inspect the current generation and readiness of the workspace, AST, and LSP
+families.
+
+Workspace-dependent calls are gated independently. During preparation they either wait up to
+`preparation_timeout_secs` or return structured readiness errors. A configured capability that fails
+is reported as degraded or failed; an absent or disabled capability is reported as unavailable.
 
 The daemon reconciles the eligible filesystem inventory with the persisted index on every startup,
 even if a previous scan-completion marker exists. It uses `.towerignore` and the same eligibility

@@ -1,4 +1,5 @@
 // Feature: F009
+// Feature: B001
 //! End-to-end integration tests for the `ast` native extension (spec 26).
 //!
 //! # What this verifies
@@ -134,7 +135,7 @@ impl RawAstChild {
         );
     }
 
-    fn initialize(&mut self) {
+    fn initialize(&mut self) -> serde_json::Value {
         self.write_frame(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -154,6 +155,7 @@ impl RawAstChild {
         let initialized = self.read_frame();
         assert_eq!(initialized["id"], 1);
         assert_eq!(initialized["result"]["type"], "Initialized");
+        initialized
     }
 
     fn invoke_planner_with_content(
@@ -311,6 +313,38 @@ fn ast_symbol_search(workspace: &Path, symbol: &str) -> serde_json::Value {
     stream
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
         .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // MCP initialization is independent of discovery. Wait for the public
+    // exhaustive declaration before asserting semantic freshness.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}})
+        )
+        .unwrap();
+        let inventory = loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if frame["id"] == 3 {
+                break frame;
+            }
+        };
+        if inventory["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "tower_ast_search_symbols")
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{inventory}");
+        thread::sleep(Duration::from_millis(10));
+    }
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -450,6 +484,77 @@ fn safe_delete_planner(
         })
         .expect("fileIndexed must seed AST index");
     (adapter, fs, apply_calls)
+}
+
+#[test]
+fn catch_up_ast_fence_observes_updated_symbol_index() {
+    let (mut adapter, fs, _) = safe_delete_planner(b"pub fn before_catch_up() {}\n");
+    fs.lock()
+        .expect("lock AST fixture filesystem")
+        .write(
+            RelativePath::new("src/lib.rs"),
+            b"pub fn after_catch_up() {}\n".to_vec(),
+        )
+        .expect("commit changed source");
+    adapter
+        .deliver_event(Event::FileChanged {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("deliver committed change");
+
+    let fence = adapter
+        .call_tool(
+            "_tower_catch_up_fence",
+            serde_json::json!({"epoch": 41, "delivered_events": 2}),
+        )
+        .expect("AST catch-up fence is declared and handled");
+    assert_eq!(
+        fence,
+        serde_json::json!({"epoch": 41, "processed_events": 2, "ready": true})
+    );
+
+    let symbols = adapter
+        .call_tool(
+            "search_symbols",
+            serde_json::json!({"query": "after_catch_up", "kind": "function"}),
+        )
+        .expect("query AST index after ready fence");
+    assert!(
+        symbols.to_string().contains("after_catch_up"),
+        "ready fence acknowledged before the changed symbol was searchable: {symbols}"
+    );
+    assert!(!symbols.to_string().contains("before_catch_up"));
+
+    // Validate the fence at its actual protocol boundary as well: a sidecar
+    // must advertise the private control, and an epoch/count that was never
+    // delivered cannot turn the capability ready.
+    let mut raw = RawAstChild::spawn();
+    let initialized = raw.initialize();
+    assert!(
+        initialized["result"]["data"]["tools"]
+            .as_array()
+            .expect("AST initialized tools must be an array")
+            .iter()
+            .any(|tool| tool["name"] == "_tower_catch_up_fence"),
+        "the AST sidecar must declare its private catch-up fence"
+    );
+    raw.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "invokeTool",
+        "params": {
+            "name": "_tower_catch_up_fence",
+            "params": {"epoch": 42, "delivered_events": 1}
+        }
+    }));
+    let rejected = raw.read_frame();
+    assert_eq!(rejected["id"], 42);
+    assert!(
+        rejected.get("error").is_some()
+            || rejected["result"]["data"]["ready"] == serde_json::json!(false),
+        "AST must reject a fence whose delivered count is not its processed count: {rejected}"
+    );
 }
 
 fn plan_safe_delete(
@@ -951,6 +1056,13 @@ fn t016_runtime_init_advertises_bare_ast_write_tools_and_request_apply_edits() {
 
     let initialized = adapter.manifest();
     let mut runtime_tools = initialized.tools.clone();
+    assert!(
+        runtime_tools
+            .iter()
+            .any(|tool| tool.name == "_tower_catch_up_fence"),
+        "initialized host dispatch must retain fence ownership"
+    );
+    runtime_tools.retain(|tool| tool.name != "_tower_catch_up_fence");
     runtime_tools.sort_by(|a, b| a.name.cmp(&b.name));
     let mut manifest_tools = static_manifest.tools;
     manifest_tools.sort_by(|a, b| a.name.cmp(&b.name));

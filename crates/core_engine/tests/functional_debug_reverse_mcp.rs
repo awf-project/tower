@@ -70,7 +70,7 @@ fn reverse_debug_registry(token: &str) -> (tempfile::TempDir, ExtensionMergedReg
 
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
-        extensions_dir: None,
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
     };
     let handle = build_engine(&opts, rr_fixture_tower_config(token))
         .expect("engine builds with debug sidecar");

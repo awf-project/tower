@@ -63,6 +63,7 @@ fn main() {
     // Extension-wide mutable state (serial protocol, no concurrency).
     let index: Mutex<SymbolIndex> = Mutex::new(SymbolIndex::default());
     let content_hashes: Mutex<HashMap<String, u64>> = Mutex::new(HashMap::new());
+    let mut processed_events = 0_u64;
 
     let mut lines = stdin.lock().lines();
 
@@ -122,6 +123,11 @@ fn main() {
 
                 let result = InitResult {
                     tools: vec![
+                        ToolDecl {
+                            name: "_tower_catch_up_fence".to_owned(),
+                            description: "Host-internal catch-up ordering fence.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"epoch":{"type":"integer","minimum":0},"delivered_events":{"type":"integer","minimum":0}},"required":["epoch","delivered_events"],"additionalProperties":false}"#.to_owned(),
+                        },
                         ToolDecl {
                             name: "get_outline".to_owned(),
                             description: "Return a structural outline (functions, structs, methods, traits, enums, impl blocks) for a workspace-relative source file. Supports Rust (.rs), Go (.go), and PHP (.php). Returns an unsupported-language result for other file types.".to_owned(),
@@ -232,15 +238,39 @@ fn main() {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
 
-                let result = tools::dispatch(
-                    &tool_name,
-                    tool_params,
-                    &index,
-                    &content_hashes,
-                    &mut out,
-                    &mut lines,
-                    &mut next_hcall_id,
-                );
+                let result = if tool_name == "_tower_catch_up_fence" {
+                    let epoch = tool_params.get("epoch").and_then(serde_json::Value::as_u64);
+                    let delivered = tool_params
+                        .get("delivered_events")
+                        .and_then(serde_json::Value::as_u64);
+                    match (epoch, delivered) {
+                        (Some(epoch), Some(delivered_events))
+                            if delivered_events == processed_events =>
+                        {
+                            Ok(serde_json::json!({
+                                "epoch": epoch,
+                                "processed_events": processed_events,
+                                "ready": true
+                            }))
+                        }
+                        (Some(epoch), Some(_)) => Ok(serde_json::json!({
+                            "epoch": epoch,
+                            "processed_events": processed_events,
+                            "ready": false
+                        })),
+                        _ => Err("invalid catch-up fence parameters".to_owned()),
+                    }
+                } else {
+                    tools::dispatch(
+                        &tool_name,
+                        tool_params,
+                        &index,
+                        &content_hashes,
+                        &mut out,
+                        &mut lines,
+                        &mut next_hcall_id,
+                    )
+                };
 
                 match result {
                     Ok(value) => {
@@ -286,6 +316,7 @@ fn main() {
                             &format!("deliverEvent reindex_single_path failed: {e}"),
                         );
                     }
+                    processed_events = processed_events.saturating_add(1);
                 }
 
                 protocol::send_response(&mut out, &id, &Response::Ack);

@@ -136,6 +136,7 @@ pub const EXPECTED_NATIVE_TOOL_NAMES: [&str; 12] = [
 /// watcher never touches the outer `EngineState` lock, there is no lock-order
 /// cycle. Short critical sections only — no blocking I/O while holding any lock.
 pub struct EngineState {
+    pub(crate) publication: Option<Arc<crate::adapters::daemon::CommittedEventPublisher>>,
     pub workspace: Arc<RwLock<ProjectWorkspace>>,
     pub index: Arc<RwLock<InvertedIndex>>,
     pub storage: Box<dyn StoragePort + Send + Sync>,
@@ -165,6 +166,7 @@ impl EngineState {
             storage,
             fs,
             extension_host: Arc::new(NoOpExtensionHost),
+            publication: None,
         }
     }
 
@@ -236,27 +238,8 @@ pub struct NativeToolRegistry {
 }
 
 impl NativeToolRegistry {
-    /// Construct a registry wrapping the given shared engine state.
     #[must_use]
-    pub fn new(state: Arc<RwLock<EngineState>>) -> Self {
-        Self::with_rename_coordinator(state, Arc::new(RenameCoordinator::default()))
-    }
-
-    /// Construct a registry sharing the daemon watcher's rename coordinator.
-    #[must_use]
-    pub fn with_rename_coordinator(
-        state: Arc<RwLock<EngineState>>,
-        rename_coordinator: Arc<RenameCoordinator>,
-    ) -> Self {
-        Self {
-            state,
-            rename_coordinator,
-        }
-    }
-}
-
-impl ToolRegistry for NativeToolRegistry {
-    fn list(&self) -> Vec<ToolDesc> {
+    pub fn descriptions() -> Vec<ToolDesc> {
         let tools = vec![
             tool_find_file_desc(),
             tool_list_dir_desc(),
@@ -281,6 +264,30 @@ impl ToolRegistry for NativeToolRegistry {
         tools
     }
 
+    /// Construct a registry wrapping the given shared engine state.
+    #[must_use]
+    pub fn new(state: Arc<RwLock<EngineState>>) -> Self {
+        Self::with_rename_coordinator(state, Arc::new(RenameCoordinator::default()))
+    }
+
+    /// Construct a registry sharing the daemon watcher's rename coordinator.
+    #[must_use]
+    pub fn with_rename_coordinator(
+        state: Arc<RwLock<EngineState>>,
+        rename_coordinator: Arc<RenameCoordinator>,
+    ) -> Self {
+        Self {
+            state,
+            rename_coordinator,
+        }
+    }
+}
+
+impl ToolRegistry for NativeToolRegistry {
+    fn list(&self) -> Vec<ToolDesc> {
+        Self::descriptions()
+    }
+
     fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
         match name {
             "tower_find_file" => call_find_file(&self.state, args),
@@ -298,6 +305,50 @@ impl ToolRegistry for NativeToolRegistry {
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
+}
+
+pub(crate) fn validate_native_call(name: &str, args: &Value) -> Result<(), ToolError> {
+    match name {
+        "tower_find_file" => {
+            require_str(args, "query")?;
+        }
+        "tower_search_text" => {
+            require_str(args, "pattern")?;
+        }
+        "tower_read_file" | "tower_list_dir" | "tower_create_directory" | "tower_delete_file" => {
+            require_str(args, "path")?;
+        }
+        "tower_create_file" => {
+            require_str(args, "path")?;
+            require_str(args, "content")?;
+            optional_version(args, "expected_version")?;
+        }
+        "tower_edit_range" => {
+            require_str(args, "path")?;
+            require_usize(args, "start_byte")?;
+            require_usize(args, "end_byte")?;
+            require_str(args, "replacement")?;
+            optional_version(args, "expected_version")?;
+        }
+        "tower_global_replace" => {
+            require_str(args, "target")?;
+            require_str(args, "replacement")?;
+            optional_version_map(args, "expected_versions")?;
+        }
+        "tower_rename_path" => {
+            serde_json::from_value::<wire::PathRenameRequest>(args.clone()).map_err(|_| {
+                ToolError::InvalidArgs("invalid tower_rename_path arguments".into())
+            })?;
+        }
+        "tower_safe_delete_symbol" => {
+            serde_json::from_value::<wire::SafeDeleteRequest>(args.clone()).map_err(|_| {
+                ToolError::InvalidArgs("invalid tower_safe_delete_symbol arguments".into())
+            })?;
+        }
+        "tower_reindex" => {}
+        _ => return Err(ToolError::NotFound(name.to_owned())),
+    }
+    Ok(())
 }
 
 // ── Tool descriptions ─────────────────────────────────────────────────────────
@@ -772,25 +823,72 @@ fn port_err_to_tool_error(err: crate::ports::PortError) -> ToolError {
     }
 }
 
-fn with_mutation_service<T>(
+pub(crate) fn with_mutation_service<T>(
     state: &Arc<RwLock<EngineState>>,
     f: impl FnOnce(&mut FileMutationService<'_>) -> Result<T, DomainError>,
 ) -> Result<T, ToolError> {
-    let mut guard = state.write().map_err(lock_poisoned)?;
-    let ws_arc = Arc::clone(&guard.workspace);
-    let idx_arc = Arc::clone(&guard.index);
-    let mut ws = ws_arc.write().map_err(lock_poisoned)?;
-    let mut idx = idx_arc.write().map_err(lock_poisoned)?;
-    let engine = &mut *guard;
-    let extension_host = Arc::clone(&engine.extension_host);
-    let mut svc = FileMutationService::new(
-        engine.fs.as_mut(),
-        &mut ws,
-        &mut idx,
-        engine.storage.as_mut(),
-        extension_host.as_ref(),
-    );
-    f(&mut svc).map_err(domain_err_to_tool_error)
+    use crate::adapters::daemon::publication::BufferedEvents;
+    let publication = state.read().map_err(lock_poisoned)?.publication.clone();
+    let commit = publication
+        .as_ref()
+        .map(|publisher| publisher.commit_lock());
+    if let Some(publisher) = &publication {
+        publisher
+            .check_capacity()
+            .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
+    }
+    let events = BufferedEvents::default();
+    let (result, host) = {
+        let mut guard = state.write().map_err(lock_poisoned)?;
+        let ws_arc = Arc::clone(&guard.workspace);
+        let idx_arc = Arc::clone(&guard.index);
+        let mut ws = ws_arc.write().map_err(lock_poisoned)?;
+        let mut idx = idx_arc.write().map_err(lock_poisoned)?;
+        let engine = &mut *guard;
+        let host = Arc::clone(&engine.extension_host);
+        let mut svc = FileMutationService::new(
+            engine.fs.as_mut(),
+            &mut ws,
+            &mut idx,
+            engine.storage.as_mut(),
+            &events,
+        );
+        let result = f(&mut svc).map_err(domain_err_to_tool_error);
+        if let Some(publisher) = &publication {
+            publisher
+                .commit_events(
+                    events
+                        .take()
+                        .into_iter()
+                        .map(|event| match event {
+                            crate::adapters::daemon::CommittedFileEvent::Changed {
+                                file_id,
+                                path,
+                            } if ws.get(file_id).is_err() => {
+                                crate::adapters::daemon::CommittedFileEvent::Deleted { path }
+                            }
+                            event => event,
+                        })
+                        .collect(),
+                )
+                .map_err(|_| {
+                    ToolError::ExecutionFailed("commit publication unavailable".to_owned())
+                })?;
+        }
+        (result, host)
+    };
+    drop(commit);
+    // Compatibility callers without the daemon publisher still receive the
+    // same notifications, but never under workspace/index/state locks.
+    for event in events.take() {
+        use crate::adapters::daemon::CommittedFileEvent;
+        match event {
+            CommittedFileEvent::Indexed { file_id, path } => host.on_file_indexed(file_id, &path),
+            CommittedFileEvent::Changed { file_id, path } => host.on_file_changed(file_id, &path),
+            CommittedFileEvent::Deleted { path } => host.on_file_deleted(&path),
+        }
+    }
+    result
 }
 
 fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
@@ -881,47 +979,18 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
     }))
 }
 
-/// Force a full rebuild of the VFS + text-search index from the current filesystem.
-///
-/// # Algorithm
-///
-/// 1. Walk the filesystem via `FileSystemPort::scan()` (no locks held during the walk).
-/// 2. Build a fresh `ProjectWorkspace` and `InvertedIndex` from the scan results.
-/// 3. Persist the rebuilt state: write fresh records via `StoragePort::put_batch`,
-///    call `StoragePort::mark_scan_complete()`, then prune records absent from
-///    the scan.
-/// 4. Acquire workspace→index write locks in that order and swap in the rebuilt
-///    structures.
-///
-/// # Concurrency trade-off
-///
-/// Decision: perform the filesystem walk and in-memory rebuild WITHOUT holding the
-/// live workspace/index write-locks. The locks are only acquired for the final swap
-/// in step 4.
-/// Why: the fs walk may be long (thousands of files); holding write-locks for its
-/// duration would starve the watcher and all MCP readers.
-/// Trade-off: a watcher event applied to the live workspace during the rebuild
-/// window is superseded by the swap, but the next watcher event will re-apply the
-/// change. For a deliberate forced reindex (external drift correction) this is
-/// acceptable — the caller is explicitly requesting a full reset.
-///
-/// # FileId generations
-///
-/// A fresh rebuild reassigns `FileId`s from a new empty `ProjectWorkspace`. Stale
-/// external `FileId`s from the previous workspace will fail `validated_index` checks
-/// (generation mismatch) — the generational invariant is preserved.
+/// Reconcile a staged inventory while retaining live generational identities.
+/// Reject a concurrent indexed commit rather than overwrite it with a stale scan.
 fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
-    // Phase 1: enumerate workspace files WITH real metadata (size, mtime,
-    // content hash) WITHOUT holding the workspace/index write-locks.
-    //
-    // Decision: for a real filesystem, perform a TRUE recursive walk via
-    // `collect_workspace_files` rather than `fs.scan()`.
-    // Why: `RealFs::scan()` only reports paths written through the adapter this
-    // session — using it for a project reindex would shrink the index to the
-    // session's own writes and miss files created/edited outside the engine.
-    // Trade-off: the walk reads each file's bytes to compute the content hash.
-    // In-memory adapters (tests) have no real root → fall back to `scan()` +
-    // read, still computing real size and hash.
+    use crate::adapters::daemon::publication::snapshot_events;
+    use crate::ports::storage::ReconciliationDelta;
+    let publication = state.read().map_err(lock_poisoned)?.publication.clone();
+    let baseline = publication
+        .as_ref()
+        .map(|publisher| publisher.capture_cut())
+        .transpose()
+        .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
+    // Filesystem enumeration stays outside the publication/authoritative locks.
     let entries: Vec<(RelativePath, FileMetadata)> = {
         let guard = state.read().map_err(lock_poisoned)?;
         match guard.fs.workspace_root() {
@@ -930,96 +999,91 @@ fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
                 .fs
                 .scan()
                 .into_iter()
-                .filter(|p| !crate::domain::mutation::is_tmp_artifact(p))
-                .map(|p| {
-                    let bytes = guard.fs.read(&p).unwrap_or_default();
+                .filter(|path| !crate::domain::mutation::is_tmp_artifact(path))
+                .map(|path| {
+                    let bytes = guard.fs.read(&path).unwrap_or_default();
                     let metadata = FileMetadata {
                         size: bytes.len() as u64,
                         modified: crate::domain::virtual_file::Timestamp(0),
                         content_hash: Some(crate::adapters::fs::scan::content_hash_of(&bytes)),
                     };
-                    (p, metadata)
+                    (path, metadata)
                 })
                 .collect(),
         }
     };
-
-    // Phase 2: build fresh in-memory structures from the enumerated entries.
-    let mut new_workspace = ProjectWorkspace::new();
-    let mut new_index = InvertedIndex::new();
-    let mut new_files: Vec<crate::domain::VirtualFile> = Vec::with_capacity(entries.len());
-
-    for (rel_path, metadata) in &entries {
-        match new_workspace.insert(rel_path.clone(), *metadata) {
-            Ok(file_id) => {
-                let virtual_file = new_workspace
-                    .get(file_id)
-                    .expect("just inserted — slot must be live")
-                    .clone();
-                let tokens = tokenize(rel_path.as_str());
-                new_index.insert(file_id, &tokens);
-                new_files.push(virtual_file);
-            }
-            Err(_) => {
-                // DuplicatePath or other domain error — skip the duplicate.
-                // A legitimate filesystem scan cannot produce duplicate paths,
-                // so this branch is defensive only.
-                continue;
-            }
+    let _commit = publication
+        .as_ref()
+        .map(|publisher| publisher.commit_lock());
+    if let Some(publisher) = &publication {
+        publisher
+            .check_capacity()
+            .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
+        if Some(
+            publisher.capture_cut().map_err(|_| {
+                ToolError::ExecutionFailed("commit publication unavailable".to_owned())
+            })?,
+        ) != baseline
+        {
+            return Err(ToolError::ExecutionFailed(
+                "workspace changed during reindex; retry the operation".to_owned(),
+            ));
         }
     }
-
-    let files_indexed = new_files.len();
-
-    // Phase 3: persist the rebuilt state.
-    //
-    // Acquire the outer write-lock for exclusive storage access.
-    // We do NOT hold the workspace/index locks during storage I/O — storage
-    // writes can be slow and the watcher must not be starved.
-    //
-    // The fresh records and scan-complete marker are written before pruning old
-    // records. If either fresh-write step fails, the previously persisted index
-    // remains recoverable instead of being partially erased.
-    {
-        let mut guard = state.write().map_err(lock_poisoned)?;
-
-        // Collect stale FileIds from the live workspace before the swap.
-        let stale_ids: Vec<crate::domain::FileId> = {
-            let ws = guard.workspace.read().map_err(lock_poisoned)?;
-            ws.snapshot().files.into_iter().map(|f| f.id).collect()
-        };
-
-        // Write all fresh records in a single atomic batch.
-        guard
-            .storage
-            .put_batch(&new_files)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-
-        // Re-set the scan-complete marker so restart guard sees a complete index.
-        guard
-            .storage
-            .mark_scan_complete()
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-
-        // Delete old records only after the replacement index is durably present.
-        // If a delete fails, the worst outcome is a stale persisted entry that the
-        // next startup reconciliation can prune; fresh records are not lost.
-        for id in stale_ids {
-            let _ = guard.storage.delete(id);
+    let mut guard = state.write().map_err(lock_poisoned)?;
+    let workspace = guard.workspace_arc();
+    let index = guard.index_arc();
+    let mut workspace = workspace.write().map_err(lock_poisoned)?;
+    let mut index = index.write().map_err(lock_poisoned)?;
+    let before = workspace.snapshot();
+    let mut staged =
+        ProjectWorkspace::from_snapshot(before.clone()).map_err(domain_err_to_tool_error)?;
+    let paths: std::collections::HashSet<_> =
+        entries.iter().map(|(path, _)| path.clone()).collect();
+    let mut removals = Vec::new();
+    for file in &before.files {
+        if !paths.contains(&file.path) {
+            staged.remove(file.id).map_err(domain_err_to_tool_error)?;
+            removals.push(file.id);
         }
     }
-
-    // Phase 4: swap the rebuilt in-memory structures into the live state.
-    // Acquire workspace→index in that order (matching the watcher lock discipline).
-    {
-        let guard = state.read().map_err(lock_poisoned)?;
-        let mut ws = guard.workspace.write().map_err(lock_poisoned)?;
-        let mut idx = guard.index.write().map_err(lock_poisoned)?;
-        *ws = new_workspace;
-        *idx = new_index;
+    for (path, metadata) in entries {
+        if let Some(id) = staged.get_by_path(&path) {
+            staged
+                .update(id, metadata)
+                .map_err(domain_err_to_tool_error)?;
+        } else {
+            staged
+                .insert(path, metadata)
+                .map_err(domain_err_to_tool_error)?;
+        }
     }
-
-    Ok(json!({ "files_indexed": files_indexed }))
+    let after = staged.snapshot();
+    let additions = after
+        .files
+        .iter()
+        .filter(|file| !before.files.contains(file))
+        .cloned()
+        .collect();
+    guard
+        .storage
+        .apply_reconciliation_delta(&ReconciliationDelta {
+            additions,
+            removals,
+        })
+        .map_err(|_| ToolError::ExecutionFailed("reindex commit failed".to_owned()))?;
+    let mut staged_index = InvertedIndex::new();
+    for file in &after.files {
+        staged_index.insert(file.id, &tokenize(file.path.as_str()));
+    }
+    *workspace = staged;
+    *index = staged_index;
+    if let Some(publisher) = &publication {
+        publisher
+            .commit_events(snapshot_events(&before, &after))
+            .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
+    }
+    Ok(json!({"files_indexed": after.files.len()}))
 }
 
 fn call_rename_path(
@@ -1059,7 +1123,7 @@ fn call_rename_path(
         locked
             .service(extension_host.as_ref())
             .plan_path_rename(domain_request, exclusions.as_ref())
-    }) {
+    })? {
         Ok(plan) => plan,
         Err(error) => return serialize_rename_failure(None, policy, error),
     };
@@ -1125,7 +1189,7 @@ fn call_rename_path(
             Err(error) => Err(RenameApplyError::Domain(Box::new(ready), error)),
         }
     });
-    let (result, mut rename_guard, committed_files) = match applied {
+    let (result, mut rename_guard, committed_files) = match applied? {
         Ok(applied) => applied,
         Err(RenameApplyError::Domain(plan, error)) => {
             return serialize_rename_failure(Some(&plan), policy, error);
@@ -1149,8 +1213,10 @@ fn call_rename_path(
             notifications.push((file.id, file.path.clone()));
         }
     }
-    for (id, path) in notifications {
-        extension_host.on_file_changed(id, &path);
+    if state.read().map_err(lock_poisoned)?.publication.is_none() {
+        for (id, path) in notifications {
+            extension_host.on_file_changed(id, &path);
+        }
     }
     drop(rename_guard);
     serialize_rename_result(&result)
@@ -1363,7 +1429,7 @@ fn run_safe_delete(
         };
         let mut mutation = locked.service(&deferred_host);
         SafeDeleteService::new(&mut mutation).safe_delete(request, declaration, semantic, snapshots)
-    })
+    })?
     .map_err(domain_err_to_tool_error)?;
 
     if report.status == wire::SafeDeleteStatus::Blocked {
@@ -1372,8 +1438,10 @@ fn run_safe_delete(
         }
     }
 
-    for (id, path) in deferred_host.drain_changed() {
-        extension_host.on_file_changed(id, &path);
+    if state.read().map_err(lock_poisoned)?.publication.is_none() {
+        for (id, path) in deferred_host.drain_changed() {
+            extension_host.on_file_changed(id, &path);
+        }
     }
     serde_json::to_value(report).map_err(|_| {
         ToolError::ExecutionFailed("failed to serialize safe-delete result".to_owned())
@@ -1403,7 +1471,20 @@ impl LockedRenameState<'_> {
 fn with_path_rename_state<T>(
     state: &Arc<RwLock<EngineState>>,
     f: impl FnOnce(&mut LockedRenameState<'_>) -> T,
-) -> T {
+) -> Result<T, ToolError> {
+    let publication = state
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .publication
+        .clone();
+    let _commit = publication
+        .as_ref()
+        .map(|publisher| publisher.commit_lock());
+    if let Some(publisher) = &publication {
+        publisher
+            .check_capacity()
+            .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
+    }
     let mut guard = state.write().unwrap_or_else(|poison| poison.into_inner());
     let workspace = Arc::clone(&guard.workspace);
     let index = Arc::clone(&guard.index);
@@ -1412,12 +1493,22 @@ fn with_path_rename_state<T>(
         .unwrap_or_else(|poison| poison.into_inner());
     let mut index = index.write().unwrap_or_else(|poison| poison.into_inner());
     let EngineState { fs, storage, .. } = &mut *guard;
-    f(&mut LockedRenameState {
+    let before = publication.as_ref().map(|_| workspace.snapshot());
+    let result = f(&mut LockedRenameState {
         fs: fs.as_mut(),
         workspace: &mut workspace,
         index: &mut index,
         storage: storage.as_mut(),
-    })
+    });
+    if let (Some(publisher), Some(before)) = (&publication, before) {
+        publisher
+            .commit_events(crate::adapters::daemon::publication::snapshot_events(
+                &before,
+                &workspace.snapshot(),
+            ))
+            .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
+    }
+    Ok(result)
 }
 
 #[derive(Default)]

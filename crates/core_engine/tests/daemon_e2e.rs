@@ -1,16 +1,19 @@
 //! Daemon end-to-end tests (Tasks 7–8).
 // Feature: F009
+// Feature: B001
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::{DaemonConfig, TowerConfig};
 use core_engine::adapters::daemon::server::run_daemon;
-use core_engine::adapters::daemon::socket::{socket_path, wait_for_socket};
+use core_engine::adapters::daemon::socket::{WorkspaceDaemonOwner, socket_path, wait_for_socket};
 use core_engine::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, Handshake, read_line_capped, write_line,
 };
@@ -19,6 +22,8 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+use extension_protocol::{Event, InitParams, PROTOCOL_VERSION, Request, Response};
 
 #[path = "support/process_binary.rs"]
 mod process_binary;
@@ -30,9 +35,31 @@ fn config_with_idle(secs: u64) -> TowerConfig {
     TowerConfig {
         daemon: DaemonConfig {
             idle_timeout_secs: secs,
+            connection_timeout_secs: 10,
+            preparation_timeout_secs: 10,
         },
         ..Default::default()
     }
+}
+
+async fn read_raw_control_status(workspace: &Path) -> String {
+    let mut connection = wait_for_socket(&socket_path(workspace), Duration::from_secs(5))
+        .await
+        .expect("connect control client for raw status");
+    connection
+        .write_all(Handshake::new(ClientRole::Control).to_line().as_bytes())
+        .await
+        .expect("send control handshake");
+    write_line(
+        &mut connection,
+        &serde_json::to_string(&ControlRequest::Status).expect("serialize status request"),
+    )
+    .await
+    .expect("send status request");
+    read_line_capped(&mut connection, 1 << 20)
+        .await
+        .expect("read raw status response")
+        .expect("daemon returned a raw status response")
 }
 
 /// Spawn `run_daemon` on a blocking thread against a tempdir workspace.
@@ -50,6 +77,11 @@ fn selected_production_binary() -> PathBuf {
     process_binary::selected_binary("TOWER_PRODUCTION_BIN")
 }
 
+fn slow_start_process_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn run_production(binary: &Path, workspace: &Path, command: &str) -> Output {
     Command::new(binary)
         .arg(command)
@@ -64,6 +96,275 @@ fn run_production(binary: &Path, workspace: &Path, command: &str) -> Output {
 
 fn selected_binary(selector: &str) -> PathBuf {
     process_binary::selected_binary(selector)
+}
+
+fn install_ast_extension(workspace: &Path) {
+    let extension_dir = workspace.join(".tower/extensions/ast");
+    fs::create_dir_all(&extension_dir).expect("create AST extension directory");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .parent()
+        .expect("workspace root");
+    let binary = root
+        .join("target/debug/ast_extension")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let manifest = fs::read_to_string(root.join("extensions/ast/extension.toml"))
+        .expect("read shipped AST manifest")
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("command") {
+                format!("command = [\"{binary}\"]")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(extension_dir.join("extension.toml"), manifest)
+        .expect("write workspace AST manifest");
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn slow_start_extension_bin() -> PathBuf {
+    workspace_root().join("target/debug/slow_start_extension")
+}
+
+struct SlowStartChild {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    frames: std::sync::mpsc::Receiver<Value>,
+}
+
+impl SlowStartChild {
+    fn spawn() -> Self {
+        let mut child = Command::new(slow_start_extension_bin())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn slow-start fixture; build workspace binaries first");
+        let stdin = child.stdin.take().expect("slow-start stdin");
+        let stdout = child.stdout.take().expect("slow-start stdout");
+        let (sender, frames) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let Ok(frame) = serde_json::from_str(&line) else {
+                    break;
+                };
+                if sender.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            frames,
+        }
+    }
+
+    fn send(&mut self, frame: Value) {
+        serde_json::to_writer(&mut self.stdin, &frame).expect("serialize fixture request");
+        self.stdin.write_all(b"\n").expect("write fixture newline");
+        self.stdin.flush().expect("flush fixture request");
+    }
+
+    fn recv(&self) -> Value {
+        self.frames
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture response within the extension operation budget")
+    }
+
+    fn initialize(&mut self, id: u64, mode: Option<Value>) -> Value {
+        let mut params = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "client_info": "daemon-e2e",
+        });
+        if let Some(mode) = mode {
+            params["extension_config"] = mode;
+        }
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": params,
+        }));
+        self.recv()
+    }
+
+    fn deliver_event(&mut self, id: u64, event: Event) -> Value {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "deliverEvent",
+            "params": serde_json::to_value(event).expect("serialize fixture event"),
+        }));
+        self.recv()
+    }
+
+    fn invoke_tool(&mut self, id: u64, name: &str, params: Value) -> Value {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "invokeTool",
+            "params": {"name": name, "params": params},
+        }));
+        self.recv()
+    }
+}
+
+impl Drop for SlowStartChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn install_slow_start_extension(workspace: &Path) {
+    let extension_dir = workspace.join(".tower/extensions/slow_start");
+    fs::create_dir_all(&extension_dir).expect("create slow-start extension directory");
+    let binary = slow_start_extension_bin()
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let manifest =
+        fs::read_to_string(workspace_root().join("extensions/fixtures/slow_start/extension.toml"))
+            .expect("read slow-start manifest")
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("command") {
+                    format!("command = [\"{binary}\"]")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    fs::write(extension_dir.join("extension.toml"), manifest).expect("write slow-start manifest");
+}
+
+fn spawn_daemon_at_pre_bind(binary: &Path, workspace: &Path) -> Child {
+    std::fs::create_dir_all(workspace.join(".tower")).unwrap();
+    std::fs::write(
+        workspace.join(".tower/config.toml"),
+        "[daemon]\nidle_timeout_secs = 300\nconnection_timeout_secs = 1\n",
+    )
+    .unwrap();
+    let mut child = Command::new(binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace)
+        .env("TOWER_TEST_PRE_BIND_HANDSHAKE", "stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start daemon with pre-bind milestone");
+    let stdout = child.stdout.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut ready = String::new();
+        let result = BufReader::new(stdout).read_line(&mut ready).map(|_| ready);
+        let _ = ready_tx.send(result);
+    });
+    let ready = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(ready)) => ready,
+        outcome => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pre-bind milestone unavailable: {outcome:?}");
+        }
+    };
+    if ready != "ownership-acquired\n" {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("unexpected pre-bind milestone: {ready:?}");
+    }
+    child
+}
+
+fn release_pre_bind(child: &mut Child) {
+    let mut stdin = child.stdin.take().expect("hooked daemon stdin");
+    stdin.write_all(b"continue\n").unwrap();
+    stdin.flush().unwrap();
+}
+
+fn spawn_daemon_at_preparation_barrier(binary: &Path, workspace: &Path, barrier: &str) -> Child {
+    spawn_daemon_at_preparation_barrier_with_config(binary, workspace, barrier, "")
+}
+
+fn spawn_daemon_at_preparation_barrier_with_config(
+    binary: &Path,
+    workspace: &Path,
+    barrier: &str,
+    extra_config: &str,
+) -> Child {
+    std::fs::create_dir_all(workspace.join(".tower")).unwrap();
+    std::fs::write(
+        workspace.join(".tower/config.toml"),
+        format!("[daemon]\nidle_timeout_secs = 300\nconnection_timeout_secs = 2\npreparation_timeout_secs = 2\n{extra_config}"),
+    )
+    .unwrap();
+    let mut child = Command::new(binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace)
+        .env("TOWER_TEST_PREPARATION_HANDSHAKE", "stdio")
+        .env("TOWER_TEST_PREPARATION_BARRIER", barrier)
+        .env(
+            "TOWER_TEST_CLEANUP_TRACE",
+            workspace.join(".tower/preparation-cleanup.json"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start daemon at preparation barrier");
+    let stdout = child.stdout.take().unwrap();
+    let (milestone_tx, milestone_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut milestone = String::new();
+        let result = BufReader::new(stdout)
+            .read_line(&mut milestone)
+            .map(|_| milestone);
+        let _ = milestone_tx.send(result);
+    });
+    let milestone = match milestone_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(milestone)) => milestone,
+        outcome => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("preparation milestone unavailable: {outcome:?}");
+        }
+    };
+    if milestone != format!("transport-bound:{barrier}\n") {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("unexpected preparation milestone: {milestone:?}");
+    }
+    child
+}
+
+fn release_preparation_barrier(child: &mut Child) {
+    let stdin = child.stdin.as_mut().expect("hooked daemon stdin");
+    stdin.write_all(b"continue\n").unwrap();
+    stdin.flush().unwrap();
 }
 
 fn selected_existing_directory(selector: &str) -> PathBuf {
@@ -186,6 +487,53 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(predicate(), "condition not met within {timeout:?}");
+}
+
+async fn await_watcher_path(
+    connection: &mut UnixStream,
+    id: u64,
+    path: &str,
+    present: bool,
+    deadline: Instant,
+) {
+    loop {
+        write_line(
+            connection,
+            &json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "tower_find_file", "arguments": {"query": path}}
+            })
+            .to_string(),
+        )
+        .await
+        .expect("observe watcher index through MCP");
+        let response: Value = serde_json::from_str(
+            &read_line_capped(connection, 1 << 20)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let data: Value = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("indexed path response"),
+        )
+        .unwrap();
+        let indexed = data["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == path);
+        if indexed == present {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher did not publish expected indexed state for {path}: {response}"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 fn indexed_paths_through_mcp(workspace: &Path) -> Result<Vec<String>, String> {
@@ -499,6 +847,15 @@ fn assert_formatter_lifecycle(
         .expect("start production daemon");
 
     wait_until(Duration::from_secs(10), || socket_path(workspace).exists());
+    let runtime = tokio::runtime::Runtime::new().expect("formatter status runtime");
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.to_path_buf()),
+        extensions_dir: None,
+    };
+    wait_until(Duration::from_secs(10), || {
+        matches!(runtime.block_on(core_engine::adapters::daemon::client::send_control_async(&opts, ControlRequest::Status)),
+            Ok(ControlResponse::Status(snapshot)) if snapshot.lifecycle == core_engine::adapters::daemon::DaemonLifecycle::Ready)
+    });
     for &(path, _) in cases {
         std::fs::write(workspace.join(path), "format me\n").unwrap();
     }
@@ -857,11 +1214,48 @@ async fn control_status_reports_a_snapshot() {
     .await
     .unwrap();
 
-    let line = read_line_capped(&mut conn, 65536).await.unwrap().unwrap();
-    let resp: ControlResponse = serde_json::from_str(&line).unwrap();
-    match resp {
-        ControlResponse::Status(s) => assert_eq!(s.indexed_files, 1),
-        _ => panic!("expected status snapshot"),
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let line = read_line_capped(&mut conn, 65536).await.unwrap().unwrap();
+        let resp: ControlResponse = serde_json::from_str(&line).unwrap();
+        match resp {
+            ControlResponse::Status(s) if s.indexed_files == 1 => {
+                assert!(s.generation > 0);
+                assert!(matches!(
+                    s.lifecycle,
+                    core_engine::adapters::daemon::DaemonLifecycle::Starting { .. }
+                        | core_engine::adapters::daemon::DaemonLifecycle::Ready
+                        | core_engine::adapters::daemon::DaemonLifecycle::Degraded { .. }
+                ));
+                assert_eq!(
+                    s.workspace,
+                    core_engine::adapters::daemon::CapabilityReadiness::Ready
+                );
+                assert!(matches!(
+                    s.lsp,
+                    core_engine::adapters::daemon::CapabilityReadiness::Preparing { .. }
+                        | core_engine::adapters::daemon::CapabilityReadiness::Ready
+                        | core_engine::adapters::daemon::CapabilityReadiness::Unavailable
+                ));
+                break;
+            }
+            ControlResponse::Status(_) if Instant::now() < deadline => {
+                conn = wait_for_socket(&sock, Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                conn.write_all(Handshake::new(ClientRole::Control).to_line().as_bytes())
+                    .await
+                    .unwrap();
+                write_line(
+                    &mut conn,
+                    &serde_json::to_string(&ControlRequest::Status).unwrap(),
+                )
+                .await
+                .unwrap();
+                tokio::task::yield_now().await;
+            }
+            _ => panic!("expected indexed status snapshot before deadline"),
+        }
     }
 }
 
@@ -882,6 +1276,7 @@ async fn daemon_self_terminates_after_idle() {
     assert!(
         core_engine::adapters::daemon::socket::try_connect(&sock)
             .await
+            .unwrap()
             .is_none(),
         "daemon should have shut down after idle"
     );
@@ -933,34 +1328,65 @@ async fn mcp_client_connect_or_spawn_then_initialize() {
 }
 
 #[tokio::test]
-async fn concurrent_clients_share_one_daemon() {
+async fn cold_start_initializes_before_extension_catch_up() {
+    use core_engine::adapters::daemon::CapabilityReadiness;
     use core_engine::adapters::daemon::client::connect_or_spawn;
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+
+    let mut recovery = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    recovery.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    recovery
+        .await_milestone(StartupMilestone::TransportBound, deadline)
+        .await;
+    recovery
+        .await_milestone(StartupMilestone::WorkspaceReady, deadline)
+        .await;
+    recovery
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    recovery.join_generation().await;
+
+    let preparing = recovery.status().await;
+    assert_eq!(preparing.workspace, CapabilityReadiness::Ready);
+    assert!(matches!(
+        preparing.ast,
+        CapabilityReadiness::Preparing { .. }
+    ));
+    let blocked = recovery.observe_probe().await;
+    assert!(!blocked.released);
+    assert!(blocked.pending_fences > 0);
+
+    let released = recovery.release_probe().await;
+    assert!(released.released);
+    recovery
+        .await_milestone(StartupMilestone::CatchUpReleased, deadline)
+        .await;
+    let ready = recovery.status().await;
+    assert_eq!(ready.ast, CapabilityReadiness::Ready);
+    let converged = recovery.observe_probe().await;
+    assert!(converged.barrier_observed);
+    recovery.shutdown_and_await_release(deadline).await;
 
     let dir = tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join(".tower")).unwrap();
+    let production = std::path::Path::new(env!("CARGO_BIN_EXE_tower"));
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    core_engine::adapters::daemon::client::register_test_daemon_exe(production);
+    let mut daemon = spawn_daemon_at_pre_bind(&hooks, dir.path());
 
-    // Register the real tower binary so daemon_exe() spawns the right process.
-    core_engine::adapters::daemon::client::register_test_daemon_exe(std::path::Path::new(env!(
-        "CARGO_BIN_EXE_tower"
-    )));
-
-    // Launch K connect-or-spawn calls near-simultaneously.
     let mut handles = Vec::new();
     for _ in 0..8 {
         let p = dir.path().to_path_buf();
-        handles.push(tokio::spawn(
-            async move { connect_or_spawn(&p).await.is_ok() },
-        ));
+        handles.push(tokio::spawn(async move { connect_or_spawn(&p).await }));
     }
-    let mut ok = 0;
-    for h in handles {
-        if h.await.unwrap() {
-            ok += 1;
-        }
-    }
-    assert_eq!(ok, 8, "all clients connect");
+    release_pre_bind(&mut daemon);
 
-    // Exactly one daemon → exactly one Sled lock dir, one socket.
+    for h in handles {
+        h.await.unwrap().expect("client joins starting daemon");
+    }
+
     let snap = core_engine::adapters::daemon::client::send_control_async(
         &GlobalOpts {
             workspace_dir: Some(dir.path().to_path_buf()),
@@ -971,7 +1397,120 @@ async fn concurrent_clients_share_one_daemon() {
     .await
     .expect("status");
     if let ControlResponse::Status(s) = snap {
-        assert!(s.uptime_secs < 60); // single fresh daemon answered
+        assert!(s.generation > 0);
+    } else {
+        panic!("expected status snapshot");
+    }
+    assert!(
+        sled::open(dir.path().join(".tower/db")).is_err(),
+        "the running daemon must be the sole Sled opener"
+    );
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(dir.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    let status = daemon.wait().expect("wait for daemon shutdown");
+    assert!(status.success(), "daemon exited with {status}");
+}
+
+#[tokio::test]
+async fn first_client_disconnect_preserves_single_daemon_owner() {
+    use core_engine::adapters::daemon::client::connect_or_spawn;
+    use core_engine::adapters::daemon::socket::{OwnerLiveness, probe_owner};
+
+    let dir = tempdir().unwrap();
+    let production = std::path::Path::new(env!("CARGO_BIN_EXE_tower"));
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    core_engine::adapters::daemon::client::register_test_daemon_exe(production);
+    let mut daemon = spawn_daemon_at_pre_bind(&hooks, dir.path());
+
+    let started = Instant::now();
+    let error = connect_or_spawn(dir.path())
+        .await
+        .expect_err("client must exhaust its connection deadline before bind");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(probe_owner(dir.path()).unwrap(), OwnerLiveness::Live);
+
+    release_pre_bind(&mut daemon);
+    wait_for_socket(&socket_path(dir.path()), Duration::from_secs(5))
+        .await
+        .expect("same owner binds after timed-out client disconnects");
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(dir.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    let status = daemon.wait().expect("wait for daemon shutdown");
+    assert!(status.success(), "daemon exited with {status}");
+}
+
+#[tokio::test]
+async fn dead_owner_allows_clean_restart() {
+    use core_engine::adapters::daemon::client::connect_or_spawn;
+    use core_engine::adapters::daemon::socket::{OwnerLiveness, probe_owner};
+
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".tower")).unwrap();
+    std::fs::write(
+        dir.path().join(".tower/config.toml"),
+        "[daemon]\nidle_timeout_secs = 300\n",
+    )
+    .unwrap();
+    let production = std::path::Path::new(env!("CARGO_BIN_EXE_tower"));
+    core_engine::adapters::daemon::client::register_test_daemon_exe(production);
+    let mut first = Command::new(production)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start first daemon");
+    wait_for_socket(&socket_path(dir.path()), Duration::from_secs(5))
+        .await
+        .expect("first daemon socket");
+    let first_generation = match core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(dir.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Status,
+    )
+    .await
+    .unwrap()
+    {
+        ControlResponse::Status(snapshot) => snapshot.generation,
+        response => panic!("expected status snapshot, got {response:?}"),
+    };
+
+    first.kill().expect("terminate first daemon");
+    first.wait().expect("reap first daemon");
+    assert_eq!(probe_owner(dir.path()).unwrap(), OwnerLiveness::Dead);
+
+    connect_or_spawn(dir.path())
+        .await
+        .expect("restart after dead owner");
+    let successor = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(dir.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Status,
+    )
+    .await
+    .unwrap();
+    match successor {
+        ControlResponse::Status(snapshot) => assert!(snapshot.generation > first_generation),
+        response => panic!("expected status snapshot, got {response:?}"),
     }
     let _ = core_engine::adapters::daemon::client::send_control_async(
         &GlobalOpts {
@@ -1010,4 +1549,2290 @@ async fn daemon_rejects_incompatible_protocol_handshake() {
         ControlRequest::Shutdown,
     )
     .await;
+}
+
+#[tokio::test]
+async fn malformed_tool_parameters_remain_invalid_params() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".tower")).unwrap();
+    spawn_daemon_thread(dir.path().to_path_buf(), config_with_idle(300));
+    let mut connection = wait_for_socket(&socket_path(dir.path()), Duration::from_secs(5))
+        .await
+        .unwrap();
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"daemon-e2e","version":"1"}}}"#,
+    )
+    .await
+    .unwrap();
+    let initialized = read_line_capped(&mut connection, 1 << 20)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(serde_json::from_str::<Value>(&initialized).unwrap()["result"].is_object());
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await
+    .unwrap();
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tower_read_file","arguments":{}}}"#,
+    )
+    .await
+    .unwrap();
+    let response = read_line_capped(&mut connection, 1 << 20)
+        .await
+        .unwrap()
+        .unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert_ne!(response["error"]["code"], -32004);
+    assert_ne!(response["error"]["code"], -32005);
+    assert_ne!(response["error"]["code"], -32006);
+
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(dir.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mutations_wait_until_workspace_reconciliation_is_ready() {
+    let workspace = tempdir().expect("create workspace");
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon = spawn_daemon_at_preparation_barrier(
+        &hooks,
+        workspace.path(),
+        "before-reconciliation-commit",
+    );
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("early transport accepts MCP clients");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"preparation-gate","version":"1"}}}"#,
+    )
+    .await
+    .unwrap();
+    let initialized: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("initialize remains available during preparation"),
+    )
+    .expect("initialize response is JSON");
+    assert!(
+        initialized["result"].is_object(),
+        "early MCP initialize must succeed without an EngineState: {initialized}"
+    );
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":11,"method":"tools/list","params":{}}"#,
+    )
+    .await
+    .unwrap();
+    let early_tools: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("native declarations remain available during preparation"),
+    )
+    .expect("early tools/list response is JSON");
+    let early_tool_names = early_tools["result"]["tools"]
+        .as_array()
+        .expect("early tools/list result contains the stable native declarations")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("tool declaration name")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        early_tool_names
+            .iter()
+            .any(|name| name == "tower_read_file"),
+        "native declarations must be stable before workspace readiness"
+    );
+
+    let early_status = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Status,
+    )
+    .await
+    .expect("control status remains available before workspace readiness");
+    assert!(matches!(
+        early_status,
+        ControlResponse::Status(ref snapshot)
+            if matches!(snapshot.workspace, core_engine::adapters::daemon::CapabilityReadiness::Preparing { .. })
+    ));
+
+    let mut read_connection =
+        wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+            .await
+            .expect("a second early MCP client can connect");
+    read_connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(
+        &mut read_connection,
+        r#"{"jsonrpc":"2.0","id":12,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"preparation-read-gate","version":"1"}}}"#,
+    )
+    .await
+    .unwrap();
+    read_line_capped(&mut read_connection, 1 << 20)
+        .await
+        .unwrap()
+        .expect("second early initialize succeeds");
+    write_line(
+        &mut read_connection,
+        r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"not-yet-readable.rs"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            read_line_capped(&mut read_connection, 1 << 20)
+        )
+        .await
+        .is_err(),
+        "a native read must not obtain EngineState before workspace readiness"
+    );
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"gated.rs","content":"pub fn gated() {}\n"}}}"#,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            read_line_capped(&mut connection, 1 << 20)
+        )
+        .await
+        .is_err(),
+        "mutation completed before durable reconciliation"
+    );
+    assert!(!workspace.path().join("gated.rs").exists());
+
+    release_preparation_barrier(&mut daemon);
+    let response = read_line_capped(&mut connection, 1 << 20)
+        .await
+        .unwrap()
+        .expect("mutation completes after workspace publication");
+    assert!(serde_json::from_str::<Value>(&response).unwrap()["result"].is_object());
+    assert!(workspace.path().join("gated.rs").exists());
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":14,"method":"tools/list","params":{}}"#,
+    )
+    .await
+    .unwrap();
+    let ready_tools: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("tools/list succeeds after workspace readiness"),
+    )
+    .expect("ready tools/list response is JSON");
+    let ready_tool_names = ready_tools["result"]["tools"]
+        .as_array()
+        .expect("ready tools/list result contains declarations")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("tool declaration name")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(early_tool_names, ready_tool_names);
+
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    assert!(daemon.wait().expect("join daemon").success());
+}
+
+#[tokio::test]
+async fn capabilities_become_ready_independently() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+
+    // Each result below comes from a configured real process dependency. This
+    // makes the admission contract observable without peeking at tool lists.
+    let mut harness = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    harness.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    harness
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    assert!(
+        harness
+            .call_tool(
+                21,
+                "tower_create_file",
+                json!({"path":"blocked.rs","content":"pub fn blocked() {}\n"}),
+            )
+            .await["result"]
+            .is_object(),
+        "workspace mutations remain independent of AST catch-up"
+    );
+    harness.release_probe().await;
+    harness
+        .await_milestone(StartupMilestone::CatchUpReleased, deadline)
+        .await;
+    assert!(
+        harness
+            .call_tool(24, "tower_ast_get_outline", json!({"path":"ready.rs"}))
+            .await["result"]
+            .is_object(),
+        "AST dispatch begins only after its host-only fence"
+    );
+    harness.shutdown_and_await_release(deadline).await;
+
+    let workspace = tempdir().expect("create workspace");
+    std::fs::write(workspace.path().join("ready.rs"), "pub fn ready() {}\n").unwrap();
+    install_ast_extension(workspace.path());
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon = spawn_daemon_at_preparation_barrier(
+        &hooks,
+        workspace.path(),
+        "capability-catch-up-blocked",
+    );
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("connect while capability catch-up is blocked");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"readiness-independent-gates","version":"1"}}}"#,
+    )
+    .await
+    .unwrap();
+    read_line_capped(&mut connection, 1 << 20)
+        .await
+        .unwrap()
+        .expect("initialize response");
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tower_read_file","arguments":{"path":"ready.rs"}}}"#,
+    )
+    .await
+    .unwrap();
+    let workspace_read: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("workspace-ready native read must complete"),
+    )
+    .unwrap();
+    assert!(workspace_read["result"].is_object());
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"tower_create_file","arguments":{"path":"mutation.rs","content":"pub fn mutation() {}\n"}}}"#,
+    )
+    .await
+    .unwrap();
+    let mutation: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("workspace-ready mutation must complete"),
+    )
+    .unwrap();
+    assert!(mutation["result"].is_object());
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#,
+    )
+    .await
+    .unwrap();
+    let blocked_list: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("tools/list remains callable"),
+    )
+    .unwrap();
+    let blocked_names = blocked_list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(blocked_names.contains(&"tower_read_file"));
+    assert!(
+        !blocked_names
+            .iter()
+            .any(|name| name.starts_with("tower_ast_"))
+    );
+    assert!(
+        !blocked_names
+            .iter()
+            .any(|name| name.starts_with("tower_lsp_"))
+    );
+
+    let status = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Status,
+    )
+    .await
+    .expect("status remains callable during capability catch-up");
+    assert!(matches!(
+        status,
+        ControlResponse::Status(ref snapshot)
+            if snapshot.workspace == core_engine::adapters::daemon::CapabilityReadiness::Ready
+                && !matches!(snapshot.ast, core_engine::adapters::daemon::CapabilityReadiness::Ready)
+                && !matches!(snapshot.lsp, core_engine::adapters::daemon::CapabilityReadiness::Ready)
+    ));
+
+    release_preparation_barrier(&mut daemon);
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"tower_ast_get_outline","arguments":{"path":"ready.rs"}}}"#,
+    )
+    .await
+    .unwrap();
+    let ast: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("published AST tool returns its outline"),
+    )
+    .unwrap();
+    assert_eq!(ast["result"]["content"][0]["type"], "text");
+    assert!(
+        ast["result"]["content"][0]["text"]
+            .as_str()
+            .expect("AST tool text")
+            .contains("ready")
+    );
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    assert!(daemon.wait().expect("join daemon").success());
+}
+
+#[tokio::test]
+async fn readiness_list_and_call_remain_coherent_during_transition() {
+    let workspace = tempdir().expect("create workspace");
+    std::fs::write(workspace.path().join("ready.rs"), "pub fn ready() {}\n").unwrap();
+    install_ast_extension(workspace.path());
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon = spawn_daemon_at_preparation_barrier(
+        &hooks,
+        workspace.path(),
+        "capability-catch-up-blocked",
+    );
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("connect during capability transition");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"readiness-transition","version":"1"}}}"#,
+    )
+    .await
+    .unwrap();
+    read_line_capped(&mut connection, 1 << 20)
+        .await
+        .unwrap()
+        .expect("initialize response");
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    )
+    .await
+    .unwrap();
+    let before: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("pre-transition list"),
+    )
+    .unwrap();
+    assert!(
+        before["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool["name"].as_str().unwrap().starts_with("tower_ast_"))
+    );
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_ast_get_outline","arguments":{"path":"ready.rs"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            read_line_capped(&mut connection, 1 << 20)
+        )
+        .await
+        .is_err(),
+        "an exhaustive AST call must not complete while its declaration is hidden"
+    );
+
+    release_preparation_barrier(&mut daemon);
+    let response: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("admitted AST call completes after publication"),
+    )
+    .unwrap();
+    assert_eq!(response["result"]["content"][0]["type"], "text");
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("AST result text")
+            .contains("ready")
+    );
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#,
+    )
+    .await
+    .unwrap();
+    let after: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .unwrap()
+            .expect("post-transition list"),
+    )
+    .unwrap();
+    assert!(
+        after["result"]["tools"]
+            .as_array()
+            .expect("tool declarations")
+            .iter()
+            .any(|tool| tool["name"] == "tower_ast_get_outline")
+    );
+
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    assert!(daemon.wait().expect("join daemon").success());
+}
+
+#[tokio::test]
+async fn failed_startup_restarts_in_same_workspace() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+
+    let mut recovery = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Fail);
+    recovery.seed_file("failed-generation.rs", "pub fn failed_generation() {}\n");
+    recovery.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    recovery
+        .await_milestone(StartupMilestone::PreparationCancelled, deadline)
+        .await;
+    let failed_generation = recovery.generation().await;
+    recovery.shutdown_and_await_release(deadline).await;
+    recovery
+        .await_milestone(StartupMilestone::ResourcesReleased, deadline)
+        .await;
+    assert_eq!(
+        recovery.released_resources().await,
+        reconciliation_process::ReleasedResources {
+            sled: true,
+            watcher: true,
+            socket: true,
+            sidecars: true,
+            ownership: true,
+        },
+        "failed generation must release every owned public resource before reuse"
+    );
+    recovery.restart().await;
+    recovery
+        .await_milestone(StartupMilestone::TransportBound, deadline)
+        .await;
+    assert!(
+        recovery.generation().await > failed_generation,
+        "same-workspace restart must acquire a strictly newer generation"
+    );
+
+    let workspace = tempdir().expect("create workspace");
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon =
+        spawn_daemon_at_preparation_barrier(&hooks, workspace.path(), "fail-reconciliation");
+    wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("transport is bound before preparation failure");
+    release_preparation_barrier(&mut daemon);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = core_engine::adapters::daemon::client::send_control_async(
+            &GlobalOpts {
+                workspace_dir: Some(workspace.path().to_path_buf()),
+                extensions_dir: None,
+            },
+            ControlRequest::Status,
+        )
+        .await
+        .expect("failed preparation remains observable through control status");
+        if matches!(
+            response,
+            ControlResponse::Status(ref snapshot)
+                if snapshot.lifecycle == core_engine::adapters::daemon::DaemonLifecycle::Failed {
+                    failure_class: core_engine::adapters::daemon::StartupFailureClass::Reconciliation,
+                }
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "failure was not published");
+        tokio::task::yield_now().await;
+    }
+
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    assert!(daemon.wait().expect("join failed daemon").success());
+
+    spawn_daemon_thread(workspace.path().to_path_buf(), config_with_idle(300));
+    wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("same persisted workspace restarts cleanly");
+    let status = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Status,
+    )
+    .await
+    .expect("restarted daemon status");
+    assert!(!matches!(
+        status,
+        ControlResponse::Status(ref snapshot)
+            if matches!(snapshot.lifecycle, core_engine::adapters::daemon::DaemonLifecycle::Failed { .. })
+    ));
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shutdown_cancels_preparation_and_releases_resources() {
+    use core_engine::adapters::daemon::socket::{OwnerLiveness, probe_owner};
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+
+    let mut recovery = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    recovery.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    recovery
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    recovery.observe_probe().await;
+    recovery.shutdown_and_await_release(deadline).await;
+    recovery
+        .await_milestone(StartupMilestone::PreparationCancelled, deadline)
+        .await;
+    recovery
+        .await_milestone(StartupMilestone::ResourcesReleased, deadline)
+        .await;
+    assert_eq!(
+        recovery.released_resources().await,
+        reconciliation_process::ReleasedResources {
+            sled: true,
+            watcher: true,
+            socket: true,
+            sidecars: true,
+            ownership: true,
+        }
+    );
+    // Hold a real storage handle throughout the quiet window rather than
+    // reopening it repeatedly (Sled's background drop can transiently retain a lock).
+    let storage = recovery.hold_released_storage(deadline).await;
+    let quiet_logs = recovery.captured_logs().await;
+    let quiet_until = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < quiet_until {
+        assert!(
+            recovery.stopped_workers_remain_absent(),
+            "independent OS probes must keep observing released workers and ownership"
+        );
+        assert_eq!(
+            recovery.captured_logs().await,
+            quiet_logs,
+            "the durable output channel must show no later worker effects"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    storage
+        .flush()
+        .expect("the independently held released storage remains usable");
+    drop(storage);
+
+    let workspace = tempdir().expect("create workspace");
+    let extensions = workspace.path().join(".tower/extensions");
+    let sidecar = extensions.join("cleanup-sentinel");
+    std::fs::create_dir_all(&sidecar).expect("create cleanup sentinel extension");
+    let launched = workspace.path().join("sidecar-launched");
+    let cleaned = workspace.path().join("sidecar-cleaned");
+    let script = sidecar.join("sentinel.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf launched > '{}'\ntrap 'printf cleaned > \"{}\"' EXIT\nwhile IFS= read -r request; do\n  case \"$request\" in\n    *initialize*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"type\":\"Initialized\",\"data\":{{\"tools\":[],\"events\":[],\"capabilities\":[]}}}}}}' ;;\n    *shutdown*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"type\":\"Ack\"}}}}'; exit 0 ;;\n  esac\ndone\n",
+            launched.display(),
+            cleaned.display(),
+        ),
+    )
+    .expect("write cleanup sentinel extension");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make cleanup sentinel executable");
+    }
+    std::fs::write(
+        sidecar.join("extension.toml"),
+        format!(
+            "name = \"cleanup-sentinel\"\nversion = \"0.1.0\"\ncommand = [\"{}\"]\nactivation = \"eager\"\n[capabilities]\nrequired = []\n",
+            script.display()
+        ),
+    )
+    .expect("write cleanup sentinel manifest");
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon = spawn_daemon_at_preparation_barrier(
+        &hooks,
+        workspace.path(),
+        "capability-catch-up-blocked",
+    );
+    wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("early transport accepts shutdown");
+
+    core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await
+    .expect("shutdown cancels blocked preparation");
+    assert!(daemon.wait().expect("joined shutdown").success());
+    assert!(
+        !socket_path(workspace.path()).exists(),
+        "joined shutdown releases the daemon socket"
+    );
+    assert_eq!(probe_owner(workspace.path()).unwrap(), OwnerLiveness::Dead);
+    sled::open(workspace.path().join(".tower/db")).expect("shutdown releases Sled");
+    WorkspaceDaemonOwner::acquire(workspace.path()).expect("shutdown releases daemon ownership");
+    assert!(
+        launched.exists(),
+        "the sidecar reached capability preparation"
+    );
+    assert!(
+        cleaned.exists(),
+        "joined shutdown terminates the sidecar process"
+    );
+    let cleanup: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(workspace.path().join(".tower/preparation-cleanup.json"))
+            .expect("startup hook recorded joined resource cleanup"),
+    )
+    .expect("cleanup trace is JSON");
+    assert_eq!(
+        cleanup,
+        [
+            "watcher",
+            "sidecars",
+            "push_fanout",
+            "sled",
+            "socket",
+            "ownership"
+        ],
+        "joined cancellation must release every owned resource in shutdown order"
+    );
+}
+
+#[test]
+fn slow_extension_protocol_examples_match_literal_json() {
+    let initialize = Request::Initialize(InitParams {
+        protocol_version: PROTOCOL_VERSION,
+        client_info: "daemon-e2e".to_owned(),
+        extension_config: Some(json!({"mode": "block"})),
+    });
+    assert_eq!(
+        serde_json::to_value(initialize).unwrap(),
+        json!({
+            "type": "Initialize",
+            "data": {
+                "protocol_version": PROTOCOL_VERSION,
+                "client_info": "daemon-e2e",
+                "extension_config": {"mode": "block"}
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Response::Ack).unwrap(),
+        json!({"type": "Ack"})
+    );
+    assert_eq!(
+        serde_json::to_value(Request::InvokeTool {
+            name: "probe_catch_up".to_owned(),
+            params: json!({"release": false}),
+        })
+        .unwrap(),
+        json!({
+            "type": "InvokeTool",
+            "data": {"name": "probe_catch_up", "params": {"release": false}}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Request::InvokeTool {
+            name: "_tower_catch_up_fence".to_owned(),
+            params: json!({"epoch": 7, "delivered_events": 1}),
+        })
+        .unwrap(),
+        json!({
+            "type": "InvokeTool",
+            "data": {
+                "name": "_tower_catch_up_fence",
+                "params": {"epoch": 7, "delivered_events": 1}
+            }
+        })
+    );
+
+    let mut child = SlowStartChild::spawn();
+    let initialized = child.initialize(1, Some(json!({"mode": "block"})));
+    assert_eq!(
+        initialized,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "type": "Initialized",
+                "data": {
+                    "tools": [
+                        {
+                            "name": "probe_catch_up",
+                            "description": "Release or observe deterministic slow-start catch-up.",
+                            "schema_json": "{\"type\":\"object\",\"properties\":{\"release\":{\"type\":\"boolean\"}},\"additionalProperties\":false}"
+                        },
+                        {
+                            "name": "_tower_catch_up_fence",
+                            "description": "Host-only catch-up ordering barrier.",
+                            "schema_json": "{\"type\":\"object\",\"properties\":{\"epoch\":{\"type\":\"integer\"},\"delivered_events\":{\"type\":\"integer\"}},\"required\":[\"epoch\",\"delivered_events\"],\"additionalProperties\":false}"
+                        }
+                    ],
+                    "events": ["event/fileIndexed", "event/fileChanged", "event/fileDeleted"],
+                    "capabilities": []
+                }
+            }
+        })
+    );
+
+    child.send(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "deliverEvent",
+        "params": serde_json::to_value(Event::FileIndexed {
+            file_id: 1,
+            path: "private.rs".to_owned(),
+        }).unwrap(),
+    }));
+    assert_eq!(
+        child.recv(),
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"type": "Ack"}})
+    );
+
+    child.send(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "invokeTool", "params": {
+            "name": "probe_catch_up", "params": {"release": false}
+        }}),
+    );
+    assert_eq!(
+        child.recv()["result"],
+        json!({"type": "ToolResult", "data": {
+            "processed_events": 0, "processed_ordinals": [], "released": false,
+            "barrier_observed": false, "pending_fences": 0
+        }})
+    );
+
+    child.send(
+        json!({"jsonrpc": "2.0", "id": 4, "method": "invokeTool", "params": {
+            "name": "_tower_catch_up_fence", "params": {"epoch": 7, "delivered_events": 1}
+        }}),
+    );
+    assert_eq!(
+        child.recv()["result"],
+        json!({"type": "ToolResult", "data": {
+            "epoch": 7, "processed_events": 0, "ready": false
+        }})
+    );
+
+    child.send(
+        json!({"jsonrpc": "2.0", "id": 5, "method": "invokeTool", "params": {
+            "name": "probe_catch_up", "params": {}
+        }}),
+    );
+    assert_eq!(
+        child.recv()["result"],
+        json!({"type": "ToolResult", "data": {
+            "processed_events": 1, "processed_ordinals": [1], "released": true,
+            "barrier_observed": false, "pending_fences": 1
+        }})
+    );
+
+    child.send(
+        json!({"jsonrpc": "2.0", "id": 6, "method": "invokeTool", "params": {
+            "name": "_tower_catch_up_fence", "params": {"epoch": 7, "delivered_events": 1}
+        }}),
+    );
+    assert_eq!(
+        child.recv()["result"],
+        json!({"type": "ToolResult", "data": {
+            "epoch": 7, "processed_events": 1, "ready": true
+        }})
+    );
+
+    let unknown_probe_field = child.invoke_tool(
+        7,
+        "probe_catch_up",
+        json!({"release": false, "unknown": true}),
+    );
+    assert_eq!(
+        unknown_probe_field,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {"code": -32602, "message": "invalid probe_catch_up parameters"}
+        })
+    );
+
+    // A release is a one-way state transition: later releases observe the same snapshot.
+    assert_eq!(
+        child.invoke_tool(8, "probe_catch_up", json!({}))["result"],
+        json!({"type": "ToolResult", "data": {
+            "processed_events": 1, "processed_ordinals": [1], "released": true,
+            "barrier_observed": true, "pending_fences": 1
+        }})
+    );
+
+    let mut resume = SlowStartChild::spawn();
+    assert!(resume.initialize(20, Some(json!({"mode": "resume"})))["result"].is_object());
+    assert_eq!(
+        resume.deliver_event(
+            21,
+            Event::FileChanged {
+                file_id: 2,
+                path: "immediate.rs".to_owned()
+            },
+        ),
+        json!({"jsonrpc": "2.0", "id": 21, "result": {"type": "Ack"}})
+    );
+    assert_eq!(
+        resume.invoke_tool(22, "probe_catch_up", json!({"release": false}))["result"]["data"]["processed_events"],
+        1,
+        "resume mode applies accepted replay events without a release probe"
+    );
+
+    let mut overflow = SlowStartChild::spawn();
+    assert!(overflow.initialize(30, Some(json!({"mode": "block"})))["result"].is_object());
+    for ordinal in 1..=65_u64 {
+        assert_eq!(
+            overflow.deliver_event(
+                30 + ordinal,
+                Event::FileChanged {
+                    file_id: ordinal,
+                    path: format!("event-{ordinal}.rs")
+                },
+            )["result"],
+            json!({"type": "Ack"})
+        );
+    }
+    assert_eq!(
+        overflow.invoke_tool(96, "probe_catch_up", json!({}))["result"]["data"],
+        json!({
+            "processed_events": 65,
+            "processed_ordinals": (2_u64..=65).collect::<Vec<_>>(),
+            "released": true,
+            "barrier_observed": false,
+            "pending_fences": 0
+        }),
+        "bounded evidence retains exactly the newest 64 ordinals while the total remains exact"
+    );
+
+    let mut malformed = SlowStartChild::spawn();
+    assert!(malformed.initialize(100, Some(json!({"mode": "block"})))["result"].is_object());
+    malformed.send(json!({
+        "jsonrpc": "2.0", "id": 101, "method": "deliverEvent", "params": null
+    }));
+    assert_eq!(
+        malformed.recv(),
+        json!({
+            "jsonrpc": "2.0", "id": 101,
+            "error": {"code": -32602, "message": "invalid deliverEvent parameters"}
+        })
+    );
+    assert_eq!(
+        malformed.invoke_tool(102, "probe_catch_up", json!({}))["result"]["data"],
+        json!({
+            "processed_events": 0, "processed_ordinals": [], "released": true,
+            "barrier_observed": false, "pending_fences": 0
+        }),
+        "a malformed event must not advance accepted or processed state"
+    );
+}
+
+#[tokio::test]
+async fn slow_extension_rejects_invalid_initialization_modes() {
+    let invalid = [
+        None,
+        Some(json!({})),
+        Some(json!({"mode": "unknown"})),
+        Some(json!({"mode": "block", "unknown": true})),
+    ];
+    for (index, config) in invalid.into_iter().enumerate() {
+        let mut child = SlowStartChild::spawn();
+        let response = child.initialize(index as u64 + 1, config);
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": index as u64 + 1,
+                "error": {"code": -32602, "message": "invalid slow_start initialization"}
+            }),
+            "initialization failures expose one fixed protocol envelope"
+        );
+    }
+
+    // The same strict validation must be reached through manifest discovery;
+    // an invalid fixture is isolated rather than preventing the MCP daemon
+    // from serving its native public surface.
+    let workspace = tempdir().expect("create invalid-discovery workspace");
+    install_slow_start_extension(workspace.path());
+    fs::write(
+        workspace.path().join(".tower/config.toml"),
+        "[daemon]\nidle_timeout_secs = 300\nconnection_timeout_secs = 2\npreparation_timeout_secs = 2\n\
+         [extensions]\nrequest_timeout_secs = 2\n\
+         [extensions.readiness]\nslow_start = \"ast\"\n\
+         [extensions.readiness_controls]\nslow_start = [\"probe_catch_up\"]\n\
+         [extensions.initialize.slow_start]\nmode = \"not-a-mode\"\n",
+    )
+    .expect("configure invalid slow-start manifest discovery");
+    let mut daemon = Command::new(selected_production_binary())
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon with discovered invalid slow-start fixture");
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("invalid extension initialization remains isolated from MCP startup");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .expect("send MCP handshake");
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"invalid-slow-start","version":"1"}}}"#,
+    )
+    .await
+    .expect("send MCP initialize");
+    let initialized: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .expect("read MCP initialize")
+            .expect("MCP initialize response"),
+    )
+    .expect("parse MCP initialize response");
+    assert!(
+        initialized["result"].is_object(),
+        "invalid fixture is isolated: {initialized}"
+    );
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    )
+    .await
+    .expect("list tools after invalid fixture initialization");
+    let tools: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .expect("read tools/list")
+            .expect("tools/list response"),
+    )
+    .expect("parse tools/list response");
+    assert!(
+        !tools["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| { tool["name"] == "tower_slow_start_probe_catch_up" }),
+        "an extension rejected during manifest discovery cannot publish its control: {tools}"
+    );
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: None,
+    };
+    let _ =
+        core_engine::adapters::daemon::client::send_control_async(&opts, ControlRequest::Shutdown)
+            .await;
+    let _ = daemon.wait();
+}
+
+#[tokio::test]
+async fn slow_extension_fail_and_crash_modes_are_deterministic() {
+    let _slow_start_guard = slow_start_process_lock().lock().await;
+    let event = serde_json::to_value(Event::FileChanged {
+        file_id: 9,
+        path: "producer-secret.rs".to_owned(),
+    })
+    .unwrap();
+
+    let mut failing = SlowStartChild::spawn();
+    assert!(failing.initialize(1, Some(json!({"mode": "fail"})))["result"].is_object());
+    failing.send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "deliverEvent", "params": event
+    }));
+    let failure = failing.recv();
+    assert_eq!(
+        failure,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {"code": -32000, "message": "planned replay failure"}
+        })
+    );
+    assert!(!failure.to_string().contains("producer-secret"));
+
+    let mut crashing = SlowStartChild::spawn();
+    assert!(crashing.initialize(3, Some(json!({"mode": "crash"})))["result"].is_object());
+    crashing.send(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "deliverEvent", "params": {
+            "type": "FileDeleted", "path": "producer-secret.rs"
+        }
+    }));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = crashing.child.try_wait().expect("poll crashing fixture") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "crash mode did not exit within its operation budget"
+        );
+        std::thread::yield_now();
+    };
+    assert!(!status.success());
+
+    // These are discovery scenarios, not direct-child substitutes: each
+    // declared mode is forwarded by the daemon to the manifest-discovered
+    // fixture. The direct checks above pin the fixture's exact wire behavior.
+    for mode in ["resume", "fail", "crash"] {
+        let workspace = tempdir().expect("create mode-discovery workspace");
+        fs::write(
+            workspace.path().join("replayed.rs"),
+            "pub fn replayed() {}\n",
+        )
+        .expect("seed replay event");
+        install_slow_start_extension(workspace.path());
+        fs::write(
+            workspace.path().join(".tower/config.toml"),
+            format!(
+                "[daemon]\nidle_timeout_secs = 300\nconnection_timeout_secs = 2\npreparation_timeout_secs = 2\n\
+                 [extensions]\nrequest_timeout_secs = 2\n\
+                 [extensions.readiness]\nslow_start = \"ast\"\n\
+                 [extensions.readiness_controls]\nslow_start = [\"probe_catch_up\"]\n\
+                 [extensions.initialize.slow_start]\nmode = \"{mode}\"\n"
+            ),
+        )
+        .expect("configure discovered fixture mode");
+        let mut daemon = Command::new(selected_production_binary())
+            .arg("daemon")
+            .arg("--workspace-dir")
+            .arg(workspace.path())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", workspace.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn daemon with discovered slow-start mode");
+        let mut connection =
+            wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+                .await
+                .expect("manifest-discovered extension does not block MCP startup");
+        connection
+            .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+            .await
+            .expect("send MCP handshake");
+        write_line(
+            &mut connection,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"slow-mode-discovery","version":"1"}}}"#,
+        )
+        .await
+        .expect("send MCP initialize");
+        let initialized: Value = serde_json::from_str(
+            &read_line_capped(&mut connection, 1 << 20)
+                .await
+                .expect("read MCP initialize")
+                .expect("MCP initialize response"),
+        )
+        .expect("parse MCP initialize response");
+        assert!(
+            initialized["result"].is_object(),
+            "mode {mode} is delivered through discovery: {initialized}"
+        );
+
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = core_engine::adapters::daemon::client::send_control_async(
+                &opts,
+                ControlRequest::Status,
+            )
+            .await
+            .expect("read mode-specific readiness");
+            let observed = match status {
+                ControlResponse::Status(snapshot) if mode == "resume" => {
+                    snapshot.ast == core_engine::adapters::daemon::CapabilityReadiness::Ready
+                }
+                ControlResponse::Status(snapshot) => matches!(
+                    snapshot.ast,
+                    core_engine::adapters::daemon::CapabilityReadiness::Failed { .. }
+                        | core_engine::adapters::daemon::CapabilityReadiness::Unavailable
+                ),
+                _ => false,
+            };
+            if observed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mode {mode} did not produce its public readiness outcome"
+            );
+            tokio::task::yield_now().await;
+        }
+        let _ = core_engine::adapters::daemon::client::send_control_async(
+            &opts,
+            ControlRequest::Shutdown,
+        )
+        .await;
+        let _ = daemon.wait();
+    }
+}
+
+#[tokio::test]
+async fn changes_during_catch_up_converge_before_ready() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+    let mut harness = ReconciliationProcessHarness::new_with_files(
+        SlowStartInitializeConfiguration::Block,
+        &[
+            ("replayed-a.rs", "pub fn replayed_a() {}\n"),
+            ("replayed-b.rs", "pub fn replayed_b() {}\n"),
+            ("replayed-c.rs", "pub fn replayed_c() {}\n"),
+        ],
+    );
+    harness.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    harness
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    assert!(!harness.observe_probe().await.released);
+
+    // Five watcher transitions; the indexed marker fences modify before delete.
+    let workspace = harness.workspace();
+    fs::write(
+        workspace.join("watcher-live.rs"),
+        "pub fn watcher_created() {}\n",
+    )
+    .unwrap();
+    harness
+        .await_indexed_path("watcher-live.rs", true, deadline)
+        .await;
+    fs::write(
+        workspace.join("watcher-live.rs"),
+        "pub fn watcher_changed() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("watcher-marker.rs"),
+        "// watcher queue marker\n",
+    )
+    .unwrap();
+    harness
+        .await_indexed_path("watcher-marker.rs", true, deadline)
+        .await;
+    fs::remove_file(workspace.join("watcher-live.rs")).unwrap();
+    harness
+        .await_indexed_path("watcher-live.rs", false, deadline)
+        .await;
+    fs::remove_file(workspace.join("watcher-marker.rs")).unwrap();
+    harness
+        .await_indexed_path("watcher-marker.rs", false, deadline)
+        .await;
+    for (id, name, arguments) in [
+        (
+            101,
+            "tower_create_file",
+            json!({"path":"mcp-live.rs","content":"pub fn mcp_created() {}\n"}),
+        ),
+        (
+            102,
+            "tower_edit_range",
+            json!({"path":"mcp-live.rs","start_byte":7,"end_byte":18,"replacement":"mcp_changed"}),
+        ),
+        (103, "tower_delete_file", json!({"path":"mcp-live.rs"})),
+    ] {
+        let response = harness.call_tool(id, name, arguments).await;
+        assert!(
+            response.get("error").is_none(),
+            "mutation failed: {response}"
+        );
+        assert!(
+            response["result"].is_object(),
+            "mutation response: {response}"
+        );
+        assert_ne!(
+            response["result"]["isError"], true,
+            "mutation failed: {response}"
+        );
+    }
+    let release = harness.release_probe().await;
+    assert!(release.released);
+    assert!(
+        !release.barrier_observed,
+        "release returns before the future ready fence"
+    );
+    harness
+        .await_milestone(StartupMilestone::CatchUpReleased, deadline)
+        .await;
+    let final_probe = harness.observe_probe().await;
+    // 3 snapshot entries + 5 watcher transitions + 3 successful MCP commits.
+    assert_eq!(final_probe.processed_events, 11);
+    assert_eq!(final_probe.processed_ordinals, (1..=11).collect::<Vec<_>>());
+    assert!(final_probe.barrier_observed);
+    assert_eq!(
+        harness.status().await.ast,
+        core_engine::adapters::daemon::CapabilityReadiness::Ready
+    );
+    harness.shutdown_and_await_release(deadline).await;
+}
+
+#[tokio::test]
+async fn startup_outputs_exclude_confidential_producer_values() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+
+    let path_sentinel = "PRIVATE_STARTUP_PATH.rs";
+    let content_sentinel = "PRIVATE_STARTUP_CONTENT";
+    let backend_sentinel = "planned replay failure";
+    let mut privacy = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Fail);
+    privacy.seed_file(
+        path_sentinel,
+        &format!("pub const SECRET: &str = {content_sentinel:?};"),
+    );
+    privacy.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let failed_response = privacy
+        .call_tool(
+            90,
+            "tower_slow_start_probe_catch_up",
+            json!({"release": true}),
+        )
+        .await;
+    privacy
+        .await_milestone(StartupMilestone::PreparationCancelled, deadline)
+        .await;
+    let status = serde_json::to_string(&privacy.status().await).expect("encode public status");
+    let logs = privacy.captured_logs().await;
+    for raw_output in [
+        status,
+        failed_response.to_string(),
+        logs.daemon,
+        logs.sidecars,
+    ] {
+        for sentinel in [path_sentinel, content_sentinel, backend_sentinel] {
+            assert!(
+                !raw_output.contains(sentinel),
+                "public startup output leaked confidential producer value {sentinel}: {raw_output}"
+            );
+        }
+    }
+
+    let cases = [
+        ("block", 2_u64, Value::Null),
+        ("fail", 2_u64, json!("extension_protocol")),
+    ];
+
+    for (mode, expected_event_count, expected_failure_class) in cases {
+        let workspace = tempdir().expect("create instrumented startup workspace");
+        let path_sentinel = "PRIVATE_STARTUP_PATH.rs";
+        let content_sentinel = "PRIVATE_STARTUP_CONTENT";
+        let backend_sentinel = "planned replay failure";
+        fs::write(
+            workspace.path().join(path_sentinel),
+            format!("pub const SECRET: &str = \"{content_sentinel}\";\n"),
+        )
+        .expect("seed confidential replay input");
+        fs::write(workspace.path().join("second.rs"), "pub fn second() {}\n")
+            .expect("seed second replay input");
+        install_slow_start_extension(workspace.path());
+        fs::write(
+            workspace.path().join(".tower/config.toml"),
+            format!(
+                "[daemon]\nidle_timeout_secs = 300\nconnection_timeout_secs = 2\npreparation_timeout_secs = 2\n\
+                 [extensions]\nrequest_timeout_secs = 2\n\
+                 [extensions.readiness]\nslow_start = \"ast\"\n\
+                 [extensions.readiness_controls]\nslow_start = [\"probe_catch_up\"]\n\
+                 [extensions.initialize.slow_start]\nmode = \"{mode}\"\n"
+            ),
+        )
+        .expect("configure instrumented slow-start fixture");
+
+        let mut daemon = Command::new(selected_production_binary())
+            .arg("daemon")
+            .arg("--workspace-dir")
+            .arg(workspace.path())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", workspace.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn instrumented production daemon");
+        wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+            .await
+            .expect("instrumented daemon binds its public socket");
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        };
+
+        if mode == "block" {
+            let mut connection =
+                wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+                    .await
+                    .expect("connect MCP client while startup replay is active");
+            connection
+                .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+                .await
+                .expect("send MCP handshake");
+            write_line(
+                &mut connection,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"startup-instrumentation","version":"1"}}}"#,
+            )
+            .await
+            .expect("send MCP initialize");
+            read_line_capped(&mut connection, 1 << 20)
+                .await
+                .expect("read MCP initialize")
+                .expect("MCP initialize response");
+
+            let probe = |id| {
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {
+                        "name": "tower_slow_start_probe_catch_up",
+                        "arguments": {"release": false}
+                    }
+                })
+                .to_string()
+            };
+            let probe_deadline = Instant::now() + Duration::from_secs(3);
+            let mut probe_id = 2;
+            loop {
+                write_line(&mut connection, &probe(probe_id))
+                    .await
+                    .expect("request deterministic replay observation");
+                let response: Value = serde_json::from_str(
+                    &read_line_capped(&mut connection, 1 << 20)
+                        .await
+                        .expect("read replay observation")
+                        .expect("replay observation response"),
+                )
+                .expect("parse replay observation");
+                let text = response["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("replay observation data");
+                if let Ok(observed) = serde_json::from_str::<Value>(text)
+                    && observed["pending_fences"].as_u64().unwrap_or(0) >= 1
+                {
+                    assert_eq!(observed["released"], false);
+                    break;
+                }
+                assert!(
+                    Instant::now() < probe_deadline,
+                    "fixture did not confirm an active replay fence before release"
+                );
+                probe_id += 1;
+                tokio::task::yield_now().await;
+            }
+
+            let active_raw_status = read_raw_control_status(workspace.path()).await;
+            for sentinel in [path_sentinel, content_sentinel, backend_sentinel] {
+                assert!(
+                    !active_raw_status.contains(sentinel),
+                    "active public startup status leaked confidential producer data"
+                );
+            }
+            let active_status: Value =
+                serde_json::from_str(&active_raw_status).expect("parse active raw status JSON");
+            let active_instrumentation = &active_status["instrumentation"];
+            let active_phases = active_instrumentation["phases"]
+                .as_array()
+                .expect("active completed phase projection");
+            assert!(
+                active_phases
+                    .iter()
+                    .any(|timing| timing["phase"] == "extensions_discovering"),
+                "completed phases remain visible while replay is active"
+            );
+            assert_eq!(
+                active_instrumentation["extension_replays"],
+                json!([]),
+                "only the active replay record is omitted until finalized"
+            );
+
+            probe_id += 1;
+            write_line(
+                &mut connection,
+                &json!({
+                    "jsonrpc": "2.0", "id": probe_id, "method": "tools/call",
+                    "params": {
+                        "name": "tower_slow_start_probe_catch_up",
+                        "arguments": {"release": true}
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("release active replay");
+            read_line_capped(&mut connection, 1 << 20)
+                .await
+                .expect("read replay release")
+                .expect("replay release response");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let expected_phase_count = if mode == "block" { 7 } else { 6 };
+        let (raw_status, snapshot) = loop {
+            let raw_status = read_raw_control_status(workspace.path()).await;
+            for sentinel in [path_sentinel, content_sentinel, backend_sentinel] {
+                assert!(
+                    !raw_status.contains(sentinel),
+                    "public startup status leaked confidential producer data"
+                );
+            }
+            let ControlResponse::Status(snapshot) = serde_json::from_str(&raw_status)
+                .expect("decode raw status response after confidentiality checks")
+            else {
+                panic!("status command returned a non-status response");
+            };
+            if !snapshot.instrumentation.extension_replays.is_empty()
+                && snapshot.instrumentation.phases.len() == expected_phase_count
+            {
+                break (raw_status, snapshot);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup replay metrics were not finalized for {mode}"
+            );
+            tokio::task::yield_now().await;
+        };
+
+        let expected_phases = if mode == "block" {
+            vec![
+                "ownership_acquired",
+                "transport_bound",
+                "storage_opening",
+                "workspace_reconciling",
+                "watcher_catching_up",
+                "extensions_discovering",
+                "capabilities_catching_up",
+            ]
+        } else {
+            vec![
+                "ownership_acquired",
+                "transport_bound",
+                "storage_opening",
+                "workspace_reconciling",
+                "watcher_catching_up",
+                "extensions_discovering",
+            ]
+        };
+        let phase_json = expected_phases
+            .iter()
+            .zip(&snapshot.instrumentation.phases)
+            .map(|(phase, timing)| {
+                json!({
+                    "phase": phase,
+                    "duration_ms": timing.duration_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot.instrumentation.phases.len(),
+            expected_phases.len(),
+            "every completed authoritative phase is projected exactly once"
+        );
+
+        let replay = &snapshot.instrumentation.extension_replays[0];
+        let expected_instrumentation = json!({
+            "phases": phase_json,
+            "extension_replays": [{
+                "extension_id": "slow_start",
+                "event_count": expected_event_count,
+                "duration_ms": replay.duration_ms,
+                "failure_class": expected_failure_class,
+            }],
+        });
+        let raw_status_value: Value =
+            serde_json::from_str(&raw_status).expect("parse final raw status JSON");
+        let actual_instrumentation = raw_status_value["instrumentation"].clone();
+        assert_eq!(actual_instrumentation, expected_instrumentation);
+
+        let _ = core_engine::adapters::daemon::client::send_control_async(
+            &opts,
+            ControlRequest::Shutdown,
+        )
+        .await;
+        let _ = daemon.wait();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly selected real-disk TMPDIR"]
+async fn slow_extension_replay_metrics_are_reproducible_on_real_disk() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, ReleasedResources, SlowStartInitializeConfiguration,
+        StartupEvidenceArtifact, StartupEvidenceRun,
+    };
+
+    const INDEXED_FILE_COUNT: u64 = 1_396;
+    const PATH_SENTINEL: &str = "PRIVATE_REAL_DISK_PATH";
+    const CONTENT_SENTINEL: &str = "PRIVATE_REAL_DISK_CONTENT";
+    const BACKEND_SENTINEL: &str = "PRIVATE_REAL_DISK_BACKEND_TEXT";
+
+    let disk = ReconciliationProcessHarness::verified_real_disk_from_tmpdir();
+    assert!(disk.tmpdir.is_absolute());
+    assert_ne!(disk.target, Path::new("/tmp"));
+    assert!(!matches!(disk.filesystem.as_str(), "tmpfs" | "ramfs"));
+
+    let binaries = ReconciliationProcessHarness::binary_provenance();
+    for (path, digest) in [
+        (&binaries.tower_path, &binaries.tower_sha256),
+        (
+            &binaries.slow_start_extension_path,
+            &binaries.slow_start_extension_sha256,
+        ),
+    ] {
+        assert!(path.is_absolute());
+        assert_eq!(
+            path,
+            &path.canonicalize().expect("canonical evidence binary")
+        );
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+    assert_eq!(
+        binaries.tower_path.parent(),
+        binaries.slow_start_extension_path.parent(),
+        "both binaries must come from the same current-checkout target directory"
+    );
+
+    let mut harness = ReconciliationProcessHarness::new_on_verified_disk(
+        &disk,
+        binaries.clone(),
+        SlowStartInitializeConfiguration::Block,
+    );
+    for ordinal in 0..INDEXED_FILE_COUNT {
+        let path = if ordinal == 0 {
+            format!("{PATH_SENTINEL}-{ordinal:04}.rs")
+        } else {
+            format!("indexed-{ordinal:04}.rs")
+        };
+        harness.seed_file(
+            &path,
+            &format!(
+                "pub const ITEM_{ordinal}: (&str, &str) = ({CONTENT_SENTINEL:?}, {BACKEND_SENTINEL:?});\n"
+            ),
+        );
+    }
+
+    let mut runs: Vec<StartupEvidenceRun> = Vec::with_capacity(3);
+    let mut logs_by_run = Vec::with_capacity(3);
+    for expected_run in 0..3 {
+        assert_eq!(
+            ReconciliationProcessHarness::binary_provenance(),
+            binaries,
+            "binary paths and digests must remain stable across evidence runs"
+        );
+        let started = Instant::now();
+        harness.start_generation().await;
+        let reindex = harness
+            .call_tool(20_000 + expected_run, "tower_reindex", json!({}))
+            .await;
+        assert!(
+            reindex.get("result").is_some(),
+            "public full reindex must complete before measuring run {expected_run}: {reindex}"
+        );
+        let indexed = loop {
+            let status = harness.status().await;
+            if status.indexed_files == INDEXED_FILE_COUNT as usize {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "public status did not reach 1,396 indexed files before the bounded deadline: {status:?}"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            indexed.indexed_files, INDEXED_FILE_COUNT as usize,
+            "public status must report exactly the 1,396 generated regular files before run {expected_run}"
+        );
+
+        let blocked = loop {
+            let probe = harness.observe_probe().await;
+            if probe.pending_fences > 0 {
+                break probe;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the internal catch-up fence was not published before the bounded deadline"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            !blocked.released,
+            "catch-up must still be blocked before release"
+        );
+        assert!(
+            blocked.pending_fences > 0,
+            "the sidecar's internal catch-up fence must be observable through the public probe"
+        );
+        assert_eq!(
+            blocked.processed_events, 0,
+            "no replay event may be processed before the nonblocking release"
+        );
+        let released = harness.release_probe().await;
+        assert!(released.released, "public probe must release catch-up");
+        harness
+            .await_milestone(
+                reconciliation_process::StartupMilestone::CatchUpReleased,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        let after_fence = harness.observe_probe().await;
+        assert!(
+            after_fence.barrier_observed,
+            "internal fence must complete after release"
+        );
+        assert!(
+            after_fence.pending_fences >= blocked.pending_fences,
+            "pending attempts may advance until the release command is processed"
+        );
+        assert_eq!(
+            harness.observe_probe().await.pending_fences,
+            after_fence.pending_fences,
+            "no pending attempt may follow public readiness"
+        );
+        let ready = harness.status().await;
+        assert_eq!(
+            ready.lifecycle,
+            core_engine::adapters::daemon::DaemonLifecycle::Ready,
+            "daemon readiness must follow the observed fence"
+        );
+        assert_eq!(
+            ready.ast,
+            core_engine::adapters::daemon::CapabilityReadiness::Ready,
+            "the configured AST capability must be ready only after the fence"
+        );
+        let catching_up = ready
+            .instrumentation
+            .phases
+            .iter()
+            .find(|phase| {
+                phase.phase == core_engine::adapters::daemon::StartupPhase::CapabilitiesCatchingUp
+            })
+            .expect("public status must include completed capabilities-catching-up timing");
+        let run = StartupEvidenceRun {
+            connection_deadline_ms: 2_000,
+            initialize_elapsed_ms: harness.initialize_elapsed_ms(),
+            catch_up_release_elapsed_ms: harness
+                .catch_up_release_elapsed_ms()
+                .expect("catch-up release milestone"),
+            generation: ready.generation,
+            capabilities_catching_up_ms: catching_up.duration_ms,
+            instrumentation: ready.instrumentation,
+        };
+        assert!(run.initialize_elapsed_ms < run.connection_deadline_ms);
+        assert!(run.initialize_elapsed_ms <= run.catch_up_release_elapsed_ms);
+
+        let matching_replays = run
+            .instrumentation
+            .extension_replays
+            .iter()
+            .filter(|replay| replay.extension_id.as_str() == "slow_start")
+            .collect::<Vec<_>>();
+        assert_eq!(matching_replays.len(), 1);
+        assert_eq!(matching_replays[0].event_count, INDEXED_FILE_COUNT);
+        assert!(
+            serde_json::to_value(matching_replays[0])
+                .expect("serialize replay evidence")
+                .get("duration_ms")
+                .is_some()
+        );
+        assert!(matching_replays[0].failure_class.is_none());
+        assert!(run.instrumentation.phases.iter().any(|phase| phase.phase
+            == core_engine::adapters::daemon::StartupPhase::CapabilitiesCatchingUp));
+
+        // Send the privacy sentinel through the real sidecar protocol boundary,
+        // rather than merely putting it in an indexed file.  Its invalid-field
+        // response is intentionally public and must not leak the field name.
+        let sidecar_boundary = harness
+            .call_tool(
+                30_000 + expected_run,
+                "tower_slow_start_probe_catch_up",
+                json!({BACKEND_SENTINEL: true}),
+            )
+            .await;
+        assert!(
+            !sidecar_boundary.to_string().contains(BACKEND_SENTINEL),
+            "sidecar output must not reflect private backend input"
+        );
+
+        harness
+            .shutdown_and_await_release(Instant::now() + Duration::from_secs(5))
+            .await;
+        let logs = harness.captured_logs().await;
+        logs_by_run.push(logs);
+        assert_eq!(
+            harness.released_resources().await,
+            ReleasedResources {
+                sled: true,
+                watcher: true,
+                socket: true,
+                sidecars: true,
+                ownership: true,
+            },
+            "cold-start run {expected_run} must fully release before reacquisition"
+        );
+        if let Some(previous) = runs.last() {
+            assert!(
+                run.generation > previous.generation,
+                "same-workspace cold starts require increasing generations"
+            );
+        }
+        runs.push(run);
+        harness.prepare_next_cold_start();
+    }
+    let runs: [_; 3] = runs.try_into().expect("exactly three raw evidence runs");
+    let artifact_path = harness.write_startup_evidence(&StartupEvidenceArtifact {
+        disk: disk.clone(),
+        binaries: binaries.clone(),
+        runs: runs.clone(),
+    });
+    let evidence_root = artifact_path
+        .parent()
+        .expect("evidence artifact has a parent")
+        .canonicalize()
+        .expect("canonical evidence directory");
+    let workspace_evidence_root = harness.evidence_root();
+    assert!(
+        evidence_root.starts_with(&workspace_evidence_root),
+        "evidence artifact must be contained by this harness workspace's .tower/perf-evidence: {}",
+        evidence_root.display()
+    );
+    let artifact = fs::read_to_string(&artifact_path).expect("read startup evidence artifact");
+    assert!(
+        artifact.len() <= 64 * 1024,
+        "evidence artifact must be bounded"
+    );
+    for provenance in [
+        disk.source,
+        disk.target.display().to_string(),
+        disk.filesystem,
+        binaries.tower_path.display().to_string(),
+        binaries.tower_sha256,
+        binaries.slow_start_extension_path.display().to_string(),
+        binaries.slow_start_extension_sha256,
+    ] {
+        assert!(artifact.contains(&provenance));
+    }
+    let artifact_json: Value = serde_json::from_str(&artifact)
+        .expect("evidence artifact must be structurally parseable JSON");
+    let raw_runs = artifact_json["raw_runs"]
+        .as_array()
+        .expect("artifact must expose raw_runs");
+    assert_eq!(
+        raw_runs.len(),
+        3,
+        "artifact must contain exactly three raw records"
+    );
+    for (ordinal, (record, run)) in raw_runs.iter().zip(runs.iter()).enumerate() {
+        let replay = run
+            .instrumentation
+            .extension_replays
+            .iter()
+            .find(|replay| replay.extension_id.as_str() == "slow_start")
+            .expect("selected slow-start replay");
+        assert_eq!(record["ordinal"], ordinal + 1);
+        assert_eq!(record["generation"], run.generation);
+        assert_eq!(record["connection_deadline_ms"], run.connection_deadline_ms);
+        assert_eq!(record["initialize_elapsed_ms"], run.initialize_elapsed_ms);
+        assert_eq!(
+            record["catch_up_release_elapsed_ms"],
+            run.catch_up_release_elapsed_ms
+        );
+        assert_eq!(
+            record["capabilities_catching_up_ms"],
+            run.capabilities_catching_up_ms
+        );
+        assert_eq!(record["event_count"], replay.event_count);
+        assert_eq!(record["duration_ms"], replay.duration_ms);
+    }
+    for sentinel in [PATH_SENTINEL, CONTENT_SENTINEL, BACKEND_SENTINEL] {
+        assert!(!artifact.contains(sentinel));
+    }
+
+    assert_eq!(logs_by_run.len(), 3, "capture logs for each cold start");
+    for logs in logs_by_run {
+        assert_eq!(
+            logs.sidecars, logs.daemon,
+            "sidecar stderr is inherited into and captured by the daemon stderr aggregate"
+        );
+        for output in [logs.daemon, logs.sidecars] {
+            for sentinel in [PATH_SENTINEL, CONTENT_SENTINEL, BACKEND_SENTINEL] {
+                assert!(!output.contains(sentinel));
+            }
+        }
+    }
+    let retained = workspace_root().join(".tower/perf-evidence/B001-startup.json");
+    fs::create_dir_all(retained.parent().unwrap()).expect("create retained evidence directory");
+    fs::write(&retained, &artifact).expect("retain validated three-run startup evidence");
+    println!("validated startup evidence: {}", retained.display());
+}
+
+#[test]
+fn startup_evidence_validators_reject_each_untrusted_disk_and_binary_input() {
+    use reconciliation_process::{
+        BinaryCandidate, BinaryProvenanceError, RealDiskCandidate, RealDiskValidationError,
+        validate_binary_provenance, validate_real_disk_candidate,
+    };
+
+    let valid_disk = || RealDiskCandidate {
+        tmpdir: PathBuf::from("/real-disk/evidence"),
+        source: "/dev/nvme0n1p2".to_owned(),
+        target: PathBuf::from("/real-disk"),
+        filesystem: "ext4".to_owned(),
+        writable: true,
+    };
+    assert_eq!(
+        validate_real_disk_candidate(RealDiskCandidate {
+            tmpdir: PathBuf::from("relative"),
+            ..valid_disk()
+        }),
+        Err(RealDiskValidationError::RelativeTmpdir)
+    );
+    assert_eq!(
+        validate_real_disk_candidate(RealDiskCandidate {
+            target: PathBuf::from("/tmp"),
+            ..valid_disk()
+        }),
+        Err(RealDiskValidationError::TmpDirectory)
+    );
+    for filesystem in ["tmpfs", "ramfs"] {
+        assert_eq!(
+            validate_real_disk_candidate(RealDiskCandidate {
+                filesystem: filesystem.to_owned(),
+                ..valid_disk()
+            }),
+            Err(RealDiskValidationError::MemoryFilesystem(
+                filesystem.to_owned()
+            ))
+        );
+    }
+    assert_eq!(
+        validate_real_disk_candidate(RealDiskCandidate {
+            writable: false,
+            ..valid_disk()
+        }),
+        Err(RealDiskValidationError::Unwritable(PathBuf::from(
+            "/real-disk/evidence"
+        )))
+    );
+
+    let valid_binary = || BinaryCandidate {
+        tower_path: PathBuf::from("/checkout/target/debug/tower"),
+        tower_sha256: "a".repeat(64),
+        slow_start_extension_path: PathBuf::from("/checkout/target/debug/slow_start_extension"),
+        slow_start_extension_sha256: "b".repeat(64),
+        target_dir: PathBuf::from("/checkout/target/debug"),
+    };
+    let expected = valid_binary();
+    assert_eq!(
+        validate_binary_provenance(
+            &expected,
+            BinaryCandidate {
+                tower_sha256: "c".repeat(64),
+                ..valid_binary()
+            },
+        ),
+        Err(BinaryProvenanceError::DigestChanged { binary: "tower" })
+    );
+    assert_eq!(
+        validate_binary_provenance(
+            &expected,
+            BinaryCandidate {
+                slow_start_extension_sha256: "d".repeat(64),
+                ..valid_binary()
+            },
+        ),
+        Err(BinaryProvenanceError::DigestChanged {
+            binary: "slow_start_extension"
+        })
+    );
+    assert_eq!(
+        validate_binary_provenance(
+            &expected,
+            BinaryCandidate {
+                tower_path: PathBuf::from("/foreign/target/debug/tower"),
+                ..valid_binary()
+            },
+        ),
+        Err(BinaryProvenanceError::ForeignTargetDirectory(
+            PathBuf::from("/foreign/target/debug/tower")
+        ))
+    );
+}
+
+// Feature: B001
+#[tokio::test]
+async fn control_call_before_extension_discovery_does_not_wait_for_catch_up() {
+    struct DaemonGuard(Child);
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("ready.rs"), "pub fn ready() {}\n").unwrap();
+    install_slow_start_extension(workspace.path());
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon = DaemonGuard(spawn_daemon_at_preparation_barrier_with_config(
+        &hooks,
+        workspace.path(),
+        "before-extension-discovery",
+        "[extensions.readiness]\nslow_start = \"ast\"\n[extensions.readiness_controls]\nslow_start = [\"probe_catch_up\"]\n[extensions.initialize.slow_start]\nmode = \"block\"\n",
+    ));
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .unwrap();
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(&mut connection, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"early-control","version":"1"}}}"#).await.unwrap();
+    read_line_capped(&mut connection, 1 << 20)
+        .await
+        .unwrap()
+        .unwrap();
+    let request = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tower_slow_start_probe_catch_up","arguments":{"release":false}}}"#;
+    write_line(&mut connection, request).await.unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_line_capped(&mut connection, 1 << 20),
+    )
+    .await
+    .expect("undeclared tool must not wait for discovery")
+    .unwrap()
+    .unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tool not found")
+    );
+    release_preparation_barrier(&mut daemon.0);
+    // Retry only after a prompt NotFound: initialized controls remain usable
+    // while exhaustive tools still wait for catch-up.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let response = loop {
+        write_line(&mut connection, request).await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_line_capped(&mut connection, 1 << 20),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        if response["result"]["isError"] == false {
+            break response;
+        }
+        assert!(Instant::now() < deadline, "{response}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let probe: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(probe["released"], false);
+    assert_eq!(probe["barrier_observed"], false);
+}
+
+#[tokio::test]
+async fn slow_extension_probe_resumes_blocked_replay_after_initialization() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+    let mut harness = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    harness.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    harness
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    let blocked = harness.observe_probe().await;
+    assert!(!blocked.released);
+    assert!(blocked.pending_fences > 0);
+    assert_eq!(
+        harness.status().await.ast,
+        core_engine::adapters::daemon::CapabilityReadiness::Preparing {
+            phase: core_engine::adapters::daemon::StartupPhase::CapabilitiesCatchingUp,
+        }
+    );
+    let release = harness.release_probe().await;
+    assert!(release.released);
+    assert!(!release.barrier_observed);
+    harness
+        .await_milestone(StartupMilestone::CatchUpReleased, deadline)
+        .await;
+    let final_probe = harness.observe_probe().await;
+    assert_eq!(final_probe.processed_events, 1);
+    assert_eq!(final_probe.processed_ordinals, vec![1]);
+    assert!(final_probe.barrier_observed);
+    harness.shutdown_and_await_release(deadline).await;
+}
+#[tokio::test]
+async fn slow_extension_pending_fence_expires_as_extension_timeout() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+    let mut harness = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    harness.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    harness
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    loop {
+        let status = harness.status().await;
+        if let core_engine::adapters::daemon::CapabilityReadiness::Failed { failure_class } =
+            status.ast
+        {
+            assert_eq!(
+                failure_class,
+                core_engine::adapters::daemon::StartupFailureClass::ExtensionTimeout
+            );
+            assert_eq!(
+                status.workspace,
+                core_engine::adapters::daemon::CapabilityReadiness::Ready
+            );
+            assert_eq!(
+                status.instrumentation.extension_replays[0].failure_class,
+                Some(failure_class)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "valid pending fence never expired"
+        );
+        tokio::task::yield_now().await;
+    }
+    harness.shutdown_and_await_release(deadline).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_failure_is_observable_and_restartable() {
+    let workspace = tempdir().unwrap();
+    fs::create_dir_all(workspace.path().join(".tower")).unwrap();
+    // Deterministic storage failure without hooks or permissions assumptions.
+    fs::write(workspace.path().join(".tower/db"), "not a directory").unwrap();
+    let root = workspace.path().to_path_buf();
+    let mut config = config_with_idle(300);
+    config.daemon.connection_timeout_secs = 1;
+    let daemon = tokio::task::spawn_blocking(move || {
+        run_daemon(
+            &GlobalOpts {
+                workspace_dir: Some(root),
+                extensions_dir: None,
+            },
+            config,
+            false,
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let raw = loop {
+        let raw = read_raw_control_status(workspace.path()).await;
+        if raw.contains("failed") {
+            break raw;
+        }
+        assert!(Instant::now() < deadline, "{raw}");
+        tokio::task::yield_now().await;
+    };
+    // Even an open control connection cannot retain fatal resources forever.
+    let mut control = UnixStream::connect(socket_path(workspace.path()))
+        .await
+        .unwrap();
+    control
+        .write_all(Handshake::new(ClientRole::Control).to_line().as_bytes())
+        .await
+        .unwrap();
+    assert!(raw.contains("failed"), "{raw}");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), daemon)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(!socket_path(workspace.path()).exists());
+    let owner = WorkspaceDaemonOwner::acquire(workspace.path())
+        .expect("failure released lifetime ownership");
+    drop(owner);
+    drop(control);
+    fs::remove_file(workspace.path().join(".tower/db")).unwrap();
+    let root = workspace.path().to_path_buf();
+    spawn_daemon_thread(root, config_with_idle(1));
+    let status = read_raw_control_status(workspace.path()).await;
+    assert!(!status.is_empty(), "fresh generation serves control");
+    // Explicit shutdown avoids a detached daemon outliving its test workspace.
+    let mut connection = UnixStream::connect(socket_path(workspace.path()))
+        .await
+        .unwrap();
+    connection
+        .write_all(Handshake::new(ClientRole::Control).to_line().as_bytes())
+        .await
+        .unwrap();
+    write_line(
+        &mut connection,
+        &serde_json::to_string(&ControlRequest::Shutdown).unwrap(),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket_path(workspace.path()).exists() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn rename_optional_lsp_fallback_does_not_wait_for_unrelated_ast_catch_up() {
+    use reconciliation_process::{
+        ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
+    };
+    let mut harness = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    harness.start_generation().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    harness
+        .await_milestone(StartupMilestone::CatchUpBlocked, deadline)
+        .await;
+    let status = harness.status().await;
+    assert_eq!(
+        status.lsp,
+        core_engine::adapters::daemon::CapabilityReadiness::Unavailable
+    );
+    assert!(matches!(
+        status.ast,
+        core_engine::adapters::daemon::CapabilityReadiness::Preparing { .. }
+    ));
+    let response = tokio::time::timeout(Duration::from_secs(1), harness.call_tool(91, "tower_rename_path", json!({"source":"ready.rs","destination":"renamed.rs","semantic_policy":"best_effort","dry_run":true}))).await.expect("absent LSP must not wait for AST catch-up");
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    harness.shutdown_and_await_release(deadline).await;
 }
