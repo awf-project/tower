@@ -52,6 +52,16 @@ cargo build --workspace --bins
 
 The main binary is `target/debug/tower`.
 
+To install the server and extensions for use across projects, run from this checkout:
+
+```bash
+make install
+make install-extensions GLOBAL=1
+```
+
+`make install` updates only the server. See [extension installation](docs/getting-started.md#install-extensions)
+for destination overrides and reloading running daemons.
+
 ### Initialize a Workspace
 
 Run this once at the project root you want Tower to index:

@@ -221,22 +221,35 @@ references, and either returns a blocking report or applies a validated declarat
 plan. Use `dry_run:true` to inspect the report without changing files. See
 [Safe-delete a symbol](user-guide/semantic-edits.md#safe-delete-a-symbol).
 
-Extensions are native sidecar binaries discovered from an extension scope by their `extension.toml`
-manifest. Install one (its binary + manifest) into a scope and restart `tower` — no recompile of the
-host:
+### Install extensions
 
-- **Global** (`<xdg-data>/tower/extensions/<name>/`) — usable by every project; scanned first.
-- **Local** (`<workspace>/.tower/extensions/<name>/`) — this project only; wins on a name collision.
-  An explicit `--extensions-dir <path>` / `$TOWER_EXTENSIONS_DIR` replaces both scopes with one dir.
+From the Tower source checkout, install the reference extensions globally:
 
 ```bash
-# Local (this project only): place the binary + manifest in its own directory.
-mkdir -p .tower/extensions/ast
-cp target/debug/ast_extension     .tower/extensions/ast/
-cp extensions/ast/extension.toml  .tower/extensions/ast/
-
-cargo run -p core_engine     # tower_ast_* tools now appear in tools/list
+make install-extensions GLOBAL=1
 ```
+
+On Linux, this uses `$XDG_DATA_HOME/tower/extensions` when `XDG_DATA_HOME` is non-empty,
+otherwise `$HOME/.local/share/tower/extensions`. Use an absolute `XDG_DATA_HOME`.
+Without `GLOBAL=1`, installation stays local to the checkout's `.tower/extensions`.
+An explicit destination always wins, including with global mode:
+
+```bash
+make install-extensions GLOBAL=1 EXT_DEST="/path with spaces/extensions"
+```
+
+The command builds the extensions and prints the destination before copying each manifest and
+executable. `EXTENSIONS=lint` installs only lint; `EXT_PROFILE=debug` uses a debug build.
+`make install` updates only the server, so run the extension installation command after updating it.
+
+After replacing binaries, reload the shared daemon for each affected workspace and reconnect its
+MCP clients. From that workspace, `tower shutdown` stops its daemon; reconnecting the clients
+starts it again with the installed extensions. Installation itself does not stop running daemons.
+
+Global extensions are available across projects. A workspace-local extension with the same name
+in `.tower/extensions/<name>/` takes precedence over its global copy. An explicit
+`--extensions-dir` or `TOWER_EXTENSIONS_DIR` replaces both discovery scopes; install into that
+location with `EXT_DEST` if you use this override.
 
 No extensions in any scope simply serves the native tools; an extension that fails to spawn (or one
 listed in the config disable list) is skipped with a stderr warning and never blocks startup. When the
