@@ -183,14 +183,6 @@ stable error codes.
 | [docs/development.md](docs/development.md)                                                                                       | Contribution workflow, CI checks, tests, and project conventions.                    |
 | [docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md](docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md) | B001 startup ownership and capability-readiness decision.                            |
 
-## Roadmap
-
-### v0.1.0
-
-- [x] F011: File and directory rename refactor.
-- [x] F012: Reference-aware safe symbol deletion.
-- [ ] B001: Reliable MCP startup and independent capability readiness.
-
 ## Development
 
 The merge gate is:

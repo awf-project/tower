@@ -68,3 +68,56 @@ pub use discovery::{
 pub use host_deps::HostDeps;
 pub use sidecar::SidecarHostAdapter;
 pub use supervisor::ExtensionSupervisor;
+
+#[cfg(test)]
+pub(crate) mod timeout_test_support {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn timeout_fixture_bin() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("core_engine must be under crates")
+            .parent()
+            .expect("crates must be under the workspace root")
+            .join("target/debug/fixture_hang_forever")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub(crate) fn timeout_manifest(name: &str, activation: &str) -> String {
+        format!(
+            r#"name = "{name}"
+version = "0.1.0"
+command = ["{}"]
+activation = "{activation}"
+
+[[tools]]
+name = "wait"
+description = "Wait forever"
+schema_json = "{{}}"
+"#,
+            timeout_fixture_bin().replace('\\', "\\\\")
+        )
+    }
+
+    pub(crate) fn assert_timeout_after(
+        instance: &mut Box<dyn crate::domain::ExtensionInstance>,
+        minimum: Duration,
+    ) -> Duration {
+        let started = Instant::now();
+        let result = instance.call_tool("wait", serde_json::json!({}));
+        let elapsed = started.elapsed();
+        assert!(matches!(
+            result,
+            Err(crate::domain::extension_host::ExtensionCallError::Fault(
+                extension_protocol::ExtensionFault::Timeout
+            ))
+        ));
+        assert!(
+            elapsed >= minimum,
+            "request timed out after {elapsed:?}, before {minimum:?}"
+        );
+        elapsed
+    }
+}

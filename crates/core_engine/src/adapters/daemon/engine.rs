@@ -1512,11 +1512,17 @@ fn load_extension_registry(
         .map_err(|_| "engine state lock poisoned")?
         .publication
         .clone();
+    let lint_request_timeout = tower_config
+        .lint_request_timeout()
+        .map_err(|error| error.to_string())?;
     let mut registration_error = None;
-    crate::adapters::extension::discovery::load_extensions_with_register_cancellable(
+    crate::adapters::extension::discovery::load_extensions_with_register_cancellable_with_timeouts(
         &extension_dirs,
         ext_deps.clone(),
-        tower_config.extensions.request_timeout(),
+        crate::adapters::extension::discovery::ExtensionRequestTimeouts::with_lint(
+            tower_config.extensions.request_timeout(),
+            lint_request_timeout,
+        ),
         &tower_config.extensions.disabled,
         &init_configs,
         cancelled,
@@ -1932,9 +1938,37 @@ fn emit_reconciliation_metrics(metrics: ReconciliationMetrics) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::*;
     use crate::adapters::config::{LspConfig, LspServerConfig};
+    use crate::adapters::extension::host_deps::{HostDeps, UnsupportedApplyEditsHost};
+    use crate::adapters::formatter::NoOpFormatQueue;
+    use crate::adapters::{InMemoryAstIndex, InMemoryFs};
+    use tempfile::TempDir;
+
+    fn write_extension_manifest(dir: &Path, name: &str, manifest: &str) {
+        let extension_dir = dir.join(name);
+        std::fs::create_dir_all(&extension_dir).expect("create extension fixture directory");
+        std::fs::write(extension_dir.join("extension.toml"), manifest)
+            .expect("write extension fixture manifest");
+    }
+
+    fn extension_host_deps() -> HostDeps {
+        HostDeps {
+            fs: Arc::new(Mutex::new(InMemoryFs::new())),
+            ast_index: Arc::new(InMemoryAstIndex::new()),
+            format_queue: Arc::new(NoOpFormatQueue),
+            apply_edits: Arc::new(UnsupportedApplyEditsHost),
+            push_tx: None,
+        }
+    }
+
+    use crate::adapters::extension::timeout_test_support::{
+        assert_timeout_after, timeout_manifest,
+    };
 
     #[test]
     fn storage_rewrite_delta_is_added_to_collected_reconciliation_metrics() {
@@ -1982,6 +2016,64 @@ mod tests {
                 "idle_timeout_secs": 45,
             }))
         );
+    }
+
+    #[test]
+    fn lint_host_deadline_override_preserves_other_extensions() {
+        let tower_config: TowerConfig = toml::from_str(
+            r#"
+[extensions]
+request_timeout_secs = 1
+
+[lint.rust]
+command = "cargo"
+timeout_secs = 2
+extensions = ["rs"]
+format = "rustc-json"
+target = "append"
+"#,
+        )
+        .expect("valid daemon lint configuration");
+
+        let global = tower_config.extensions.request_timeout();
+        let lint = tower_config
+            .lint_request_timeout()
+            .expect("valid lint deadline must be derived by daemon assembly");
+        assert_eq!(global, Duration::from_secs(1));
+        assert_eq!(lint, Duration::from_secs(5));
+
+        let extensions = TempDir::new().expect("create extension fixture root");
+        write_extension_manifest(extensions.path(), "lint", &timeout_manifest("lint", "lazy"));
+        write_extension_manifest(
+            extensions.path(),
+            "other",
+            &timeout_manifest("other", "lazy"),
+        );
+        let mut instances = Vec::new();
+
+        crate::adapters::extension::discovery::load_extensions_with_register_cancellable_with_timeouts(
+            &[extensions.path().to_path_buf()],
+            extension_host_deps(),
+            crate::adapters::extension::discovery::ExtensionRequestTimeouts::with_lint(global, lint),
+            &[],
+            &crate::adapters::extension::ExtensionInitConfigMap::new(),
+            None,
+            |instance, name, _| instances.push((name.to_owned(), instance)),
+        );
+
+        let other = instances
+            .iter_mut()
+            .find(|(name, _)| name == "other")
+            .expect("unrelated extension must remain registered");
+        let other_elapsed = assert_timeout_after(&mut other.1, Duration::from_millis(800));
+        let lint_instance = instances
+            .iter_mut()
+            .find(|(name, _)| name == "lint")
+            .expect("lint extension must remain registered");
+        let lint_elapsed = assert_timeout_after(&mut lint_instance.1, Duration::from_secs(4));
+
+        assert!(other_elapsed < Duration::from_secs(4));
+        assert!(lint_elapsed > other_elapsed);
     }
 }
 

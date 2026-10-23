@@ -5,6 +5,7 @@ use core_engine::adapters::config::lint::{LintCommandConfig, ParserFormat, Targe
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunnerLintConfig {
     pub command: String,
+    pub timeout_secs: u64,
     pub args: Vec<String>,
     pub extensions: Vec<String>,
     pub format: ParserFormat,
@@ -17,6 +18,7 @@ impl From<&LintCommandConfig> for RunnerLintConfig {
     fn from(config: &LintCommandConfig) -> Self {
         Self {
             command: config.command.clone(),
+            timeout_secs: config.timeout_secs,
             args: config.args.clone(),
             extensions: config.extensions.clone(),
             format: config.format,

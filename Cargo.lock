@@ -956,6 +956,7 @@ dependencies = [
  "extension_protocol",
  "extension_sidecar_harness",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
 ]

@@ -1,14 +1,14 @@
 # Extensions
 
 Tower's extensibility model is an **out-of-process native extension** system. An extension is a
-standalone native binary (a *sidecar*) that the host spawns as a child process and talks to over a
+standalone native binary (a _sidecar_) that the host spawns as a child process and talks to over a
 tower-specific **JSON-RPC 2.0 protocol on stdio**. Each extension contributes MCP tools (surfaced to
 clients as `tower_<ext>_<tool>`), subscribes to workspace events, and reaches the workspace only
 through host capability callbacks.
 
 > **Previously WASM; now native sidecars.** Earlier versions sandboxed plugins as `wasm32-wasip1`
 > modules inside an embedded `wasmtime` runtime. That model was replaced (spec 20) because tower wants
-> an *extensibility* unit, not a *security sandbox*: rich extensions need subprocesses, sockets,
+> an _extensibility_ unit, not a _security sandbox_: rich extensions need subprocesses, sockets,
 > long-lived state, and threads — exactly what WASI removes. Isolation is now the **OS process
 > boundary**. The external MCP tool contract is unchanged: clients still see `tower_<ext>_<tool>`.
 
@@ -30,7 +30,7 @@ An extension is:
   `tower_<ext>_<tool>` namespace;
 - a **subscriber** to workspace events (`fileIndexed` / `fileChanged` / `fileDeleted`);
 - a **consumer** of host capabilities (read a file, list files, read/write the AST index, request a
-  format, log) — and *only* the capabilities it declares.
+  format, log) — and _only_ the capabilities it declares.
 
 The shared wire contract lives in the `extension_protocol` crate (`crates/extension_protocol/`),
 which contains types and serde (de)serialization only — no process, filesystem, or transport code.
@@ -63,12 +63,12 @@ host  ──initialize──►  extension       (host sends protocol_version + 
       ◄──Ack─────────
 ```
 
-| Method         | Direction        | Purpose                                                              |
-|----------------|------------------|---------------------------------------------------------------------|
+| Method         | Direction        | Purpose                                                                                                                                                               |
+| -------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `initialize`   | host → extension | Sent once after spawn. Carries `protocol_version` + `client_info`. The extension replies with its declared `tools`, subscribed `events`, and required `capabilities`. |
-| `invokeTool`   | host → extension | Invoke a declared tool by `name` with a JSON `params` object. Reply is `ToolResult` (a JSON value). |
-| `deliverEvent` | host → extension | Deliver a workspace event. Sent as a notification (no `id`); the extension replies `Ack`. |
-| `shutdown`     | host → extension | Ask the extension to flush and exit. Reply `Ack`. |
+| `invokeTool`   | host → extension | Invoke a declared tool by `name` with a JSON `params` object. Reply is `ToolResult` (a JSON value).                                                                   |
+| `deliverEvent` | host → extension | Deliver a workspace event. Sent as a notification (no `id`); the extension replies `Ack`.                                                                             |
+| `shutdown`     | host → extension | Ask the extension to flush and exit. Reply `Ack`.                                                                                                                     |
 
 Requests and responses are serialized with adjacent tagging
 (`{"type":"<Variant>","data":<payload>}`; unit variants such as `Shutdown` emit no `data` key). Events
@@ -85,11 +85,11 @@ params, `-32603` internal).
 The host fans out workspace events to extensions that subscribe to them. Subscriptions are declared in
 the manifest's `[events] subscribe` list and re-asserted in the `Initialized` response.
 
-| Event method          | Payload                | Fired when |
-|-----------------------|------------------------|------------|
-| `event/fileIndexed`   | `{ file_id, path }`    | A file was indexed (or re-indexed) in the VFS. |
-| `event/fileChanged`   | `{ file_id, path }`    | A file's content changed on disk and the VFS was updated. |
-| `event/fileDeleted`   | `{ path }`             | A file was deleted from the workspace. |
+| Event method        | Payload             | Fired when                                                |
+| ------------------- | ------------------- | --------------------------------------------------------- |
+| `event/fileIndexed` | `{ file_id, path }` | A file was indexed (or re-indexed) in the VFS.            |
+| `event/fileChanged` | `{ file_id, path }` | A file's content changed on disk and the VFS was updated. |
+| `event/fileDeleted` | `{ path }`          | A file was deleted from the workspace.                    |
 
 These map to `ExtensionHostPort::on_file_indexed` / `on_file_changed` / `on_file_deleted` on the host
 side and to the `Event::FileIndexed` / `FileChanged` / `FileDeleted` variants on the wire. `file_id`
@@ -110,16 +110,16 @@ is routed by the sidecar adapter to an existing outbound port — there is no pr
 An extension may only use a capability it **declares** in its manifest; an undeclared `HostCall` is
 rejected with a protocol error.
 
-| Capability (manifest)  | Wire method                | Backed by port      | Effect |
-|------------------------|----------------------------|---------------------|--------|
-| `read_file`            | `workspace/readFile`       | `FileSystemPort`    | Read a workspace-relative file's bytes. |
-| `list_files`           | `workspace/listFiles`      | `FileSystemPort`    | Enumerate indexed workspace files. |
-| `index_get`            | `index/get`                | `AstIndexPort`      | Read a value from the AST index cache (e.g. key `ast/<path>`). |
-| `index_put`            | `index/put`                | `AstIndexPort`      | Write bytes to the AST index cache. |
-| `request_apply_edits`  | `workspace/applyEdits`     | `ApplyEditsHostPort`| Apply one or more byte-range edits across one or more workspace files through the host's CAS-guarded atomic mutation path, or preview them when `dry_run:true` is set. |
-| `request_format`       | `workspace/requestFormat`  | `FormatQueuePort`   | Enqueue a workspace file for formatting. |
-| `notify`               | `notify/resourceUpdated`   | MCP push channel    | Push a `notifications/resources/updated` event to subscribed MCP clients (best-effort, no round trip). |
-| `log`                  | `log`                      | host logging        | Emit a log line (`trace`/`debug`/`info`/`warn`/`error`) through the host. |
+| Capability (manifest) | Wire method               | Backed by port       | Effect                                                                                                                                                                 |
+| --------------------- | ------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read_file`           | `workspace/readFile`      | `FileSystemPort`     | Read a workspace-relative file's bytes.                                                                                                                                |
+| `list_files`          | `workspace/listFiles`     | `FileSystemPort`     | Enumerate indexed workspace files.                                                                                                                                     |
+| `index_get`           | `index/get`               | `AstIndexPort`       | Read a value from the AST index cache (e.g. key `ast/<path>`).                                                                                                         |
+| `index_put`           | `index/put`               | `AstIndexPort`       | Write bytes to the AST index cache.                                                                                                                                    |
+| `request_apply_edits` | `workspace/applyEdits`    | `ApplyEditsHostPort` | Apply one or more byte-range edits across one or more workspace files through the host's CAS-guarded atomic mutation path, or preview them when `dry_run:true` is set. |
+| `request_format`      | `workspace/requestFormat` | `FormatQueuePort`    | Enqueue a workspace file for formatting.                                                                                                                               |
+| `notify`              | `notify/resourceUpdated`  | MCP push channel     | Push a `notifications/resources/updated` event to subscribed MCP clients (best-effort, no round trip).                                                                 |
+| `log`                 | `log`                     | host logging         | Emit a log line (`trace`/`debug`/`info`/`warn`/`error`) through the host.                                                                                              |
 
 ### Capability security
 
@@ -163,15 +163,15 @@ description = "Return a structural outline for a workspace-relative source file.
 schema_json = '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}'
 ```
 
-| Field                    | Meaning |
-|--------------------------|---------|
-| `name`                   | Unique extension identifier (snake_case recommended). Used as the `tower_<name>_*` tool namespace and matched against the disable list. |
-| `version`                | SemVer string. |
-| `command`                | Argv to spawn the child process. |
-| `activation`             | `eager` (spawn at startup) or `lazy` (spawn on first tool call / event). Defaults to `lazy`. |
-| `[events] subscribe`     | List of event methods (`event/fileIndexed`, `event/fileChanged`, `event/fileDeleted`). Requires `eager` activation. |
-| `[capabilities] required`| List of capability names the extension may call (see the table above). |
-| `[[tools]]`              | One block per tool: `name`, `description`, and `schema_json` (a JSON Schema string for the tool's input). Tools are merged into the MCP registry as `tower_<name>_<tool>`. |
+| Field                     | Meaning                                                                                                                                                                    |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                    | Unique extension identifier (snake_case recommended). Used as the `tower_<name>_*` tool namespace and matched against the disable list.                                    |
+| `version`                 | SemVer string.                                                                                                                                                             |
+| `command`                 | Argv to spawn the child process.                                                                                                                                           |
+| `activation`              | `eager` (spawn at startup) or `lazy` (spawn on first tool call / event). Defaults to `lazy`.                                                                               |
+| `[events] subscribe`      | List of event methods (`event/fileIndexed`, `event/fileChanged`, `event/fileDeleted`). Requires `eager` activation.                                                        |
+| `[capabilities] required` | List of capability names the extension may call (see the table above).                                                                                                     |
+| `[[tools]]`               | One block per tool: `name`, `description`, and `schema_json` (a JSON Schema string for the tool's input). Tools are merged into the MCP registry as `tower_<name>_<tool>`. |
 
 ---
 
@@ -192,9 +192,9 @@ resolved search path.
 
 ### Activation
 
-| Activation | Behavior |
-|------------|----------|
-| `eager`    | The child process is spawned immediately at startup (via `SidecarHostAdapter::spawn`). Required for any extension that subscribes to events. |
+| Activation | Behavior                                                                                                                                                                   |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `eager`    | The child process is spawned immediately at startup (via `SidecarHostAdapter::spawn`). Required for any extension that subscribes to events.                               |
 | `lazy`     | A supervisor is created but the child is **not** spawned until the first tool invocation. Lazy extensions must not subscribe to events (the host does not replay history). |
 
 Failures are non-fatal to the host: a `lazy + events` manifest is skipped with a stderr warning, and a
@@ -210,12 +210,12 @@ the host or sever the MCP link.
 
 ### Fault kinds
 
-| Fault           | Cause |
-|-----------------|-------|
+| Fault           | Cause                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------- |
 | `Timeout`       | The extension did not respond within the configured per-call deadline. The child is killed. |
-| `Crashed`       | The child process exited unexpectedly (carries the OS exit code when available). |
-| `ProtocolError` | The extension sent or received a message that violated the protocol. |
-| `Quarantined`   | The extension was disabled after too many consecutive faults (see below). |
+| `Crashed`       | The child process exited unexpectedly (carries the OS exit code when available).            |
+| `ProtocolError` | The extension sent or received a message that violated the protocol.                        |
+| `Quarantined`   | The extension was disabled after too many consecutive faults (see below).                   |
 
 ### Timeout
 
@@ -224,7 +224,7 @@ Every `invokeTool` and `deliverEvent` is bounded by `request_timeout_secs` (defa
 
 ### Restart with backoff
 
-The supervisor respawns a crashed or timed-out **lazy** child on the *next* call, after an exponential
+The supervisor respawns a crashed or timed-out **lazy** child on the _next_ call, after an exponential
 backoff: `min(2^n · 100 ms, 30 s)`. A successful call clears the backoff state. The supervisor itself
 does not quarantine — it keeps offering to respawn as long as the registry keeps asking.
 
@@ -282,27 +282,27 @@ max_traces = 20
 record_timeout_secs = 60
 ```
 
-| Field | Meaning |
-|-------|---------|
-| `extensions` | File extensions, without leading `.`, associated with this debug language. Must not be empty. |
-| `command` | Debug adapter executable. Must not be empty. |
-| `args` | Optional adapter arguments. |
-| `adapter_type` | DAP adapter identifier sent during initialize, for example `lldb`, `go`, or `python`. |
-| `launch` | Adapter-specific default launch arguments. Tool-level `launch_overrides` are merged into this object. |
+| Field                  | Meaning                                                                                                       |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `extensions`           | File extensions, without leading `.`, associated with this debug language. Must not be empty.                 |
+| `command`              | Debug adapter executable. Must not be empty.                                                                  |
+| `args`                 | Optional adapter arguments.                                                                                   |
+| `adapter_type`         | DAP adapter identifier sent during initialize, for example `lldb`, `go`, or `python`.                         |
+| `launch`               | Adapter-specific default launch arguments. Tool-level `launch_overrides` are merged into this object.         |
 | `default_timeout_secs` | Positive per-operation timeout used by launch, resume, inspect, and cleanup calls unless a tool overrides it. |
-| `idle_ttl_secs` | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it. |
+| `idle_ttl_secs`        | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it.              |
 
 Add `[debug.record] backend = "rr"` only when rr record/replay tools should be exposed. The host
 validates this section at startup and forwards it through the sidecar initialize payload; the sidecar
 does not reread `.tower/config.toml`.
 
-| Field | Meaning |
-|-------|---------|
-| `backend` | Required record backend. The only supported value is `"rr"`. |
-| `trace_dir` | Optional workspace-relative trace root. Defaults to `.tower/traces`; absolute paths and `..` traversal are rejected. |
-| `ttl_secs` | Optional positive trace TTL in seconds. Omit for no TTL expiry. |
-| `max_traces` | Optional positive retained trace limit. Defaults to `20`; pruning still applies without TTL. |
-| `record_timeout_secs` | Optional positive default record timeout. Defaults to `60`; tool calls may pass `timeout_ms`. |
+| Field                 | Meaning                                                                                                              |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `backend`             | Required record backend. The only supported value is `"rr"`.                                                         |
+| `trace_dir`           | Optional workspace-relative trace root. Defaults to `.tower/traces`; absolute paths and `..` traversal are rejected. |
+| `ttl_secs`            | Optional positive trace TTL in seconds. Omit for no TTL expiry.                                                      |
+| `max_traces`          | Optional positive retained trace limit. Defaults to `20`; pruning still applies without TTL.                         |
+| `record_timeout_secs` | Optional positive default record timeout. Defaults to `60`; tool calls may pass `timeout_ms`.                        |
 
 The debug sidecar declares no workspace mutation capabilities. A discovered extension named `debug`
 takes priority over the bundled fallback. It owns adapter and debuggee process lifecycle inside the
@@ -316,24 +316,30 @@ idle expiry. See [debug sessions](user-guide/debug-sessions.md) for the operator
 
 The reference extensions live in `extensions/`:
 
-| Extension          | Activation | Highlights |
-|--------------------|------------|------------|
-| `extensions/hello` | lazy       | Minimal example — a single `greet` tool, no events, no capabilities. The smallest possible extension. |
+| Extension          | Activation | Highlights                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `extensions/hello` | lazy       | Minimal example — a single `greet` tool, no events, no capabilities. The smallest possible extension.                                                                                                                                                                                                                                                       |
 | `extensions/ast`   | eager      | Tree-sitter AST analysis plus anchored symbol edits. Subscribes to `fileIndexed`/`fileChanged`, uses `read_file`/`list_files`/`index_get`/`index_put`/`request_apply_edits`/`log`. Tools: `get_outline`, `find_symbols`, `search_symbols`, `reindex`, `read_symbol`, `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`, `delete_symbol`. |
-| `extensions/lsp`   | eager      | Language-server bridge. Subscribes to `fileChanged`/`fileDeleted`, uses `read_file`/`notify`/`log`/`request_apply_edits`. Tools: `diagnostics`, `definition`, `references`, `hover`, `implementations`, `rename`. |
-| `extensions/lint`  | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`request_apply_edits`/`log`, runs configured external linters read-only, returns LSP-shaped diagnostics, and applies structured fixes through the host. Tools: `check`, `fix`. |
+| `extensions/lsp`   | eager      | Language-server bridge. Subscribes to `fileChanged`/`fileDeleted`, uses `read_file`/`notify`/`log`/`request_apply_edits`. Tools: `diagnostics`, `definition`, `references`, `hover`, `implementations`, `rename`.                                                                                                                                           |
+| `extensions/lint`  | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`request_apply_edits`/`log`, runs configured external linters read-only, returns LSP-shaped diagnostics, and applies structured fixes through the host. Tools: `check`, `fix`.                                                                                                                      |
 
 The `lint` extension is configured from `<workspace>/.tower/config.toml` under `[lint.<language>]`.
-Each entry declares a command, file extensions, parser format, and target mode:
+Each entry declares a command, optional positive `timeout_secs` (default `2`), file extensions,
+parser format, and target mode:
 
 ```toml
 [lint.rust]
 command = "cargo"
 args = ["clippy", "--message-format=json"]
+timeout_secs = 10
 extensions = ["rs"]
 format = "rustc-json"
 target = "none"
 ```
+
+The configured timeout is used for checks, fix preparation, and the post-fix verification pass.
+Tower derives a lint-specific host deadline large enough for the configured command and terminates
+the full linter process tree when the command expires.
 
 See [mcp-tools.md](mcp-tools.md#standalone-lint-tools) for the `tower_lint_check` and
 `tower_lint_fix` wire contracts and the full lint configuration reference.
@@ -359,6 +365,7 @@ See [mcp-tools.md](mcp-tools.md#standalone-lint-tools) for the `tower_lint_check
    description = "Return a greeting string."
    schema_json = '{"type":"object","properties":{"name":{"type":"string"}}}'
    ```
+
 3. Drop the binary + manifest into an extension scope (global XDG dir or `<workspace>/.tower/extensions/<name>/`)
    and restart `tower`. The tool appears in `tools/list` as `tower_hello_greet`.
 
