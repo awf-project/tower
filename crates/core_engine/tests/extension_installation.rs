@@ -189,8 +189,18 @@ impl MakeInstallFixture {
 }
 
 fn write_executable(path: &Path, content: &str) {
-    fs::write(path, content).expect("write fixture executable");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("mark fixture executable");
+    // Open the writable executable only in a child process. Otherwise a
+    // concurrent test's fork can inherit that descriptor until exec, causing
+    // ETXTBSY when this test launches its newly written script.
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+        .arg("write-fixture-executable")
+        .arg(path)
+        .arg(content)
+        .status()
+        .expect("spawn fixture executable writer");
+    assert!(status.success(), "write fixture executable: {status}");
 }
 
 fn assert_success(output: &Output, operation: &str) {

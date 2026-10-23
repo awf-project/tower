@@ -156,6 +156,9 @@ enum EventFailure {
 }
 
 fn main() {
+    // Keep process ownership observable even when a planned replay failure
+    // causes the host to reap this fixture before the test can inspect procfs.
+    eprintln!("tower-slow-start-process: {}", std::process::id());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut output = stdout.lock();

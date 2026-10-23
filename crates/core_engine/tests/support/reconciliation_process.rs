@@ -44,6 +44,29 @@ fn install_slow_start_extension_from(workspace: &Path, binary: &Path) {
     fs::write(extension_dir.join("extension.toml"), manifest).expect("write slow-start manifest");
 }
 
+#[test]
+fn sidecar_ownership_remains_observable_after_process_exit() {
+    let mut harness = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Fail);
+    fs::create_dir_all(harness.workspace.path().join(".tower"))
+        .expect("create fixture log directory");
+    let log = File::create(&harness.logs_path).expect("create generation log");
+    let mut sidecar =
+        Command::new(super::workspace_root().join("target/debug/slow_start_extension"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn short-lived sidecar");
+    let pid = sidecar.id();
+    assert!(sidecar.wait().expect("reap sidecar").success());
+    assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+
+    // No live child remains to sample: ownership must survive in captured stderr.
+    harness.child = Some(sidecar);
+    harness.observe_owned_processes();
+    assert_eq!(harness.sidecar_pids, vec![pid]);
+}
+
 fn child_process_ids(parent_id: u32) -> Vec<u32> {
     // Linux attributes children to the spawning thread, which need not be
     // the daemon's main thread (extensions spawn on its preparation worker).
@@ -729,6 +752,16 @@ impl ReconciliationProcessHarness {
             self.watcher_thread = Some((pid, thread));
         }
         self.sidecar_pids.extend(child_process_ids(pid));
+        // Failed startup can reap the sidecar before our first procfs sample.
+        // Its inherited stderr records ownership before it accepts any request.
+        // spawn_generation truncates this log, so only this generation is read.
+        if let Ok(log) = fs::read_to_string(&self.logs_path) {
+            self.sidecar_pids.extend(log.lines().filter_map(|line| {
+                line.strip_prefix("tower-slow-start-process: ")?
+                    .parse::<u32>()
+                    .ok()
+            }));
+        }
         self.sidecar_pids.sort_unstable();
         self.sidecar_pids.dedup();
     }

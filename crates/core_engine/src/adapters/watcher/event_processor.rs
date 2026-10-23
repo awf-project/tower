@@ -703,6 +703,14 @@ impl EventProcessor {
             return Ok(());
         }
 
+        // A queued deletion (including the source half of a rename) may arrive
+        // after this path was recreated and indexed by a full scan. Reconcile
+        // the current file instead of deleting that newer entry. Excluded
+        // files still need removal even when they remain on disk.
+        if !self.is_excluded(&rel_path) && abs_path.is_file() {
+            return self.handle_modify(abs_path);
+        }
+
         // ── Write lock ────────────────────────────────────────────────────────
         // `rel_path` is cloned before the lock is taken so it is available for
         // the post-lock extension_host call (OP1) without holding the lock during
@@ -2249,6 +2257,29 @@ mod tests {
 
     // ── TDD step 3/4: Delete + Rename consistency ──────────────────────────────
 
+    #[test]
+    fn delayed_delete_preserves_recreated_file_already_indexed_by_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let path = root.join("recreated.rs");
+        std::fs::write(&path, b"original").unwrap();
+        let (mut processor, workspace, index) = make_processor(root);
+        processor
+            .process_event(WatchEvent::Create(path.clone()))
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"recreated content").unwrap();
+        processor.reconcile_workspace().unwrap();
+        let relative = RelativePath::new("recreated.rs");
+        let id = workspace.read().unwrap().get_by_path(&relative).unwrap();
+
+        processor.process_event(WatchEvent::Delete(path)).unwrap();
+
+        assert_eq!(workspace.read().unwrap().get_by_path(&relative), Some(id));
+        assert!(!find_file(&workspace, &index, "recreated").is_empty());
+        assert_eq!(workspace.read().unwrap().get(id).unwrap().size, 17);
+    }
+
     /// AC2: After a Delete event, the file disappears from search.
     #[test]
     fn delete_event_removes_file_from_search() {
@@ -2714,6 +2745,7 @@ mod tests {
         );
 
         // Simulate an external agent renaming foo.rs → foo.rs.tmp_write.
+        std::fs::rename(&real_file, root.join("foo.rs.tmp_write")).unwrap();
         processor
             .process_event(WatchEvent::Rename {
                 from: real_file,
@@ -2749,6 +2781,7 @@ mod tests {
             .process_event(WatchEvent::Create(real_file.clone()))
             .unwrap();
 
+        std::fs::rename(&real_file, root.join("bar.rs.~tmp")).unwrap();
         processor
             .process_event(WatchEvent::Rename {
                 from: real_file,
@@ -2783,6 +2816,7 @@ mod tests {
 
         let dst = root.join("src").join("deploy.key");
         std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::rename(&src, &dst).unwrap();
         processor
             .process_event(WatchEvent::Rename { from: src, to: dst })
             .unwrap();
