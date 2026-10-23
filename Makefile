@@ -8,18 +8,26 @@
 
 BIN          := tower
 PKG          := core_engine
-VERSION      := v$(shell sed -n 's/^version = "\(.*\)"/\1/p' crates/$(PKG)/Cargo.toml | head -1)
-HOST_TARGET  := $(shell rustc -vV | sed -n 's/^host: //p')
+# Distribution metadata is needed only when constructing an archive name.
+VERSION      = v$(shell sed -n 's/^version = "\(.*\)"/\1/p' crates/$(PKG)/Cargo.toml | head -1)
+HOST_TARGET  = $(shell rustc -vV | sed -n 's/^host: //p')
 INSTALL_DIR  ?= $(HOME)/.local/bin
 
 # `install-extensions` knobs.
 #   EXTENSIONS  — reference extensions to install (space-separated; manifest dir names).
 #   EXT_DEST    — discovery scope to install into. Default: local project scope.
-#                 For the global XDG scope, pass
-#                   EXT_DEST=$(HOME)/.local/share/tower/extensions
+#                 GLOBAL=1 selects the XDG global scope unless EXT_DEST is explicit.
 #   EXT_PROFILE — release (default, deployable) or debug (fast, reuses dev build).
 EXTENSIONS   ?= ast debug fmt lint lsp
+ifeq ($(GLOBAL),1)
+ifneq ($(strip $(XDG_DATA_HOME)),)
+EXT_DEST     ?= $(XDG_DATA_HOME)/tower/extensions
+else
+EXT_DEST     ?= $(HOME)/.local/share/tower/extensions
+endif
+else
 EXT_DEST     ?= .tower/extensions
+endif
 EXT_PROFILE  ?= release
 
 .DEFAULT_GOAL := help
@@ -115,17 +123,18 @@ install: release ## Build release and install tower to $(INSTALL_DIR)
 # `command` is resolved relative to the extension directory). This builds them
 # and lays out that structure. Restart tower (or reconnect the MCP server) after.
 .PHONY: install-extensions
-install-extensions: ## Build + install reference extensions ($(EXTENSIONS), $(EXT_PROFILE)) into $(EXT_DEST)
+install-extensions: ## Build + install extensions (default: .tower/extensions; GLOBAL=1 selects XDG_DATA_HOME/tower/extensions, falling back to HOME/.local/share/tower/extensions; EXT_DEST overrides those defaults; make install updates only the server, not extensions)
 	cargo build $(if $(filter release,$(EXT_PROFILE)),--release,) \
 	  $(addprefix -p ,$(addsuffix _extension,$(EXTENSIONS)))
-	@for ext in $(EXTENSIONS); do \
+	@echo "installing extensions into $(EXT_DEST)"
+	@set -e; for ext in $(EXTENSIONS); do \
 	  dest="$(EXT_DEST)/$$ext"; \
 	  mkdir -p "$$dest"; \
 	  install -m 0644 "extensions/$$ext/extension.toml" "$$dest/extension.toml"; \
 	  install -m 0755 "target/$(EXT_PROFILE)/$${ext}_extension" "$$dest/$${ext}_extension"; \
 	  echo "installed extension '$$ext' ($(EXT_PROFILE)) -> $$dest"; \
 	done
-	@echo "restart tower / reconnect the MCP server to load the new extensions"
+	@echo "reload the relevant shared daemon and reconnect its clients to load the new extensions"
 
 ## ---------------------------------------------------------------------------
 ## Housekeeping

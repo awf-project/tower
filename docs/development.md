@@ -60,20 +60,21 @@ cargo deny check                   # make deny
 
 The `Makefile` is the developer task runner; `make help` lists everything.
 
-| Target           | Command |
-|------------------|---------|
-| `make build`     | `cargo build --workspace` (host + native extensions, debug) |
-| `make release`   | `cargo build --release -p core_engine` |
-| `make run`       | `cargo run -p core_engine` (MCP server over stdio) |
-| `make fmt`       | `cargo fmt --all` |
-| `make fmt-check` | `cargo fmt --all --check` (gate step 1) |
-| `make clippy`    | `cargo clippy --workspace --all-targets -- -D warnings` (gate step 2) |
-| `make test`      | `cargo build --workspace --bins` then `cargo test --workspace` (gate step 3) |
-| `make deny`      | `cargo deny check` (gate step 4) |
-| `make gate`      | full quality gate: fmt-check + clippy + test + deny |
-| `make dist`      | package a release tarball + sha256 for the host target |
-| `make install`   | build release and install `tower` to `$INSTALL_DIR` (default `~/.local/bin`) |
-| `make clean`     | `cargo clean` + remove `dist/` |
+| Target                    | Command                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `make build`              | `cargo build --workspace` (host + native extensions, debug)                                                     |
+| `make release`            | `cargo build --release -p core_engine`                                                                          |
+| `make run`                | `cargo run -p core_engine` (MCP server over stdio)                                                              |
+| `make fmt`                | `cargo fmt --all`                                                                                               |
+| `make fmt-check`          | `cargo fmt --all --check` (gate step 1)                                                                         |
+| `make clippy`             | `cargo clippy --workspace --all-targets -- -D warnings` (gate step 2)                                           |
+| `make test`               | `cargo build --workspace --bins` then `cargo test --workspace` (gate step 3)                                    |
+| `make deny`               | `cargo deny check` (gate step 4)                                                                                |
+| `make gate`               | full quality gate: fmt-check + clippy + test + deny                                                             |
+| `make dist`               | package a release tarball + sha256 for the host target                                                          |
+| `make install`            | build release and install `tower` to `$INSTALL_DIR` (default `~/.local/bin`)                                    |
+| `make install-extensions` | build and install extensions locally; `GLOBAL=1` selects the global scope, `EXT_DEST` overrides the destination |
+| `make clean`              | `cargo clean` + remove `dist/`                                                                                  |
 
 ---
 
@@ -198,12 +199,12 @@ must pass the same contract test suite as its in-memory fake."
 Integration tests live in `crates/core_engine/tests/` and exercise full
 adapter-wired scenarios:
 
-| File | Covers |
-|------|--------|
-| `integration_mcp_native_tools.rs` | JSON-RPC over stdio, the native VFS tools |
-| `integration_global_replace.rs` | Parallel mass find-and-replace, error cases |
-| `integration_mutation.rs` | Shadow-file atomic writes |
-| `ast_e2e.rs` | AST outline + symbol search via MCP, end-to-end through the `ast` extension |
+| File                              | Covers                                                                      |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| `integration_mcp_native_tools.rs` | JSON-RPC over stdio, the native VFS tools                                   |
+| `integration_global_replace.rs`   | Parallel mass find-and-replace, error cases                                 |
+| `integration_mutation.rs`         | Shadow-file atomic writes                                                   |
+| `ast_e2e.rs`                      | AST outline + symbol search via MCP, end-to-end through the `ast` extension |
 
 Native extension binaries are located either through `CARGO_BIN_EXE_<name>` env vars
 for package integration tests or through the workspace `target/debug/` convention

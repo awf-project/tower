@@ -276,3 +276,10 @@
 {"ts":1792676123,"op":"assert","clause":"trigger('daemon_production_drives_catch_up_coordinator','crates/core_engine/src/adapters/daemon',directory)"}
 {"ts":1792676123,"op":"assert","clause":"rule('daemon_publishes_extension_readiness',pitfall,'Ensure configured extensions publish readiness only through the production daemon startup lifecycle after their catch-up and ordering barriers complete.',high,'implement')"}
 {"ts":1792676124,"op":"assert","clause":"trigger('daemon_publishes_extension_readiness','crates/core_engine/src/adapters/daemon',directory)"}
+
+{"ts":1792751091,"op":"assert","clause":"rule('extension_install_destination_policy_coverage',test,'Always test install-extensions destination selection for the local default, GLOBAL=1 XDG/HOME fallback, and explicit EXT_DEST precedence in isolated environments.',high,'implement')"}
+{"ts":1792751091,"op":"assert","clause":"trigger('extension_install_destination_policy_coverage','Makefile',file)"}
+{"ts":1792751091,"op":"assert","clause":"trigger('extension_install_destination_policy_coverage','crates/core_engine/tests',directory)"}
+{"ts":1792751091,"op":"assert","clause":"rule('extension_install_public_flow_contract',test,'Ensure extension-installation tests invoke the public make install-extensions entry point and verify the resulting extension layout at the selected destination.',high,'implement')"}
+{"ts":1792751092,"op":"assert","clause":"trigger('extension_install_public_flow_contract','crates/core_engine/tests',directory)"}
+{"ts":1792751092,"op":"assert","clause":"trigger('extension_install_public_flow_contract','Makefile',file)"}

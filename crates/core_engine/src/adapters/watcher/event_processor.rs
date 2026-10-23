@@ -821,6 +821,13 @@ impl EventProcessor {
             return self.handle_create(to);
         };
 
+        // A delayed rename can outlive recreation of its source. Reconcile both
+        // endpoints from disk instead of removing that newer source from the VFS.
+        if from.is_file() {
+            self.handle_modify(from)?;
+            return self.handle_modify(to);
+        }
+
         if !to.is_file() {
             return self.handle_delete(from);
         }
@@ -1581,10 +1588,21 @@ mod tests {
         drop(guard);
 
         std::fs::write(&source, b"recreated").unwrap();
-        processor.process_event(WatchEvent::Create(source)).unwrap();
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
         std::fs::remove_file(&destination).unwrap();
         processor
-            .process_event(WatchEvent::Delete(destination))
+            .process_event(WatchEvent::Delete(destination.clone()))
+            .unwrap();
+
+        // The original native rename notification can arrive after both external
+        // changes (or a full reindex). It must not delete the recreated source.
+        processor
+            .process_event(WatchEvent::Rename {
+                from: source,
+                to: destination,
+            })
             .unwrap();
 
         let workspace = workspace.read().unwrap();
@@ -2618,7 +2636,6 @@ mod tests {
         let a = root.join("alpha_atomic.rs");
         let b = root.join("beta_atomic.rs");
         std::fs::write(&a, b"x").unwrap();
-        std::fs::write(&b, b"x").unwrap();
 
         let workspace = Arc::new(RwLock::new(ProjectWorkspace::new()));
         let index = Arc::new(RwLock::new(InvertedIndex::new()));
@@ -2653,7 +2670,8 @@ mod tests {
             }
         });
 
-        // Perform the rename — this must appear atomic to the reader above.
+        // Deliver the notification after the actual OS rename.
+        std::fs::rename(&a, &b).unwrap();
         processor
             .process_event(WatchEvent::Rename {
                 from: a.clone(),
