@@ -13,6 +13,7 @@ extensions = ["rs"]
 [lint.rust]
 command = "cargo"
 args = ["clippy", "--message-format=json", "--quiet"]
+timeout_secs = 60
 extensions = ["rs"]
 format = "rustc-json"
 target = "none"

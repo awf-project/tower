@@ -1,6 +1,3 @@
-//! Daemon end-to-end tests (Tasks 7–8).
-// Feature: F009
-// Feature: B001
 #![forbid(unsafe_code)]
 
 use std::fs;
@@ -94,6 +91,84 @@ fn run_production(binary: &Path, workspace: &Path, command: &str) -> Output {
         .expect("run production tower binary")
 }
 
+struct ProductionDaemonGuard {
+    child: Option<Child>,
+    binary: PathBuf,
+    workspace: PathBuf,
+}
+
+impl ProductionDaemonGuard {
+    fn new(child: Child, binary: &Path, workspace: &Path) -> Self {
+        Self {
+            child: Some(child),
+            binary: binary.to_path_buf(),
+            workspace: workspace.to_path_buf(),
+        }
+    }
+
+    fn wait_and_disarm(&mut self) -> std::process::ExitStatus {
+        let status = self
+            .child
+            .as_mut()
+            .expect("daemon guard is armed")
+            .wait()
+            .expect("wait for lint daemon shutdown");
+        self.child = None;
+        status
+    }
+}
+
+impl Drop for ProductionDaemonGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+
+        let _ = Command::new(&self.binary)
+            .arg("shutdown")
+            .arg("--workspace-dir")
+            .arg(&self.workspace)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn production_daemon_guard_reaps_child_on_failure_path() {
+    let child = Command::new("sh")
+        .args(["-c", "sleep 60"])
+        .spawn()
+        .expect("spawn guarded process");
+    let pid = child.id().to_string();
+    let guard = ProductionDaemonGuard::new(child, Path::new("/bin/true"), Path::new("/tmp"));
+
+    drop(guard);
+
+    let status = Command::new("kill")
+        .args(["-0", &pid])
+        .stderr(Stdio::null())
+        .status()
+        .expect("probe guarded process");
+    assert!(!status.success(), "guarded process {pid} was not reaped");
+}
+
 fn selected_binary(selector: &str) -> PathBuf {
     process_binary::selected_binary(selector)
 }
@@ -124,6 +199,29 @@ fn install_ast_extension(workspace: &Path) {
         .join("\n");
     fs::write(extension_dir.join("extension.toml"), manifest)
         .expect("write workspace AST manifest");
+}
+
+fn install_lint_extension(workspace: &Path) {
+    let extension_dir = workspace.join(".tower/extensions/lint");
+    fs::create_dir_all(&extension_dir).expect("create lint extension directory");
+    let binary = workspace_root()
+        .join("target/debug/lint_extension")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let manifest = fs::read_to_string(workspace_root().join("extensions/lint/extension.toml"))
+        .expect("read shipped lint manifest")
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("command") {
+                format!("command = [\"{binary}\"]")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(extension_dir.join("extension.toml"), manifest)
+        .expect("write workspace lint manifest");
 }
 
 fn workspace_root() -> PathBuf {
@@ -1325,6 +1423,128 @@ async fn mcp_client_connect_or_spawn_then_initialize() {
         ControlRequest::Shutdown,
     )
     .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_lint_default_timeout_precedes_small_global_deadline() {
+    for explicit_timeout in [None, Some(2_u64)] {
+        let payload = daemon_lint_timeout_payload(explicit_timeout).await;
+        assert_eq!(payload["error"]["code"], "lint_timeout");
+        assert_eq!(payload["supported"], false);
+        assert_eq!(payload["diagnostics"], json!([]));
+    }
+}
+
+#[cfg(unix)]
+async fn daemon_lint_timeout_payload(explicit_timeout: Option<u64>) -> Value {
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = tempdir().expect("create lint deadline workspace");
+    install_lint_extension(workspace.path());
+    fs::create_dir_all(workspace.path().join("src")).expect("create source directory");
+    fs::write(workspace.path().join("src/main.txt"), "lint me\n").expect("seed source");
+    let command = workspace.path().join("hang-lint.sh");
+    fs::write(&command, "#!/bin/sh\nsleep 60\n").expect("write hanging linter");
+    let mut permissions = fs::metadata(&command).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&command, permissions).expect("make hanging linter executable");
+    let timeout = explicit_timeout
+        .map(|seconds| format!("timeout_secs = {seconds}\n"))
+        .unwrap_or_default();
+    fs::write(
+        workspace.path().join(".tower/config.toml"),
+        format!(
+            "[daemon]\nidle_timeout_secs = 300\n\
+             [extensions]\nrequest_timeout_secs = 1\n\
+             [lint.fixture]\ncommand = {:?}\n{}extensions = [\"txt\"]\nformat = \"generic-regex\"\ntarget = \"append\"\nregex = \"^(?P<message>.*)$\"\nsource = \"fixture-lint\"\n",
+            command.to_string_lossy(),
+            timeout
+        ),
+    )
+    .expect("write lint configuration");
+
+    let production_binary = selected_production_binary();
+    let daemon = Command::new(&production_binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn production daemon");
+    let mut daemon = ProductionDaemonGuard::new(daemon, &production_binary, workspace.path());
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("production daemon binds its public socket");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .expect("send MCP handshake");
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"lint-deadline","version":"1"}}}"#,
+    )
+    .await
+    .expect("send MCP initialize");
+    read_line_capped(&mut connection, 1 << 20)
+        .await
+        .expect("read MCP initialize")
+        .expect("MCP initialize response");
+
+    let discovery_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let raw_status = read_raw_control_status(workspace.path()).await;
+        let status: Value = serde_json::from_str(&raw_status).expect("parse daemon status");
+        if status["extensions"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "check"))
+        {
+            break;
+        }
+        if Instant::now() >= discovery_deadline {
+            panic!("lint extension was not discovered through the production daemon: {raw_status}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tower_lint_check","arguments":{"path":"src/main.txt"}}}"#,
+    )
+    .await
+    .expect("request lint check");
+    let raw = tokio::time::timeout(
+        Duration::from_secs(7),
+        read_line_capped(&mut connection, 1 << 20),
+    )
+    .await
+    .expect("client budget above five seconds must not expire")
+    .expect("read lint response")
+    .expect("lint response frame");
+    let response: Value = serde_json::from_str(&raw).expect("parse lint response");
+    let payload = response["result"]["content"][0]["text"]
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+
+    drop(connection);
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    let status = daemon.wait_and_disarm();
+    assert!(status.success(), "daemon exited with {status}");
+
+    payload.unwrap_or_else(|| {
+        panic!("lint tool must return a structured success-result payload: {raw}")
+    })
 }
 
 #[tokio::test]

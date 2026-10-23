@@ -22,10 +22,16 @@ target = "none"
 [lint.javascript]
 command = "eslint"
 args = ["--format", "json"]
+timeout_secs = 10
 extensions = ["js", "jsx", "ts", "tsx"]
 format = "eslint-json"
 target = "append"
 ```
+
+`timeout_secs` is optional, positive, and measured in seconds. It defaults to `2` when omitted.
+The same configured deadline is used for the initial lint run, fix preparation, and the follow-up
+check after edits. Tower also gives the lint extension a sufficient derived host budget. If a
+command reaches its deadline, Tower terminates and reaps its process tree.
 
 Supported fix extraction is built in for `rustc-json` and `eslint-json`. `generic-regex` diagnostics
 can still be reported by `tower_lint_check`, but they are reported as unsupported by
@@ -104,7 +110,14 @@ The response reports:
 - `remaining_diagnostics`: one follow-up lint pass after successful writes
 
 When `path` is omitted, Tower walks indexed files, selects only files with a matching lint
-configuration, and processes them in path order.
+configuration, and prepares all fix plans in path order before writing any file. A preparation
+failure leaves all files unchanged. Plans are then applied with per-file version checks; the
+application phase is not a multi-file transaction.
+
+If the initial lint or fix-preparation command expires, the response remains an in-band tool result
+with `lint_timeout` for a check or `lint_fix_unavailable` for fix preparation. If edits were already
+committed and the follow-up check expires, Tower returns `lint_fix_apply_failed` with the cause and
+an indication that edits were applied; it does not report an empty successful diagnostic list.
 
 ---
 
@@ -136,13 +149,13 @@ Without `unsafe:true`, those fixes are returned in `fixes_skipped` with `reason:
 
 `fixes_skipped` is part of normal tool behavior. Common reasons are:
 
-| Reason | Meaning |
-|---|---|
-| `unsafe` | The fix was structured but not safe-by-default, and `unsafe:true` was not set. |
-| `unsupported` | The diagnostic had no supported structured fix payload for `tower_lint_fix`. |
-| `conflict` | The fix overlapped another accepted edit or the host rejected an overlapping edit. |
-| `cas_conflict` | The file changed between lint extraction and apply, so Tower refused the write. |
-| `invalid_range` | The emitted byte range was not valid for the current file content. |
+| Reason          | Meaning                                                                            |
+| --------------- | ---------------------------------------------------------------------------------- |
+| `unsafe`        | The fix was structured but not safe-by-default, and `unsafe:true` was not set.     |
+| `unsupported`   | The diagnostic had no supported structured fix payload for `tower_lint_fix`.       |
+| `conflict`      | The fix overlapped another accepted edit or the host rejected an overlapping edit. |
+| `cas_conflict`  | The file changed between lint extraction and apply, so Tower refused the write.    |
+| `invalid_range` | The emitted byte range was not valid for the current file content.                 |
 
 These are reported in-band so callers can branch on them without treating the tool call itself as a
 transport failure.

@@ -1093,10 +1093,17 @@ target = "none"
 [lint.javascript]
 command = "eslint"
 args = ["--format", "json"]
+timeout_secs = 10
 extensions = ["js", "jsx", "ts", "tsx"]
 format = "eslint-json"
 target = "append"
 ```
+
+`timeout_secs` is an optional positive integer in seconds and defaults to `2`. It applies to each
+lint command, including fix preparation and the follow-up check after edits. Tower derives a
+lint-specific host budget so this inner deadline can elapse without being pre-empted by the base
+extension deadline. Invalid values are configuration errors naming
+`lint.<language>.timeout_secs`.
 
 Supported `format` values are `rustc-json`, `eslint-json`, and `generic-regex`. Supported `target`
 values are:
@@ -1196,6 +1203,10 @@ clients can branch without treating expected lint-runner failures as transport f
 Stable lint error codes are `lint_missing_binary`, `lint_unparseable_output`, `lint_nonzero_exit`,
 `lint_timeout`, and `lint_invalid_config`.
 
+When a lint command reaches its configured deadline, Tower terminates and reaps the command's
+process tree and returns `lint_timeout` in the successful tool payload. The timeout is not a JSON-RPC
+transport error.
+
 ### tower_lint_fix
 
 Apply or preview structured fixes emitted by configured linters. `rustc-json` fixes are extracted
@@ -1270,6 +1281,11 @@ diagnostics are reported as skipped unsupported fixes, not tool failures.
 counts accepted fix records. `fixes_skipped` uses stable reasons: `conflict`, `unsafe`,
 `unsupported`, `cas_conflict`, and `invalid_range`. `remaining_diagnostics` is produced by one
 follow-up lint check after successful writes; `tower_lint_fix` does not run an iterative fix loop.
+
+Fix preparation timeout returns `lint_fix_unavailable` without changing files. If the follow-up
+check times out after edits were committed, the result uses `lint_fix_apply_failed`, retains the
+timeout cause, and reports that edits were applied rather than returning an empty successful
+diagnostic list.
 
 Dry-run responses keep `files_changed` at `0` and include preview entries:
 

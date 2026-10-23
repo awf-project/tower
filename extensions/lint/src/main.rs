@@ -28,7 +28,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const HOST_CALL_START_ID: u64 = 10_000;
-const LINT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() {
     serve_lint_check();
@@ -418,26 +417,32 @@ where
     let mut result = FixResult::default();
     let mut changed_files = BTreeSet::new();
 
+    // Preparation failures must precede every write, including workspace batches.
+    // Applying the prepared plans still uses per-file CAS rather than a batch transaction.
+    let mut plans = Vec::new();
     for path in fix_target_paths(&request, lines, out, next_id, queued)? {
         if let Some(plan) =
             collect_fix_plan(path, &config, workspace_root, lines, out, next_id, queued)?
         {
-            apply_fix_plan(
-                plan,
-                FixApplyOptions {
-                    unsafe_fixes: request.unsafe_fixes,
-                    dry_run: request.dry_run,
-                },
-                lines,
-                out,
-                next_id,
-                queued,
-                FixApplyAccum {
-                    result: &mut result,
-                    changed_files: &mut changed_files,
-                },
-            )?;
+            plans.push(plan);
         }
+    }
+    for plan in plans {
+        apply_fix_plan(
+            plan,
+            FixApplyOptions {
+                unsafe_fixes: request.unsafe_fixes,
+                dry_run: request.dry_run,
+            },
+            lines,
+            out,
+            next_id,
+            queued,
+            FixApplyAccum {
+                result: &mut result,
+                changed_files: &mut changed_files,
+            },
+        )?;
     }
 
     result.files_changed = changed_files.len();
@@ -497,7 +502,7 @@ where
         workspace_root,
         target_path: Some(&path),
         stdin_content: Some(&content),
-        timeout: LINT_TIMEOUT,
+        timeout: Duration::from_secs(runner_config.timeout_secs),
     })
     .map_err(|error| fix_unavailable(lint_fix_unavailable_message(error)))?;
 
@@ -726,10 +731,30 @@ where
         check_one(&path, config, workspace_root, lines, out, next_id, queued)
     } else {
         check_workspace(config, workspace_root, lines, out, next_id, queued)
+    };
+
+    map_follow_up_check(check)
+}
+
+fn map_follow_up_check(
+    check: Result<CheckResult, String>,
+) -> Result<Vec<LintDiagnosticDto>, FixFailure> {
+    let check = check.map_err(follow_up_failed)?;
+    if let Some(error) = check.error {
+        return Err(follow_up_failed(format!(
+            "{}: {}",
+            error.code, error.message
+        )));
     }
-    .map_err(fix_apply_failed)?;
 
     Ok(check.diagnostics)
+}
+
+fn follow_up_failed(cause: impl Into<String>) -> FixFailure {
+    fix_apply_failed(format!(
+        "{}; edits were applied before the follow-up lint check failed",
+        cause.into()
+    ))
 }
 
 fn validate_fix_path(path: &str) -> Result<(), FixFailure> {
@@ -855,7 +880,7 @@ fn run_configured_linter(
         workspace_root,
         target_path: Some(target_path),
         stdin_content,
-        timeout: LINT_TIMEOUT,
+        timeout: Duration::from_secs(config.timeout_secs),
     }) {
         Ok(outcome) => Ok(check_result_from_run_outcome(outcome)),
         Err(error) => Ok(CheckResult {
@@ -950,4 +975,72 @@ fn workspace_root() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diagnostic(message: &str) -> LintDiagnosticDto {
+        LintDiagnosticDto {
+            path: "src/lib.rs".to_owned(),
+            line: 1,
+            character: 2,
+            end_line: 1,
+            end_character: 3,
+            severity: "warning".to_owned(),
+            code: Some("fixture".to_owned()),
+            message: message.to_owned(),
+            source: Some("fixture-lint".to_owned()),
+        }
+    }
+
+    #[test]
+    fn follow_up_check_preserves_successful_diagnostics() {
+        let expected = vec![diagnostic("remaining diagnostic")];
+        let actual = map_follow_up_check(Ok(CheckResult {
+            supported: true,
+            diagnostics: expected.clone(),
+            error: None,
+        }))
+        .expect("successful follow-up should preserve diagnostics");
+        assert_eq!(actual, expected);
+
+        let unsupported = map_follow_up_check(Ok(unsupported_result()))
+            .expect("unsupported follow-up should be empty success");
+        assert!(unsupported.is_empty());
+    }
+
+    #[test]
+    fn follow_up_check_maps_tool_errors_to_apply_failed() {
+        for (code, message) in [
+            ("lint_timeout", "lint command timed out"),
+            ("lint_missing_binary", "lint command is unavailable"),
+        ] {
+            let failure = map_follow_up_check(Ok(CheckResult {
+                supported: false,
+                diagnostics: vec![diagnostic("must not mask the error")],
+                error: Some(LintToolErrorResponse {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                }),
+            }))
+            .expect_err("tool error must fail after edits");
+
+            assert_eq!(failure.code, "lint_fix_apply_failed");
+            assert!(failure.message.contains(code));
+            assert!(failure.message.contains(message));
+            assert!(failure.message.contains("edits were applied"));
+        }
+    }
+
+    #[test]
+    fn follow_up_check_maps_transport_failure_to_apply_failed() {
+        let failure = map_follow_up_check(Err("sidecar response stream closed".to_owned()))
+            .expect_err("transport error must fail after edits");
+
+        assert_eq!(failure.code, "lint_fix_apply_failed");
+        assert!(failure.message.contains("sidecar response stream closed"));
+        assert!(failure.message.contains("edits were applied"));
+    }
 }

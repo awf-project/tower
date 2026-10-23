@@ -58,6 +58,36 @@ pub const XDG_EXTENSIONS_SUBDIR: &str = "tower/extensions";
 
 pub type ExtensionInitConfigMap = BTreeMap<String, Value>;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ExtensionRequestTimeouts {
+    default: Duration,
+    lint: Option<Duration>,
+}
+
+impl ExtensionRequestTimeouts {
+    pub(crate) fn with_lint(default: Duration, lint: Duration) -> Self {
+        Self {
+            default,
+            lint: Some(lint),
+        }
+    }
+
+    fn default_only(default: Duration) -> Self {
+        Self {
+            default,
+            lint: None,
+        }
+    }
+
+    fn for_extension(self, name: &str) -> Duration {
+        if name == "lint" {
+            self.lint.unwrap_or(self.default)
+        } else {
+            self.default
+        }
+    }
+}
+
 /// Apply the host's debug capability gate to static and runtime declarations.
 /// Installed extensions follow the same opt-in contract as the bundled sidecar.
 pub(super) fn filter_debug_tools(manifest: &mut ExtensionManifest, rr_enabled: bool) {
@@ -494,6 +524,46 @@ pub(crate) fn load_extensions_with_register_cancellable(
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
+    register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
+) {
+    load_extensions_with_register_cancellable_inner(
+        dirs,
+        deps,
+        ExtensionRequestTimeouts::default_only(request_timeout),
+        disabled,
+        init_configs,
+        cancelled,
+        register_instance,
+    );
+}
+
+pub(crate) fn load_extensions_with_register_cancellable_with_timeouts(
+    dirs: &[PathBuf],
+    deps: HostDeps,
+    request_timeouts: ExtensionRequestTimeouts,
+    disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
+) {
+    load_extensions_with_register_cancellable_inner(
+        dirs,
+        deps,
+        request_timeouts,
+        disabled,
+        init_configs,
+        cancelled,
+        register_instance,
+    );
+}
+
+fn load_extensions_with_register_cancellable_inner(
+    dirs: &[PathBuf],
+    deps: HostDeps,
+    request_timeouts: ExtensionRequestTimeouts,
+    disabled: &[String],
+    init_configs: &ExtensionInitConfigMap,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
     mut register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
 ) {
     // ── Phase 1: scan every scope, read manifests. ────────────────────────────
@@ -547,6 +617,7 @@ pub(crate) fn load_extensions_with_register_cancellable(
         let init_config = init_configs.get(&name).cloned();
         match decision {
             Shadow::Keep => {
+                let instance_timeout = request_timeouts.for_extension(&name);
                 // Resolve the command: if the first element is a relative path
                 // (not starting with '/'), resolve it relative to ext_dir.
                 let manifest = resolve_command_paths(manifest, &ext_dir);
@@ -557,7 +628,7 @@ pub(crate) fn load_extensions_with_register_cancellable(
                         match super::sidecar::SidecarHostAdapter::spawn(
                             manifest.clone(),
                             clone_deps(&deps),
-                            request_timeout,
+                            instance_timeout,
                             init_config.clone(),
                         ) {
                             Ok(inst) => inst,
@@ -575,7 +646,7 @@ pub(crate) fn load_extensions_with_register_cancellable(
                         Box::new(ExtensionSupervisor::new(
                             manifest,
                             clone_deps(&deps),
-                            request_timeout,
+                            instance_timeout,
                             init_config,
                         ))
                     }
@@ -647,6 +718,7 @@ fn clone_deps(deps: &HostDeps) -> HostDeps {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use extension_protocol::manifest::{CapabilitiesSection, EventsSection};
     use extension_protocol::{Activation, ExtensionManifest};
@@ -992,6 +1064,161 @@ activation = "lazy"
             apply_edits: Arc::new(UnsupportedApplyEditsHost),
             push_tx: None,
         }
+    }
+
+    use super::super::timeout_test_support::{assert_timeout_after, timeout_manifest};
+
+    #[test]
+    fn lint_deadline_override_reaches_eager_and_lazy_instances() {
+        let deadline = Duration::from_millis(300);
+        for activation in ["eager", "lazy"] {
+            let extensions = TempDir::new().unwrap();
+            write_manifest(
+                extensions.path(),
+                "lint",
+                &timeout_manifest("lint", activation),
+            );
+            let mut instances = Vec::new();
+            let started = Instant::now();
+            super::load_extensions_with_register_cancellable_with_timeouts(
+                &[extensions.path().to_path_buf()],
+                make_host_deps(),
+                super::ExtensionRequestTimeouts::with_lint(Duration::from_millis(80), deadline),
+                &[],
+                &ExtensionInitConfigMap::new(),
+                None,
+                |instance, _, _| instances.push(instance),
+            );
+
+            if activation == "eager" {
+                assert!(instances.is_empty(), "failed eager spawn must degrade");
+                assert!(started.elapsed() >= Duration::from_millis(240));
+            } else {
+                assert_eq!(instances.len(), 1);
+                assert_timeout_after(&mut instances[0], Duration::from_millis(240));
+            }
+        }
+    }
+
+    #[test]
+    fn lint_deadline_override_survives_lazy_restart() {
+        let extensions = TempDir::new().unwrap();
+        write_manifest(extensions.path(), "lint", &timeout_manifest("lint", "lazy"));
+        let mut instances = Vec::new();
+        super::load_extensions_with_register_cancellable_with_timeouts(
+            &[extensions.path().to_path_buf()],
+            make_host_deps(),
+            super::ExtensionRequestTimeouts::with_lint(
+                Duration::from_millis(80),
+                Duration::from_millis(300),
+            ),
+            &[],
+            &ExtensionInitConfigMap::new(),
+            None,
+            |instance, _, _| instances.push(instance),
+        );
+
+        assert_timeout_after(&mut instances[0], Duration::from_millis(240));
+        std::thread::sleep(Duration::from_millis(120));
+        assert_timeout_after(&mut instances[0], Duration::from_millis(240));
+    }
+
+    #[test]
+    fn lint_deadline_override_skips_disabled_lint_candidate() {
+        let extensions = TempDir::new().unwrap();
+        write_manifest(extensions.path(), "lint", &timeout_manifest("lint", "lazy"));
+        write_manifest(
+            extensions.path(),
+            "other",
+            &timeout_manifest("other", "lazy"),
+        );
+        let mut registered = Vec::new();
+
+        super::load_extensions_with_register_cancellable_with_timeouts(
+            &[extensions.path().to_path_buf()],
+            make_host_deps(),
+            super::ExtensionRequestTimeouts::with_lint(
+                Duration::from_millis(80),
+                Duration::from_millis(300),
+            ),
+            &["lint".to_owned()],
+            &ExtensionInitConfigMap::new(),
+            None,
+            |_, name, _| registered.push(name.to_owned()),
+        );
+
+        assert_eq!(registered, vec!["other"]);
+    }
+
+    #[test]
+    fn lint_deadline_override_applies_only_to_post_shadowing_winner() {
+        let global_extensions = TempDir::new().unwrap();
+        let local_extensions = TempDir::new().unwrap();
+        write_manifest(
+            global_extensions.path(),
+            "lint",
+            &timeout_manifest("lint", "eager"),
+        );
+        write_manifest(
+            local_extensions.path(),
+            "lint",
+            &timeout_manifest("lint", "lazy"),
+        );
+        let mut instances = Vec::new();
+
+        super::load_extensions_with_register_cancellable_with_timeouts(
+            &[
+                global_extensions.path().to_path_buf(),
+                local_extensions.path().to_path_buf(),
+            ],
+            make_host_deps(),
+            super::ExtensionRequestTimeouts::with_lint(
+                Duration::from_millis(80),
+                Duration::from_millis(300),
+            ),
+            &[],
+            &ExtensionInitConfigMap::new(),
+            None,
+            |instance, name, _| instances.push((name.to_owned(), instance)),
+        );
+
+        assert_eq!(
+            instances.len(),
+            1,
+            "only the local lint candidate may register"
+        );
+        assert_eq!(instances[0].0, "lint");
+        assert_timeout_after(&mut instances[0].1, Duration::from_millis(240));
+    }
+
+    #[test]
+    fn lint_deadline_override_honors_cancellation_before_discovery_and_registration() {
+        let extensions = TempDir::new().unwrap();
+        write_manifest(
+            extensions.path(),
+            "lint",
+            &timeout_manifest("lint", "eager"),
+        );
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut registered = Vec::new();
+
+        super::load_extensions_with_register_cancellable_with_timeouts(
+            &[extensions.path().to_path_buf()],
+            make_host_deps(),
+            super::ExtensionRequestTimeouts::with_lint(
+                Duration::from_millis(80),
+                Duration::from_millis(300),
+            ),
+            &[],
+            &ExtensionInitConfigMap::new(),
+            Some(&cancelled),
+            |_, name, _| registered.push(name.to_owned()),
+        );
+
+        assert!(
+            registered.is_empty(),
+            "cancelled discovery must not register extensions"
+        );
     }
 
     /// AC4: disabled extension is not registered.

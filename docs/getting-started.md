@@ -359,10 +359,14 @@ target = "none"
 [lint.javascript]
 command = "eslint"
 args = ["--format", "json"]
+timeout_secs = 10
 extensions = ["js", "jsx", "ts", "tsx"]
 format = "eslint-json"
 target = "append"
 ```
+
+`timeout_secs` is optional and defaults to two seconds. Set a positive integer when a configured
+linter needs longer; the same deadline applies to lint checks and both phases of a lint fix.
 
 Call `tower_lint_check` with a path to lint one file, or with `{}` to lint every indexed file
 that has a matching lint configuration.

@@ -4,6 +4,42 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+const fn default_timeout_secs() -> u64 {
+    2
+}
+
+fn deserialize_positive_timeout_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("must be a positive integer"));
+    }
+    Ok(value)
+}
+
+pub(super) fn validate_timeout_values(raw: &toml::Value) -> Result<(), toml::de::Error> {
+    let invalid_field = raw
+        .get("lint")
+        .and_then(toml::Value::as_table)
+        .and_then(|commands| {
+            commands.iter().find_map(|(language, command)| {
+                let timeout = command.get("timeout_secs")?;
+                (!matches!(timeout.as_integer(), Some(value) if value > 0))
+                    .then(|| format!("lint.{language}.timeout_secs"))
+            })
+        });
+
+    if let Some(field) = invalid_field {
+        return Err(<toml::de::Error as serde::de::Error>::custom(format!(
+            "{field}: must be a positive integer"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct LintConfig {
@@ -44,6 +80,11 @@ impl LintConfig {
 #[serde(deny_unknown_fields)]
 pub struct LintCommandConfig {
     pub command: String,
+    #[serde(
+        default = "default_timeout_secs",
+        deserialize_with = "deserialize_positive_timeout_secs"
+    )]
+    pub timeout_secs: u64,
     #[serde(default)]
     pub args: Vec<String>,
     pub extensions: Vec<String>,
@@ -98,6 +139,93 @@ mod tests {
         let dir = root.join(".tower");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn lint_config(timeout: Option<&str>) -> String {
+        let timeout = timeout
+            .map(|value| format!("timeout_secs = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            "[lint.rust]\ncommand = \"cargo\"\n{timeout}extensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n"
+        )
+    }
+
+    #[test]
+    fn lint_timeout_defaults_to_two_seconds_when_omitted() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), &lint_config(None));
+
+        let config = load(tmp.path()).expect("omitted lint timeout must use its default");
+
+        assert_eq!(config.lint.commands["rust"].timeout_secs, 2);
+    }
+
+    #[test]
+    fn lint_timeout_accepts_positive_integer_seconds() {
+        for timeout_secs in [1, 2, 17, 86_400] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), &lint_config(Some(&timeout_secs.to_string())));
+
+            let config = load(tmp.path()).expect("positive integer lint timeout must parse");
+
+            assert_eq!(
+                config.lint.commands["rust"].timeout_secs, timeout_secs,
+                "timeout {timeout_secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn lint_timeout_rejects_non_positive_malformed_and_overflowing_values() {
+        for (name, value, typed_error) in [
+            ("zero", "0", true),
+            ("negative", "-1", true),
+            ("string", "\"2\"", true),
+            ("float", "2.5", true),
+            ("parser-range overflow", "9223372036854775808", false),
+        ] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), &lint_config(Some(value)));
+            let expected_path = tmp.path().join(".tower/config.toml");
+
+            let err = load(tmp.path()).expect_err(name);
+            let rendered = err.to_string();
+            match err {
+                ConfigError::Parse { path, source } => {
+                    assert_eq!(path, expected_path, "{name}");
+                    if typed_error {
+                        assert!(
+                            source.to_string().contains("lint.rust.timeout_secs"),
+                            "{name}: {source}"
+                        );
+                    } else {
+                        assert!(source.span().is_some(), "{name}: {source}");
+                    }
+                }
+                other => panic!("{name}: expected ConfigError::Parse, got {other:?}"),
+            }
+            assert!(
+                rendered.starts_with(&format!("invalid config {}:", expected_path.display())),
+                "{name}: {rendered}"
+            );
+        }
+
+        let tmp = tempdir().unwrap();
+        let timeout_secs = 9_223_372_036_854_775_807_u64;
+        write_config(tmp.path(), &lint_config(Some(&timeout_secs.to_string())));
+
+        let err = load(tmp.path()).expect_err("unrepresentable lint deadline must fail at load");
+        match &err {
+            ConfigError::InvalidLintDeadline { field, value } => {
+                assert_eq!(field, "lint.rust.timeout_secs");
+                assert_eq!(*value, timeout_secs);
+            }
+            other => panic!("expected ConfigError::InvalidLintDeadline, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "invalid lint deadline lint.rust.timeout_secs: 9223372036854775807 cannot produce 2 * timeout_secs + 1"
+        );
     }
 
     #[test]

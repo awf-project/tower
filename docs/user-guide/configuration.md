@@ -44,6 +44,29 @@ temporary file is passed to the command). Use `{path}` where the command needs t
 The generated configuration includes the standard formatter mappings; edit or remove them for a
 project's toolchain.
 
+Linters are configured per language under `[lint.<language>]`. `timeout_secs` is an optional
+positive integer and defaults to `2` when omitted. It is the maximum time allowed for each lint
+command, including commands used to prepare or verify a lint fix:
+
+```toml
+[lint.rust]
+command = "cargo"
+args = ["clippy", "--message-format=json"]
+timeout_secs = 10
+extensions = ["rs"]
+format = "rustc-json"
+target = "none"
+```
+
+Zero, negative, fractional, non-integer, and unrepresentable values fail configuration loading.
+Tower derives the lint-specific host budget as
+`max([extensions].request_timeout_secs, 2 * max(resolved lint timeout_secs) + 1)` seconds across
+configured lint entries. This allows both fix passes and response handling; omitted entries use
+the two-second default. The global extension deadline and unrelated extensions are unchanged.
+Set an external MCP client's request deadline above this budget, with room for daemon preparation
+and transport. A workspace-wide lint request can run commands for several files and may need a
+larger client deadline.
+
 The daemon has separate connection and preparation deadlines. The connection deadline only covers
 locating or spawning the workspace daemon; it does not cancel preparation already owned by that
 daemon. The preparation deadline bounds a workspace-dependent request while reconciliation or

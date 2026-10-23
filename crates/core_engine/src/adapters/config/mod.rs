@@ -68,6 +68,38 @@ pub struct TowerConfig {
     pub daemon: DaemonConfig,
 }
 
+impl TowerConfig {
+    pub fn lint_request_timeout(&self) -> Result<std::time::Duration, ConfigError> {
+        let maximum: Option<(&String, &LintCommandConfig)> =
+            self.lint
+                .commands
+                .iter()
+                .fold(None, |maximum, entry| match maximum {
+                    Some((_, current)) if current.timeout_secs >= entry.1.timeout_secs => maximum,
+                    _ => Some(entry),
+                });
+        let Some((language, command)) = maximum else {
+            return Ok(self.extensions.request_timeout());
+        };
+
+        let invalid_deadline = || ConfigError::InvalidLintDeadline {
+            field: format!("lint.{language}.timeout_secs"),
+            value: command.timeout_secs,
+        };
+        let lint_secs = command
+            .timeout_secs
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(invalid_deadline)?;
+        let lint_timeout = std::time::Duration::from_secs(lint_secs);
+        std::time::Instant::now()
+            .checked_add(lint_timeout)
+            .ok_or_else(invalid_deadline)?;
+
+        Ok(self.extensions.request_timeout().max(lint_timeout))
+    }
+}
+
 /// `[extensions]` section (spec 24 — supervision & fault model; spec 25 — disable list).
 ///
 /// Controls per-request timeout, respawn backoff, and which extensions are
@@ -281,6 +313,10 @@ pub enum ConfigError {
         field: &'static str,
         value: u64,
     },
+    InvalidLintDeadline {
+        field: String,
+        value: u64,
+    },
     InvalidExtensionConfiguration {
         field: &'static str,
         reason: ExtensionConfigurationReason,
@@ -304,6 +340,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidDaemonDeadline { field, value } => {
                 write!(f, "invalid daemon deadline {field}: {value}")
             }
+            ConfigError::InvalidLintDeadline { field, value } => write!(
+                f,
+                "invalid lint deadline {field}: {value} cannot produce 2 * timeout_secs + 1"
+            ),
             ConfigError::InvalidExtensionConfiguration { field, reason } => {
                 write!(f, "invalid extension configuration {field}: {reason:?}")
             }
@@ -368,10 +408,15 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         });
     }
 
+    lint::validate_timeout_values(&raw).map_err(|source| ConfigError::Parse {
+        path: path.clone(),
+        source,
+    })?;
     let config: TowerConfig =
         toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })?;
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
+    config.lint_request_timeout()?;
     Ok(config)
 }
 
@@ -606,6 +651,86 @@ mod tests {
         let cfg = load(tmp.path()).expect("empty config is valid");
         assert!(cfg.extensions.disabled.is_empty());
         assert!(cfg.formatter.tools.is_empty());
+    }
+
+    #[test]
+    fn lint_timeout_derives_sufficient_host_budget() {
+        for (host_secs, lint_entries, expected_secs) in [
+            (1, "", 1),
+            (
+                1,
+                "[lint.rust]\ncommand = \"cargo\"\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+                5,
+            ),
+            (
+                2,
+                "[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 2\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+                5,
+            ),
+            (
+                4,
+                "[lint.go]\ncommand = \"golangci-lint\"\ntimeout_secs = 7\nextensions = [\"go\"]\nformat = \"generic-regex\"\ntarget = \"append\"\n[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 3\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+                15,
+            ),
+            (
+                30,
+                "[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 7\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+                30,
+            ),
+        ] {
+            let source =
+                format!("[extensions]\nrequest_timeout_secs = {host_secs}\n{lint_entries}");
+            let config: TowerConfig = toml::from_str(&source).expect("valid timeout fixture");
+
+            assert_eq!(
+                config
+                    .lint_request_timeout()
+                    .expect("representable lint deadline"),
+                std::time::Duration::from_secs(expected_secs),
+                "host={host_secs}, lint={lint_entries:?}"
+            );
+            assert_eq!(config.extensions.request_timeout_secs, host_secs);
+        }
+
+        let mut arithmetic_overflow: TowerConfig = toml::from_str(
+            "[lint.rust]\ncommand = \"cargo\"\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+        )
+        .unwrap();
+        arithmetic_overflow
+            .lint
+            .commands
+            .get_mut("rust")
+            .unwrap()
+            .timeout_secs = u64::MAX;
+        let err = arithmetic_overflow
+            .lint_request_timeout()
+            .expect_err("u64 arithmetic overflow must be rejected");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidLintDeadline { ref field, value }
+                if field == "lint.rust.timeout_secs" && value == u64::MAX
+        ));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid lint deadline lint.rust.timeout_secs: {} cannot produce 2 * timeout_secs + 1",
+                u64::MAX
+            )
+        );
+
+        let instant_overflow = u64::MAX / 2;
+        let mut unrepresentable_deadline: TowerConfig = toml::from_str(
+            "[lint.go]\ncommand = \"golangci-lint\"\nextensions = [\"go\"]\nformat = \"generic-regex\"\ntarget = \"append\"\n[lint.rust]\ncommand = \"cargo\"\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+        )
+        .unwrap();
+        for command in unrepresentable_deadline.lint.commands.values_mut() {
+            command.timeout_secs = instant_overflow;
+        }
+        assert!(matches!(
+            unrepresentable_deadline.lint_request_timeout(),
+            Err(ConfigError::InvalidLintDeadline { field, value })
+                if field == "lint.go.timeout_secs" && value == instant_overflow
+        ));
     }
 
     #[test]

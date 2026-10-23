@@ -4,14 +4,28 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use core_engine::adapters::extension::HostDeps;
+use core_engine::adapters::extension::SidecarHostAdapter;
 use core_engine::adapters::extension::host_deps::{ApplyEditsHostPort, FsAdapter};
 use core_engine::adapters::formatter::NoOpFormatQueue;
+use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
+use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
+use core_engine::adapters::mcp::native_tools::EngineState;
+use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
 use core_engine::adapters::{InMemoryAstIndex, RealFs};
+use core_engine::adapters::{InMemoryStorage, config};
+use core_engine::domain::extension_host::ExtensionRegistry;
+use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::mutation::compute_content_version;
+use core_engine::domain::token::tokenize;
+use core_engine::domain::virtual_file::FileMetadata;
+use core_engine::domain::workspace::ProjectWorkspace;
 use core_engine::domain::{DomainError, RelativePath};
+use core_engine::ports::FileSystemPort;
 use core_engine::ports::inbound::{
     ApplyEditsRequest, PerFileEditResult, TextEdit, WorkspaceApplyEditsError,
     WorkspaceApplyEditsErrorCode, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
@@ -19,6 +33,7 @@ use core_engine::ports::inbound::{
 };
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
 use extension_protocol::{ExtensionManifest, ToolDecl};
+use rmcp::{RoleClient, ServiceExt};
 
 pub const SIMPLE_GENERIC_REGEX: &str =
     r"(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<message>.+)";
@@ -403,4 +418,106 @@ fn validate_edit(path: &RelativePath, content: &str, edit: &TextEdit) -> Result<
         )));
     }
     Ok(())
+}
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn engine_state(workspace: &TestWorkspace, indexed_paths: &[&str]) -> Arc<RwLock<EngineState>> {
+    let mut project = ProjectWorkspace::new();
+    let mut index = InvertedIndex::new();
+    let mut fs = workspace.real_fs();
+    let storage = InMemoryStorage::new();
+
+    for path in indexed_paths {
+        let relative_path = RelativePath::new(*path);
+        let id = project
+            .insert(relative_path.clone(), FileMetadata::default())
+            .expect("index workspace file");
+        index.insert(id, &tokenize(relative_path.as_str()));
+        let content = fs
+            .read(&relative_path)
+            .expect("indexed file must exist on disk");
+        fs.write(relative_path, content)
+            .expect("write indexed file");
+    }
+
+    Arc::new(RwLock::new(EngineState::new(
+        project,
+        index,
+        Box::new(storage),
+        Box::new(fs),
+    )))
+}
+
+pub fn handler_with_timeout(
+    workspace: &TestWorkspace,
+    indexed_paths: &[&str],
+    request_timeout: Duration,
+) -> TowerMcpHandler {
+    let mut extension_registry = ExtensionRegistry::new();
+    let lint_extension = SidecarHostAdapter::spawn(
+        lint_fix_manifest(&lint_extension_bin()),
+        host_deps(workspace.real_fs()),
+        request_timeout,
+        None,
+    )
+    .expect("spawn lint extension");
+    extension_registry
+        .register(lint_extension)
+        .expect("register lint extension");
+
+    let merged = ExtensionMergedRegistry::new(
+        engine_state(workspace, indexed_paths),
+        Arc::new(RwLock::new(extension_registry)),
+    );
+    TowerMcpHandler::new(
+        merged,
+        Arc::new(NoOpDiagnosticsReader),
+        Arc::new(Mutex::new(SubscriptionRegistry::new())),
+        vec![],
+    )
+}
+
+pub fn handler(workspace: &TestWorkspace, indexed_paths: &[&str]) -> TowerMcpHandler {
+    handler_with_timeout(workspace, indexed_paths, TEST_TIMEOUT)
+}
+
+pub fn configure_lint_timeout_and_host_budget(
+    workspace: &TestWorkspace,
+    timeout_secs: Option<u64>,
+) -> Duration {
+    let path = workspace.root().join(".tower/config.toml");
+    let mut contents = std::fs::read_to_string(&path).expect("read lint config");
+    if let Some(timeout_secs) = timeout_secs {
+        contents.push_str(&format!("timeout_secs = {timeout_secs}\n"));
+    }
+    contents.push_str("\n[extensions]\nrequest_timeout_secs = 1\n");
+    std::fs::write(&path, contents).expect("write lint and host timeouts");
+
+    config::load(workspace.root())
+        .expect("load lint config")
+        .lint_request_timeout()
+        .expect("derive lint request timeout")
+}
+
+pub async fn start_server(
+    handler: TowerMcpHandler,
+) -> rmcp::service::RunningService<RoleClient, ()> {
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+    tokio::spawn(async move {
+        if let Ok(server) = handler.serve(server_transport).await {
+            let _ = server.waiting().await;
+        }
+    });
+    ().serve(client_transport)
+        .await
+        .expect("client connect failed")
+}
+
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
 }

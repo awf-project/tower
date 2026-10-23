@@ -1,108 +1,18 @@
-// Feature: F003
-
 #![forbid(unsafe_code)]
 #![allow(clippy::pedantic)]
 
 use std::fs;
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 mod lint_support;
 
-use core_engine::adapters::InMemoryStorage;
-use core_engine::adapters::extension::SidecarHostAdapter;
-use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
-use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
-use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
-use core_engine::adapters::mcp::native_tools::EngineState;
-use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
-use core_engine::domain::RelativePath;
-use core_engine::domain::extension_host::ExtensionRegistry;
-use core_engine::domain::index::InvertedIndex;
-use core_engine::domain::token::tokenize;
-use core_engine::domain::virtual_file::FileMetadata;
-use core_engine::domain::workspace::ProjectWorkspace;
-use core_engine::ports::FileSystemPort;
 use lint_support::{
-    SEVERITY_CODE_GENERIC_REGEX, TestWorkspace, host_deps, lint_extension_bin, lint_fix_manifest,
+    SEVERITY_CODE_GENERIC_REGEX, TestWorkspace, block_on, configure_lint_timeout_and_host_budget,
+    handler, handler_with_timeout, start_server,
 };
+use rmcp::RoleClient;
 use rmcp::model::CallToolRequestParams;
-use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(15);
-
-fn engine_state(workspace: &TestWorkspace, indexed_paths: &[&str]) -> Arc<RwLock<EngineState>> {
-    let mut project = ProjectWorkspace::new();
-    let mut index = InvertedIndex::new();
-    let mut fs = workspace.real_fs();
-    let storage = InMemoryStorage::new();
-
-    for path in indexed_paths {
-        let relative_path = RelativePath::new(*path);
-        let id = project
-            .insert(relative_path.clone(), FileMetadata::default())
-            .expect("index workspace file");
-        index.insert(id, &tokenize(relative_path.as_str()));
-        let content = fs
-            .read(&relative_path)
-            .expect("indexed file must exist on disk");
-        fs.write(relative_path, content)
-            .expect("write indexed file");
-    }
-
-    Arc::new(RwLock::new(EngineState::new(
-        project,
-        index,
-        Box::new(storage),
-        Box::new(fs),
-    )))
-}
-
-fn handler(workspace: &TestWorkspace, indexed_paths: &[&str]) -> TowerMcpHandler {
-    let mut extension_registry = ExtensionRegistry::new();
-    let lint_extension = SidecarHostAdapter::spawn(
-        lint_fix_manifest(&lint_extension_bin()),
-        host_deps(workspace.real_fs()),
-        TEST_TIMEOUT,
-        None,
-    )
-    .expect("spawn lint extension");
-    extension_registry
-        .register(lint_extension)
-        .expect("register lint extension");
-
-    let merged = ExtensionMergedRegistry::new(
-        engine_state(workspace, indexed_paths),
-        Arc::new(RwLock::new(extension_registry)),
-    );
-    TowerMcpHandler::new(
-        merged,
-        Arc::new(NoOpDiagnosticsReader),
-        Arc::new(Mutex::new(SubscriptionRegistry::new())),
-        vec![],
-    )
-}
-
-async fn start_server(handler: TowerMcpHandler) -> rmcp::service::RunningService<RoleClient, ()> {
-    let (server_transport, client_transport) = tokio::io::duplex(65_536);
-    tokio::spawn(async move {
-        if let Ok(server) = handler.serve(server_transport).await {
-            let _ = server.waiting().await;
-        }
-    });
-    ().serve(client_transport)
-        .await
-        .expect("client connect failed")
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
-}
 
 async fn call_lint_fix(
     client: &rmcp::service::RunningService<RoleClient, ()>,
@@ -241,4 +151,76 @@ fn lint_fix_returns_structured_error_for_missing_linter_without_mcp_error() {
     });
 
     assert_eq!(payload["error"]["code"], "lint_fix_unavailable");
+}
+
+#[test]
+fn tower_lint_fix_honors_configured_timeout_for_fix_and_verification() {
+    const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(14);
+
+    let workspace = TestWorkspace::new();
+    let counter = workspace.root().join("configured-fix-count.txt");
+    let counter_path = counter.to_string_lossy().replace('\\', "\\\\");
+    let script = workspace.script(
+        "configured-timeout-fix.sh",
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{counter_path}" ]; then count=$(cat "{counter_path}"); fi
+count=$((count + 1))
+printf '%s' "$count" > "{counter_path}"
+if [ "$count" = 1 ]; then
+  printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope","level":"warning","code":{{"code":"fixture::replace"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}}]}}}}'
+else
+  printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy","level":"warning","code":{{"code":"fixture::remaining"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":4}}]}}}}'
+fi
+"#
+        ),
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    let host_timeout = configure_lint_timeout_and_host_budget(&workspace, Some(4));
+    assert_eq!(host_timeout, Duration::from_secs(9));
+    workspace.write_file("src/main.rs", "nope\n");
+
+    let payload = block_on(async {
+        let client = start_server(handler_with_timeout(
+            &workspace,
+            &["src/main.rs"],
+            host_timeout,
+        ))
+        .await;
+        let result = tokio::time::timeout(
+            MCP_REQUEST_TIMEOUT,
+            call_lint_fix(&client, json!({ "path": "src/main.rs" })),
+        )
+        .await
+        .expect("lint fix MCP request must finish within its harness budget");
+        let payload = result_json(&result);
+        client.cancel().await.expect("cancel client");
+        payload
+    });
+
+    assert_eq!(payload["files_changed"], 1);
+    assert_eq!(payload["fixes_applied"], 1);
+    assert_eq!(
+        payload["remaining_diagnostics"],
+        json!([{
+            "path": "src/main.rs",
+            "line": 0,
+            "character": 0,
+            "endLine": 0,
+            "endCharacter": 3,
+            "severity": "warning",
+            "code": "fixture::remaining",
+            "message": "still noisy",
+            "source": "fixture-lint"
+        }])
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("src/main.rs")).expect("read fixed file"),
+        "yep\n"
+    );
+    assert_eq!(
+        fs::read_to_string(counter).expect("read invocation count"),
+        "2"
+    );
 }

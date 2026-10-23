@@ -1,11 +1,11 @@
 #![allow(clippy::pedantic)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod lint_support;
 
@@ -389,6 +389,61 @@ fn spawn_lint_fix_adapter(
         None,
     )
     .expect("lint extension must spawn")
+}
+
+struct ShutdownGuard {
+    adapter: Box<dyn core_engine::domain::ExtensionInstance>,
+}
+
+impl ShutdownGuard {
+    fn new(adapter: Box<dyn core_engine::domain::ExtensionInstance>) -> Self {
+        Self { adapter }
+    }
+}
+
+impl std::ops::Deref for ShutdownGuard {
+    type Target = dyn core_engine::domain::ExtensionInstance;
+
+    fn deref(&self) -> &Self::Target {
+        self.adapter.as_ref()
+    }
+}
+
+impl std::ops::DerefMut for ShutdownGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.adapter.as_mut()
+    }
+}
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        self.adapter.shutdown();
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn assert_process_exits(pid_path: &std::path::Path) {
+    let pid = fs::read_to_string(pid_path)
+        .unwrap_or_else(|error| panic!("read descendant pid from {}: {error}", pid_path.display()));
+    let pid = pid.trim();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_is_alive(pid),
+        "timed-out descendant {pid} remained alive"
+    );
 }
 
 #[test]
@@ -1105,15 +1160,6 @@ fn lint_fix_maps_host_precondition_failed_and_invalid_range_to_nonfatal_skipped_
         "result": "bad\n"
     }));
 
-    let apply_cas = child.read_frame();
-    assert_eq!(apply_cas["method"], "workspace/applyEdits");
-    assert_eq!(apply_cas["params"]["path"], "src/cas.rs");
-    child.write_frame(json!({
-        "jsonrpc": "2.0",
-        "id": apply_cas["id"].clone(),
-        "error": { "code": -32000, "message": "precondition_failed: stale content version" }
-    }));
-
     let read_range = child.read_frame();
     assert_eq!(read_range["method"], "workspace/readFile");
     assert_eq!(read_range["params"]["path"], "src/range.rs");
@@ -1121,6 +1167,15 @@ fn lint_fix_maps_host_precondition_failed_and_invalid_range_to_nonfatal_skipped_
         "jsonrpc": "2.0",
         "id": read_range["id"].clone(),
         "result": "bad\n"
+    }));
+
+    let apply_cas = child.read_frame();
+    assert_eq!(apply_cas["method"], "workspace/applyEdits");
+    assert_eq!(apply_cas["params"]["path"], "src/cas.rs");
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": apply_cas["id"].clone(),
+        "error": { "code": -32000, "message": "precondition_failed: stale content version" }
     }));
 
     let apply_range = child.read_frame();
@@ -1226,6 +1281,219 @@ fi
         fs::read_to_string(counter).expect("read linter invocation counter"),
         "2",
         "successful writes must trigger exactly one follow-up check and no iterative fix loop"
+    );
+}
+
+fn set_lint_timeout(workspace: &TestWorkspace, timeout_secs: u64) {
+    let config_path = workspace.root().join(".tower/config.toml");
+    let mut config = fs::read_to_string(&config_path).expect("read lint config");
+    config.push_str(&format!("timeout_secs = {timeout_secs}\n"));
+    fs::write(config_path, config).expect("set lint timeout");
+}
+
+#[test]
+fn lint_fix_uses_configured_timeout_for_preparation_and_follow_up_check() {
+    let workspace = TestWorkspace::new();
+    let counter = workspace.root().join("configured-timeout-count.txt");
+    let counter_path = counter.to_string_lossy().replace('\\', "\\\\");
+    let script = workspace.script(
+        "configured-timeout-lint.sh",
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{counter_path}" ]; then count=$(cat "{counter_path}"); fi
+count=$((count + 1))
+printf '%s' "$count" > "{counter_path}"
+if [ "$count" = 1 ]; then exit 0; fi
+if [ "$count" = 2 ]; then
+  sleep 3
+  printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope","level":"warning","code":{{"code":"fixture::replace"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}}]}}}}'
+  exit 0
+fi
+sleep 3
+printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy","level":"warning","code":{{"code":"fixture::remaining"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":4}}]}}}}'
+"#
+        ),
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    set_lint_timeout(&workspace, 4);
+    workspace.write_file("src/main.rs", "nope\n");
+
+    let mut adapter = SidecarHostAdapter::spawn(
+        lint_fix_manifest(&lint_extension_bin()),
+        host_deps(workspace.real_fs()),
+        Duration::from_secs(12),
+        None,
+    )
+    .expect("lint extension with two configured-timeout fix passes must spawn");
+    let check = adapter
+        .call_tool("check", json!({ "path": "src/main.rs" }))
+        .expect("configured check must return a tool result");
+    assert_success_check_result(&check);
+    assert_eq!(check["error"], Value::Null);
+
+    let fix = adapter
+        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .expect("configured fix must return a tool result");
+    adapter.shutdown();
+
+    assert!(fix.get("error").is_none(), "configured fix failed: {fix}");
+    assert_eq!(fix["files_changed"], 1);
+    assert_eq!(fix["fixes_applied"], 1);
+    assert_eq!(
+        fix["remaining_diagnostics"],
+        json!([{
+            "path": "src/main.rs",
+            "code": "fixture::remaining",
+            "message": "still noisy",
+            "source": "fixture-lint",
+            "severity": "warning",
+            "line": 0,
+            "character": 0,
+            "endLine": 0,
+            "endCharacter": 3,
+        }]),
+        "the configured follow-up pass must return its remaining diagnostic exactly"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("src/main.rs")).expect("read fixed file"),
+        "yep\n",
+        "the successful post-fix verification must retain the edit"
+    );
+    assert_eq!(
+        fs::read_to_string(counter).expect("read invocation counter"),
+        "3",
+        "check, fix preparation, and post-fix verification must each use the configured timeout"
+    );
+}
+
+#[test]
+fn lint_fix_follow_up_timeout_reports_applied_changes() {
+    let workspace = TestWorkspace::new();
+    let counter = workspace.root().join("post-edit-tool-failure-count.txt");
+    let counter_path = counter.to_string_lossy().replace('\\', "\\\\");
+    let descendant_pid = workspace.root().join(".tower/follow-up-descendant.pid");
+    let descendant_pid_path = descendant_pid.to_string_lossy().replace('\\', "\\\\");
+    let script = workspace.script(
+        "post-edit-tool-failure.sh",
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{counter_path}" ]; then count=$(cat "{counter_path}"); fi
+count=$((count + 1))
+printf '%s' "$count" > "{counter_path}"
+if [ "$count" = 1 ]; then
+  printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope","level":"warning","code":{{"code":"fixture::replace"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}}]}}}}'
+  exit 0
+fi
+sh -c 'trap "" TERM; echo $$ > "{descendant_pid_path}"; while :; do sleep 1; done' &
+while [ ! -f "{descendant_pid_path}" ]; do :; done
+wait
+"#
+        ),
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    set_lint_timeout(&workspace, 1);
+    workspace.write_file("src/main.rs", "nope\n");
+
+    let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
+    let result = adapter
+        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .expect("post-edit tool failure must return a structured tool result");
+
+    assert_eq!(result["error"]["code"], "lint_fix_apply_failed");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("lint command timed out")),
+        "the public error must retain the runner failure cause: {result}"
+    );
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("edits were applied")),
+        "the public error must warn that edits committed: {result}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("src/main.rs")).expect("read applied file"),
+        "yep\n"
+    );
+    #[cfg(unix)]
+    assert_process_exits(&descendant_pid);
+}
+
+#[test]
+fn lint_fix_reports_post_edit_transport_failure_and_retains_applied_file_contents() {
+    let workspace = TestWorkspace::new();
+    let script = rustc_fix_script(
+        &workspace,
+        "post-edit-transport-failure.sh",
+        "MachineApplicable",
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    workspace.write_file("src/main.rs", "nope\n");
+
+    let mut child = ProtocolChild::spawn(&workspace);
+    child.initialize();
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "invokeTool",
+        "params": { "name": "fix", "params": { "path": "src/main.rs" } }
+    }));
+
+    let initial_read = child.read_frame();
+    assert_eq!(initial_read["method"], "workspace/readFile");
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": initial_read["id"].clone(),
+        "result": "nope\n"
+    }));
+
+    let apply = child.read_frame();
+    assert_eq!(apply["method"], "workspace/applyEdits");
+    assert_eq!(apply["params"]["path"], "src/main.rs");
+    assert_eq!(apply["params"]["edits"][0]["replacement"], "yep");
+    fs::write(workspace.root().join("src/main.rs"), "yep\n").expect("record committed edit");
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": apply["id"].clone(),
+        "result": {
+            "applied": [{ "start_byte": 0, "end_byte": 4, "replacement": "yep" }],
+            "skipped": [],
+            "new_version": "committed-version",
+            "preview": null
+        }
+    }));
+
+    let follow_up_read = child.read_frame();
+    assert_eq!(follow_up_read["method"], "workspace/readFile");
+    child.write_frame(json!({
+        "jsonrpc": "2.0",
+        "id": follow_up_read["id"].clone(),
+        "error": { "code": -32000, "message": "sidecar response stream closed" }
+    }));
+
+    let response = child.read_frame();
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"]["type"], "ToolResult");
+    let result = &response["result"]["data"];
+    assert_eq!(result["error"]["code"], "lint_fix_apply_failed");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("sidecar response stream closed")),
+        "the public error must retain the transport cause: {result}"
+    );
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("edits were applied")),
+        "the public error must warn that edits committed: {result}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("src/main.rs")).expect("read applied file"),
+        "yep\n"
     );
 }
 
@@ -1473,29 +1741,271 @@ source = "fixture-lint"
 }
 
 #[test]
-fn hanging_linter_preserves_success_result_path_with_stable_timeout_code() {
+fn configured_lint_timeout_returns_stable_timeout_result_and_reaps_descendants() {
     let workspace = TestWorkspace::new();
-    let script = workspace.script("hanging-lint.sh", "#!/bin/sh\nsleep 60\n");
+    let descendant_pid = workspace.root().join(".tower/check-descendant.pid");
+    let descendant_pid_path = descendant_pid.to_string_lossy().replace('\\', "\\\\");
+    let script = workspace.script(
+        "hanging-lint.sh",
+        &format!(
+            r#"#!/bin/sh
+sh -c 'trap "" TERM; echo $$ > "{descendant_pid_path}"; while :; do sleep 1; done' &
+while [ ! -f "{descendant_pid_path}" ]; do :; done
+wait
+"#
+        ),
+    );
     workspace.write_lint_config(&script);
+    set_lint_timeout(&workspace, 1);
     let mut fs = workspace.real_fs();
     write_file(&mut fs, "src/main.txt", b"plain text");
 
-    let mut adapter = SidecarHostAdapter::spawn(
-        lint_empty_manifest(&lint_extension_bin()),
-        host_deps(fs),
-        TEST_TIMEOUT,
-        None,
-    )
-    .expect("lint extension must spawn");
+    let mut adapter = ShutdownGuard::new(
+        SidecarHostAdapter::spawn(
+            lint_empty_manifest(&lint_extension_bin()),
+            host_deps(fs),
+            TEST_TIMEOUT,
+            None,
+        )
+        .expect("lint extension must spawn"),
+    );
     let result = adapter
         .call_tool("check", json!({ "path": "src/main.txt" }))
         .expect("timeout must remain on the success-result path");
 
-    adapter.shutdown();
-
     assert_eq!(result["supported"], false);
     assert_eq!(result["diagnostics"], json!([]));
     assert_eq!(result["error"]["code"], "lint_timeout");
+    #[cfg(unix)]
+    assert_process_exits(&descendant_pid);
+}
+
+#[test]
+fn lint_fix_preparation_timeout_preserves_files() {
+    let workspace = TestWorkspace::new();
+    let descendant_pid = workspace.root().join(".tower/preparation-descendant.pid");
+    let descendant_pid_path = descendant_pid.to_string_lossy().replace('\\', "\\\\");
+    let script = workspace.script(
+        "preparation-timeout.sh",
+        &format!(
+            r#"#!/bin/sh
+sh -c 'trap "" TERM; echo $$ > "{descendant_pid_path}"; while :; do sleep 1; done' &
+while [ ! -f "{descendant_pid_path}" ]; do :; done
+wait
+"#
+        ),
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    set_lint_timeout(&workspace, 1);
+    workspace.write_file("src/main.rs", "nope\n");
+    let original = fs::read(workspace.root().join("src/main.rs")).expect("read original file");
+
+    let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
+    let result = adapter
+        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .expect("preparation timeout must return a structured tool result");
+
+    assert_eq!(result["error"]["code"], "lint_fix_unavailable");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("lint command timed out")),
+        "the preparation failure must preserve the timeout cause: {result}"
+    );
+    assert_eq!(
+        fs::read(workspace.root().join("src/main.rs")).expect("read preserved file"),
+        original
+    );
+    #[cfg(unix)]
+    assert_process_exits(&descendant_pid);
+}
+
+#[cfg(unix)]
+fn assert_sidecar_process_cleanup(closes_stdin: bool, restricted_path: bool) {
+    let workspace = TestWorkspace::new();
+    let script = workspace.script(
+        "process-cleanup.sh",
+        &format!(
+            r#"#!/bin/sh
+echo $$ > .tower/direct.pid
+/bin/sh -c 'trap "" TERM; echo $$ > .tower/descendant.pid; while :; do /bin/sleep 1; done' &
+while [ ! -f .tower/descendant.pid ]; do :; done
+{}
+wait
+"#,
+            if closes_stdin { "exec 0<&-" } else { "" }
+        ),
+    );
+    workspace.write_lint_config_with_format(
+        &script,
+        &["txt"],
+        "generic-regex",
+        if closes_stdin { "stdin" } else { "none" },
+        Some(lint_support::SIMPLE_GENERIC_REGEX),
+    );
+    set_lint_timeout(&workspace, 1);
+    let empty_path = workspace.root().join(".tower/empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let mut child =
+        ProtocolChild::spawn_with_path(&workspace, restricted_path.then_some(empty_path.as_path()));
+    child.initialize();
+    child.write_frame(json!({ "jsonrpc": "2.0", "id": 1, "method": "invokeTool",
+        "params": { "name": "check", "params": { "path": "src/main.txt" } } }));
+    let read = child.read_frame();
+    assert_eq!(read["method"], "workspace/readFile");
+    let started = Instant::now();
+    child.write_frame(
+        json!({ "jsonrpc": "2.0", "id": read["id"], "result": "x".repeat(2 * 1024 * 1024) }),
+    );
+    let response = child.read_frame();
+    assert_eq!(response["id"], 1);
+    assert_eq!(
+        response["result"]["data"]["error"]["code"],
+        if closes_stdin {
+            "lint_invalid_config"
+        } else {
+            "lint_timeout"
+        }
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // Observe cleanup while the sidecar is still running, before owner shutdown.
+    assert!(child.child.try_wait().unwrap().is_none());
+    assert_process_exits(&workspace.root().join(".tower/direct.pid"));
+    assert_process_exits(&workspace.root().join(".tower/descendant.pid"));
+    child.write_frame(json!({ "jsonrpc": "2.0", "id": 2, "method": "deliverEvent", "params": {} }));
+    assert_eq!(
+        child.read_frame()["id"],
+        2,
+        "the sidecar must remain responsive after cleanup"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdin_error_reaps_process_tree_before_sidecar_shutdown() {
+    assert_sidecar_process_cleanup(true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_linter_timeout_reaps_process_tree_without_kill_in_path() {
+    assert_sidecar_process_cleanup(false, true);
+}
+
+#[test]
+fn workspace_fix_preparation_timeout_preserves_every_file() {
+    let workspace = TestWorkspace::new();
+    let script = workspace.script(
+        "workspace-preparation-timeout.sh",
+        r#"#!/bin/sh
+if [ "$1" = src/b.rs ]; then sleep 60; fi
+printf '%s\n' '{"reason":"compiler-message","message":{"message":"replace nope","level":"warning","spans":[{"file_name":"src/a.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}]}}'
+"#,
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    set_lint_timeout(&workspace, 1);
+    workspace.write_file("src/a.rs", "nope\n");
+    workspace.write_file("src/b.rs", "nope\n");
+    let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
+    let result = adapter
+        .call_tool("fix", json!({}))
+        .expect("workspace fix result");
+    assert_eq!(result["error"]["code"], "lint_fix_unavailable");
+    for path in ["src/a.rs", "src/b.rs"] {
+        assert_eq!(
+            fs::read_to_string(workspace.root().join(path)).unwrap(),
+            "nope\n",
+            "preparation failure changed {path}"
+        );
+    }
+}
+
+#[test]
+fn workspace_lint_operations_process_multiple_files_with_sufficient_request_budget() {
+    let workspace = TestWorkspace::new();
+    let counter = workspace.root().join(".tower/workspace-lint-count.txt");
+    let counter_path = counter.to_string_lossy().replace('\\', "\\\\");
+    let script = workspace.script(
+        "workspace-budget-lint.sh",
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{counter_path}" ]; then count=$(cat "{counter_path}"); fi
+count=$((count + 1))
+printf '%s' "$count" > "{counter_path}"
+sleep 1
+printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope","level":"warning","code":{{"code":"fixture::replace"}},"spans":[{{"file_name":"'$1'","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}}]}}}}'
+"#
+        ),
+    );
+    workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
+    set_lint_timeout(&workspace, 2);
+    workspace.write_file("src/a.rs", "nope\n");
+    workspace.write_file("src/b.rs", "nope\n");
+
+    let mut adapter = SidecarHostAdapter::spawn(
+        lint_fix_manifest(&lint_extension_bin()),
+        host_deps(workspace.real_fs()),
+        Duration::from_secs(8),
+        None,
+    )
+    .expect("lint extension must spawn");
+    let check = adapter
+        .call_tool("check", json!({}))
+        .expect("workspace check must fit the sufficient request budget");
+    let dry_run = adapter
+        .call_tool("fix", json!({ "dry_run": true }))
+        .expect("workspace dry-run fix must fit the sufficient request budget");
+    adapter.shutdown();
+
+    assert_eq!(check["supported"], true);
+    assert_eq!(check["diagnostics"].as_array().map(Vec::len), Some(2));
+    let check_paths = check["diagnostics"]
+        .as_array()
+        .expect("workspace check diagnostics must be an array")
+        .iter()
+        .map(|diagnostic| {
+            diagnostic["path"]
+                .as_str()
+                .expect("workspace check diagnostic must name its file")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        check_paths,
+        BTreeSet::from(["src/a.rs", "src/b.rs"]),
+        "workspace check diagnostics must cover both requested files"
+    );
+    assert_eq!(dry_run["files_changed"], 0);
+    assert_eq!(dry_run["fixes_applied"], 2);
+    assert_eq!(dry_run["previews"].as_array().map(Vec::len), Some(2));
+    let preview_paths = dry_run["previews"]
+        .as_array()
+        .expect("workspace dry-run previews must be an array")
+        .iter()
+        .map(|preview| {
+            preview["path"]
+                .as_str()
+                .expect("workspace dry-run preview must name its file")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        preview_paths,
+        BTreeSet::from(["src/a.rs", "src/b.rs"]),
+        "workspace dry-run previews must cover both requested files"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("src/a.rs")).expect("read first file"),
+        "nope\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("src/b.rs")).expect("read second file"),
+        "nope\n"
+    );
+    assert_eq!(
+        fs::read_to_string(counter).expect("read invocation counter"),
+        "4",
+        "two-file check plus dry-run preparation must not start a follow-up pass"
+    );
 }
 
 #[test]
@@ -1529,12 +2039,20 @@ fn workspace_check_propagates_per_file_runner_error_with_stable_lint_error_code(
 struct ProtocolChild {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: std::sync::mpsc::Receiver<String>,
 }
 
 impl ProtocolChild {
     fn spawn(workspace: &TestWorkspace) -> Self {
-        let mut child = Command::new(lint_extension_bin())
+        Self::spawn_with_path(workspace, None)
+    }
+
+    fn spawn_with_path(workspace: &TestWorkspace, path: Option<&std::path::Path>) -> Self {
+        let mut command = Command::new(lint_extension_bin());
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let mut child = command
             .current_dir(workspace.root())
             .env("TOWER_WORKSPACE", workspace.root())
             .stdin(Stdio::piped())
@@ -1544,11 +2062,20 @@ impl ProtocolChild {
             .expect("spawn lint extension");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                let line = line.expect("read sidecar frame");
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
 
         Self {
             child,
             stdin,
-            stdout,
+            stdout: receiver,
         }
     }
 
@@ -1560,8 +2087,10 @@ impl ProtocolChild {
     }
 
     fn read_frame(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read frame");
+        let line = self
+            .stdout
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("sidecar must return a frame within the test budget");
         assert!(
             !line.is_empty(),
             "child stdout closed before a frame arrived"
