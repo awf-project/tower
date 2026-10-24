@@ -26,9 +26,6 @@
 //! authoritative and can be reused immediately. This eliminates the fixed settle
 //! budget and the `Instant`-stamp double-publish heuristic.
 //!
-//! The cap [`CHECK_TIMEOUT`] exists as a safety net for servers that never signal
-//! (e.g. a crashed rust-analyzer). After the cap elapses, `check` returns a typed
-//! server-timeout failure.
 //!
 //! # Lock discipline
 //!
@@ -41,10 +38,9 @@
 //!    `acquire_doc` and `release_doc` (navigation-side doc holds) follow the
 //!    same `inner` → `writer` ordering, so this discipline covers both the
 //!    watcher and navigation paths.
-//! 2. `self.writer` (`Mutex<Box<dyn Write + Send>>`) — guards the stdin write
-//!    half. Acquired via [`write_framed`] for the duration of one framed write.
-//!    Never held across a condvar wait. The reader thread acquires it only for
-//!    acks; it never holds `inner` at the same time, so no cycle exists.
+//! 2. `self.writer` — serializes stdin writes on a dedicated worker. Callers
+//!    enqueue one complete frame and may use a deadline-aware acknowledgement;
+//!    the reader thread uses the same queue for server-request acks.
 //! 3. `self.state` / `self.responses` (each `Mutex` inside their `Arc`) —
 //!    written by the reader thread, waited on by `check` and `send_request_once`.
 //!    The reader thread never acquires `inner`, so the ordering
@@ -150,10 +146,8 @@ pub struct DiagnosticsEvent {
 /// `None` = push disabled; a disconnected receiver is silently ignored.
 pub type DiagnosticsSender = mpsc::Sender<DiagnosticsEvent>;
 
-/// Upper bound on how long `check` waits for the server to settle. A safety net,
-/// not the primary mechanism — the ready gate (serverStatus/`$/progress`) should
-/// fire well before this. Generous because a cold first `cargo check` is slow.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const DIAGNOSTIC_PUBLICATION_HISTORY: usize = 64;
 
 /// How long a navigation request waits for its response before erroring.
 const REQUEST_BUDGET: Duration = Duration::from_secs(10);
@@ -251,6 +245,12 @@ enum ProviderCapability {
     Available,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticsCapability {
+    Push,
+    Pull,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SemanticCapabilities {
@@ -262,6 +262,7 @@ struct SemanticCapabilities {
     rename: RenameCapability,
     will_rename_files: ProviderCapability,
     safe_delete: ProviderCapability,
+    diagnostics: DiagnosticsCapability,
 }
 
 #[allow(dead_code)]
@@ -281,6 +282,14 @@ impl SemanticCapabilities {
             rename: parse_rename_provider(capabilities.get("renameProvider"))?,
             will_rename_files: parse_will_rename_files(capabilities.get("workspace"))?,
             safe_delete: parse_safe_delete(capabilities.get("experimental"))?,
+            diagnostics: if matches!(
+                capabilities.get("diagnosticProvider"),
+                Some(Value::Bool(true) | Value::Object(_))
+            ) {
+                DiagnosticsCapability::Pull
+            } else {
+                DiagnosticsCapability::Push
+            },
         })
     }
 }
@@ -406,18 +415,108 @@ fn parse_rename_provider(value: Option<&Value>) -> Result<RenameCapability, LspS
 const REFERENCES_SETTLE_FALLBACK: Duration = Duration::from_millis(1500);
 
 /// Correlates request ids to the full response message the reader thread parsed.
-type ResponseCache = Arc<(Mutex<HashMap<i64, Value>>, Condvar)>;
+type ResponseCache = Arc<(Mutex<HashMap<i64, Option<Value>>>, Condvar)>;
+
+/// Registers before submission so immediate replies are accepted; dropping the
+/// guard removes the reservation on success, timeout, or transport failure.
+struct PendingRequest {
+    responses: ResponseCache,
+    id: i64,
+}
+
+impl PendingRequest {
+    fn new(responses: &ResponseCache, id: i64) -> Self {
+        let (lock, cvar) = &**responses;
+        lock.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, None);
+        cvar.notify_all();
+        Self {
+            responses: Arc::clone(responses),
+            id,
+        }
+    }
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.responses;
+        lock.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+        cvar.notify_all();
+    }
+}
 
 /// Write half of the server's stdin, shared between the adapter (requests, doc
 /// sync, handshake) and the reader thread (acking server→client requests). A
 /// boxed trait object so tests can substitute an in-memory sink.
-type Writer = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+#[derive(Clone)]
+struct Writer {
+    tx: mpsc::Sender<WriteJob>,
+}
+
+struct WriteJob {
+    message: Value,
+    result: mpsc::SyncSender<std::io::Result<()>>,
+}
+
+impl Writer {
+    fn new(mut output: Box<dyn std::io::Write + Send>) -> Self {
+        let (tx, rx) = mpsc::channel::<WriteJob>();
+        std::thread::spawn(move || {
+            for job in rx {
+                let result = jsonrpc::write_message(&mut *output, &job.message);
+                let _ = job.result.send(result);
+            }
+        });
+        Self { tx }
+    }
+
+    fn submit(&self, message: &Value) -> std::io::Result<mpsc::Receiver<std::io::Result<()>>> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(WriteJob {
+                message: message.clone(),
+                result: result_tx,
+            })
+            .map_err(|_| broken_writer())?;
+        Ok(result_rx)
+    }
+
+    fn write(&self, message: &Value) -> std::io::Result<()> {
+        let result_rx = self.submit(message)?;
+        result_rx.recv().map_err(|_| broken_writer())?
+    }
+
+    fn write_before(&self, message: &Value, deadline: Instant) -> std::io::Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "LSP write deadline elapsed",
+            ));
+        }
+        let result_rx = self.submit(message)?;
+        result_rx
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "LSP write deadline elapsed")
+                }
+                mpsc::RecvTimeoutError::Disconnected => broken_writer(),
+            })?
+    }
+}
+
+fn broken_writer() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "LSP writer stopped")
+}
 
 /// Frame and write `msg` to the shared writer. Held only across the write, never
 /// across a condvar wait.
 fn write_framed(writer: &Writer, msg: &Value) -> std::io::Result<()> {
-    let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
-    jsonrpc::write_message(&mut **w, msg)
+    writer.write(msg)
 }
 
 // Handlers run only on the reader thread that owns the Dispatcher; `Send` lets
@@ -473,8 +572,10 @@ impl Dispatcher {
                 if let Some(id) = id.as_i64() {
                     let (lock, cvar) = &*self.responses;
                     let mut map = lock.lock().unwrap_or_else(|p| p.into_inner());
-                    map.insert(id, msg.clone());
-                    cvar.notify_all();
+                    if let Some(response @ None) = map.get_mut(&id) {
+                        *response = Some(msg.clone());
+                        cvar.notify_all();
+                    }
                 }
             }
             (None, None) => {}
@@ -555,12 +656,12 @@ fn build_dispatcher(
         }),
     );
 
-    let w = Arc::clone(&writer);
+    let w = writer.clone();
     dispatcher.on_request(
         "client/registerCapability",
         Box::new(move |msg| ack(&w, msg)),
     );
-    let w = Arc::clone(&writer);
+    let w = writer.clone();
     dispatcher.on_request(
         "window/workDoneProgress/create",
         Box::new(move |msg| ack(&w, msg)),
@@ -572,9 +673,16 @@ fn build_dispatcher(
 /// Diagnostics for one URI, tagged with the generation at which they were
 /// published, so `wait_for_settled` can require a strictly newer publish than
 /// the one seen before the `didOpen`/`didChange` was sent.
+#[derive(Clone)]
 struct DiagEntry {
     diags: Vec<Diagnostic>,
+    #[cfg_attr(not(test), allow(dead_code))]
     generation: u64,
+}
+
+struct PushWaiter {
+    watermark: u64,
+    first_fresh: Option<Vec<Diagnostic>>,
 }
 
 /// Diagnostics + readiness for the resident session, behind one mutex so `check`
@@ -588,6 +696,8 @@ pub struct SessionStateInner {
     /// diagnostics are not authoritative.
     ready: bool,
     by_uri: HashMap<String, DiagEntry>,
+    push_waiters: HashMap<String, HashMap<u64, PushWaiter>>,
+    next_push_waiter_id: u64,
     /// Monotonic, bumped on every `publishDiagnostics` for any URI.
     next_gen: u64,
     /// Monotonic, bumped on every authoritative quiescent signal. Allows
@@ -606,7 +716,24 @@ impl SessionStateInner {
     fn publish(&mut self, uri: String, diags: Vec<Diagnostic>) {
         self.next_gen += 1;
         let generation = self.next_gen;
-        self.by_uri.insert(uri, DiagEntry { diags, generation });
+        self.by_uri.insert(
+            uri.clone(),
+            DiagEntry {
+                diags: diags.clone(),
+                generation,
+            },
+        );
+        if let Some(waiters) = self.push_waiters.get_mut(&uri) {
+            for waiter in waiters.values_mut() {
+                if generation > waiter.watermark && waiter.first_fresh.is_none() {
+                    waiter.first_fresh = Some(
+                        self.by_uri
+                            .get(&uri)
+                            .map_or_else(Vec::new, |entry| entry.diags.clone()),
+                    );
+                }
+            }
+        }
     }
 
     fn signal_ready(&mut self) {
@@ -617,11 +744,8 @@ impl SessionStateInner {
 
 /// Shared session state; the reader thread notifies the condvar on every
 /// readiness change or diagnostics publish.
-/// Shared session state; the reader thread notifies the condvar on every
-/// readiness change or diagnostics publish.
 pub type SharedState = Arc<(Mutex<SessionStateInner>, Condvar)>;
 
-/// Store diagnostics for `uri`, bumping the generation, and wake any waiter.
 /// Store diagnostics for `uri`, bumping the generation, wake any waiter,
 /// and return the new generation so the caller can attach it to a push event.
 fn record_diagnostics(state: &SharedState, uri: String, diags: Vec<Diagnostic>) -> u64 {
@@ -666,9 +790,39 @@ fn is_server_status_active(state: &SharedState) -> bool {
 
 /// Read the current diagnostics generation. Call before syncing so `check` can
 /// wait for a strictly newer generation (a publish caused by this sync or later).
+#[cfg(test)]
 fn current_generation(state: &SharedState) -> u64 {
     let (lock, _) = &**state;
     lock.lock().unwrap_or_else(|p| p.into_inner()).next_gen
+}
+
+fn register_push_waiter(state: &SharedState, uri: &str) -> (u64, u64) {
+    let (lock, _) = &**state;
+    let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let watermark = state.next_gen;
+    let waiter_id = state.next_push_waiter_id;
+    state.next_push_waiter_id += 1;
+    state
+        .push_waiters
+        .entry(uri.to_owned())
+        .or_default()
+        .insert(
+            waiter_id,
+            PushWaiter {
+                watermark,
+                first_fresh: None,
+            },
+        );
+    (watermark, waiter_id)
+}
+
+fn remove_push_waiter(state: &mut SessionStateInner, uri: &str, waiter_id: u64) {
+    if let Some(waiters) = state.push_waiters.get_mut(uri) {
+        waiters.remove(&waiter_id);
+        if waiters.is_empty() {
+            state.push_waiters.remove(uri);
+        }
+    }
 }
 
 /// Read the current ready generation. Call before opening documents so
@@ -735,6 +889,7 @@ pub struct LspClientAdapter {
     responses: ResponseCache,
     /// Semantic provider capabilities reported by the initialized server.
     semantic_capabilities: Mutex<SemanticCapabilities>,
+    diagnostics_deadline: Duration,
     /// Root `.towerignore` policy applied to navigation results.
     ignore: Gitignore,
     next_id: AtomicI64,
@@ -880,6 +1035,7 @@ impl LspClientAdapter {
         language_id: String,
         workspace_root: std::path::PathBuf,
         push_tx: Option<DiagnosticsSender>,
+        diagnostics_deadline: Duration,
     ) -> Result<Self, CodeIntelError> {
         Self::spawn_resolved(
             Path::new(command),
@@ -888,6 +1044,7 @@ impl LspClientAdapter {
             language_id,
             workspace_root,
             push_tx,
+            diagnostics_deadline,
         )
         .map_err(session_to_code_intel_error)
     }
@@ -899,6 +1056,7 @@ impl LspClientAdapter {
         language_id: String,
         root: PathBuf,
         push_tx: Option<DiagnosticsSender>,
+        diagnostics_deadline: Duration,
     ) -> Result<Self, LspSessionError> {
         if !root.is_dir() {
             return Err(LspSessionError::Backend(
@@ -922,7 +1080,7 @@ impl LspClientAdapter {
             extension_protocol::LspOutcomeCode::ServerLaunchFailed,
         ))?;
 
-        let writer: Writer = Arc::new(Mutex::new(Box::new(stdin)));
+        let writer = Writer::new(Box::new(stdin));
         let state: SharedState =
             Arc::new((Mutex::new(SessionStateInner::default()), Condvar::new()));
         let responses: ResponseCache = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
@@ -932,7 +1090,7 @@ impl LspClientAdapter {
         let dispatcher = build_dispatcher(
             Arc::clone(&state),
             Arc::clone(&responses),
-            Arc::clone(&writer),
+            writer.clone(),
             push_tx,
         );
         let dead_flag_clone = Arc::clone(&dead_flag);
@@ -980,7 +1138,9 @@ impl LspClientAdapter {
                 rename: RenameCapability::Unavailable,
                 will_rename_files: ProviderCapability::Unavailable,
                 safe_delete: ProviderCapability::Unavailable,
+                diagnostics: DiagnosticsCapability::Push,
             }),
+            diagnostics_deadline,
             ignore,
             next_id: AtomicI64::new(1),
             dead_flag,
@@ -999,22 +1159,7 @@ impl LspClientAdapter {
 
     fn handshake(&self) -> Result<(), LspSessionError> {
         let root_uri = path_to_uri(&self.workspace_root);
-        let initialize_params = json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": { "publishDiagnostics": {} },
-                "workspace": {
-                    "fileOperations": { "willRename": true }
-                },
-                "window": { "workDoneProgress": true },
-                // rust-analyzer reads serverStatus capability at
-                // params.capabilities.experimental.serverStatusNotification,
-                // NOT as a sibling of capabilities.
-                "experimental": { "serverStatusNotification": true }
-            },
-            "initializationOptions": {}
-        });
+        let initialize_params = initialize_params(std::process::id(), &root_uri);
         let initialized = json!({
             "jsonrpc": "2.0",
             "method": "initialized",
@@ -1273,14 +1418,24 @@ impl LspClientAdapter {
         if self.dead_flag.load(Ordering::Acquire) {
             return Err(self.reader_failure());
         }
+        let _pending = PendingRequest::new(&self.responses, id);
         let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         // The request does not touch `docs`, so we write directly without holding `inner`.
-        write_framed(&self.writer, &request).map_err(|_| self.transport_failure())?;
+        self.writer
+            .write_before(&request, deadline)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+                } else {
+                    self.transport_failure()
+                }
+            })?;
 
         let (lock, cvar) = &*self.responses;
         let mut map = lock.lock().unwrap_or_else(|p| p.into_inner());
         loop {
-            if let Some(msg) = map.remove(&id) {
+            if let Some(msg) = map.get_mut(&id).and_then(Option::take) {
+                map.remove(&id);
                 let has_result = msg.get("result").is_some();
                 let has_error = msg.get("error").is_some();
                 if has_result == has_error {
@@ -1342,33 +1497,38 @@ impl LspClientAdapter {
     fn wait_for_settled_or_failure(
         &self,
         uri: &str,
-        sync_gen: u64,
-        pre_sync_ready_gen: u64,
+        waiter_id: u64,
         emitted_sync: bool,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<Vec<Diagnostic>, LspSessionError> {
         let (lock, cvar) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let deadline = Instant::now() + timeout;
         loop {
             if self.dead_flag.load(Ordering::Acquire) {
+                remove_push_waiter(&mut state, uri, waiter_id);
                 return Err(self.reader_failure());
             }
             let fresh = state
-                .by_uri
+                .push_waiters
                 .get(uri)
-                .is_some_and(|entry| entry.generation > sync_gen);
-            let quiescent = state.ready_gen > pre_sync_ready_gen;
+                .and_then(|waiters| waiters.get(&waiter_id))
+                .and_then(|waiter| waiter.first_fresh.clone());
             let settled_cache = !emitted_sync && state.ready && state.by_uri.contains_key(uri);
             let now = Instant::now();
-            if (quiescent && fresh) || settled_cache {
-                return Ok(state
+            if let Some(diagnostics) = fresh {
+                remove_push_waiter(&mut state, uri, waiter_id);
+                return Ok(diagnostics);
+            }
+            if settled_cache {
+                let diagnostics = state
                     .by_uri
                     .get(uri)
-                    .map(|entry| entry.diags.clone())
-                    .unwrap_or_default());
+                    .map_or_else(Vec::new, |entry| entry.diags.clone());
+                remove_push_waiter(&mut state, uri, waiter_id);
+                return Ok(diagnostics);
             }
             if now >= deadline {
+                remove_push_waiter(&mut state, uri, waiter_id);
                 return Err(LspSessionError::Backend(
                     extension_protocol::LspOutcomeCode::ServerTimeout,
                 ));
@@ -1378,6 +1538,37 @@ impl LspClientAdapter {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next;
         }
+    }
+
+    fn pull_diagnostics(
+        &self,
+        uri: &str,
+        deadline: Instant,
+    ) -> Result<Vec<Diagnostic>, LspSessionError> {
+        use lsp_types::{DocumentDiagnosticReport, DocumentDiagnosticReportResult};
+
+        let value = self.send_request_before(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": uri } }),
+            deadline,
+        )?;
+        let report = serde_json::from_value::<DocumentDiagnosticReportResult>(value)
+            .map_err(|_| malformed_capabilities())?;
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = report
+        else {
+            return Err(malformed_capabilities());
+        };
+
+        full.full_document_diagnostic_report
+            .items
+            .into_iter()
+            .map(|diagnostic| {
+                serde_json::to_value(diagnostic)
+                    .ok()
+                    .and_then(|value| parse_one_diagnostic(&value))
+                    .ok_or_else(malformed_capabilities)
+            })
+            .collect()
     }
 
     fn classify_request_failure(&self, failure: &RequestFailure) -> LspSessionError {
@@ -1683,6 +1874,28 @@ impl DocumentSyncPort for LspClientAdapter {
     }
 }
 
+fn initialize_params(process_id: u32, root_uri: &str) -> Value {
+    json!({
+        "processId": process_id,
+        "rootUri": root_uri,
+        "capabilities": {
+            "textDocument": {
+                "publishDiagnostics": {},
+                "diagnostic": {},
+            },
+            "workspace": {
+                "fileOperations": { "willRename": true }
+            },
+            "window": { "workDoneProgress": true },
+            // rust-analyzer reads serverStatus capability at
+            // params.capabilities.experimental.serverStatusNotification,
+            // NOT as a sibling of capabilities.
+            "experimental": { "serverStatusNotification": true }
+        },
+        "initializationOptions": {}
+    })
+}
+
 impl CodeIntelligencePort for LspClientAdapter {
     fn check(&self, path: &RelativePath, text: &str) -> Result<Vec<Diagnostic>, CodeIntelError> {
         pool::PooledSession::check_lsp(self, path, text).map_err(session_to_code_intel_error)
@@ -1735,9 +1948,17 @@ impl pool::PooledSession for LspClientAdapter {
         if self.dead_flag.load(Ordering::Acquire) {
             return Err(self.reader_failure());
         }
+        let deadline = Instant::now()
+            .checked_add(self.diagnostics_deadline)
+            .ok_or(LspSessionError::Backend(LspOutcomeCode::ServerTimeout))?;
         let uri = self.uri_for(path);
-        let sync_gen = current_generation(&self.state);
-        let pre_sync_ready_gen = current_ready_gen(&self.state);
+        let diagnostics = self
+            .semantic_capabilities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .diagnostics;
+        let push_waiter = (diagnostics == DiagnosticsCapability::Push)
+            .then(|| register_push_waiter(&self.state, &uri).1);
         let emitted_sync = {
             let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let sync = if session.docs.is_open(&uri) {
@@ -1746,18 +1967,32 @@ impl pool::PooledSession for LspClientAdapter {
                 session.docs.acquire(&uri, &self.language_id, text)
             };
             let emitted_sync = sync.is_some();
-            if let Some(sync) = sync {
-                write_doc_sync(&self.writer, &uri, &sync).map_err(|_| self.transport_failure())?;
+            if let Some(sync) = sync
+                && let Err(error) = write_doc_sync_before(&self.writer, &uri, &sync, deadline)
+            {
+                if let Some(waiter_id) = push_waiter {
+                    let (lock, _) = &*self.state;
+                    remove_push_waiter(
+                        &mut lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        &uri,
+                        waiter_id,
+                    );
+                }
+                return Err(if error.kind() == std::io::ErrorKind::TimedOut {
+                    LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+                } else {
+                    self.transport_failure()
+                });
             }
             emitted_sync
         };
-        self.wait_for_settled_or_failure(
-            &uri,
-            sync_gen,
-            pre_sync_ready_gen,
-            emitted_sync,
-            CHECK_TIMEOUT,
-        )
+        match diagnostics {
+            DiagnosticsCapability::Push => {
+                let waiter_id = push_waiter.ok_or_else(malformed_response)?;
+                self.wait_for_settled_or_failure(&uri, waiter_id, emitted_sync, deadline)
+            }
+            DiagnosticsCapability::Pull => self.pull_diagnostics(&uri, deadline),
+        }
     }
 
     fn definition_lsp(
@@ -2338,6 +2573,23 @@ fn build_ignore_matcher(root: &Path) -> Gitignore {
 /// Serialise a [`DocSync`] action to the matching LSP notification and write it
 /// through the shared writer.
 fn write_doc_sync(writer: &Writer, uri: &str, sync: &DocSync) -> std::io::Result<()> {
+    write_doc_sync_message(uri, sync, |message| write_framed(writer, message))
+}
+
+fn write_doc_sync_before(
+    writer: &Writer,
+    uri: &str,
+    sync: &DocSync,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    write_doc_sync_message(uri, sync, |message| writer.write_before(message, deadline))
+}
+
+fn write_doc_sync_message(
+    uri: &str,
+    sync: &DocSync,
+    write: impl FnOnce(&Value) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let msg = match sync {
         DocSync::Open {
             version,
@@ -2367,7 +2619,7 @@ fn write_doc_sync(writer: &Writer, uri: &str, sync: &DocSync) -> std::io::Result
             "params": { "textDocument": { "uri": uri } }
         }),
     };
-    write_framed(writer, &msg)
+    write(&msg)
 }
 
 /// Normalize decoded raw locations to workspace-relative domain [`Location`]s,
@@ -2528,19 +2780,21 @@ mod tests {
     use std::io::{BufReader, Error, ErrorKind, Write};
     use std::path::Path;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::Ordering;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
 
     use super::{
-        CHECK_TIMEOUT, DiagnosticsEvent, LspClientAdapter, LspSessionError, ProviderCapability,
-        RawLocation, RawWorkspaceEdit, ReaderExit, RenameCapability, RenameNavigationError,
-        ResponseCache, SemanticCapabilities, Session, SharedState, UriAccessPolicy,
-        UriClassification, Writer, build_dispatcher, classify_reader_error, current_generation,
-        decode, mark_ready, parse_publish_diagnostics, path_to_uri, progress_kind,
-        record_diagnostics, server_status_is_quiescent, wait_for_settled, workspace_locations,
+        DIAGNOSTIC_PUBLICATION_HISTORY, DiagnosticsCapability, DiagnosticsEvent, LspClientAdapter,
+        LspSessionError, ProviderCapability, RawLocation, RawWorkspaceEdit, ReaderExit,
+        RenameCapability, RenameNavigationError, ResponseCache, SemanticCapabilities, Session,
+        SharedState, UriAccessPolicy, UriClassification, Writer, build_dispatcher,
+        classify_reader_error, current_generation, decode, initialize_params, mark_ready,
+        parse_publish_diagnostics, path_to_uri, progress_kind, record_diagnostics,
+        server_status_is_quiescent, wait_for_settled, workspace_locations,
     };
     use crate::lsp_adapter::documents::DocumentTracker;
     use crate::lsp_adapter::pool::PooledSession;
@@ -2550,6 +2804,18 @@ mod tests {
     use extension_protocol::{
         LspOutcomeCode, TypeHierarchyDirection, TypeHierarchyQuery, TypeHierarchyRange,
     };
+
+    const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn initialize_advertises_pull_diagnostics_client_capability() {
+        let params = initialize_params(42, "file:///workspace");
+
+        assert_eq!(
+            params["capabilities"]["textDocument"]["diagnostic"],
+            json!({})
+        );
+    }
 
     fn new_state() -> SharedState {
         Arc::new((
@@ -2781,8 +3047,63 @@ mod tests {
 
     fn test_writer() -> (Writer, SharedSink) {
         let sink = SharedSink::default();
-        let writer: Writer = Arc::new(Mutex::new(Box::new(sink.clone())));
+        let writer = Writer::new(Box::new(sink.clone()));
         (writer, sink)
+    }
+
+    #[derive(Clone)]
+    struct BlockingWriter {
+        sink: SharedSink,
+        started: Arc<(Mutex<bool>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl BlockingWriter {
+        fn new(sink: SharedSink) -> Self {
+            Self {
+                sink,
+                started: Arc::new((Mutex::new(false), Condvar::new())),
+                released: Arc::new((Mutex::new(false), Condvar::new())),
+            }
+        }
+
+        fn writer(&self) -> Writer {
+            Writer::new(Box::new(self.clone()))
+        }
+
+        fn wait_until_write_starts(&self) -> bool {
+            let (lock, cvar) = &*self.started;
+            let started = lock.lock().unwrap();
+            let (started, timeout) = cvar
+                .wait_timeout_while(started, Duration::from_millis(250), |started| !*started)
+                .unwrap();
+            *started && !timeout.timed_out()
+        }
+
+        fn release(&self) {
+            let (lock, cvar) = &*self.released;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (started_lock, started_cvar) = &*self.started;
+            *started_lock.lock().unwrap() = true;
+            started_cvar.notify_all();
+
+            let (released_lock, released_cvar) = &*self.released;
+            let mut released = released_lock.lock().unwrap();
+            while !*released {
+                released = released_cvar.wait(released).unwrap();
+            }
+            self.sink.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn test_adapter() -> (LspClientAdapter, SharedSink, ResponseCache) {
@@ -2817,7 +3138,9 @@ mod tests {
                 rename: RenameCapability::RenameWithPrepare,
                 will_rename_files: ProviderCapability::Unavailable,
                 safe_delete: ProviderCapability::Unavailable,
+                diagnostics: DiagnosticsCapability::Push,
             }),
+            diagnostics_deadline: CHECK_TIMEOUT,
             ignore: empty_ignore(),
             next_id: AtomicI64::new(1),
             dead_flag: Arc::new(AtomicBool::new(false)),
@@ -3044,24 +3367,27 @@ mod tests {
     }
 
     fn complete_response(responses: ResponseCache, response: serde_json::Value) {
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            let (lock, cvar) = &*responses;
-            lock.lock().unwrap().insert(1, response);
-            cvar.notify_all();
-        });
+        complete_responses(responses, vec![response]);
     }
 
     fn complete_responses(responses: ResponseCache, responses_by_id: Vec<serde_json::Value>) {
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
             let (lock, cvar) = &*responses;
-            let mut cache = lock.lock().unwrap();
             for response in responses_by_id {
                 let id = response["id"].as_i64().expect("test response has id");
-                cache.insert(id, response);
+                let cache = lock.lock().unwrap();
+                let (mut cache, timeout) = cvar
+                    .wait_timeout_while(cache, Duration::from_secs(2), |cache| {
+                        !cache.contains_key(&id)
+                    })
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "request {id} must be registered before its response"
+                );
+                cache.insert(id, Some(response));
+                cvar.notify_all();
             }
-            cvar.notify_all();
         });
     }
 
@@ -3374,9 +3700,9 @@ mod tests {
             }
         }
 
-        let (adapter, _sink, _responses) = test_adapter();
+        let (mut adapter, _sink, _responses) = test_adapter();
         enable_type_hierarchy(&adapter);
-        *adapter.writer.lock().unwrap() = Box::new(FailingWriter);
+        adapter.writer = Writer::new(Box::new(FailingWriter));
 
         let error = adapter
             .type_hierarchy_lsp(
@@ -3411,13 +3737,13 @@ mod tests {
             let (lock, cvar) = &*delayed_responses;
             lock.lock().unwrap().insert(
                 1,
-                json!({"id": 1, "result": [hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9)]}),
+                Some(json!({"id": 1, "result": [hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9)]})),
             );
             cvar.notify_all();
             std::thread::sleep(Duration::from_secs(6));
             lock.lock()
                 .unwrap()
-                .insert(2, json!({"id": 2, "result": []}));
+                .insert(2, Some(json!({"id": 2, "result": []})));
             cvar.notify_all();
         });
 
@@ -3455,6 +3781,7 @@ mod tests {
             "rust".to_owned(),
             std::env::current_dir().expect("test process has a current directory"),
             None,
+            CHECK_TIMEOUT,
         )
         .expect("the valid initialize response must allow the session to start")
     }
@@ -3485,6 +3812,443 @@ mod tests {
             .find(|msg| msg.get("method").and_then(serde_json::Value::as_str) == Some(method))
             .cloned()
             .unwrap()
+    }
+
+    fn enable_pull_diagnostics(adapter: &LspClientAdapter) {
+        adapter.semantic_capabilities.lock().unwrap().diagnostics = DiagnosticsCapability::Pull;
+    }
+
+    fn full_diagnostic_response(id: i64, message: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "kind": "full",
+                "items": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "severity": 1,
+                    "message": message
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn diagnostic_capability_selects_push_when_pull_is_not_advertised() {
+        let capabilities = SemanticCapabilities::from_initialize_result(&json!({
+            "capabilities": {}
+        }))
+        .unwrap();
+
+        assert_eq!(capabilities.diagnostics, DiagnosticsCapability::Push);
+    }
+
+    #[test]
+    fn diagnostic_capability_selects_pull_when_document_diagnostics_are_advertised() {
+        for provider in [json!(true), json!({"identifier": "rust"})] {
+            let capabilities = SemanticCapabilities::from_initialize_result(&json!({
+                "capabilities": {"diagnosticProvider": provider}
+            }))
+            .unwrap();
+
+            assert_eq!(capabilities.diagnostics, DiagnosticsCapability::Pull);
+        }
+    }
+
+    #[test]
+    fn diagnostics_deadline_overflow_returns_typed_error_without_unwinding() {
+        let (mut adapter, _sink, _responses) = test_adapter();
+        adapter.diagnostics_deadline = Duration::MAX;
+
+        let result = std::panic::catch_unwind(|| {
+            PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}")
+        });
+
+        assert_eq!(
+            result.expect("overflow must not unwind"),
+            Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout))
+        );
+    }
+
+    #[test]
+    fn push_diagnostics_distinguish_explicit_empty_from_absent_publication() {
+        for expected in [Vec::new(), vec![diag("fresh diagnostic")]] {
+            let (mut adapter, sink, _responses) = test_adapter();
+            adapter.diagnostics_deadline = Duration::from_millis(250);
+            let uri = "file:///workspace/src/main.rs";
+            record_diagnostics(
+                &adapter.state,
+                uri.to_owned(),
+                vec![diag("stale diagnostic")],
+            );
+            let writer = BlockingWriter::new(sink);
+            adapter.writer = writer.writer();
+
+            let actual = std::thread::scope(|scope| {
+                let check = scope.spawn(|| {
+                    PooledSession::check_lsp(
+                        &adapter,
+                        &RelativePath::new("src/main.rs"),
+                        "fn changed() {}",
+                    )
+                });
+                let write_started = writer.wait_until_write_starts();
+                record_diagnostics(
+                    &adapter.state,
+                    "file:///workspace/src/other.rs".to_owned(),
+                    vec![diag("fresh wrong-uri diagnostic")],
+                );
+                record_diagnostics(&adapter.state, uri.to_owned(), expected.clone());
+                for index in 0..=DIAGNOSTIC_PUBLICATION_HISTORY {
+                    record_diagnostics(
+                        &adapter.state,
+                        uri.to_owned(),
+                        vec![diag(&format!("later same-uri diagnostic {index}"))],
+                    );
+                }
+                record_diagnostics(
+                    &adapter.state,
+                    uri.to_owned(),
+                    vec![diag("later fresh diagnostic")],
+                );
+                mark_ready(&adapter.state);
+                writer.release();
+                assert!(
+                    write_started,
+                    "didOpen/didChange must be blocked before publishing"
+                );
+                check.join().unwrap()
+            })
+            .unwrap();
+
+            assert_eq!(actual, expected);
+        }
+
+        let (mut adapter, _sink, _responses) = test_adapter();
+        adapter.diagnostics_deadline = Duration::from_millis(20);
+        assert_eq!(
+            PooledSession::check_lsp(
+                &adapter,
+                &RelativePath::new("src/main.rs"),
+                "fn no_publication() {}",
+            ),
+            Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout))
+        );
+    }
+
+    #[test]
+    fn pull_diagnostics_decode_full_reports_and_reject_ungrounded_unchanged_reports() {
+        let (mut adapter, sink, responses) = test_adapter();
+        adapter.diagnostics_deadline = Duration::from_millis(250);
+        enable_pull_diagnostics(&adapter);
+        record_diagnostics(
+            &adapter.state,
+            "file:///workspace/src/main.rs".to_owned(),
+            vec![diag("conflicting push diagnostic")],
+        );
+        complete_response(responses, full_diagnostic_response(1, "pulled diagnostic"));
+
+        let diagnostics =
+            PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}")
+                .unwrap();
+
+        assert_eq!(diagnostics, vec![diag("pulled diagnostic")]);
+        let request = request_with_method(&written_messages(&sink), "textDocument/diagnostic");
+        assert!(request["params"].get("previousResultId").is_none());
+
+        for result in [
+            json!({"kind": "unchanged", "resultId": "unrequested"}),
+            json!({"relatedDocuments": {}}),
+        ] {
+            let (mut adapter, _sink, responses) = test_adapter();
+            adapter.diagnostics_deadline = Duration::from_millis(250);
+            enable_pull_diagnostics(&adapter);
+            complete_response(
+                responses,
+                json!({"jsonrpc": "2.0", "id": 1, "result": result}),
+            );
+
+            assert_eq!(
+                PooledSession::check_lsp(
+                    &adapter,
+                    &RelativePath::new("src/main.rs"),
+                    "fn main() {}",
+                ),
+                Err(LspSessionError::Backend(
+                    LspOutcomeCode::ServerMalformedResponse
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_resynchronize_changed_documents_before_querying() {
+        let path = RelativePath::new("src/main.rs");
+        let uri = "file:///workspace/src/main.rs";
+
+        let (mut push_adapter, push_sink, _push_responses) = test_adapter();
+        push_adapter.diagnostics_deadline = Duration::from_millis(250);
+        push_adapter
+            .inner
+            .lock()
+            .unwrap()
+            .docs
+            .acquire(uri, "rust", "fn old() {}");
+        let push_writer = BlockingWriter::new(push_sink.clone());
+        push_adapter.writer = push_writer.writer();
+        let changed_push = std::thread::scope(|scope| {
+            let check = scope
+                .spawn(|| PooledSession::check_lsp(&push_adapter, &path, "fn new_content() {}"));
+            let write_started = push_writer.wait_until_write_starts();
+            record_diagnostics(
+                &push_adapter.state,
+                uri.to_owned(),
+                vec![diag("push changed-content result")],
+            );
+            mark_ready(&push_adapter.state);
+            push_writer.release();
+            assert!(
+                write_started,
+                "push didChange must be written before publication"
+            );
+            check.join().unwrap()
+        })
+        .unwrap();
+        assert_eq!(changed_push, vec![diag("push changed-content result")]);
+        assert_eq!(
+            PooledSession::check_lsp(&push_adapter, &path, "fn new_content() {}").unwrap(),
+            vec![diag("push changed-content result")],
+            "only identical push content may reuse the settled publication"
+        );
+        assert_eq!(
+            method_count(&written_messages(&push_sink), "textDocument/didChange"),
+            1
+        );
+
+        let (mut pull_adapter, pull_sink, pull_responses) = test_adapter();
+        pull_adapter.diagnostics_deadline = Duration::from_millis(250);
+        enable_pull_diagnostics(&pull_adapter);
+        pull_adapter
+            .inner
+            .lock()
+            .unwrap()
+            .docs
+            .acquire(uri, "rust", "fn old() {}");
+        let pull_writer = BlockingWriter::new(pull_sink.clone());
+        pull_adapter.writer = pull_writer.writer();
+        let changed_pull = std::thread::scope(|scope| {
+            let check = scope
+                .spawn(|| PooledSession::check_lsp(&pull_adapter, &path, "fn new_content() {}"));
+            let write_started = pull_writer.wait_until_write_starts();
+            complete_response(
+                Arc::clone(&pull_responses),
+                full_diagnostic_response(1, "pull changed-content result"),
+            );
+            pull_writer.release();
+            assert!(
+                write_started,
+                "pull didChange must precede its diagnostic request"
+            );
+            check.join().unwrap()
+        })
+        .unwrap();
+        assert_eq!(changed_pull, vec![diag("pull changed-content result")]);
+        complete_response(
+            pull_responses,
+            full_diagnostic_response(2, "pull identical-content result"),
+        );
+        assert_eq!(
+            PooledSession::check_lsp(&pull_adapter, &path, "fn new_content() {}").unwrap(),
+            vec![diag("pull identical-content result")],
+            "pull diagnostics must query again even when the document content is unchanged"
+        );
+        let pull_messages = written_messages(&pull_sink);
+        let methods = methods(&pull_messages);
+        let change = methods
+            .iter()
+            .position(|method| *method == "textDocument/didChange")
+            .unwrap();
+        let query = methods
+            .iter()
+            .position(|method| *method == "textDocument/diagnostic")
+            .unwrap();
+        assert!(change < query);
+        assert_eq!(method_count(&pull_messages, "textDocument/didChange"), 1);
+        assert_eq!(method_count(&pull_messages, "textDocument/diagnostic"), 2);
+    }
+
+    #[test]
+    fn diagnostics_timeout_preserves_the_live_session() {
+        let (mut adapter, sink, responses) = test_adapter();
+        adapter.diagnostics_deadline = Duration::from_millis(20);
+        enable_pull_diagnostics(&adapter);
+        let path = RelativePath::new("src/main.rs");
+
+        assert_eq!(
+            PooledSession::check_lsp(&adapter, &path, "fn first() {}"),
+            Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout))
+        );
+        assert!(
+            adapter
+                .inner
+                .lock()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+
+        adapter.diagnostics_deadline = Duration::from_millis(250);
+        complete_response(responses, full_diagnostic_response(2, "session survived"));
+        let diagnostics = PooledSession::check_lsp(&adapter, &path, "fn second() {}").unwrap();
+
+        assert_eq!(diagnostics, vec![diag("session survived")]);
+        assert_eq!(
+            method_count(&written_messages(&sink), "textDocument/diagnostic"),
+            2
+        );
+        assert!(
+            adapter
+                .inner
+                .lock()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn writer_shutdown_maps_submission_failure_to_broken_pipe() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = Writer { tx };
+        drop(rx);
+        let message = json!({"id": 1, "method": "textDocument/diagnostic"});
+        assert_eq!(
+            writer.write(&message).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            writer
+                .write_before(&message, Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn diagnostics_blocked_pull_write_times_out_and_recovers() {
+        let (mut adapter, sink, responses) = test_adapter();
+        enable_pull_diagnostics(&adapter);
+        // Open first: the blocked operation must be the pull request, not didOpen.
+        adapter
+            .acquire_doc("file:///workspace/src/main.rs", "fn main() {}")
+            .unwrap();
+        let writer = BlockingWriter::new(sink.clone());
+        adapter.writer = writer.writer();
+        adapter.diagnostics_deadline = Duration::from_millis(50);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let adapter_ref = &adapter;
+            let check = scope.spawn(move || {
+                tx.send(PooledSession::check_lsp(
+                    adapter_ref,
+                    &RelativePath::new("src/main.rs"),
+                    "fn main() {}",
+                ))
+                .unwrap();
+            });
+            let started = writer.wait_until_write_starts();
+            let result = rx.recv_timeout(Duration::from_millis(500));
+            // Release even if the bounded receive failed, so a regression cannot
+            // strand the worker or prevent the scoped thread from joining.
+            writer.release();
+            check.join().unwrap();
+            assert!(started);
+            assert_eq!(
+                result,
+                Ok(Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout)))
+            );
+            assert!(responses.0.lock().unwrap().is_empty());
+        });
+        adapter.diagnostics_deadline = Duration::from_secs(1);
+        complete_response(
+            Arc::clone(&responses),
+            full_diagnostic_response(2, "recovered"),
+        );
+        assert_eq!(
+            PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}")
+                .unwrap(),
+            vec![diag("recovered")]
+        );
+        assert!(responses.0.lock().unwrap().is_empty());
+        assert_eq!(
+            method_count(&written_messages(&sink), "textDocument/diagnostic"),
+            2
+        );
+        assert!(!adapter.dead_flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn timed_out_requests_discard_late_unsolicited_and_duplicate_responses() {
+        let (adapter, _sink, responses) = test_adapter();
+        let dispatcher = super::Dispatcher::new(Arc::clone(&responses));
+        for id in 1..=32 {
+            let result = adapter
+                .send_request_once_before(
+                    "textDocument/diagnostic",
+                    json!({}),
+                    Instant::now() + Duration::from_millis(1),
+                )
+                .unwrap();
+            assert!(matches!(
+                result,
+                super::RequestOutcome::Error(super::RequestFailure::Timeout)
+            ));
+            dispatcher.dispatch(&json!({"id": id, "result": {}}));
+            dispatcher.dispatch(&json!({"id": id + 1000, "result": {}}));
+            assert!(responses.0.lock().unwrap().is_empty());
+        }
+        {
+            let _pending = super::PendingRequest::new(&responses, 100);
+            dispatcher.dispatch(&json!({"id": 100, "result": "first"}));
+            dispatcher.dispatch(&json!({"id": 100, "result": "duplicate"}));
+            assert_eq!(
+                responses.0.lock().unwrap()[&100].as_ref().unwrap()["result"],
+                "first"
+            );
+        }
+        assert!(responses.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_deadline_bounds_blocked_document_synchronization() {
+        let (mut adapter, sink, _responses) = test_adapter();
+        adapter.diagnostics_deadline = Duration::from_millis(20);
+        let writer = BlockingWriter::new(sink);
+        adapter.writer = writer.writer();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = PooledSession::check_lsp(
+                &adapter,
+                &RelativePath::new("src/main.rs"),
+                "fn blocked_sync() {}",
+            );
+            let _ = result_tx.send(result);
+        });
+
+        assert!(writer.wait_until_write_starts());
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_millis(250)),
+            Ok(Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout)))
+        );
     }
 
     #[test]
@@ -3526,6 +4290,7 @@ mod tests {
             "rust".to_owned(),
             workspace.path().to_path_buf(),
             None,
+            CHECK_TIMEOUT,
         ) {
             Ok(_) => panic!("removed executable must not spawn"),
             Err(error) => error,
@@ -3546,6 +4311,7 @@ mod tests {
             "rust".to_owned(),
             workspace.path().to_path_buf(),
             None,
+            CHECK_TIMEOUT,
         ) {
             Ok(_) => panic!("non-executable file must not spawn"),
             Err(error) => error,
@@ -3573,6 +4339,7 @@ mod tests {
             "rust".to_owned(),
             removed_root,
             None,
+            CHECK_TIMEOUT,
         ) {
             Ok(_) => panic!("removed working directory must not permit spawn"),
             Err(error) => error,
@@ -3726,8 +4493,8 @@ mod tests {
             }
         }
 
-        let (adapter, _sink, _responses) = test_adapter();
-        *adapter.writer.lock().unwrap() = Box::new(FailingWriter);
+        let (mut adapter, _sink, _responses) = test_adapter();
+        adapter.writer = Writer::new(Box::new(FailingWriter));
 
         let error = PooledSession::definition_lsp(
             &adapter,
@@ -3961,6 +4728,7 @@ mod tests {
                     rename: RenameCapability::RenameOnly,
                     will_rename_files: ProviderCapability::Unavailable,
                     safe_delete: ProviderCapability::Unavailable,
+                    diagnostics: DiagnosticsCapability::Push,
                 },
             ),
             (
@@ -3982,6 +4750,7 @@ mod tests {
                     rename: RenameCapability::RenameWithPrepare,
                     will_rename_files: ProviderCapability::Unavailable,
                     safe_delete: ProviderCapability::Unavailable,
+                    diagnostics: DiagnosticsCapability::Push,
                 },
             ),
             (
@@ -4003,6 +4772,7 @@ mod tests {
                     rename: RenameCapability::Unavailable,
                     will_rename_files: ProviderCapability::Unavailable,
                     safe_delete: ProviderCapability::Unavailable,
+                    diagnostics: DiagnosticsCapability::Push,
                 },
             ),
             (
@@ -4016,6 +4786,7 @@ mod tests {
                     rename: RenameCapability::Unavailable,
                     will_rename_files: ProviderCapability::Unavailable,
                     safe_delete: ProviderCapability::Unavailable,
+                    diagnostics: DiagnosticsCapability::Push,
                 },
             ),
         ];
@@ -4130,7 +4901,7 @@ mod tests {
         let dispatcher = build_dispatcher(
             Arc::clone(&adapter.state),
             responses,
-            Arc::clone(&adapter.writer),
+            adapter.writer.clone(),
             None,
         );
         let publish_and_settle = std::thread::spawn(move || {
@@ -4586,7 +5357,7 @@ mod tests {
         let dispatcher = build_dispatcher(
             Arc::clone(&state),
             Arc::clone(&responses),
-            Arc::clone(&writer),
+            writer.clone(),
             None,
         );
 
@@ -4603,6 +5374,7 @@ mod tests {
             "id": 99, "method": "client/registerCapability",
             "params": { "registrations": [] }
         }));
+        let _pending = super::PendingRequest::new(&responses, 7);
         dispatcher.dispatch(&json!({ "id": 7, "result": { "ok": true } }));
 
         let (lock, _) = &*state;
@@ -4649,7 +5421,7 @@ mod tests {
         let dispatcher = build_dispatcher(
             Arc::clone(&state),
             Arc::clone(&responses),
-            Arc::clone(&writer),
+            writer.clone(),
             None,
         );
         // build_dispatcher must not panic regardless of future language_id value.
@@ -4715,7 +5487,7 @@ mod tests {
         let dispatcher = build_dispatcher(
             Arc::clone(&state),
             Arc::clone(&responses),
-            Arc::clone(&writer),
+            writer.clone(),
             Some(tx),
         );
 
@@ -4744,7 +5516,7 @@ mod tests {
         let dispatcher = build_dispatcher(
             Arc::clone(&state),
             Arc::clone(&responses),
-            Arc::clone(&writer),
+            writer.clone(),
             None,
         );
         // Must not panic or error.

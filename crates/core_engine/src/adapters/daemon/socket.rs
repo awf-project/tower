@@ -145,17 +145,30 @@ pub fn probe_owner(workspace_root: &Path) -> Result<OwnerLiveness, OwnershipErro
         .write(true)
         .open(lock_path)
         .map_err(OwnershipError::LivenessProbe)?;
-    match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+    probe_owner_lock(&lock, &metadata_path)
+}
+
+fn probe_owner_lock(
+    lock: &std::fs::File,
+    metadata_path: &Path,
+) -> Result<OwnerLiveness, OwnershipError> {
+    match rustix::fs::flock(lock, rustix::fs::FlockOperation::NonBlockingLockShared) {
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(OwnerLiveness::Live),
         Err(error) => Err(OwnershipError::LivenessProbe(
             std::io::Error::from_raw_os_error(error.raw_os_error()),
         )),
         Ok(()) => {
-            if metadata_path.exists() {
-                read_generation(&metadata_path).map(|_| OwnerLiveness::Dead)
+            // Probes may overlap without masquerading as an exclusive owner.
+            // Explicit unlock also releases any copy inherited by a concurrent
+            // fork before exec; closing only this descriptor is insufficient.
+            let result = if metadata_path.exists() {
+                read_generation(metadata_path).map(|_| OwnerLiveness::Dead)
             } else {
                 Ok(OwnerLiveness::Absent)
-            }
+            };
+            rustix::fs::flock(lock, rustix::fs::FlockOperation::Unlock)
+                .map_err(|error| OwnershipError::LivenessProbe(error.into()))?;
+            result
         }
     }
 }
@@ -391,6 +404,62 @@ pub async fn wait_for_socket(path: &Path, timeout: Duration) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::{MetadataPublicationStage, read_generation, write_owner_metadata_with_hook};
+
+    #[test]
+    fn concurrent_owner_probes_do_not_report_each_other_as_live_owners() {
+        use super::{OwnerLiveness, WorkspaceDaemonOwner, owner_lock_path, probe_owner};
+        use rustix::fs::{FlockOperation, flock};
+
+        let dir = tempfile::tempdir().unwrap();
+        let owner = WorkspaceDaemonOwner::acquire(dir.path()).unwrap();
+        assert_eq!(probe_owner(dir.path()).unwrap(), OwnerLiveness::Live);
+        drop(owner);
+
+        let other_probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(owner_lock_path(dir.path()))
+            .unwrap();
+        flock(&other_probe, FlockOperation::NonBlockingLockShared).unwrap();
+        assert_eq!(probe_owner(dir.path()).unwrap(), OwnerLiveness::Dead);
+        assert!(matches!(
+            WorkspaceDaemonOwner::acquire(dir.path()),
+            Err(super::OwnershipError::LiveOwner)
+        ));
+        flock(&other_probe, FlockOperation::Unlock).unwrap();
+        let owner = WorkspaceDaemonOwner::acquire(dir.path()).unwrap();
+        assert_eq!(probe_owner(dir.path()).unwrap(), OwnerLiveness::Live);
+        drop(owner);
+        assert_eq!(probe_owner(dir.path()).unwrap(), OwnerLiveness::Dead);
+    }
+
+    #[test]
+    fn owner_probe_unlocks_even_when_another_descriptor_retains_the_file() {
+        use super::{
+            OwnerLiveness, WorkspaceDaemonOwner, owner_lock_path, owner_metadata_path,
+            probe_owner_lock,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        drop(WorkspaceDaemonOwner::acquire(dir.path()).unwrap());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(owner_lock_path(dir.path()))
+            .unwrap();
+        // A duplicate shares the open file description, just like a descriptor
+        // inherited by fork before exec. Closing the probe alone cannot unlock it.
+        let retained = lock.try_clone().unwrap();
+        assert_eq!(
+            probe_owner_lock(&lock, &owner_metadata_path(dir.path())).unwrap(),
+            OwnerLiveness::Dead
+        );
+        drop(lock);
+        let owner = WorkspaceDaemonOwner::acquire(dir.path())
+            .expect("retained probe descriptor must not retain the lock");
+        drop(owner);
+        drop(retained);
+    }
 
     #[test]
     fn generation_publication_recovers_from_interruption_at_every_stage() {

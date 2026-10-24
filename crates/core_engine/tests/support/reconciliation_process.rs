@@ -970,20 +970,40 @@ impl ReconciliationProcessHarness {
         }
     }
 
-    pub(crate) fn stopped_workers_remain_absent(&mut self) -> bool {
-        self.child
+    pub(crate) fn assert_stopped_workers_remain_absent(&mut self) {
+        // Evaluate every probe before asserting so a failure identifies all
+        // resources still observed, rather than hiding them behind short-circuiting.
+        let daemon = self
+            .child
             .as_mut()
-            .is_none_or(|child| child.try_wait().expect("poll stopped daemon").is_some())
-            && !socket_path(self.workspace.path()).exists()
-            && matches!(probe_owner(self.workspace.path()), Ok(OwnerLiveness::Dead))
-            && self.watcher_thread.is_some_and(|(pid, tid)| {
-                !PathBuf::from(format!("/proc/{pid}/task/{tid}")).exists()
-            })
-            && !self.sidecar_pids.is_empty()
-            && self
-                .sidecar_pids
-                .iter()
-                .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists())
+            .map(|child| (child.id(), child.try_wait().expect("poll stopped daemon")));
+        let socket = socket_path(self.workspace.path());
+        let socket_exists = socket.exists();
+        let owner = probe_owner(self.workspace.path());
+        let watcher = self.watcher_thread.map(|(pid, tid)| {
+            (
+                pid,
+                tid,
+                PathBuf::from(format!("/proc/{pid}/task/{tid}")).exists(),
+            )
+        });
+        let sidecars = self
+            .sidecar_pids
+            .iter()
+            .map(|pid| (*pid, PathBuf::from(format!("/proc/{pid}")).exists()))
+            .collect::<Vec<_>>();
+        let released = daemon.as_ref().is_none_or(|(_, status)| status.is_some())
+            && !socket_exists
+            && matches!(&owner, Ok(OwnerLiveness::Dead))
+            && watcher.is_some_and(|(_, _, exists)| !exists)
+            && !sidecars.is_empty()
+            && sidecars.iter().all(|(_, exists)| !exists);
+        assert!(
+            released,
+            "shutdown resource probes failed: daemon (pid, exit_status)={daemon:?}; \
+             socket={socket:?}, exists={socket_exists}; owner={owner:?}; \
+             watcher (pid, tid, exists)={watcher:?}; sidecars (pid, exists)={sidecars:?}"
+        );
     }
 
     pub(crate) async fn released_resources(&mut self) -> ReleasedResources {

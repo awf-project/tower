@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use crate::lsp_adapter::decode::{WorkspaceEditDecodeError, decode_workspace_edit};
 use crate::lsp_adapter::{DiagnosticsEvent, LspSessionError, RawWorkspaceEdit, SessionPool};
@@ -39,10 +40,17 @@ impl LspSessionPool {
         config: LspConfig,
         workspace_root: PathBuf,
         push_tx: Option<Sender<DiagnosticsEvent>>,
+        diagnostics_deadline: Duration,
     ) -> Self {
         use std::sync::Arc;
         let spawner = Arc::new(crate::lsp_adapter::pool::RealSpawner);
-        let pool = SessionPool::with_spawner(config, workspace_root.clone(), spawner, push_tx);
+        let pool = SessionPool::with_spawner(
+            config,
+            workspace_root.clone(),
+            spawner,
+            push_tx,
+            diagnostics_deadline,
+        );
         Self {
             inner: pool,
             workspace_root,
@@ -239,9 +247,47 @@ mod tests {
     }
 
     #[test]
+    fn lsp_session_pool_new_uses_the_configured_diagnostics_deadline() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let mut config = LspConfig::default();
+        config.servers.insert(
+            "rust".to_owned(),
+            core_engine::adapters::config::lsp::LspServerConfig {
+                command: fixture_lsp_server::binary_path()
+                    .to_string_lossy()
+                    .into_owned(),
+                extensions: vec!["rs".to_owned()],
+                args: vec!["diagnostics_timeout".to_owned()],
+            },
+        );
+        let pool = LspSessionPool::new(
+            config,
+            workspace.path().to_path_buf(),
+            None,
+            Duration::from_millis(40),
+        );
+
+        let started = std::time::Instant::now();
+        let error = pool
+            .check(&RelativePath::new("src/main.rs"), "fn main() {}")
+            .expect_err("a server that never settles must exhaust the configured budget");
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn session_exposes_decoded_rename_edit_data_without_performing_hostcall() {
         let workspace = tempfile::tempdir().unwrap();
-        let pool = LspSessionPool::new(LspConfig::default(), workspace.path().to_path_buf(), None);
+        let pool = LspSessionPool::new(
+            LspConfig::default(),
+            workspace.path().to_path_buf(),
+            None,
+            Duration::from_secs(2),
+        );
         let uri_path = workspace.path().join("src/main.rs");
         let mut changes = HashMap::new();
         changes.insert(

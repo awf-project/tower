@@ -163,7 +163,7 @@ fn production_daemon_guard_reaps_child_on_failure_path() {
 
     let status = Command::new("kill")
         .args(["-0", &pid])
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .status()
         .expect("probe guarded process");
     assert!(!status.success(), "guarded process {pid} was not reaped");
@@ -2438,10 +2438,7 @@ async fn shutdown_cancels_preparation_and_releases_resources() {
     let quiet_logs = recovery.captured_logs().await;
     let quiet_until = Instant::now() + Duration::from_millis(200);
     while Instant::now() < quiet_until {
-        assert!(
-            recovery.stopped_workers_remain_absent(),
-            "independent OS probes must keep observing released workers and ownership"
-        );
+        recovery.assert_stopped_workers_remain_absent();
         assert_eq!(
             recovery.captured_logs().await,
             quiet_logs,
@@ -4055,4 +4052,482 @@ async fn rename_optional_lsp_fallback_does_not_wait_for_unrelated_ast_catch_up()
     let response = tokio::time::timeout(Duration::from_secs(1), harness.call_tool(91, "tower_rename_path", json!({"source":"ready.rs","destination":"renamed.rs","semantic_policy":"best_effort","dry_run":true}))).await.expect("absent LSP must not wait for AST catch-up");
     assert_eq!(response["result"]["isError"], false, "{response}");
     harness.shutdown_and_await_release(deadline).await;
+}
+
+#[tokio::test]
+async fn tower_lsp_diagnostics_returns_fixture_results_through_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempdir().expect("create fixture diagnostics workspace");
+    let tower_dir = workspace.path().join(".tower");
+    let source_dir = workspace.path().join("src");
+    fs::create_dir_all(&tower_dir).expect("create tower directory");
+    fs::create_dir_all(&source_dir).expect("create source directory");
+    fs::write(source_dir.join("valid.rs"), "fn valid() {}\n").expect("write valid fixture");
+    fs::write(source_dir.join("invalid.rs"), "fixture_invalid\n").expect("write invalid fixture");
+    fs::write(source_dir.join("timeout.rs"), "fixture_invalid\n").expect("write timeout fixture");
+
+    let sidecar_pid_log = tower_dir.join("lsp-sidecar.pids");
+    let sidecar_launcher = tower_dir.join("launch-lsp-sidecar.sh");
+    fs::write(
+        &sidecar_launcher,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {}\nexec {}\n",
+            shell_quote(&sidecar_pid_log),
+            shell_quote(&workspace_root().join("target/debug/lsp_extension")),
+        ),
+    )
+    .expect("write sidecar launcher");
+    let mut permissions = fs::metadata(&sidecar_launcher).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&sidecar_launcher, permissions).expect("make launcher executable");
+    install_lsp_extension_with_command(workspace.path(), &sidecar_launcher);
+
+    let fixture_log = tower_dir.join("fixture-lsp.log");
+    let fixture_pid_log = tower_dir.join("fixture-lsp.pids");
+    fs::write(
+        tower_dir.join("config.toml"),
+        format!(
+            "[daemon]\nidle_timeout_secs = 300\n[extensions]\nrequest_timeout_secs = 3\n\
+             [lsp.rust]\ncommand = {}\nargs = [\"diagnostics_by_content\", {}, {}]\nextensions = [\"rs\"]\n",
+            toml_string(&workspace_root().join("target/debug/fixture_lsp_server")),
+            toml_string(&fixture_log),
+            toml_string(&fixture_pid_log),
+        ),
+    )
+    .expect("write fixture diagnostics configuration");
+
+    let (mut daemon, mut connection) = start_lsp_daemon(workspace.path()).await;
+    await_public_lsp_diagnostics(&mut connection, Duration::from_secs(15)).await;
+
+    let valid = call_public_diagnostics(&mut connection, 100, "src/valid.rs", 5).await;
+    assert_eq!(valid["result"]["isError"], false, "{valid}");
+    assert_eq!(
+        tool_payload(&valid),
+        json!({"supported": true, "diagnostics": []})
+    );
+
+    let invalid = call_public_diagnostics(&mut connection, 101, "src/invalid.rs", 5).await;
+    assert_eq!(invalid["result"]["isError"], false, "{invalid}");
+    assert_eq!(
+        tool_payload(&invalid),
+        json!({
+            "supported": true,
+            "diagnostics": [{
+                "line": 0,
+                "character": 0,
+                "endLine": 0,
+                "endCharacter": 1,
+                "severity": "error",
+                "message": "fixture syntax error",
+                "source": "fixture-lsp",
+                "code": "fixture-syntax",
+            }],
+        }),
+        "{invalid}"
+    );
+
+    let sidecar_pid_before = only_recorded_pid(&sidecar_pid_log, "LSP sidecar");
+    let fixture_pid_before = only_recorded_pid(&fixture_pid_log, "fixture language server");
+    let timeout = call_public_diagnostics(&mut connection, 102, "src/timeout.rs", 5).await;
+    assert_eq!(timeout["result"]["isError"], true, "{timeout}");
+    assert_eq!(
+        timeout["result"]["structuredContent"]["outcome"],
+        json!({
+            "status": "error",
+            "code": "server_timeout",
+            "language": "rust",
+            "command": workspace_root().join("target/debug/fixture_lsp_server"),
+            "operation": "diagnostics",
+            "path": "src/timeout.rs",
+            "phase": "runtime",
+            "message": "language server request failed",
+        }),
+        "{timeout}"
+    );
+
+    let recovered = call_public_diagnostics(&mut connection, 103, "src/valid.rs", 5).await;
+    assert_eq!(recovered["result"]["isError"], false, "{recovered}");
+    assert_eq!(
+        tool_payload(&recovered),
+        json!({"supported": true, "diagnostics": []})
+    );
+    assert_eq!(
+        only_recorded_pid(&sidecar_pid_log, "LSP sidecar"),
+        sidecar_pid_before
+    );
+    assert_eq!(
+        only_recorded_pid(&fixture_pid_log, "fixture language server"),
+        fixture_pid_before
+    );
+
+    stop_lsp_daemon(workspace.path(), &mut daemon, connection).await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly provisioned real LSP servers"]
+async fn configured_javascript_yaml_json_and_css_servers_return_diagnostics() {
+    let bin_dir = std::env::var_os("TOWER_REAL_LSP_BIN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!("TOWER_REAL_LSP_BIN_DIR must point to provisioned real LSP binaries")
+        });
+    let bin_dir = bin_dir.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "TOWER_REAL_LSP_BIN_DIR {} cannot be canonicalized: {error}",
+            bin_dir.display()
+        )
+    });
+    let servers: [(&str, &[&str], &str); 4] = [
+        ("javascript", &["js"], "typescript-language-server"),
+        ("yaml", &["yaml", "yml"], "yaml-language-server"),
+        ("json", &["json"], "vscode-json-language-server"),
+        ("css", &["css"], "vscode-css-language-server"),
+    ];
+    let commands: Vec<_> = servers
+        .iter()
+        .map(|(_, _, executable)| {
+            let path = bin_dir.join(executable);
+            let canonical = path.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "required provisioned LSP binary {} is unavailable: {error}",
+                    path.display()
+                )
+            });
+            assert!(
+                canonical.is_file(),
+                "required provisioned LSP binary is not a file: {}",
+                canonical.display()
+            );
+            canonical
+        })
+        .collect();
+
+    let workspace = tempdir().expect("create real-server diagnostics workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("create source directory");
+    fs::create_dir_all(workspace.path().join(".tower")).expect("create tower directory");
+    install_lsp_extension_with_command(
+        workspace.path(),
+        &workspace_root().join("target/debug/lsp_extension"),
+    );
+    let documents = [
+        (
+            "src/valid.js",
+            "const value = 1;\n",
+            "src/invalid.js",
+            "const value = ;\n",
+            14,
+            15,
+        ),
+        (
+            "src/valid.yaml",
+            "value: 1\n",
+            "src/invalid.yaml",
+            "value: [1, 2\n",
+            7,
+            12,
+        ),
+        (
+            "src/valid.json",
+            "{\"value\": 1}\n",
+            "src/invalid.json",
+            "{\"value\": }\n",
+            10,
+            11,
+        ),
+        (
+            "src/valid.css",
+            "a { color: red; }\n",
+            "src/invalid.css",
+            "a { color red; }\n",
+            4,
+            14,
+        ),
+    ];
+    for (valid_path, valid, invalid_path, invalid, _, _) in documents {
+        fs::write(workspace.path().join(valid_path), valid).expect("write valid real-server input");
+        fs::write(workspace.path().join(invalid_path), invalid)
+            .expect("write invalid real-server input");
+    }
+    let mut config = String::from(
+        "[daemon]\nidle_timeout_secs = 300\n[extensions]\nrequest_timeout_secs = 30\n",
+    );
+    for ((language, extensions, _), command) in servers.iter().zip(&commands) {
+        config.push_str(&format!(
+            "[lsp.{language}]\ncommand = {}\nargs = [\"--stdio\"]\nextensions = {}\n",
+            toml_string(command),
+            serde_json::to_string(extensions).expect("serialize LSP extensions")
+        ));
+    }
+    fs::write(workspace.path().join(".tower/config.toml"), config)
+        .expect("write real-server configuration");
+
+    let (mut daemon, mut connection) = start_lsp_daemon(workspace.path()).await;
+    await_public_lsp_diagnostics(&mut connection, Duration::from_secs(45)).await;
+    let mut successful_calls = 0_u8;
+    for (index, (valid_path, _, invalid_path, invalid_source, expected_start, expected_end)) in
+        documents.iter().enumerate()
+    {
+        let valid =
+            call_public_diagnostics(&mut connection, 200 + index as u64 * 2, valid_path, 40).await;
+        assert_eq!(valid["result"]["isError"], false, "{valid_path}: {valid}");
+        let valid_payload = tool_payload(&valid);
+        assert_eq!(
+            valid_payload["supported"], true,
+            "{valid_path}: {valid_payload}"
+        );
+        assert_eq!(
+            valid_payload["diagnostics"],
+            json!([]),
+            "{valid_path}: {valid_payload}"
+        );
+        successful_calls += 1;
+
+        let invalid =
+            call_public_diagnostics(&mut connection, 201 + index as u64 * 2, invalid_path, 40)
+                .await;
+        assert_eq!(
+            invalid["result"]["isError"], false,
+            "{invalid_path}: {invalid}"
+        );
+        let invalid_payload = tool_payload(&invalid);
+        assert_eq!(
+            invalid_payload["supported"], true,
+            "{invalid_path}: {invalid_payload}"
+        );
+        let diagnostics = invalid_payload["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("{invalid_path} must return a diagnostics array: {invalid_payload}")
+            });
+        assert_invalid_syntax_diagnostic(
+            servers[index].0,
+            invalid_path,
+            invalid_source,
+            *expected_start,
+            *expected_end,
+            diagnostics,
+        );
+        successful_calls += 1;
+    }
+    assert_eq!(
+        successful_calls, 8,
+        "the real-server matrix must make exactly eight successful calls"
+    );
+    stop_lsp_daemon(workspace.path(), &mut daemon, connection).await;
+}
+
+fn assert_invalid_syntax_diagnostic(
+    language: &str,
+    path: &str,
+    source: &str,
+    expected_start: u64,
+    expected_end: u64,
+    diagnostics: &[Value],
+) {
+    let line_lengths: Vec<u64> = source
+        .split('\n')
+        .map(|line| {
+            line.encode_utf16()
+                .count()
+                .try_into()
+                .expect("source line length fits in u64")
+        })
+        .collect();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            let (Some(line), Some(character), Some(end_line), Some(end_character)) = (
+                diagnostic["line"].as_u64(),
+                diagnostic["character"].as_u64(),
+                diagnostic["endLine"].as_u64(),
+                diagnostic["endCharacter"].as_u64(),
+            ) else {
+                return false;
+            };
+            let range_is_bounded = line_lengths
+                .get(line as usize)
+                .is_some_and(|length| character <= *length)
+                && line_lengths
+                    .get(end_line as usize)
+                    .is_some_and(|length| end_character <= *length)
+                && (line, character) <= (end_line, end_character);
+            let identifies_expected_syntax = if language == "yaml" {
+                diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("flow sequence"))
+                    && ((line == 0
+                        && end_line == 0
+                        && character <= expected_end
+                        && end_character >= expected_start)
+                        || (line == 1 && character == 0 && end_line == 1 && end_character == 0))
+            } else {
+                line == 0
+                    && end_line == 0
+                    && character <= expected_end
+                    && end_character >= expected_start
+            };
+            diagnostic["severity"] == "error" && range_is_bounded && identifies_expected_syntax
+        }),
+        "{language} invalid document {path} must report an error with numeric, document-bounded \
+         range on the expected syntax location {expected_start}..={expected_end}: {diagnostics:?}"
+    );
+}
+
+fn toml_string(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).expect("serialize TOML-compatible path string")
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn install_lsp_extension_with_command(workspace: &Path, command: &Path) {
+    let extension_dir = workspace.join(".tower/extensions/lsp");
+    fs::create_dir_all(&extension_dir).expect("create workspace LSP extension directory");
+    let manifest = fs::read_to_string(workspace_root().join("extensions/lsp/extension.toml"))
+        .expect("read shipped LSP manifest")
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("command") {
+                format!("command = [{}]", toml_string(command))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(extension_dir.join("extension.toml"), manifest)
+        .expect("write workspace LSP manifest");
+}
+
+async fn start_lsp_daemon(workspace: &Path) -> (ProductionDaemonGuard, UnixStream) {
+    let binary = selected_production_binary();
+    let child = Command::new(&binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn production daemon");
+    let guard = ProductionDaemonGuard::new(child, &binary, workspace);
+    let mut connection = wait_for_socket(&socket_path(workspace), Duration::from_secs(10))
+        .await
+        .expect("daemon binds public socket");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .expect("send MCP handshake");
+    write_line(&mut connection, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"lsp-diagnostics-e2e","version":"1"}}}"#).await.expect("initialize MCP session");
+    let initialized = read_mcp_response(&mut connection, 1, Duration::from_secs(10)).await;
+    assert!(initialized["result"].is_object(), "{initialized}");
+    (guard, connection)
+}
+
+async fn read_mcp_response(connection: &mut UnixStream, id: u64, timeout: Duration) -> Value {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let line = read_line_capped(connection, 1 << 20)
+                .await
+                .expect("read MCP frame")
+                .expect("MCP connection closed");
+            let frame: Value = serde_json::from_str(&line).expect("parse MCP frame");
+            if frame["id"] == id {
+                return frame;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("MCP response {id} exceeded {timeout:?}"))
+}
+
+async fn await_public_lsp_diagnostics(connection: &mut UnixStream, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut id = 10_u64;
+    loop {
+        write_line(
+            connection,
+            &json!({"jsonrpc":"2.0", "id":id, "method":"tools/list", "params":{}}).to_string(),
+        )
+        .await
+        .expect("request tools/list");
+        let response = read_mcp_response(connection, id, Duration::from_secs(5)).await;
+        if response["result"]["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "tower_lsp_diagnostics")
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tower_lsp_diagnostics was not published: {response}"
+        );
+        id += 1;
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn call_public_diagnostics(
+    connection: &mut UnixStream,
+    id: u64,
+    path: &str,
+    timeout_secs: u64,
+) -> Value {
+    write_line(
+        connection,
+        &json!({
+            "jsonrpc":"2.0", "id":id, "method":"tools/call",
+            "params":{"name":"tower_lsp_diagnostics", "arguments":{"path":path}}
+        })
+        .to_string(),
+    )
+    .await
+    .expect("invoke public diagnostics tool");
+    read_mcp_response(connection, id, Duration::from_secs(timeout_secs)).await
+}
+
+fn tool_payload(response: &Value) -> Value {
+    serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool result lacks JSON text content: {response}")),
+    )
+    .unwrap_or_else(|error| panic!("tool result text is not JSON: {error}: {response}"))
+}
+
+fn only_recorded_pid(path: &Path, process: &str) -> u32 {
+    let pids: Vec<u32> = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read {process} PID log {}: {error}", path.display()))
+        .lines()
+        .map(|line| {
+            line.parse()
+                .unwrap_or_else(|error| panic!("invalid {process} PID {line}: {error}"))
+        })
+        .collect();
+    assert_eq!(pids.len(), 1, "{process} must start exactly once: {pids:?}");
+    pids[0]
+}
+
+async fn stop_lsp_daemon(
+    workspace: &Path,
+    daemon: &mut ProductionDaemonGuard,
+    connection: UnixStream,
+) {
+    drop(connection);
+    core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await
+    .expect("request daemon shutdown");
+    let status = daemon.wait_and_disarm();
+    assert!(status.success(), "daemon exited with {status}");
 }

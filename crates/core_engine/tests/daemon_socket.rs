@@ -278,6 +278,20 @@ async fn bind_cleans_a_stale_socket_file() {
         let owner = WorkspaceDaemonOwner::acquire(dir.path()).expect("acquire first owner");
         let _l = bind_listener(&owner).expect("bind 1");
     }
+    // A concurrent fork can temporarily retain the listener descriptor until
+    // exec. Establish that the fixture is actually stale before testing cleanup.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while try_connect(&path).await.unwrap().is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture listener remained live after drop"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        path.exists(),
+        "the stale socket file must still require cleanup"
+    );
     // Successor acquisition must prove the listener is dead, clean the stale
     // socket, and permit a new bind.
     let successor = WorkspaceDaemonOwner::acquire(dir.path()).expect("recover stale socket");

@@ -424,6 +424,7 @@ idle_ttl_secs = 300
                 }
             },
             "idle_timeout_secs": null,
+            "diagnostics_timeout_secs": 29,
         })
     );
 
@@ -1078,6 +1079,7 @@ fn f008_startup_validation_hands_an_explicit_empty_servers_map_to_the_lsp_extens
         serde_json::json!({
             "servers": {},
             "idle_timeout_secs": null,
+            "diagnostics_timeout_secs": 1,
         }),
         "daemon must hand the explicit empty LSP configuration to its lsp extension"
     );

@@ -204,6 +204,7 @@ pub trait SessionSpawner: Send + Sync {
         root: PathBuf,
         workspace_root: &std::path::Path,
         push_tx: Option<DiagnosticsSender>,
+        diagnostics_deadline: Duration,
     ) -> Result<Arc<dyn PooledSession>, LspSessionError>;
 }
 
@@ -221,6 +222,7 @@ impl SessionSpawner for RealSpawner {
         root: PathBuf,
         workspace_root: &std::path::Path,
         push_tx: Option<DiagnosticsSender>,
+        diagnostics_deadline: Duration,
     ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
         use crate::lsp_adapter::LspClientAdapter;
 
@@ -237,6 +239,7 @@ impl SessionSpawner for RealSpawner {
             language_id.to_owned(),
             root,
             push_tx,
+            diagnostics_deadline,
         )?;
         Ok(Arc::new(adapter))
     }
@@ -275,6 +278,7 @@ pub struct SessionPool {
     workspace_root: PathBuf,
     idle_timeout: Option<Duration>,
     push_tx: Option<DiagnosticsSender>,
+    diagnostics_deadline: Duration,
 }
 
 impl SessionPool {
@@ -313,8 +317,14 @@ impl SessionPool {
     /// Production constructor: uses `RealSpawner` and no push channel.
     #[allow(dead_code)]
     #[must_use]
-    pub fn new(config: LspConfig, workspace_root: PathBuf) -> Self {
-        Self::with_spawner(config, workspace_root, Arc::new(RealSpawner), None)
+    pub fn new(config: LspConfig, workspace_root: PathBuf, diagnostics_deadline: Duration) -> Self {
+        Self::with_spawner(
+            config,
+            workspace_root,
+            Arc::new(RealSpawner),
+            None,
+            diagnostics_deadline,
+        )
     }
 
     /// Test seam constructor: inject `spawner` and optionally a `push_tx`.
@@ -324,6 +334,7 @@ impl SessionPool {
         workspace_root: PathBuf,
         spawner: Arc<dyn SessionSpawner>,
         push_tx: Option<DiagnosticsSender>,
+        diagnostics_deadline: Duration,
     ) -> Self {
         let mut lang_index = HashMap::new();
         let mut ext_index = HashMap::new();
@@ -341,6 +352,7 @@ impl SessionPool {
             workspace_root,
             idle_timeout: config.idle_timeout,
             push_tx,
+            diagnostics_deadline,
         }
     }
 
@@ -398,9 +410,14 @@ impl SessionPool {
             .lang_index
             .get(lang)
             .ok_or(LspSessionError::Unconfigured)?;
-        let session =
-            self.spawner
-                .spawn(cfg, lang, root, &self.workspace_root, self.push_tx.clone())?;
+        let session = self.spawner.spawn(
+            cfg,
+            lang,
+            root,
+            &self.workspace_root,
+            self.push_tx.clone(),
+            self.diagnostics_deadline,
+        )?;
 
         // Phase 3: re-acquire to insert; discard concurrent loser.
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -832,6 +849,8 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
 
+    const TEST_DIAGNOSTICS_DEADLINE: Duration = Duration::from_secs(2);
+
     fn path_rename_request() -> PathRenamePlanningRequest {
         PathRenamePlanningRequest {
             moves: vec![
@@ -864,6 +883,7 @@ mod tests {
                 "rust".to_owned(),
                 workspace.path().to_path_buf(),
                 None,
+                TEST_DIAGNOSTICS_DEADLINE,
             )
             .expect("scripted language server must initialize"),
             requests,
@@ -1475,6 +1495,7 @@ mod tests {
             _root: PathBuf,
             _workspace_root: &std::path::Path,
             _push_tx: Option<DiagnosticsSender>,
+            _diagnostics_deadline: Duration,
         ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
             self.total_spawn_attempts.fetch_add(1, Ordering::Relaxed);
             let session = match self.per_lang.lock().unwrap().get_mut(language_id) {
@@ -1549,7 +1570,80 @@ mod tests {
     }
 
     fn pool_with_spawner(config: LspConfig, spawner: Arc<dyn SessionSpawner>) -> SessionPool {
-        SessionPool::with_spawner(config, PathBuf::from("/workspace"), spawner, None)
+        SessionPool::with_spawner(
+            config,
+            PathBuf::from("/workspace"),
+            spawner,
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        )
+    }
+
+    #[test]
+    fn diagnostics_deadline_reaches_spawned_sessions() {
+        struct CapturingSpawner {
+            deadlines: Mutex<Vec<Duration>>,
+            session: Arc<FakeSession>,
+        }
+
+        impl SessionSpawner for CapturingSpawner {
+            fn spawn(
+                &self,
+                _: &LspServerConfig,
+                _: &str,
+                _: PathBuf,
+                _: &std::path::Path,
+                _: Option<DiagnosticsSender>,
+                diagnostics_deadline: Duration,
+            ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
+                self.deadlines.lock().unwrap().push(diagnostics_deadline);
+                Ok(Arc::clone(&self.session) as Arc<dyn PooledSession>)
+            }
+        }
+
+        let expected = Duration::from_millis(137);
+        let spawner = Arc::new(CapturingSpawner {
+            deadlines: Mutex::new(Vec::new()),
+            session: FakeSession::new(),
+        });
+        let pool = SessionPool::with_spawner(
+            rust_config(),
+            PathBuf::from("/workspace"),
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+            None,
+            expected,
+        );
+        let path = RelativePath::new("src/main.rs");
+
+        pool.check_lsp(&path, "").unwrap();
+        pool.check_lsp(&path, "").unwrap();
+
+        assert_eq!(*spawner.deadlines.lock().unwrap(), vec![expected]);
+        assert_eq!(spawner.session.calls(), 2);
+    }
+
+    #[test]
+    fn session_pool_new_retains_the_diagnostics_deadline() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let mut config = rust_config();
+        let server = config.servers.get_mut("rust").unwrap();
+        server.command = fixture_lsp_server::binary_path()
+            .to_string_lossy()
+            .into_owned();
+        server.args = vec!["diagnostics_timeout".to_owned()];
+        let budget = Duration::from_millis(40);
+        let pool = SessionPool::new(config, workspace.path().to_path_buf(), budget);
+
+        let started = Instant::now();
+        let error = pool
+            .check_lsp(&RelativePath::new("src/main.rs"), "fn main() {}")
+            .expect_err("a server that never settles must exhaust the supplied budget");
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     fn f008_lifecycle_config() -> LspConfig {
@@ -1749,7 +1843,11 @@ mod tests {
         let server = config.servers.get_mut("rust").unwrap();
         server.command = "./server with spaces.sh".to_owned();
         server.args = vec!["first argument".to_owned(), "--second=value".to_owned()];
-        let pool = SessionPool::new(config, workspace.path().to_path_buf());
+        let pool = SessionPool::new(
+            config,
+            workspace.path().to_path_buf(),
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
 
         pool.get_or_spawn("rust", &RelativePath::new("crates/app/src/main.rs"))
             .expect("resolved language server should spawn");
@@ -1779,9 +1877,13 @@ mod tests {
 
         let mut config = rust_config();
         config.servers.get_mut("rust").unwrap().command = " ".to_owned();
-        let error = SessionPool::new(config, workspace.path().to_path_buf())
-            .check_lsp(&RelativePath::new("src/main.rs"), "")
-            .unwrap_err();
+        let error = SessionPool::new(
+            config,
+            workspace.path().to_path_buf(),
+            TEST_DIAGNOSTICS_DEADLINE,
+        )
+        .check_lsp(&RelativePath::new("src/main.rs"), "")
+        .unwrap_err();
         assert_eq!(
             error,
             LspSessionError::Backend(LspOutcomeCode::InvalidCommand)
@@ -1789,9 +1891,13 @@ mod tests {
 
         let mut config = rust_config();
         config.servers.get_mut("rust").unwrap().command = "missing-server".to_owned();
-        let error = SessionPool::new(config, workspace.path().to_path_buf())
-            .check_lsp(&RelativePath::new("src/main.rs"), "")
-            .unwrap_err();
+        let error = SessionPool::new(
+            config,
+            workspace.path().to_path_buf(),
+            TEST_DIAGNOSTICS_DEADLINE,
+        )
+        .check_lsp(&RelativePath::new("src/main.rs"), "")
+        .unwrap_err();
         assert_eq!(
             error,
             LspSessionError::Backend(LspOutcomeCode::ServerMissing)
@@ -1799,9 +1905,13 @@ mod tests {
 
         let mut config = rust_config();
         config.servers.get_mut("rust").unwrap().command = "./invalid-format".to_owned();
-        let error = SessionPool::new(config, workspace.path().to_path_buf())
-            .check_lsp(&RelativePath::new("src/main.rs"), "")
-            .unwrap_err();
+        let error = SessionPool::new(
+            config,
+            workspace.path().to_path_buf(),
+            TEST_DIAGNOSTICS_DEADLINE,
+        )
+        .check_lsp(&RelativePath::new("src/main.rs"), "")
+        .unwrap_err();
         assert_eq!(
             error,
             LspSessionError::Backend(LspOutcomeCode::ServerNotExecutable)
@@ -1818,6 +1928,7 @@ mod tests {
             workspace.path().join("missing-working-directory"),
             workspace.path(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         ) {
             Ok(_) => panic!("a missing working directory must fail process launch"),
             Err(error) => error,
@@ -1844,6 +1955,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
+                _: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.started.send(()).expect("report that spawn started");
                 self.release
@@ -1867,6 +1979,7 @@ mod tests {
             PathBuf::from("/workspace"),
             spawner,
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         ));
         let spawned_pool = Arc::clone(&pool);
         let spawned_request = std::thread::spawn(move || {
@@ -1904,6 +2017,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
+                _: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(LspSessionError::Backend(
@@ -1923,6 +2037,7 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let path = RelativePath::new("src/main.rs");
 
@@ -1953,6 +2068,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
+                _: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 let index = self.next.fetch_add(1, Ordering::SeqCst);
                 self.barrier.wait();
@@ -1972,6 +2088,7 @@ mod tests {
             PathBuf::from("/workspace"),
             spawner,
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         ));
 
         let requests: Vec<_> = (0..2)
@@ -2016,6 +2133,7 @@ mod tests {
                 idle_timeout: None,
             },
             workspace.path().to_path_buf(),
+            TEST_DIAGNOSTICS_DEADLINE,
         );
 
         let error = pool
@@ -2040,7 +2158,11 @@ mod tests {
     // AC5: empty config, no server configured.
     #[test]
     fn empty_config_returns_unsupported() {
-        let pool = SessionPool::new(LspConfig::default(), PathBuf::from("/workspace"));
+        let pool = SessionPool::new(
+            LspConfig::default(),
+            PathBuf::from("/workspace"),
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let rel = RelativePath::new("src/main.rs");
         assert!(!pool.serves(&rel));
         let err = pool.check(&rel, "fn main() {}").unwrap_err();
@@ -2105,6 +2227,7 @@ mod tests {
                 root: PathBuf,
                 workspace_root: &std::path::Path,
                 _: Option<DiagnosticsSender>,
+                _: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.roots
                     .lock()
@@ -2128,6 +2251,7 @@ mod tests {
             workspace.path().to_path_buf(),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
 
         pool.check(&RelativePath::new("crates/alpha/src/lib.rs"), "")
@@ -2190,6 +2314,7 @@ mod tests {
                 _root: PathBuf,
                 _workspace_root: &std::path::Path,
                 _push_tx: Option<DiagnosticsSender>,
+                _diagnostics_deadline: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 *self
                     .counts
@@ -2220,6 +2345,7 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let rel = RelativePath::new("src/main.rs");
 
@@ -2264,6 +2390,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
+                _: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.queue
@@ -2285,8 +2412,13 @@ mod tests {
         let mut config = rust_config();
         config.idle_timeout = Some(Duration::from_millis(1));
 
-        let pool =
-            SessionPool::with_spawner(config, PathBuf::from("/workspace"), spawner_arc, None);
+        let pool = SessionPool::with_spawner(
+            config,
+            PathBuf::from("/workspace"),
+            spawner_arc,
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let rel = RelativePath::new("lib.rs");
 
         pool.check(&rel, "").unwrap();
@@ -2601,6 +2733,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
+                _: Duration,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.queue
@@ -2629,6 +2762,7 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let rel = RelativePath::new("src/main.rs");
         let pos = Position {

@@ -69,6 +69,10 @@ pub struct TowerConfig {
 }
 
 impl TowerConfig {
+    pub fn lsp_budget_required(&self) -> bool {
+        !self.lsp.servers.is_empty() && !self.extensions.disabled.iter().any(|name| name == "lsp")
+    }
+
     pub fn lint_request_timeout(&self) -> Result<std::time::Duration, ConfigError> {
         let maximum: Option<(&String, &LintCommandConfig)> =
             self.lint
@@ -135,6 +139,8 @@ pub struct ExtensionConfig {
 }
 
 impl ExtensionConfig {
+    pub const LSP_SUPERVISION_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
     const fn default_request_timeout_secs() -> u64 {
         30
     }
@@ -143,6 +149,16 @@ impl ExtensionConfig {
     #[must_use]
     pub fn request_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.request_timeout_secs)
+    }
+
+    pub fn lsp_diagnostics_timeout(&self) -> Result<std::time::Duration, ConfigError> {
+        self.request_timeout()
+            .checked_sub(Self::LSP_SUPERVISION_MARGIN)
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or(ConfigError::InvalidLspDiagnosticsDeadline {
+                request_timeout_secs: self.request_timeout_secs,
+                required_margin_secs: Self::LSP_SUPERVISION_MARGIN.as_secs(),
+            })
     }
 }
 
@@ -317,6 +333,10 @@ pub enum ConfigError {
         field: String,
         value: u64,
     },
+    InvalidLspDiagnosticsDeadline {
+        request_timeout_secs: u64,
+        required_margin_secs: u64,
+    },
     InvalidExtensionConfiguration {
         field: &'static str,
         reason: ExtensionConfigurationReason,
@@ -343,6 +363,13 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidLintDeadline { field, value } => write!(
                 f,
                 "invalid lint deadline {field}: {value} cannot produce 2 * timeout_secs + 1"
+            ),
+            ConfigError::InvalidLspDiagnosticsDeadline {
+                request_timeout_secs,
+                required_margin_secs,
+            } => write!(
+                f,
+                "invalid LSP diagnostics deadline {request_timeout_secs}: requires a {required_margin_secs}-second supervision margin"
             ),
             ConfigError::InvalidExtensionConfiguration { field, reason } => {
                 write!(f, "invalid extension configuration {field}: {reason:?}")
@@ -417,6 +444,9 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
     config.lint_request_timeout()?;
+    if config.lsp_budget_required() {
+        config.extensions.lsp_diagnostics_timeout()?;
+    }
     Ok(config)
 }
 
@@ -731,6 +761,28 @@ mod tests {
             Err(ConfigError::InvalidLintDeadline { field, value })
                 if field == "lint.go.timeout_secs" && value == instant_overflow
         ));
+    }
+
+    #[test]
+    fn lsp_request_timeout_rejects_a_budget_without_cleanup_margin() {
+        for request_timeout_secs in [0, 1] {
+            let tmp = tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!(
+                    "[extensions]\nrequest_timeout_secs = {request_timeout_secs}\n\
+                     [lsp.rust]\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\n"
+                ),
+            );
+
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigError::InvalidLspDiagnosticsDeadline {
+                    request_timeout_secs: actual,
+                    required_margin_secs: 1,
+                }) if actual == request_timeout_secs
+            ));
+        }
     }
 
     #[test]

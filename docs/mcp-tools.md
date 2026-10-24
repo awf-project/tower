@@ -851,6 +851,14 @@ compiler/linter diagnostics. Use after editing a file to verify the change.
 `severity` is one of `error`, `warning`, `info`, `hint`. No backend or
 unsupported language → `{"supported": false, "diagnostics": []}`.
 
+Diagnostics follow the capability advertised during server initialization: a `diagnosticProvider`
+selects `textDocument/diagnostic`; otherwise Tower waits for `textDocument/publishDiagnostics`.
+A successful explicit empty result means no diagnostics; absence of a publication is not treated
+as an empty result. Document synchronization and pull request writes share the diagnostics deadline.
+Expiration returns the structured runtime outcome `server_timeout` without terminating or
+quarantining the sidecar. A subsequent call can reuse the resident session. The host-derived budget
+is described in [workspace configuration](user-guide/configuration.md).
+
 ### tower_lsp_definition
 
 Resolve the definition site(s) of the symbol at a position.

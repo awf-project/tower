@@ -79,7 +79,7 @@ impl ExtensionRequestTimeouts {
         }
     }
 
-    fn for_extension(self, name: &str) -> Duration {
+    pub(crate) fn for_extension(self, name: &str) -> Duration {
         if name == "lint" {
             self.lint.unwrap_or(self.default)
         } else {
@@ -1530,6 +1530,69 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"t
             tool_names.iter().any(|name| name == "other_no_config"),
             "non-debug extensions must receive None for initialize config; got {tool_names:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_initialization_payload_is_forwarded_only_to_the_lsp_extension() {
+        for activation in ["eager", "lazy"] {
+            let tmp = TempDir::new().unwrap();
+            let lsp_capture = tmp.path().join(format!("lsp-{activation}.json"));
+            let other_capture = tmp.path().join(format!("other-{activation}.json"));
+            for (name, capture) in [("lsp", &lsp_capture), ("other", &other_capture)] {
+                let script = tmp.path().join(format!("{name}-{activation}.sh"));
+                write_shell_script(
+                    &script,
+                    &format!(
+                        "read -r line\nprintf '%s' \"$line\" > '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"type\":\"Initialized\",\"data\":{{\"tools\":[{{\"name\":\"{name}_{activation}_probe\",\"description\":\"probe\",\"schema_json\":\"{{}}\"}}],\"events\":[],\"capabilities\":[]}}}}}}'\nwhile read -r request; do\n  case \"$request\" in\n    *'\"method\":\"invokeTool\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"type\":\"ToolResult\",\"data\":{{\"ok\":true}}}}}}' ;;\n    *'\"method\":\"shutdown\"'*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"type\":\"ShutdownAck\"}}}}'; exit 0 ;;\n  esac\ndone\n",
+                        capture.display()
+                    ),
+                );
+                write_manifest(
+                    tmp.path(),
+                    name,
+                    &format!(
+                        "name = \"{name}\"\nversion = \"0.1.0\"\ncommand = [\"/bin/sh\", \"{}\"]\nactivation = \"{activation}\"\n\n[[tools]]\nname = \"{name}_{activation}_probe\"\ndescription = \"probe\"\nschema_json = \"{{}}\"\n",
+                        script.display()
+                    ),
+                );
+            }
+            let expected = serde_json::json!({
+                "servers": {"rust": {"command": "rust-analyzer", "extensions": ["rs"], "args": []}},
+                "idle_timeout_secs": 45,
+                "diagnostics_timeout_secs": 4,
+            });
+            let init_configs = ExtensionInitConfigMap::from([("lsp".to_owned(), expected.clone())]);
+            let registry = super::load_extensions_into_registry(
+                &[tmp.path().to_owned()],
+                make_host_deps(),
+                Duration::from_secs(5),
+                &[],
+                &init_configs,
+            );
+            if activation == "lazy" {
+                registry
+                    .invoke("lsp_lazy_probe", serde_json::json!({}))
+                    .expect("lazy LSP extension starts");
+                registry
+                    .invoke("other_lazy_probe", serde_json::json!({}))
+                    .expect("lazy unrelated extension starts");
+            }
+
+            let lsp_initialize: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&lsp_capture).expect("LSP initialize captured"),
+            )
+            .unwrap();
+            let other_initialize: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&other_capture).expect("other initialize captured"),
+            )
+            .unwrap();
+            assert_eq!(lsp_initialize["params"]["extension_config"], expected);
+            assert!(
+                other_initialize["params"].get("extension_config").is_none(),
+                "unrelated extension received LSP config: {other_initialize}"
+            );
+        }
     }
 
     // ── resolve_command_paths helper ──────────────────────────────────────────

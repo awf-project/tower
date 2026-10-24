@@ -98,7 +98,11 @@ fn spawn_initialized_lsp(mut manifest: ExtensionManifest) -> Box<dyn ExtensionIn
         manifest,
         deps,
         Duration::from_secs(15),
-        Some(serde_json::json!({"servers": {}, "idle_timeout_secs": null})),
+        Some(serde_json::json!({
+            "servers": {},
+            "idle_timeout_secs": null,
+            "diagnostics_timeout_secs": 1,
+        })),
     )
     .expect("spawn and initialize shipped lsp_extension")
 }
