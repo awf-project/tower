@@ -13,8 +13,35 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticsMode {
+    PushEmpty,
+    PushNonempty,
+    PushAbsent,
+    PullFull,
+    PullTimeout,
+    PullUnchanged,
+    ByContent,
+}
+
+impl DiagnosticsMode {
+    fn from_fixture_mode(mode: &str) -> Option<Self> {
+        match mode {
+            "diagnostics_push_empty" => Some(Self::PushEmpty),
+            "diagnostics_push_nonempty" => Some(Self::PushNonempty),
+            "diagnostics_push_absent" => Some(Self::PushAbsent),
+            "diagnostics_pull_full" => Some(Self::PullFull),
+            "diagnostics_pull_timeout" => Some(Self::PullTimeout),
+            "diagnostics_pull_unchanged" => Some(Self::PullUnchanged),
+            "diagnostics_by_content" => Some(Self::ByContent),
+            _ => None,
+        }
+    }
+}
+
 struct Server {
     mode: String,
+    diagnostics_mode: Option<DiagnosticsMode>,
     dispatch_profile: bool,
     log: Option<PathBuf>,
     documents: HashMap<String, String>,
@@ -27,6 +54,7 @@ impl Server {
             && !self.dispatch_profile
         {
             fields["event"] = json!(event);
+            fields["pid"] = json!(std::process::id());
             append_line(
                 PathBuf::from(format!("{}.trace", log.display())),
                 &fields.to_string(),
@@ -78,7 +106,89 @@ impl Server {
         ) {
             capabilities["referencesProvider"] = json!(false);
         }
+        if matches!(
+            self.diagnostics_mode,
+            Some(
+                DiagnosticsMode::PullFull
+                    | DiagnosticsMode::PullTimeout
+                    | DiagnosticsMode::PullUnchanged
+            )
+        ) {
+            capabilities["diagnosticProvider"] =
+                json!({"interFileDependencies": false, "workspaceDiagnostics": false});
+        }
         capabilities
+    }
+
+    fn fixture_diagnostic(severity: u8, code: &str, source: &str, message: &str) -> Value {
+        json!({
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "severity": severity,
+            "code": code,
+            "source": source,
+            "message": message,
+        })
+    }
+
+    fn publish_diagnostics(&self, uri: &str, diagnostics: Value) -> io::Result<()> {
+        wire::send(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": diagnostics},
+        }))?;
+        self.trace("published", json!({"uri": uri}))
+    }
+
+    fn publish_quiescent(&self) -> io::Result<()> {
+        wire::send(&json!({
+            "jsonrpc": "2.0",
+            "method": "experimental/serverStatus",
+            "params": {"quiescent": true},
+        }))
+    }
+
+    fn publish_after_sync(&self, uri: &str) -> io::Result<()> {
+        match self.diagnostics_mode {
+            Some(DiagnosticsMode::PushEmpty) => self.publish_diagnostics(uri, json!([])),
+            Some(DiagnosticsMode::PushNonempty) => self.publish_diagnostics(
+                uri,
+                json!([Self::fixture_diagnostic(
+                    1,
+                    "fixture-syntax",
+                    "fixture-lsp",
+                    "fixture syntax error",
+                )]),
+            ),
+            Some(DiagnosticsMode::PullFull) => self.publish_diagnostics(
+                uri,
+                json!([Self::fixture_diagnostic(
+                    2,
+                    "fixture-push-decoy",
+                    "fixture-push",
+                    "push cache decoy",
+                )]),
+            ),
+            Some(DiagnosticsMode::ByContent) if !uri.ends_with("/timeout.rs") => {
+                let diagnostics = if self
+                    .documents
+                    .get(uri)
+                    .is_some_and(|text| text.contains("fixture_invalid"))
+                {
+                    json!([Self::fixture_diagnostic(
+                        1,
+                        "fixture-syntax",
+                        "fixture-lsp",
+                        "fixture syntax error",
+                    )])
+                } else {
+                    json!([])
+                };
+                self.publish_diagnostics(uri, diagnostics)?;
+                self.publish_quiescent()?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn synchronize(&mut self, method: &str, params: &Value, uri: &str) -> io::Result<()> {
@@ -92,6 +202,7 @@ impl Server {
                         .to_owned(),
                 );
                 self.trace("didOpen", json!({"uri": uri, "text": self.documents[uri]}))?;
+                self.publish_after_sync(uri)?;
                 if self.dispatch_profile || self.mode == "diagnostics_ready" {
                     wire::send(
                         &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": []}}),
@@ -118,6 +229,7 @@ impl Server {
                     );
                 }
                 self.trace("didChange", json!({"uri": uri, "text": self.documents.get(uri).map(String::as_str).unwrap_or_default()}))?;
+                self.publish_after_sync(uri)?;
             }
             "textDocument/didClose" => {
                 self.trace("didClose", json!({"uri": uri}))?;
@@ -156,11 +268,34 @@ impl Server {
                 continue;
             };
             if method == "initialize" {
+                if self.diagnostics_mode.is_some() {
+                    self.trace("initialized", json!({}))?;
+                }
                 wire::reply(id, json!({"capabilities": self.capabilities()}))?;
                 if self.mode == "server_transport_error" {
                     disconnect_stdin()?;
                     std::thread::sleep(Duration::from_secs(300));
                     return Ok(());
+                }
+            } else if method == "textDocument/diagnostic" {
+                self.trace(
+                    "textDocument/diagnostic",
+                    json!({"uri": uri, "requestId": id}),
+                )?;
+                match self.diagnostics_mode {
+                    Some(DiagnosticsMode::PullFull) => {
+                        wire::reply(
+                            id,
+                            json!({"kind": "full", "items": [Self::fixture_diagnostic(1, "fixture-syntax", "fixture-lsp", "fixture syntax error")]}),
+                        )?;
+                        self.trace("diagnosticResponse", json!({"uri": uri, "requestId": id}))?;
+                    }
+                    Some(DiagnosticsMode::PullTimeout) => {}
+                    Some(DiagnosticsMode::PullUnchanged) => {
+                        wire::reply(id, json!({"kind": "unchanged", "resultId": "ungrounded"}))?;
+                        self.trace("diagnosticResponse", json!({"uri": uri, "requestId": id}))?;
+                    }
+                    _ => wire::error(id, -32601, "diagnostics unavailable")?,
                 }
             } else if method == "textDocument/prepareTypeHierarchy"
                 || method.starts_with("typeHierarchy/")
@@ -466,8 +601,14 @@ fn run() -> io::Result<()> {
         append_line(pids, &std::process::id().to_string())?;
     }
     let dispatch_profile = mode.starts_with("dispatch_");
+    let diagnostics_mode = if mode.starts_with("diagnostics_") {
+        DiagnosticsMode::from_fixture_mode(&mode)
+    } else {
+        None
+    };
     Server {
         mode,
+        diagnostics_mode,
         dispatch_profile,
         log,
         documents: HashMap::new(),
@@ -480,5 +621,61 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("fixture_lsp_server: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiagnosticsMode, Server};
+
+    #[test]
+    fn diagnostics_modes_map_exactly_and_reject_unknown_modes() {
+        let cases = [
+            ("diagnostics_push_empty", DiagnosticsMode::PushEmpty),
+            ("diagnostics_push_nonempty", DiagnosticsMode::PushNonempty),
+            ("diagnostics_push_absent", DiagnosticsMode::PushAbsent),
+            ("diagnostics_pull_full", DiagnosticsMode::PullFull),
+            ("diagnostics_pull_timeout", DiagnosticsMode::PullTimeout),
+            ("diagnostics_pull_unchanged", DiagnosticsMode::PullUnchanged),
+            ("diagnostics_by_content", DiagnosticsMode::ByContent),
+        ];
+
+        for (mode, expected) in cases {
+            assert_eq!(DiagnosticsMode::from_fixture_mode(mode), Some(expected));
+        }
+        assert_eq!(
+            DiagnosticsMode::from_fixture_mode("diagnostics_unknown"),
+            None
+        );
+        assert_eq!(DiagnosticsMode::from_fixture_mode("normal"), None);
+    }
+
+    #[test]
+    fn only_pull_diagnostics_modes_advertise_diagnostic_provider() {
+        let cases = [
+            ("diagnostics_push_empty", false),
+            ("diagnostics_push_nonempty", false),
+            ("diagnostics_push_absent", false),
+            ("diagnostics_pull_full", true),
+            ("diagnostics_pull_timeout", true),
+            ("diagnostics_pull_unchanged", true),
+            ("diagnostics_by_content", false),
+        ];
+
+        for (mode, advertises_pull_diagnostics) in cases {
+            let server = Server {
+                mode: mode.to_owned(),
+                diagnostics_mode: DiagnosticsMode::from_fixture_mode(mode),
+                dispatch_profile: false,
+                log: None,
+                documents: Default::default(),
+                safe_delete_requests: 0,
+            };
+            assert_eq!(
+                server.capabilities().get("diagnosticProvider").is_some(),
+                advertises_pull_diagnostics,
+                "{mode} diagnosticProvider advertisement"
+            );
+        }
     }
 }

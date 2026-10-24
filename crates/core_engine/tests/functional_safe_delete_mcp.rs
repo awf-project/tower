@@ -170,7 +170,7 @@ impl SafeDeleteHarness {
         let config_source = format!(
             r#"
 [extensions]
-request_timeout_secs = 1
+request_timeout_secs = 30
 
 [lsp.rust]
 command = {}

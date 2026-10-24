@@ -1011,6 +1011,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_DIAGNOSTICS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// A pool seam that supplies an edit requiring the production read resolver.
     /// The dispatch path, decoder, and HostCall transport remain real.
     struct PlanningSession {
@@ -1140,6 +1142,7 @@ mod tests {
             _: PathBuf,
             _: &Path,
             _: Option<crate::lsp_adapter::DiagnosticsSender>,
+            _: std::time::Duration,
         ) -> Result<
             Arc<dyn crate::lsp_adapter::pool::PooledSession>,
             crate::lsp_adapter::LspSessionError,
@@ -1192,6 +1195,7 @@ mod tests {
             path_rename_fixture_config(workspace, mode),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut lines = input.into_iter();
         let mut next_id = HostCallIdAllocator::new(10_000);
@@ -1273,7 +1277,12 @@ mod tests {
 
         let workspace_root = workspace.path().to_path_buf();
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut pool = LspSessionPool::new(
+            LspConfig::default(),
+            workspace_root.clone(),
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut ids = HostCallIdAllocator::new(10_000);
         let mut deferred = VecDeque::new();
@@ -1327,6 +1336,7 @@ mod tests {
             workspace.path().to_path_buf(),
             Arc::new(PlanningSpawner(session)),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut pool =
             LspSessionPool::with_session_pool_for_test(inner, workspace.path().to_path_buf());
@@ -1393,6 +1403,7 @@ mod tests {
             workspace.to_path_buf(),
             Arc::new(PlanningSpawner(session)),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut pool = LspSessionPool::with_session_pool_for_test(inner, workspace.to_path_buf());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -1573,7 +1584,11 @@ mod tests {
                 "params": {
                     "protocol_version": 1,
                     "client_info": "path-rename-test",
-                    "extension_config": { "servers": {}, "idle_timeout_secs": null }
+                    "extension_config": {
+                        "servers": {},
+                        "idle_timeout_secs": null,
+                        "diagnostics_timeout_secs": 1
+                    }
                 }
             })
         )
@@ -1687,7 +1702,12 @@ mod tests {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         let workspace_root = workspace.path().to_path_buf();
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut pool = LspSessionPool::new(
+            LspConfig::default(),
+            workspace_root.clone(),
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut next_id = HostCallIdAllocator::new(10_000);
         let mut deferred = VecDeque::new();
@@ -1719,7 +1739,12 @@ mod tests {
     fn type_hierarchy_unconfigured_dispatch_is_unsupported_without_host_call() {
         let workspace_root = PathBuf::from("/workspace");
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut pool = LspSessionPool::new(
+            LspConfig::default(),
+            workspace_root.clone(),
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut next_id = HostCallIdAllocator::new(10_000);
         let mut deferred = VecDeque::new();
@@ -1773,6 +1798,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let source = "private immutable hierarchy source";
         let mut lines = vec![Ok(
@@ -1825,6 +1851,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let source = "private immutable hierarchy source";
         let deferred_content = "queued event content must not replace the active snapshot";
@@ -1928,6 +1955,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, false),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut lines = (10_000..10_003)
             .map(|id| {
@@ -1979,7 +2007,12 @@ mod tests {
     fn type_hierarchy_invalid_query_is_legacy_error_before_host_call() {
         let workspace_root = PathBuf::from("/workspace");
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut pool = LspSessionPool::new(
+            LspConfig::default(),
+            workspace_root.clone(),
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let mut next_id = HostCallIdAllocator::new(10_000);
 
         for params in [
@@ -2015,6 +2048,7 @@ mod tests {
             lsp_fixture_config_with_backend_failure(&workspace_root, true, true),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let secret = "opaque backend data must stay private";
         let mut lines = vec![Ok(
@@ -2074,6 +2108,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, false),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut lines = vec![Ok(
             json!({ "jsonrpc": "2.0", "id": 10_000, "result": "fn main() {}" }).to_string(),
@@ -2171,6 +2206,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut lines = (10_000..10_005)
             .map(|id| {
@@ -2235,7 +2271,12 @@ mod tests {
     fn f008_rename_outcome_decorates_unsupported_language_and_classified_server_failures() {
         let workspace_root = PathBuf::from("/workspace");
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let mut pool = LspSessionPool::new(LspConfig::default(), workspace_root.clone(), None);
+        let mut pool = LspSessionPool::new(
+            LspConfig::default(),
+            workspace_root.clone(),
+            None,
+            TEST_DIAGNOSTICS_DEADLINE,
+        );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut next_id = HostCallIdAllocator::new(10_000);
         let mut deferred = VecDeque::new();
@@ -2355,6 +2396,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, false),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut lines = vec![Ok(
             json!({ "jsonrpc": "2.0", "id": 10_000, "result": "fn main() {}" }).to_string(),
@@ -2397,6 +2439,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
+            TEST_DIAGNOSTICS_DEADLINE,
         );
         let mut lines = vec![
             Ok(

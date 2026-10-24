@@ -53,7 +53,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use core_engine::adapters::config::lsp::{LspInitializeError, decode_lsp_initialize_config};
+use core_engine::adapters::config::lsp::{
+    LspInitializeError, decode_diagnostics_timeout, decode_lsp_initialize_config,
+};
 use extension_protocol::messages::PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON;
 use extension_protocol::{
     Capability, InitParams, InitResult, PROTOCOL_VERSION, ProtocolError, Response, ToolDecl,
@@ -188,6 +190,18 @@ fn main() {
                         continue;
                     }
                 };
+                let diagnostics_deadline =
+                    match decode_diagnostics_timeout(extension_config.as_ref()) {
+                        Ok(timeout) => timeout,
+                        Err(error) => {
+                            protocol::send_protocol_error(
+                                &stdout_lock,
+                                &id,
+                                &invalid_lsp_initialize_error(error),
+                            );
+                            continue;
+                        }
+                    };
                 backend_configured = !lsp_config.servers.is_empty();
 
                 // Read workspace root from environment or default to CWD.
@@ -213,6 +227,7 @@ fn main() {
                     lsp_config,
                     workspace_root.clone(),
                     Some(push_tx),
+                    diagnostics_deadline,
                 ));
 
                 let result = InitResult {
@@ -402,5 +417,119 @@ fn handle_event(params: Value, pool: &mut LspSessionPool, workspace_root: &std::
             pool.on_file_deleted(path, workspace_root);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+    struct LspExtensionProcess {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl LspExtensionProcess {
+        fn spawn() -> Self {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let workspace_root = manifest_dir
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("lsp extension must reside below the workspace root");
+            let binary = workspace_root
+                .join("target")
+                .join("debug")
+                .join("lsp_extension");
+            let mut child = Command::new(&binary)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|error| panic!("failed to launch {}: {error}", binary.display()));
+            let stdin = child.stdin.take().expect("child stdin must be piped");
+            let stdout = child.stdout.take().expect("child stdout must be piped");
+
+            Self {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+            }
+        }
+
+        fn exchange(&mut self, request: serde_json::Value) -> serde_json::Value {
+            writeln!(self.stdin, "{request}").expect("initialize request must be writable");
+            self.stdin.flush().expect("initialize request must flush");
+            let mut response = String::new();
+            self.stdout
+                .read_line(&mut response)
+                .expect("initialize response must be readable");
+            serde_json::from_str(&response).expect("initialize response must be JSON")
+        }
+    }
+
+    impl Drop for LspExtensionProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn initialize_rejects_invalid_diagnostics_deadline_before_session_construction() {
+        let mut extension = LspExtensionProcess::spawn();
+        let invalid = [
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null}),
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": null}),
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": 0}),
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": -1}),
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": 1.5}),
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": "2"}),
+        ];
+
+        for (id, payload) in (1_u64..).zip(invalid) {
+            assert_eq!(
+                extension.exchange(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "initialize",
+                    "params": {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "client_info": "lsp-unit-test/0.1.0",
+                        "extension_config": payload,
+                    },
+                })),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": "invalid LSP initialization configuration",
+                        "data": {
+                            "kind": "invalid_lsp_initialize_config",
+                            "reason": "invalid_configuration",
+                        },
+                    },
+                }),
+            );
+            assert_eq!(
+                extension.exchange(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 100 + id,
+                    "method": "invokeTool",
+                    "params": {"name": "diagnostics", "params": {"path": "src/lib.rs"}},
+                })),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 100 + id,
+                    "error": {
+                        "code": -32000,
+                        "message": "LSP extension not initialized",
+                    },
+                }),
+                "an invalid initialize request must not install a session pool",
+            );
+        }
     }
 }

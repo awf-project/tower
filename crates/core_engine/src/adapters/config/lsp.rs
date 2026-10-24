@@ -37,6 +37,17 @@ pub fn lsp_initialize_payload(config: &LspConfig) -> serde_json::Value {
     .expect("LSP initialization configuration contains only serializable values")
 }
 
+pub fn lsp_initialize_payload_with_diagnostics_timeout(
+    config: &LspConfig,
+    diagnostics_timeout: Duration,
+) -> serde_json::Value {
+    serde_json::json!({
+        "servers": &config.servers,
+        "idle_timeout_secs": config.idle_timeout.map(|timeout| timeout.as_secs()),
+        "diagnostics_timeout_secs": diagnostics_timeout.as_secs(),
+    })
+}
+
 pub fn decode_lsp_initialize_config(
     payload: Option<&serde_json::Value>,
 ) -> Result<LspConfig, LspInitializeError> {
@@ -48,6 +59,21 @@ pub fn decode_lsp_initialize_config(
         servers: payload.servers,
         idle_timeout: payload.idle_timeout_secs.map(Duration::from_secs),
     })
+}
+
+pub fn decode_diagnostics_timeout(
+    extension_config: Option<&serde_json::Value>,
+) -> Result<Duration, LspInitializeError> {
+    let seconds = extension_config
+        .and_then(|config| config.get("diagnostics_timeout_secs"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|seconds| *seconds > 0)
+        .ok_or(LspInitializeError::InvalidConfiguration)?;
+    let timeout = Duration::from_secs(seconds);
+    std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or(LspInitializeError::InvalidConfiguration)?;
+    Ok(timeout)
 }
 
 #[derive(Serialize)]
@@ -386,6 +412,80 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn diagnostics_deadline_decoder_rejects_missing_zero_and_malformed_values() {
+        let invalid = [
+            None,
+            Some(serde_json::json!({"servers": {}})),
+            Some(serde_json::json!({"diagnostics_timeout_secs": null})),
+            Some(serde_json::json!({"diagnostics_timeout_secs": 0})),
+            Some(serde_json::json!({"diagnostics_timeout_secs": -1})),
+            Some(serde_json::json!({"diagnostics_timeout_secs": 1.5})),
+            Some(serde_json::json!({"diagnostics_timeout_secs": "2"})),
+            Some(serde_json::json!({"diagnostics_timeout_secs": u64::MAX})),
+        ];
+
+        for payload in &invalid {
+            assert_eq!(
+                decode_diagnostics_timeout(payload.as_ref()),
+                Err(LspInitializeError::InvalidConfiguration),
+                "payload {payload:?}"
+            );
+        }
+
+        assert_eq!(
+            decode_diagnostics_timeout(Some(&serde_json::json!({"diagnostics_timeout_secs": 7}))),
+            Ok(Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn lsp_request_timeout_codec_round_trips_the_business_deadline() {
+        let config = LspConfig {
+            servers: BTreeMap::from([(
+                "rust".to_owned(),
+                LspServerConfig {
+                    command: "rust-analyzer".to_owned(),
+                    extensions: vec!["rs".to_owned()],
+                    args: vec!["--stdio".to_owned()],
+                },
+            )]),
+            idle_timeout: Some(Duration::from_secs(45)),
+        };
+
+        let payload =
+            lsp_initialize_payload_with_diagnostics_timeout(&config, Duration::from_secs(4));
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "servers": {
+                    "rust": {
+                        "command": "rust-analyzer",
+                        "extensions": ["rs"],
+                        "args": ["--stdio"],
+                    }
+                },
+                "idle_timeout_secs": 45,
+                "diagnostics_timeout_secs": 4,
+            })
+        );
+        assert_eq!(decode_lsp_initialize_config(Some(&payload)), Ok(config));
+        assert_eq!(
+            decode_diagnostics_timeout(Some(&payload)),
+            Ok(Duration::from_secs(4))
+        );
+        for malformed in [
+            serde_json::json!({"servers": {}, "diagnostics_timeout_secs": 0}),
+            serde_json::json!({"servers": {}, "diagnostics_timeout_secs": "4"}),
+        ] {
+            assert_eq!(
+                decode_diagnostics_timeout(Some(&malformed)),
+                Err(LspInitializeError::InvalidConfiguration)
+            );
+        }
+    }
 
     #[test]
     fn f008_initialize_codec_implements_the_exact_codec_without_filesystem_access() {

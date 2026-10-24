@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::TowerConfig;
-use core_engine::adapters::config::lsp::{LspConfig, LspServerConfig, lsp_initialize_payload};
+use core_engine::adapters::config::lsp::{
+    LspConfig, LspServerConfig, lsp_initialize_payload_with_diagnostics_timeout,
+};
 use core_engine::adapters::daemon::engine::{EngineHandle, build_engine};
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use core_engine::adapters::mcp::registry::ToolRegistry;
@@ -103,7 +105,7 @@ impl PathRenameHarness {
         let config_source = format!(
             r#"
 [extensions]
-request_timeout_secs = 1
+request_timeout_secs = 30
 
 [lsp.rust]
 command = {}
@@ -570,7 +572,10 @@ fn concurrent_spawn_and_request_handles_queued_frames_twenty_times_with_fresh_na
                     "params": {
                         "protocol_version": extension_protocol::PROTOCOL_VERSION,
                         "client_info": "path-rename-queue-test/0.1.0",
-                        "extension_config": lsp_initialize_payload(&config)
+                        "extension_config": lsp_initialize_payload_with_diagnostics_timeout(
+                            &config,
+                            Duration::from_secs(29),
+                        )
                     }
                 }));
                 assert!(

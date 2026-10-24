@@ -21,7 +21,9 @@ use crate::adapters::ast_index::{
 };
 use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_workspace_root};
 use crate::adapters::config::TowerConfig;
-use crate::adapters::config::lsp::{lsp_initialize_payload, validate_lsp_commands};
+use crate::adapters::config::lsp::{
+    lsp_initialize_payload_with_diagnostics_timeout, validate_lsp_commands,
+};
 use crate::adapters::daemon::instrumentation::StartupInstrumentation;
 use crate::adapters::daemon::lifecycle::{
     CapabilityDependency, CapabilityReadiness, DaemonLifecycle, ReadinessController,
@@ -63,6 +65,9 @@ use extension_protocol::ExtensionManifest;
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
 type FormatterEchoSet = Arc<Mutex<HashMap<String, ()>>>;
 const BUNDLED_DEBUG_MANIFEST: &str = include_str!("../../../../../extensions/debug/extension.toml");
+/// Smallest valid sidecar diagnostics timeout when LSP has no active language mapping.
+/// The value satisfies the initialization schema without consuming a derived request budget.
+const INACTIVE_LSP_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub enum PreparationError {
     Cancelled,
@@ -1505,7 +1510,7 @@ fn load_extension_registry(
         push_tx: Some(push_tx),
     };
 
-    let init_configs = extension_init_configs(tower_config);
+    let init_configs = extension_init_configs(tower_config).map_err(|error| error.to_string())?;
 
     let publication = state
         .read()
@@ -1618,18 +1623,39 @@ fn load_extension_registry(
     Ok(push_rx)
 }
 
-fn extension_init_configs(tower_config: &TowerConfig) -> ExtensionInitConfigMap {
+fn extension_init_configs(
+    tower_config: &TowerConfig,
+) -> Result<ExtensionInitConfigMap, crate::adapters::config::ConfigError> {
     let mut init_configs: ExtensionInitConfigMap = tower_config
         .extensions
         .initialize
         .iter()
         .map(|(identity, config)| (identity.clone(), serde_json::Value::Object(config.clone())))
         .collect();
-    init_configs.insert("lsp".to_owned(), lsp_initialize_payload(&tower_config.lsp));
+    let lsp_disabled = tower_config
+        .extensions
+        .disabled
+        .iter()
+        .any(|name| name == "lsp");
+    if tower_config.lsp_budget_required() {
+        let diagnostics_timeout = tower_config.extensions.lsp_diagnostics_timeout()?;
+        init_configs.insert(
+            "lsp".to_owned(),
+            lsp_initialize_payload_with_diagnostics_timeout(&tower_config.lsp, diagnostics_timeout),
+        );
+    } else if !lsp_disabled {
+        init_configs.insert(
+            "lsp".to_owned(),
+            lsp_initialize_payload_with_diagnostics_timeout(
+                &tower_config.lsp,
+                INACTIVE_LSP_DIAGNOSTICS_TIMEOUT,
+            ),
+        );
+    }
     if let Some(debug_config) = tower_config.debug.for_extension_initialize() {
         init_configs.insert("debug".to_owned(), debug_config);
     }
-    init_configs
+    Ok(init_configs)
 }
 
 fn register_bundled_debug_extension(
@@ -1791,6 +1817,12 @@ fn replay_initial_index_to_extensions(
 /// loading it via `config::load` before calling this function.
 pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<EngineHandle, String> {
     let workspace_root = resolve_workspace_root(opts);
+    if tower_config.lsp_budget_required() {
+        tower_config
+            .extensions
+            .lsp_diagnostics_timeout()
+            .map_err(|error| error.to_string())?;
+    }
     #[cfg(feature = "startup-test-hooks")]
     let startup_test_hooks = StartupTestHooks::for_workspace(&workspace_root);
     emit_lsp_startup_diagnostics(&tower_config, &workspace_root);
@@ -1943,7 +1975,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::adapters::config::{LspConfig, LspServerConfig};
+    use crate::adapters::config::{LspConfig, LspServerConfig, load};
     use crate::adapters::extension::host_deps::{HostDeps, UnsupportedApplyEditsHost};
     use crate::adapters::formatter::NoOpFormatQueue;
     use crate::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -1985,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn f008_daemon_hands_lsp_configuration_to_extension_discovery() {
+    fn lsp_request_timeout_provides_a_business_deadline_before_supervision() {
         let tower_config = TowerConfig {
             lsp: LspConfig {
                 servers: BTreeMap::from([(
@@ -1998,10 +2030,18 @@ mod tests {
                 )]),
                 idle_timeout: Some(std::time::Duration::from_secs(45)),
             },
+            extensions: crate::adapters::config::ExtensionConfig {
+                request_timeout_secs: 5,
+                initialize: BTreeMap::from([(
+                    "other".to_owned(),
+                    serde_json::Map::from_iter([("preserved".to_owned(), serde_json::json!(true))]),
+                )]),
+                ..crate::adapters::config::ExtensionConfig::default()
+            },
             ..TowerConfig::default()
         };
 
-        let init_configs = extension_init_configs(&tower_config);
+        let init_configs = extension_init_configs(&tower_config).expect("valid LSP budget");
 
         assert_eq!(
             init_configs.get("lsp"),
@@ -2014,8 +2054,250 @@ mod tests {
                     },
                 },
                 "idle_timeout_secs": 45,
+                "diagnostics_timeout_secs": 4,
             }))
         );
+        assert_eq!(
+            init_configs.get("other"),
+            Some(&serde_json::json!({"preserved": true}))
+        );
+        assert_eq!(
+            tower_config.extensions.request_timeout(),
+            Duration::from_secs(5)
+        );
+        let supervision_timeouts =
+            crate::adapters::extension::discovery::ExtensionRequestTimeouts::with_lint(
+                tower_config.extensions.request_timeout(),
+                tower_config
+                    .lint_request_timeout()
+                    .expect("valid unrelated lint timeout"),
+            );
+        assert_eq!(
+            supervision_timeouts.for_extension("other"),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn non_lsp_configurations_preserve_small_global_deadlines() {
+        for request_timeout_secs in [0, 1] {
+            let workspace = TempDir::new().expect("create empty-LSP workspace");
+            let config_dir = workspace.path().join(".tower");
+            std::fs::create_dir_all(&config_dir).expect("create config directory");
+            std::fs::write(
+                config_dir.join("config.toml"),
+                format!(
+                    "[extensions]\nrequest_timeout_secs = {request_timeout_secs}\n\
+                     [extensions.initialize.other]\npreserved = true\n"
+                ),
+            )
+            .expect("write empty-LSP configuration");
+
+            let config = load(workspace.path()).expect("enabled empty LSP must be exempt");
+            let init_configs = extension_init_configs(&config).expect("empty LSP is exempt");
+            assert_eq!(
+                config.extensions.request_timeout(),
+                Duration::from_secs(request_timeout_secs)
+            );
+            assert_eq!(
+                init_configs.get("lsp"),
+                Some(&serde_json::json!({
+                    "servers": {},
+                    "idle_timeout_secs": null,
+                    "diagnostics_timeout_secs": 1,
+                }))
+            );
+            assert_eq!(
+                init_configs.get("other"),
+                Some(&serde_json::json!({"preserved": true}))
+            );
+
+            let disabled_workspace = TempDir::new().expect("create disabled-LSP workspace");
+            let disabled_config_dir = disabled_workspace.path().join(".tower");
+            std::fs::create_dir_all(&disabled_config_dir).expect("create config directory");
+            std::fs::write(
+                disabled_config_dir.join("config.toml"),
+                format!(
+                    "[extensions]\nrequest_timeout_secs = {request_timeout_secs}\ndisabled = [\"lsp\"]\n\
+                     [extensions.initialize.other]\npreserved = true\n\
+                     [lsp.rust]\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\n"
+                ),
+            )
+            .expect("write disabled-LSP configuration");
+
+            let disabled_config =
+                load(disabled_workspace.path()).expect("disabled LSP must be exempt");
+            let disabled_init_configs =
+                extension_init_configs(&disabled_config).expect("disabled LSP is exempt");
+            assert_eq!(
+                disabled_config.extensions.request_timeout(),
+                Duration::from_secs(request_timeout_secs)
+            );
+            assert!(
+                !disabled_init_configs.contains_key("lsp"),
+                "disabled LSP must not receive generated initialization configuration"
+            );
+            assert_eq!(
+                disabled_init_configs.get("other"),
+                Some(&serde_json::json!({"preserved": true}))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_lsp_request_timeout_prevents_extension_spawn() {
+        for request_timeout_secs in [0, 1] {
+            let workspace = TempDir::new().expect("create workspace");
+            let extensions = workspace.path().join("extensions");
+            let marker = workspace
+                .path()
+                .join(format!("spawned-{request_timeout_secs}"));
+            let private_marker = workspace
+                .path()
+                .join(format!("spawned-{request_timeout_secs}.private"));
+            let script = workspace
+                .path()
+                .join(format!("marker-{request_timeout_secs}.sh"));
+            std::fs::write(
+                &script,
+                format!(
+                    "printf spawned > '{}'\nmv '{}' '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"type\":\"Initialized\",\"data\":{{\"tools\":[],\"events\":[],\"capabilities\":[]}}}}}}'\n",
+                    private_marker.display(),
+                    private_marker.display(),
+                    marker.display(),
+                ),
+            )
+            .expect("write eager marker sidecar");
+            write_extension_manifest(
+                &extensions,
+                "lsp",
+                &format!(
+                    "name = \"lsp\"\nversion = \"0.1.0\"\ncommand = [\"/bin/sh\", \"{}\"]\nactivation = \"eager\"\n",
+                    script.display()
+                ),
+            );
+            let config = TowerConfig {
+                lsp: LspConfig {
+                    servers: BTreeMap::from([(
+                        "rust".to_owned(),
+                        LspServerConfig {
+                            command: "rust-analyzer".to_owned(),
+                            extensions: vec!["rs".to_owned()],
+                            args: vec![],
+                        },
+                    )]),
+                    idle_timeout: None,
+                },
+                extensions: crate::adapters::config::ExtensionConfig {
+                    request_timeout_secs,
+                    ..crate::adapters::config::ExtensionConfig::default()
+                },
+                ..TowerConfig::default()
+            };
+            let opts = GlobalOpts {
+                workspace_dir: Some(workspace.path().to_path_buf()),
+                extensions_dir: Some(extensions),
+            };
+
+            let error = match build_engine(&opts, config) {
+                Ok(_) => panic!("invalid LSP budget {request_timeout_secs} must fail assembly"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("invalid LSP diagnostics deadline")
+                    && error.contains(&request_timeout_secs.to_string())
+                    && error.contains("1-second supervision margin"),
+                "unexpected error: {error}"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < deadline {
+                assert!(
+                    !marker.exists(),
+                    "invalid configuration spawned the sidecar"
+                );
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_business_timeout_returns_before_host_supervision_without_quarantine() {
+        let workspace = TempDir::new().expect("create workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let extensions = workspace.path().join("extensions");
+        let extension_dir = extensions.join("lsp");
+        std::fs::create_dir_all(&extension_dir).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let lsp_extension = root.join("target/debug/lsp_extension");
+        let log = workspace.path().join("fake_lsp.log");
+        let pids = workspace.path().join("fake_lsp.pids");
+        std::fs::write(
+            extension_dir.join("extension.toml"),
+            format!(
+                "name = \"lsp\"\nversion = \"0.1.0\"\ncommand = [{}]\nactivation = \"eager\"\n\n[events]\nsubscribe = [\"event/fileChanged\", \"event/fileDeleted\"]\n\n[capabilities]\nrequired = [\"read_file\", \"notify\", \"log\", \"request_apply_edits\"]\n\n[[tools]]\nname = \"diagnostics\"\ndescription = \"diagnostics\"\nschema_json = '{{\"type\":\"object\"}}'\n",
+                serde_json::to_string(&lsp_extension).unwrap(),
+            ),
+        )
+        .unwrap();
+        let config = TowerConfig {
+            lsp: LspConfig {
+                servers: BTreeMap::from([(
+                    "rust".to_owned(),
+                    LspServerConfig {
+                        command: fixture_lsp_server::binary_path()
+                            .to_string_lossy()
+                            .into_owned(),
+                        extensions: vec!["rs".to_owned()],
+                        args: vec![
+                            "diagnostics_timeout".to_owned(),
+                            log.to_string_lossy().into_owned(),
+                            pids.to_string_lossy().into_owned(),
+                        ],
+                    },
+                )]),
+                idle_timeout: None,
+            },
+            extensions: crate::adapters::config::ExtensionConfig {
+                request_timeout_secs: 3,
+                ..crate::adapters::config::ExtensionConfig::default()
+            },
+            ..TowerConfig::default()
+        };
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: Some(extensions),
+        };
+        let engine = build_engine(&opts, config).expect("assemble real LSP sidecar");
+
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let error = engine
+                .ext_registry
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .invoke("diagnostics", serde_json::json!({"path": "src/lib.rs"}))
+                .expect_err("fixture must report a diagnostics timeout");
+            let InvokeError::Application(application) = error else {
+                panic!("diagnostics timeout must be an application error, not a transport fault");
+            };
+            let outcome: extension_protocol::LspOutcome = serde_json::from_value(
+                application
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("outcome"))
+                    .cloned()
+                    .expect("application error must include an LSP outcome payload"),
+            )
+            .expect("application error outcome must match the LSP protocol schema");
+            assert_eq!(
+                outcome.code,
+                extension_protocol::LspOutcomeCode::ServerTimeout
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
     }
 
     #[test]

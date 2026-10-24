@@ -1,5 +1,4 @@
-//! Spec 27 — LSP extension **process-level** e2e tests.
-// Feature: B001
+//! LSP extension **process-level** e2e tests.
 //!
 //! These tests spawn the actual `lsp_extension` binary via stdio and drive it
 //! through the JSON-RPC protocol. They do NOT require a real language server.
@@ -460,7 +459,7 @@ fn safe_delete_session_facades_preserve_resident_session_lifecycle() {
         );
         assert_no_mutation_host_calls(&host_calls);
     }
-    let pids = fs::read_to_string(workspace.path().join("fake_lsp.pids")).unwrap();
+    let pids = fs::read_to_string(workspace.path().join(".tower/fake_lsp.pids")).unwrap();
     assert_eq!(pids.lines().count(), 1, "resident session must be reused");
 }
 
@@ -697,7 +696,8 @@ fn safe_delete_rejects_stale_declarations_before_backend_lookup() {
     assert_eq!(data["plan"]["references"], serde_json::json!([]));
     assert_eq!(data["plan"]["cleanup_edits"], serde_json::json!([]));
     assert_no_mutation_host_calls(&host_calls);
-    let backend_log = fs::read_to_string(workspace.path().join("fake_lsp.log")).unwrap_or_default();
+    let backend_log =
+        fs::read_to_string(workspace.path().join(".tower/fake_lsp.log")).unwrap_or_default();
     assert!(
         !backend_log.contains("textDocument/references"),
         "a stale declaration must stop before reference lookup: {backend_log}"
@@ -781,7 +781,7 @@ fn safe_delete_rejects_invalid_declaration_positions_before_backend_lookup() {
         assert_eq!(safe_delete_data(&response)["status"], "invalid_location");
         assert_no_mutation_host_calls(&host_calls);
         let backend_log =
-            fs::read_to_string(workspace.path().join("fake_lsp.log")).unwrap_or_default();
+            fs::read_to_string(workspace.path().join(".tower/fake_lsp.log")).unwrap_or_default();
         assert!(
             !backend_log.contains("textDocument/references"),
             "invalid declaration position must stop before lookup: {backend_log}"
@@ -1003,7 +1003,12 @@ impl RawLspChild {
         let initialize_config = workspace
             .and_then(|root| fs::read_to_string(root.join(".tower/config.toml")).ok())
             .and_then(|source| core_engine::adapters::config::lsp::parse_lsp_config(&source).ok())
-            .map(|config| core_engine::adapters::config::lsp::lsp_initialize_payload(&config))
+            .map(|config| {
+                let mut payload =
+                    core_engine::adapters::config::lsp::lsp_initialize_payload(&config);
+                payload["diagnostics_timeout_secs"] = serde_json::json!(2);
+                payload
+            })
             .unwrap_or_else(empty_lsp_initialize_payload);
         let mut command = Command::new(lsp_extension_bin());
         command.stdin(Stdio::piped());
@@ -1066,7 +1071,11 @@ impl RawLspChild {
 }
 
 fn empty_lsp_initialize_payload() -> serde_json::Value {
-    serde_json::json!({"servers": {}, "idle_timeout_secs": null})
+    serde_json::json!({
+        "servers": {},
+        "idle_timeout_secs": null,
+        "diagnostics_timeout_secs": 2,
+    })
 }
 
 fn fake_lsp_workspace(mode: &str) -> tempfile::TempDir {
@@ -1085,8 +1094,8 @@ extensions = ["rs"]
 "#,
         command = serde_json::to_string(&fixture_lsp_server::binary_path()).unwrap(),
         mode = serde_json::to_string(mode).unwrap(),
-        log = serde_json::to_string(&workspace.path().join("fake_lsp.log")).unwrap(),
-        pids = serde_json::to_string(&workspace.path().join("fake_lsp.pids")).unwrap(),
+        log = serde_json::to_string(&workspace.path().join(".tower/fake_lsp.log")).unwrap(),
+        pids = serde_json::to_string(&workspace.path().join(".tower/fake_lsp.pids")).unwrap(),
     );
     fs::write(workspace.path().join(".tower/config.toml"), config).expect("write lsp config");
 
@@ -1129,24 +1138,48 @@ fn invoke_configured_read_tool(
     name: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
+    invoke_configured_read_tool_with_content(child, id, name, params, "fn old_name() {}\n")
+}
+
+fn invoke_configured_read_tool_with_content(
+    child: &mut RawLspChild,
+    id: u64,
+    name: &str,
+    params: serde_json::Value,
+    content: &str,
+) -> serde_json::Value {
     child.write_frame(serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "invokeTool",
         "params": {"name": name, "params": params},
     }));
-    let read_file = child.read_frame();
-    assert_eq!(
-        read_file["method"], "workspace/readFile",
-        "configured {name} must read the requested file; got {read_file}"
-    );
+    let read_file = loop {
+        let frame = child.read_frame_bounded();
+        match frame["method"].as_str() {
+            Some("workspace/readFile") => break frame,
+            Some("notify/resourceUpdated") => {
+                child.write_frame(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": frame["id"].clone(),
+                    "result": null,
+                }));
+            }
+            Some(method) => panic!(
+                "configured {name} emitted unexpected HostCall before workspace/readFile: {method}; frame: {frame}"
+            ),
+            None => {
+                panic!("configured {name} returned a response before workspace/readFile: {frame}")
+            }
+        }
+    };
     child.write_frame(serde_json::json!({
         "jsonrpc": "2.0",
         "id": read_file["id"].clone(),
-        "result": "fn old_name() {}\n",
+        "result": content,
     }));
     loop {
-        let frame = child.read_frame();
+        let frame = child.read_frame_bounded();
         if frame["method"] == "notify/resourceUpdated" {
             child.write_frame(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1155,8 +1188,573 @@ fn invoke_configured_read_tool(
             }));
             continue;
         }
+        assert_eq!(
+            frame["id"], id,
+            "configured {name} must return the invokeTool response; got {frame}"
+        );
         return frame;
     }
+}
+
+#[test]
+fn diagnostics_follow_the_servers_advertised_push_or_pull_capability() {
+    let diagnostic = serde_json::json!({
+        "line": 0,
+        "character": 0,
+        "endLine": 0,
+        "endCharacter": 1,
+        "severity": "error",
+        "code": "fixture-syntax",
+        "source": "fixture-lsp",
+        "message": "fixture syntax error",
+    });
+    let cases = [
+        ("diagnostics_push_empty", Some(serde_json::json!([])), None),
+        (
+            "diagnostics_push_nonempty",
+            Some(serde_json::json!([diagnostic.clone()])),
+            None,
+        ),
+        ("diagnostics_push_absent", None, Some("server_timeout")),
+        (
+            "diagnostics_pull_full",
+            Some(serde_json::json!([diagnostic.clone()])),
+            None,
+        ),
+        ("diagnostics_pull_timeout", None, Some("server_timeout")),
+        (
+            "diagnostics_pull_unchanged",
+            None,
+            Some("server_malformed_response"),
+        ),
+    ];
+
+    for (offset, (mode, expected_diagnostics, expected_error)) in cases.into_iter().enumerate() {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let id = 440 + offset as u64;
+        let response = invoke_configured_read_tool(
+            &mut child,
+            id,
+            "diagnostics",
+            read_tool_params("diagnostics", "src/lib.rs"),
+        );
+
+        if let Some(diagnostics) = expected_diagnostics {
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "type": "ToolResult",
+                        "data": {"supported": true, "diagnostics": diagnostics},
+                    },
+                }),
+                "{mode} must return the fixture diagnostics through invokeTool"
+            );
+        } else {
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": "language server request failed",
+                        "data": {"outcome": {
+                            "status": "error",
+                            "code": expected_error.expect("failure case must name its outcome"),
+                            "language": "rust",
+                            "command": fixture_lsp_server::binary_path().to_str(),
+                            "operation": "diagnostics",
+                            "path": "src/lib.rs",
+                            "phase": "runtime",
+                            "message": "language server request failed",
+                        }}
+                    }
+                }),
+                "{mode} must preserve the typed diagnostics failure"
+            );
+        }
+
+        let trace = read_trace(&workspace);
+        assert_eq!(trace[0]["event"], "initialized", "{mode}: {trace:?}");
+        assert!(trace[0]["pid"].is_u64(), "{mode}: {trace:?}");
+        let synchronized = trace
+            .iter()
+            .position(|entry| entry["event"] == "didOpen")
+            .expect("diagnostics fixture must trace document synchronization");
+        assert!(
+            trace.iter().skip(1).all(|entry| {
+                entry["pid"].is_u64()
+                    && entry["uri"]
+                        .as_str()
+                        .is_some_and(|uri| uri.ends_with("/src/lib.rs"))
+            }),
+            "every diagnostics operation trace must identify its fixture process and URI: {trace:?}"
+        );
+        let pull = trace
+            .iter()
+            .position(|entry| entry["event"] == "textDocument/diagnostic");
+        if mode.starts_with("diagnostics_pull_") {
+            assert!(
+                pull.is_some_and(|index| index > synchronized),
+                "{mode}: {trace:?}"
+            );
+        } else {
+            assert_eq!(
+                pull, None,
+                "push capability must not trigger a pull: {trace:?}"
+            );
+        }
+        if matches!(mode, "diagnostics_push_empty" | "diagnostics_push_nonempty") {
+            let published = trace
+                .iter()
+                .position(|entry| entry["event"] == "published")
+                .expect("fixed push fixture must trace its publication");
+            assert!(published > synchronized, "{mode}: {trace:?}");
+        }
+        if mode == "diagnostics_push_absent" {
+            assert!(
+                trace.iter().all(|entry| entry["event"] != "published"),
+                "absent push fixture must not publish: {trace:?}"
+            );
+        }
+        if mode == "diagnostics_pull_full" {
+            let published = trace
+                .iter()
+                .position(|entry| entry["event"] == "published")
+                .expect("full pull fixture must trace its decoy publication");
+            let responded = trace
+                .iter()
+                .position(|entry| entry["event"] == "diagnosticResponse")
+                .expect("full pull fixture must trace its correlated response");
+            assert!(
+                trace[pull.unwrap()]["requestId"].is_u64(),
+                "full pull request trace must include its JSON-RPC id: {trace:?}"
+            );
+            assert_eq!(
+                trace[pull.unwrap()]["requestId"],
+                trace[responded]["requestId"],
+                "full pull response must identify the request it completes: {trace:?}"
+            );
+            assert!(
+                published < pull.unwrap() && pull.unwrap() < responded,
+                "{trace:?}"
+            );
+        }
+    }
+
+    let workspace = fake_lsp_workspace("diagnostics_by_content");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let invalid = invoke_configured_read_tool_with_content(
+        &mut child,
+        450,
+        "diagnostics",
+        read_tool_params("diagnostics", "src/lib.rs"),
+        "fn fixture_invalid() {}\n",
+    );
+    assert_eq!(
+        invalid["result"]["data"]["diagnostics"],
+        serde_json::json!([diagnostic])
+    );
+    let valid = invoke_configured_read_tool_with_content(
+        &mut child,
+        451,
+        "diagnostics",
+        read_tool_params("diagnostics", "src/lib.rs"),
+        "fn valid() {}\n",
+    );
+    assert_eq!(
+        valid["result"]["data"]["diagnostics"],
+        serde_json::json!([])
+    );
+    let trace = read_trace(&workspace);
+    let target_uri = format!("file://{}", workspace.path().join("src/lib.rs").display());
+    let did_open = trace
+        .iter()
+        .position(|entry| entry["event"] == "didOpen" && entry["uri"] == target_uri)
+        .expect("content-driven diagnostics must trace didOpen for the exact target URI");
+    let did_open_entry = &trace[did_open];
+    let fixture_pid = did_open_entry["pid"]
+        .as_u64()
+        .expect("content-driven didOpen must identify its fixture process");
+    assert_eq!(did_open_entry["uri"], target_uri);
+    let first_published = trace
+        .iter()
+        .enumerate()
+        .skip(did_open + 1)
+        .find(|(_, entry)| entry["event"] == "published" && entry["uri"] == target_uri)
+        .expect("content-driven diagnostics must publish after didOpen");
+    assert_eq!(first_published.1["pid"], fixture_pid);
+    assert_eq!(first_published.1["uri"], target_uri);
+
+    let did_change = trace
+        .iter()
+        .enumerate()
+        .skip(first_published.0 + 1)
+        .find(|(_, entry)| entry["event"] == "didChange" && entry["uri"] == target_uri)
+        .expect("content-driven diagnostics must trace didChange for the exact target URI");
+    assert_eq!(did_change.1["pid"], fixture_pid);
+    assert_eq!(did_change.1["uri"], target_uri);
+    let changed_published = trace
+        .iter()
+        .enumerate()
+        .skip(did_change.0 + 1)
+        .find(|(_, entry)| entry["event"] == "published" && entry["uri"] == target_uri)
+        .expect("content-driven diagnostics must publish after didChange");
+    assert_eq!(changed_published.1["pid"], fixture_pid);
+    assert_eq!(changed_published.1["uri"], target_uri);
+
+    let timeout = invoke_configured_read_tool_with_content(
+        &mut child,
+        452,
+        "diagnostics",
+        read_tool_params("diagnostics", "src/timeout.rs"),
+        "fn fixture_invalid() {}\n",
+    );
+    assert_eq!(
+        timeout["error"]["data"]["outcome"]["code"],
+        "server_timeout"
+    );
+    assert_eq!(
+        timeout["error"]["data"]["outcome"]["path"],
+        "src/timeout.rs"
+    );
+    let trace = read_trace(&workspace);
+    let timeout_uri = trace
+        .iter()
+        .find(|entry| {
+            entry["event"] == "didOpen"
+                && entry["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with("/src/timeout.rs"))
+        })
+        .and_then(|entry| entry["uri"].as_str())
+        .expect("timeout path synchronization must be traced");
+    assert!(trace.iter().all(|entry| {
+        entry["event"] != "published" || entry["uri"].as_str() != Some(timeout_uri)
+    }));
+}
+
+#[test]
+fn push_diagnostics_return_explicit_empty_and_nonempty_results() {
+    let cases = [
+        ("diagnostics_push_empty", serde_json::json!([])),
+        (
+            "diagnostics_push_nonempty",
+            serde_json::json!([{
+                "line": 0,
+                "character": 0,
+                "endLine": 0,
+                "endCharacter": 1,
+                "severity": "error",
+                "code": "fixture-syntax",
+                "source": "fixture-lsp",
+                "message": "fixture syntax error",
+            }]),
+        ),
+    ];
+
+    for (offset, (mode, diagnostics)) in cases.into_iter().enumerate() {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        initialize_raw_lsp_child_bounded(&mut child);
+        let id = 460 + offset as u64;
+
+        let response = invoke_configured_read_tool(
+            &mut child,
+            id,
+            "diagnostics",
+            serde_json::json!({"path": "src/lib.rs"}),
+        );
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "type": "ToolResult",
+                    "data": {"supported": true, "diagnostics": diagnostics},
+                },
+            })
+        );
+        let trace = read_trace(&workspace);
+        assert!(trace.iter().any(|entry| entry["event"] == "published"));
+        assert!(
+            trace
+                .iter()
+                .all(|entry| entry["event"] != "textDocument/diagnostic")
+        );
+    }
+}
+
+#[test]
+fn diagnostics_send_did_open_then_did_change_with_current_content() {
+    let workspace = fake_lsp_workspace("diagnostics_by_content");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+    let cases = [
+        (470, "fn valid() {}\n", serde_json::json!([])),
+        (
+            471,
+            "fn fixture_invalid() {}\n",
+            serde_json::json!([{
+                "line": 0,
+                "character": 0,
+                "endLine": 0,
+                "endCharacter": 1,
+                "severity": "error",
+                "code": "fixture-syntax",
+                "source": "fixture-lsp",
+                "message": "fixture syntax error",
+            }]),
+        ),
+        (472, "fn valid_again() {}\n", serde_json::json!([])),
+    ];
+
+    for (id, content, expected) in cases {
+        let trace_path = workspace.path().join(".tower/fake_lsp.log.trace");
+        let trace_before_len = if trace_path.exists() {
+            read_trace(&workspace).len()
+        } else {
+            0
+        };
+        let response = invoke_configured_read_tool_with_content(
+            &mut child,
+            id,
+            "diagnostics",
+            serde_json::json!({"path": "src/lib.rs"}),
+            content,
+        );
+        assert_eq!(response["result"]["data"]["diagnostics"], expected);
+
+        let trace = read_trace(&workspace);
+        let new_entries = &trace[trace_before_len..];
+        let sync = new_entries
+            .iter()
+            .position(|entry| {
+                entry["event"] == if id == 470 { "didOpen" } else { "didChange" }
+                    && entry["text"] == content
+            })
+            .expect("each invocation must synchronize its current content");
+        let publication = new_entries
+            .iter()
+            .position(|entry| entry["event"] == "published")
+            .expect("each invocation must observe a fresh publication");
+        assert!(
+            sync < publication,
+            "publication must follow synchronization"
+        );
+    }
+
+    let trace = read_trace(&workspace);
+    let fixture_pids: std::collections::BTreeSet<_> = trace
+        .iter()
+        .filter_map(|entry| entry["pid"].as_u64())
+        .collect();
+    assert_eq!(
+        fixture_pids.len(),
+        1,
+        "all updates must use one LSP session"
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|entry| entry["event"] == "initialized")
+            .count(),
+        1
+    );
+}
+
+fn expected_diagnostics_error(id: u64, outcome_code: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": "language server request failed",
+            "data": {"outcome": {
+                "status": "error",
+                "code": outcome_code,
+                "language": "rust",
+                "command": fixture_lsp_server::binary_path().to_str(),
+                "operation": "diagnostics",
+                "path": "src/lib.rs",
+                "phase": "runtime",
+                "message": "language server request failed",
+            }}
+        }
+    })
+}
+
+#[test]
+fn absent_diagnostics_publication_returns_a_structured_timeout() {
+    let workspace = fake_lsp_workspace("diagnostics_push_absent");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let response = invoke_configured_read_tool(
+        &mut child,
+        480,
+        "diagnostics",
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+
+    assert_eq!(response, expected_diagnostics_error(480, "server_timeout"));
+    let trace = read_trace(&workspace);
+    assert!(trace.iter().any(|entry| entry["event"] == "didOpen"));
+    assert!(trace.iter().all(|entry| entry["event"] != "published"));
+}
+
+#[test]
+fn pull_diagnostics_timeout_returns_the_complete_structured_error() {
+    let workspace = fake_lsp_workspace("diagnostics_pull_timeout");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let response = invoke_configured_read_tool(
+        &mut child,
+        481,
+        "diagnostics",
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+
+    assert_eq!(response, expected_diagnostics_error(481, "server_timeout"));
+    let trace = read_trace(&workspace);
+    let synchronized = trace
+        .iter()
+        .position(|entry| entry["event"] == "didOpen")
+        .expect("pull diagnostics must synchronize first");
+    let requested = trace
+        .iter()
+        .position(|entry| entry["event"] == "textDocument/diagnostic")
+        .expect("pull diagnostics must send a request");
+    assert!(synchronized < requested);
+    assert!(
+        trace
+            .iter()
+            .all(|entry| entry["event"] != "diagnosticResponse")
+    );
+}
+
+#[test]
+fn diagnostics_reject_ungrounded_pull_unchanged_with_complete_malformed_response_error() {
+    let workspace = fake_lsp_workspace("diagnostics_pull_unchanged");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let response = invoke_configured_read_tool(
+        &mut child,
+        482,
+        "diagnostics",
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+
+    assert_eq!(
+        response,
+        expected_diagnostics_error(482, "server_malformed_response")
+    );
+    let trace = read_trace(&workspace);
+    let requested = trace
+        .iter()
+        .position(|entry| entry["event"] == "textDocument/diagnostic")
+        .expect("pull diagnostics must send a request");
+    let responded = trace
+        .iter()
+        .position(|entry| entry["event"] == "diagnosticResponse")
+        .expect("fixture must return its ungrounded unchanged report");
+    assert!(
+        trace[requested]["requestId"].is_u64(),
+        "unchanged pull request trace must include its JSON-RPC id: {trace:?}"
+    );
+    assert_eq!(
+        trace[requested]["requestId"], trace[responded]["requestId"],
+        "unchanged pull response must identify the request it completes: {trace:?}"
+    );
+    assert!(requested < responded);
+}
+
+#[test]
+fn diagnostics_business_timeout_keeps_the_sidecar_usable() {
+    let workspace = fake_lsp_workspace("diagnostics_pull_timeout");
+    let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+    let sidecar_pid = child.child.id();
+    initialize_raw_lsp_child_bounded(&mut child);
+
+    let timeout = invoke_configured_read_tool(
+        &mut child,
+        483,
+        "diagnostics",
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+    assert_eq!(
+        timeout,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 483,
+            "error": {
+                "code": -32000,
+                "message": "language server request failed",
+                "data": {"outcome": {
+                    "status": "error",
+                    "code": "server_timeout",
+                    "language": "rust",
+                    "command": fixture_lsp_server::binary_path().to_str(),
+                    "operation": "diagnostics",
+                    "path": "src/lib.rs",
+                    "phase": "runtime",
+                    "message": "language server request failed",
+                }}
+            }
+        })
+    );
+    let before_recovery = read_trace(&workspace);
+    let fixture_pid = before_recovery[0]["pid"]
+        .as_u64()
+        .expect("initialized trace must identify the fixture process");
+
+    let recovery = invoke_configured_read_tool(
+        &mut child,
+        484,
+        "hover",
+        serde_json::json!({"path": "src/lib.rs", "line": 0, "character": 3}),
+    );
+
+    assert_eq!(child.child.id(), sidecar_pid);
+    assert_eq!(
+        recovery,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 484,
+            "result": {
+                "type": "ToolResult",
+                "data": {
+                    "supported": true,
+                    "hover": {"contents": "fn old_name()"},
+                },
+            },
+        }),
+        "the same sidecar must return the supported hover payload after its diagnostics timeout"
+    );
+    let after_recovery = read_trace(&workspace);
+    assert_eq!(after_recovery[0]["pid"], fixture_pid);
+    assert!(
+        after_recovery
+            .iter()
+            .all(|entry| entry["pid"].as_u64() == Some(fixture_pid))
+    );
+    assert_eq!(
+        after_recovery
+            .iter()
+            .filter(|entry| entry["event"] == "initialized")
+            .count(),
+        1
+    );
 }
 
 fn read_tool_params(name: &str, path: &str) -> serde_json::Value {
@@ -1214,7 +1812,7 @@ fn invoke_type_hierarchy(
 }
 
 fn read_trace(workspace: &tempfile::TempDir) -> Vec<serde_json::Value> {
-    fs::read_to_string(workspace.path().join("fake_lsp.log.trace"))
+    fs::read_to_string(workspace.path().join(".tower/fake_lsp.log.trace"))
         .expect("read exact fake LSP trace")
         .lines()
         .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
@@ -1508,7 +2106,7 @@ fn f008_bare_read_checks_absent_false_and_method_not_found_semantic_providers_fo
                 "{name} must report {mode} as capability_unavailable"
             );
             if mode != "method_not_found" {
-                let log = fs::read_to_string(workspace.path().join("fake_lsp.log"))
+                let log = fs::read_to_string(workspace.path().join(".tower/fake_lsp.log"))
                     .expect("read fake LSP method log");
                 let semantic_method = [
                     ("definition", "textDocument/definition"),
@@ -1632,7 +2230,7 @@ fn expected_lsp_outcome(code: &str, command: Option<&str>, operation: &str) -> s
 
 #[cfg(target_os = "linux")]
 fn assert_fixture_servers_stopped(workspace: &std::path::Path) {
-    let pids = fs::read_to_string(workspace.join("fake_lsp.pids"))
+    let pids = fs::read_to_string(workspace.join(".tower/fake_lsp.pids"))
         .expect("fixture server must record its pid");
     for pid in pids.lines() {
         let proc_entry = std::path::Path::new("/proc").join(pid);
@@ -2066,6 +2664,64 @@ impl Drop for RawLspChild {
 // ── AC1/U1: spawn and initialize ─────────────────────────────────────────────
 
 #[test]
+fn lsp_process_initialization_requires_an_explicit_diagnostics_deadline() {
+    let mut child = RawLspChild::spawn();
+
+    for (id, extension_config) in [
+        (
+            31,
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null}),
+        ),
+        (
+            32,
+            serde_json::json!({
+                "servers": {},
+                "idle_timeout_secs": null,
+                "diagnostics_timeout_secs": 0,
+            }),
+        ),
+    ] {
+        child.write_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocol_version": extension_protocol::PROTOCOL_VERSION,
+                "client_info": "lsp-e2e/0.1.0",
+                "extension_config": extension_config,
+            },
+        }));
+        assert_eq!(
+            child.read_frame(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32602,
+                    "message": "invalid LSP initialization configuration",
+                    "data": {
+                        "kind": "invalid_lsp_initialize_config",
+                        "reason": "invalid_configuration",
+                    },
+                },
+            })
+        );
+    }
+
+    child.write_frame(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 33,
+        "method": "initialize",
+        "params": {
+            "protocol_version": extension_protocol::PROTOCOL_VERSION,
+            "client_info": "lsp-e2e/0.1.0",
+            "extension_config": empty_lsp_initialize_payload(),
+        },
+    }));
+    assert_eq!(child.read_frame()["result"]["type"], "Initialized");
+}
+
+#[test]
 fn f008_initialize_uses_exact_errors_without_fallback_or_partial_initialization() {
     let mut child = RawLspChild::spawn();
 
@@ -2116,7 +2772,7 @@ fn f008_initialize_uses_exact_errors_without_fallback_or_partial_initialization(
         "params": {
             "protocol_version": extension_protocol::PROTOCOL_VERSION,
             "client_info": "lsp-e2e/0.1.0",
-            "extension_config": {"servers": {}, "idle_timeout_secs": null},
+            "extension_config": empty_lsp_initialize_payload(),
         },
     }));
     let initialized = child.read_frame();
@@ -2135,7 +2791,7 @@ fn f008_initialize_decodes_host_config_before_pool_creation_and_ignores_disk_con
         "params": {
             "protocol_version": extension_protocol::PROTOCOL_VERSION,
             "client_info": "lsp-e2e/0.1.0",
-            "extension_config": {"servers": {}, "idle_timeout_secs": null},
+            "extension_config": empty_lsp_initialize_payload(),
         },
     }));
     assert_eq!(child.read_frame()["result"]["type"], "Initialized");
@@ -2169,6 +2825,7 @@ fn f008_initialize_process_fixture_accepts_explicit_empty_and_valid_payloads_wit
                     },
                 },
                 "idle_timeout_secs": null,
+                "diagnostics_timeout_secs": 2,
             }),
         ),
     ] {
@@ -2211,6 +2868,7 @@ fn f008_initialize_is_ready_for_the_next_request() {
                     },
                 },
                 "idle_timeout_secs": null,
+                "diagnostics_timeout_secs": 2,
             },
         },
     }));
@@ -2746,7 +3404,7 @@ fn type_hierarchy_invalid_and_backend_failures_use_public_error_envelopes() {
     );
     assert!(malformed.get("result").is_none());
     assert!(malformed["error"].get("data").is_none());
-    assert!(!workspace.path().join("fake_lsp.log").exists());
+    assert!(!workspace.path().join(".tower/fake_lsp.log").exists());
 
     let (failure, logs) =
         invoke_type_hierarchy(&mut child, 641, "subtypes", "PRIVATE_SOURCE_BYTES");
@@ -3648,7 +4306,7 @@ fn configured_lazy_lsp_session_synchronizes_document_before_first_query() {
         "fn first_query_document() {}\n",
     )
     .expect("commit document before the first semantic query");
-    let backend_log = workspace.path().join("fake_lsp.log");
+    let backend_log = workspace.path().join(".tower/fake_lsp.log");
     let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
     initialize_raw_lsp_child_bounded(&mut child);
 
@@ -4185,7 +4843,8 @@ fn safe_delete_rejects_invalid_deletion_span_boundaries_before_backend_lookup() 
             "{response}"
         );
         assert_no_mutation_host_calls(&host_calls);
-        let log = fs::read_to_string(workspace.path().join("fake_lsp.log")).unwrap_or_default();
+        let log =
+            fs::read_to_string(workspace.path().join(".tower/fake_lsp.log")).unwrap_or_default();
         assert!(
             !log.contains("textDocument/references"),
             "invalid span reached backend: {log}"
