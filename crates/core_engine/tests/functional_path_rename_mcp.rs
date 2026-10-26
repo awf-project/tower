@@ -150,12 +150,15 @@ extensions = ["rs"]
                     "semantic_policy": policy,
                     "expected_versions": {}
                 }),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("tower_rename_path must return a structured result")
     }
 
     fn call(&mut self, name: &str, args: Value) -> Value {
-        self.registry.call(name, args).expect("public tool call")
+        self.registry
+            .call(name, args, &core_engine::domain::NeverCancelled)
+            .expect("public tool call")
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -174,6 +177,7 @@ extensions = ["rs"]
                     .call(
                         "tower_read_file",
                         json!({"path": path, "with_version": true}),
+                        &core_engine::domain::NeverCancelled,
                     )
                     .ok()
             })
@@ -574,7 +578,7 @@ fn concurrent_spawn_and_request_handles_queued_frames_twenty_times_with_fresh_na
                         "client_info": "path-rename-queue-test/0.1.0",
                         "extension_config": lsp_initialize_payload_with_diagnostics_timeout(
                             &config,
-                            Duration::from_secs(29),
+                            Some(Duration::from_secs(29)),
                         )
                     }
                 }));
@@ -756,7 +760,11 @@ fn native_rename_records_real_disk_100k_path_p95() {
         Arc::clone(&handle.rename_coordinator),
     );
     let indexed = registry
-        .call("tower_list_dir", json!({"path": "", "recursive": true}))
+        .call(
+            "tower_list_dir",
+            json!({"path": "", "recursive": true}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("list indexed benchmark paths");
     let indexed_file_count = indexed["entries"]
         .as_array()
@@ -778,6 +786,7 @@ fn native_rename_records_real_disk_100k_path_p95() {
                     "semantic_policy": "none",
                     "expected_versions": {}
                 }),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("warm-up public native rename dispatch");
         assert_applied(&result);
@@ -797,6 +806,7 @@ fn native_rename_records_real_disk_100k_path_p95() {
                     "semantic_policy": "none",
                     "expected_versions": {}
                 }),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("measured public native rename dispatch");
         let elapsed_micros = u64::try_from(started.elapsed().as_micros())

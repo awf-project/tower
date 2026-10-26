@@ -222,9 +222,9 @@ end-to-end via `ast_e2e.rs`.
 ### Fault isolation tests
 
 Extension fault isolation is exercised through the sidecar adapter and supervisor
-(`adapters/extension/`): a child that crashes, hangs past the per-call timeout, or
+(`adapters/extension/`): a child that crashes, exceeds a configured per-call timeout, or
 violates the protocol yields the corresponding `ExtensionFault`
-(`Crashed` / `Timeout` / `ProtocolError`), and repeated faults drive the
+(`Crashed` / `Timeout` / `ProtocolError`). Repeated crash and protocol faults drive the
 `ExtensionRegistry` quarantine policy (`MAX_CONSECUTIVE_FAILURES = 3`). The
 test-only fault fixtures live under `extensions/fixtures/`.
 
@@ -245,9 +245,9 @@ These hold at every commit:
 - **Zero lock contention**: `EngineState` is behind `Arc<RwLock<EngineState>>`;
   critical sections are short and contain no blocking I/O. The fs watcher
   (writer) must not starve MCP handlers (readers).
-- **Extension fault isolation**: a child crash, hang (per-call timeout), or
+- **Extension fault isolation**: a child crash, configured timeout, or
   protocol violation must not crash the host process or sever the MCP link.
-  Enforced by the OS process boundary plus `SidecarHostAdapter` (timeout/kill)
+  Enforced by the OS process boundary plus `SidecarHostAdapter` (configured timeout/kill)
   mapping faults to `ExtensionFault`.
 - **Capability security**: extensions reach the workspace only through declared
   capability callbacks routed to outbound ports; an undeclared `HostCall` is

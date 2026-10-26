@@ -408,6 +408,7 @@ impl ExtensionHostPort for RecordingHost {
         &self,
         tool_name: &str,
         _params: serde_json::Value,
+        _: &dyn crate::domain::CancellationSignal,
     ) -> Result<serde_json::Value, crate::domain::InvokeError> {
         Err(crate::domain::InvokeError::ToolNotFound(
             tool_name.to_owned(),

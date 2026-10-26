@@ -180,6 +180,7 @@ fn reverse_debug_records_replays_and_finds_origin_through_public_tools() {
         .call(
             "tower_debug_record",
             record_request(&replay_token, "watchpoint_stop"),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_record returns a fixture-backed trace");
     assert_eq!(record["recordable"], true, "record payload: {record}");
@@ -193,6 +194,7 @@ fn reverse_debug_records_replays_and_finds_origin_through_public_tools() {
         .call(
             "tower_debug_replay",
             json!({ "trace_id": trace_id, "language": "rust", "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_replay opens the recorded trace");
     assert_eq!(replay["state"], "stopped", "replay payload: {replay}");
@@ -206,6 +208,7 @@ fn reverse_debug_records_replays_and_finds_origin_through_public_tools() {
         .call(
             "tower_debug_reverse_continue",
             json!({ "session_id": session_id, "thread_id": 1, "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_reverse_continue returns a stop");
     assert_eq!(
@@ -214,7 +217,11 @@ fn reverse_debug_records_replays_and_finds_origin_through_public_tools() {
     );
 
     let terminated = registry
-        .call("tower_debug_terminate", json!({ "session_id": session_id }))
+        .call(
+            "tower_debug_terminate",
+            json!({ "session_id": session_id }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("tower_debug_terminate cleans up replay session");
     assert_eq!(terminated["ok"], true, "terminate payload: {terminated}");
     assert_replay_cleanup_once(&replay_token);
@@ -228,6 +235,7 @@ fn reverse_debug_records_replays_and_finds_origin_through_public_tools() {
         .call(
             "tower_debug_record",
             record_request(&origin_token, "watchpoint_stop"),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_record returns a fixture-backed trace");
     assert_eq!(record["recordable"], true, "record payload: {record}");
@@ -249,6 +257,7 @@ fn reverse_debug_records_replays_and_finds_origin_through_public_tools() {
                 "max_depth": 8,
                 "max_children": 8
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_find_origin returns origin evidence");
     assert_eq!(origin["found"], true, "origin payload: {origin}");
@@ -285,6 +294,7 @@ fn reverse_debug_reports_no_prior_write_as_structured_tool_result() {
                     "max_children": 8
                 }
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("expected no-prior-write returns a structured successful payload");
 

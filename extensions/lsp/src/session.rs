@@ -31,6 +31,18 @@ pub struct LspSessionPool {
 }
 
 impl LspSessionPool {
+    #[must_use]
+    pub(crate) fn operation_timeout(&self) -> Option<Duration> {
+        self.inner.operation_timeout()
+    }
+
+    pub(crate) fn diagnostics_for_path(
+        &self,
+        path: &RelativePath,
+    ) -> Vec<core_engine::domain::code_intel::Diagnostic> {
+        self.inner.diagnostics_for_path(path)
+    }
+
     /// Build the pool from the parsed `[lsp.*]` config.
     ///
     /// Pass `push_tx` to enable the push path (spec 27 O1): diagnostics events
@@ -40,7 +52,7 @@ impl LspSessionPool {
         config: LspConfig,
         workspace_root: PathBuf,
         push_tx: Option<Sender<DiagnosticsEvent>>,
-        diagnostics_deadline: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Self {
         use std::sync::Arc;
         let spawner = Arc::new(crate::lsp_adapter::pool::RealSpawner);
@@ -49,7 +61,7 @@ impl LspSessionPool {
             workspace_root.clone(),
             spawner,
             push_tx,
-            diagnostics_deadline,
+            operation_timeout,
         );
         Self {
             inner: pool,
@@ -220,6 +232,18 @@ impl LspSessionPool {
 #[allow(clippy::mutable_key_type)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_pool_preserves_an_absent_operation_timeout() {
+        let pool = LspSessionPool::new(
+            LspConfig::default(),
+            PathBuf::from("/workspace"),
+            None,
+            None,
+        );
+
+        assert_eq!(pool.operation_timeout(), None);
+    }
     use core_engine::domain::mutation::compute_content_version;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -264,7 +288,7 @@ mod tests {
             config,
             workspace.path().to_path_buf(),
             None,
-            Duration::from_millis(40),
+            Some(Duration::from_millis(40)),
         );
 
         let started = std::time::Instant::now();
@@ -286,7 +310,7 @@ mod tests {
             LspConfig::default(),
             workspace.path().to_path_buf(),
             None,
-            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
         );
         let uri_path = workspace.path().join("src/main.rs");
         let mut changes = HashMap::new();

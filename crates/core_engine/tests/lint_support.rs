@@ -39,6 +39,22 @@ pub const SIMPLE_GENERIC_REGEX: &str =
     r"(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<message>.+)";
 pub const SEVERITY_CODE_GENERIC_REGEX: &str = r"(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<severity>warning|error|info|hint): (?P<code>[^:]+): (?P<message>.+)";
 
+#[derive(Clone, Default)]
+pub struct HostCallLog(Arc<Mutex<Vec<String>>>);
+
+impl HostCallLog {
+    fn record(&self, method: &str, params: serde_json::Value) {
+        self.0
+            .lock()
+            .expect("HostCall log mutex")
+            .push(serde_json::json!({ "method": method, "params": params }).to_string());
+    }
+
+    pub fn joined(&self) -> String {
+        self.0.lock().expect("HostCall log mutex").join("\n")
+    }
+}
+
 pub struct TestWorkspace {
     temp: tempfile::TempDir,
 }
@@ -244,6 +260,66 @@ pub fn host_deps(fs: RealFs) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(FixtureApplyEditsHost { fs }),
         push_tx: None,
+    }
+}
+
+fn recording_host_deps(fs: RealFs, log: HostCallLog) -> HostDeps {
+    let fs = Arc::new(RecordingFs {
+        inner: Arc::new(Mutex::new(fs)),
+        log: log.clone(),
+    });
+    HostDeps {
+        fs: fs.clone(),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(RecordingApplyEditsHost {
+            inner: FixtureApplyEditsHost {
+                fs: fs.inner.clone(),
+            },
+            log,
+        }),
+        push_tx: None,
+    }
+}
+
+struct RecordingFs {
+    inner: Arc<Mutex<RealFs>>,
+    log: HostCallLog,
+}
+
+impl FsAdapter for RecordingFs {
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.log
+            .record("workspace/readFile", serde_json::json!({ "path": path }));
+        self.inner.read_file(path)
+    }
+
+    fn list_files(&self) -> Vec<String> {
+        self.log
+            .record("workspace/listFiles", serde_json::json!({}));
+        self.inner.list_files()
+    }
+
+    fn workspace_root(&self) -> Option<PathBuf> {
+        self.inner.workspace_root()
+    }
+}
+
+struct RecordingApplyEditsHost {
+    inner: FixtureApplyEditsHost,
+    log: HostCallLog,
+}
+
+impl ApplyEditsHostPort for RecordingApplyEditsHost {
+    fn apply_batch_edits(
+        &self,
+        request: WorkspaceApplyEditsRequest,
+    ) -> Result<WorkspaceApplyEditsResult, DomainError> {
+        self.log.record(
+            "workspace/applyEdits",
+            serde_json::to_value(&request).expect("serialize HostCall request"),
+        );
+        self.inner.apply_batch_edits(request)
     }
 }
 
@@ -478,6 +554,36 @@ pub fn handler_with_timeout(
     )
 }
 
+pub fn handler_with_timeout_and_host_call_log(
+    workspace: &TestWorkspace,
+    indexed_paths: &[&str],
+    request_timeout: Duration,
+    log: HostCallLog,
+) -> TowerMcpHandler {
+    let mut extension_registry = ExtensionRegistry::new();
+    let lint_extension = SidecarHostAdapter::spawn(
+        lint_fix_manifest(&lint_extension_bin()),
+        recording_host_deps(workspace.real_fs(), log),
+        request_timeout,
+        None,
+    )
+    .expect("spawn lint extension");
+    extension_registry
+        .register(lint_extension)
+        .expect("register lint extension");
+
+    let merged = ExtensionMergedRegistry::new(
+        engine_state(workspace, indexed_paths),
+        Arc::new(RwLock::new(extension_registry)),
+    );
+    TowerMcpHandler::new(
+        merged,
+        Arc::new(NoOpDiagnosticsReader),
+        Arc::new(Mutex::new(SubscriptionRegistry::new())),
+        vec![],
+    )
+}
+
 pub fn handler(workspace: &TestWorkspace, indexed_paths: &[&str]) -> TowerMcpHandler {
     handler_with_timeout(workspace, indexed_paths, TEST_TIMEOUT)
 }
@@ -498,6 +604,7 @@ pub fn configure_lint_timeout_and_host_budget(
         .expect("load lint config")
         .lint_request_timeout()
         .expect("derive lint request timeout")
+        .expect("fixture configures a lint timeout")
 }
 
 pub async fn start_server(

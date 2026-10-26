@@ -20,7 +20,10 @@ pub mod virtual_file;
 pub mod workspace;
 
 pub use error::DomainError;
-pub use extension_host::{ExtensionId, ExtensionInstance, ExtensionRegistry, InvokeError};
+pub use extension_host::{
+    CancellationSignal, ExtensionId, ExtensionInstance, ExtensionRegistry, InvokeError,
+    NeverCancelled,
+};
 pub use file_id::FileId;
 pub use virtual_file::{ContentHash, FileMetadata, RelativePath, Timestamp, VirtualFile};
 pub use workspace::{ProjectWorkspace, WorkspaceSnapshot};

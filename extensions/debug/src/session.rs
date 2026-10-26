@@ -12,8 +12,67 @@ use crate::protocol::DebugInitializeConfig;
 use crate::traces::TraceId;
 use crate::types::{
     DebugBreakpoint, DebugOutput, DebugRuntimeError, DebugScope, DebugSessionId, DebugSessionState,
-    DebugStackFrame, DebugStop, DebugThread, DebugVariable,
+    DebugStackFrame, DebugStop, DebugThread, DebugVariable, RuntimeFailure,
 };
+
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// One admitted operation budget. Exhaustion stays finite and metadata keeps
+/// the original budget even when an adapter receives only the remaining time.
+pub(crate) struct OperationBudget {
+    deadline: Option<Instant>,
+    budget_ms: Option<u64>,
+}
+
+impl OperationBudget {
+    pub(crate) fn new(timeout: Option<Duration>) -> Result<Self, DebugRuntimeError> {
+        if timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(DebugRuntimeError::InvalidParams(
+                "invalid debug operation timeout".to_owned(),
+            ));
+        }
+        Self::from_remaining(timeout)
+    }
+
+    // A nested step may receive an exhausted but still finite budget.
+    pub(crate) fn from_remaining(timeout: Option<Duration>) -> Result<Self, DebugRuntimeError> {
+        let admitted = timeout
+            .map(|timeout| {
+                let invalid = || {
+                    DebugRuntimeError::InvalidParams("invalid debug operation timeout".to_owned())
+                };
+                let budget_ms = u64::try_from(timeout.as_millis()).map_err(|_| invalid())?;
+                let deadline = Instant::now().checked_add(timeout).ok_or_else(invalid)?;
+                Ok::<_, DebugRuntimeError>((deadline, budget_ms))
+            })
+            .transpose()?;
+        Ok(Self {
+            deadline: admitted.map(|(deadline, _)| deadline),
+            budget_ms: admitted.map(|(_, budget_ms)| budget_ms),
+        })
+    }
+
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub(crate) fn map_error(&self, error: DebugRuntimeError) -> DebugRuntimeError {
+        match (error, self.budget_ms) {
+            (
+                DebugRuntimeError::DebugTimeout {
+                    message,
+                    mut detail,
+                },
+                Some(budget_ms),
+            ) => {
+                detail.budget_ms = budget_ms;
+                DebugRuntimeError::DebugTimeout { message, detail }
+            }
+            (error, _) => error,
+        }
+    }
+}
 
 pub struct SessionManager {
     config: DebugInitializeConfig,
@@ -34,7 +93,7 @@ struct SessionEntry {
     last_stop: Option<DebugStop>,
     output: Vec<DebugOutput>,
     adapter: Box<dyn DebugAdapterSession>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     idle_ttl: Duration,
     last_activity: Instant,
 }
@@ -55,6 +114,21 @@ impl SessionManager {
         }
     }
 
+    pub fn default_timeout_for_language(
+        &self,
+        language: &str,
+    ) -> Result<Option<Duration>, DebugRuntimeError> {
+        self.config
+            .languages
+            .get(language)
+            .map(|config| config.default_timeout_secs.map(Duration::from_secs))
+            .ok_or_else(|| {
+                DebugRuntimeError::LaunchFailed(format!(
+                    "no debug adapter configured for language {language}"
+                ))
+            })
+    }
+
     pub fn launch(&self, params: LaunchRequest) -> Result<LaunchResult, DebugRuntimeError> {
         self.launch_with_initial_breakpoints(params, Vec::new())
             .map(|(result, _)| result)
@@ -65,44 +139,60 @@ impl SessionManager {
         params: LaunchRequest,
         initial_breakpoints: Vec<DebugBreakpoint>,
     ) -> Result<(LaunchResult, Vec<DebugBreakpoint>), DebugRuntimeError> {
+        self.launch_with_initial_breakpoints_timeout(params, initial_breakpoints, None)
+    }
+
+    pub fn launch_with_initial_breakpoints_timeout(
+        &self,
+        params: LaunchRequest,
+        initial_breakpoints: Vec<DebugBreakpoint>,
+        timeout_override: Option<Duration>,
+    ) -> Result<(LaunchResult, Vec<DebugBreakpoint>), DebugRuntimeError> {
         let adapter_config = self.config.languages.get(&params.language).ok_or_else(|| {
             DebugRuntimeError::LaunchFailed(format!(
                 "no debug adapter configured for language {}",
                 params.language
             ))
         })?;
-        let timeout = Duration::from_secs(adapter_config.default_timeout_secs);
+        let timeout = timeout_override
+            .or_else(|| adapter_config.default_timeout_secs.map(Duration::from_secs));
+        let budget = OperationBudget::new(timeout)?;
+
         let idle_ttl = Duration::from_secs(adapter_config.idle_ttl_secs);
 
         let mut adapter = self.adapter_factory.start(&params)?;
-        if let Err(error) = adapter.initialize(timeout) {
-            let _ = adapter.terminate(timeout);
-            return Err(error);
+        if let Err(error) = adapter.initialize(budget.remaining()) {
+            let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+            return Err(budget.map_error(error));
         }
-        if let Err(error) = adapter.launch(&params, timeout) {
-            let _ = adapter.terminate(timeout);
-            return Err(error);
+        if let Err(error) = adapter.launch(&params, budget.remaining()) {
+            let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+            return Err(budget.map_error(error));
         }
         let configured_breakpoints = if initial_breakpoints.is_empty() {
             Vec::new()
         } else {
-            match adapter.set_breakpoints(&initial_breakpoints, timeout) {
+            match adapter.set_breakpoints(&initial_breakpoints, budget.remaining()) {
                 Ok(breakpoints) => breakpoints,
                 Err(error) => {
-                    let _ = adapter.terminate(timeout);
-                    return Err(error);
+                    let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+                    return Err(budget.map_error(error));
                 }
             }
         };
-        if let Err(error) = adapter.set_breakpoints(&[], timeout) {
-            let _ = adapter.terminate(timeout);
-            return Err(error);
+        if let Err(error) = adapter.set_breakpoints(&[], budget.remaining()) {
+            let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+            return Err(budget.map_error(error));
         }
 
-        let top_frame = adapter
-            .stack(1, timeout)
-            .ok()
-            .and_then(|frames| frames.into_iter().next());
+        let top_frame = match adapter.stack(1, budget.remaining()) {
+            Ok(frames) => frames.into_iter().next(),
+            Err(error @ DebugRuntimeError::DebugTimeout { .. }) => {
+                let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+                return Err(budget.map_error(error));
+            }
+            Err(_) => None,
+        };
         let stop = DebugStop {
             state: DebugSessionState::Stopped,
             reason: Some("breakpoint".to_owned()),
@@ -110,6 +200,7 @@ impl SessionManager {
             top_frame,
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         };
@@ -163,7 +254,9 @@ impl SessionManager {
         let timeout = request
             .timeout_secs
             .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(adapter_config.default_timeout_secs));
+            .or_else(|| adapter_config.default_timeout_secs.map(Duration::from_secs));
+
+        let budget = OperationBudget::new(timeout)?;
         let idle_ttl = Duration::from_secs(adapter_config.idle_ttl_secs);
         let trace_id = request.trace_id;
         let language = request.language;
@@ -200,19 +293,23 @@ impl SessionManager {
         };
 
         let mut adapter = self.adapter_factory.start(&start_request)?;
-        if let Err(error) = adapter.initialize(timeout) {
-            let _ = adapter.terminate(timeout);
-            return Err(error);
+        if let Err(error) = adapter.initialize(budget.remaining()) {
+            let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+            return Err(budget.map_error(error));
         }
-        if let Err(error) = adapter.launch(&start_request, timeout) {
-            let _ = adapter.terminate(timeout);
-            return Err(error);
+        if let Err(error) = adapter.launch(&start_request, budget.remaining()) {
+            let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+            return Err(budget.map_error(error));
         }
 
-        let top_frame = adapter
-            .stack(1, timeout)
-            .ok()
-            .and_then(|frames| frames.into_iter().next());
+        let top_frame = match adapter.stack(1, budget.remaining()) {
+            Ok(frames) => frames.into_iter().next(),
+            Err(error @ DebugRuntimeError::DebugTimeout { .. }) => {
+                let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+                return Err(budget.map_error(error));
+            }
+            Err(_) => None,
+        };
         let stop = DebugStop {
             state: DebugSessionState::Stopped,
             reason: Some("replay".to_owned()),
@@ -220,6 +317,7 @@ impl SessionManager {
             top_frame,
             hit_breakpoint_ids: Vec::new(),
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         };
@@ -300,8 +398,20 @@ impl SessionManager {
         session_id: &DebugSessionId,
         watchpoint: WatchpointSpec,
     ) -> Result<WatchpointResult, DebugRuntimeError> {
+        self.set_watchpoint_with_timeout(session_id, watchpoint, None)
+    }
+
+    pub fn set_watchpoint_with_timeout(
+        &self,
+        session_id: &DebugSessionId,
+        watchpoint: WatchpointSpec,
+        timeout: Option<Duration>,
+    ) -> Result<WatchpointResult, DebugRuntimeError> {
         self.with_replay_session(session_id, |session| {
-            session.adapter.set_watchpoint(watchpoint, session.timeout)
+            OperationBudget::new(timeout.or(session.timeout))?;
+            session
+                .adapter
+                .set_watchpoint(watchpoint, timeout.or(session.timeout))
         })
     }
 
@@ -407,8 +517,20 @@ impl SessionManager {
         session_id: &DebugSessionId,
         thread_id: u64,
     ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
+        self.stack_with_timeout(session_id, thread_id, None)
+    }
+
+    pub fn stack_with_timeout(
+        &self,
+        session_id: &DebugSessionId,
+        thread_id: u64,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
         self.with_stopped_session(session_id, |session| {
-            session.adapter.stack(thread_id, session.timeout)
+            OperationBudget::new(timeout.or(session.timeout))?;
+            session
+                .adapter
+                .stack(thread_id, timeout.or(session.timeout))
         })
     }
 
@@ -417,8 +539,20 @@ impl SessionManager {
         session_id: &DebugSessionId,
         frame_id: u64,
     ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
+        self.scopes_with_timeout(session_id, frame_id, None)
+    }
+
+    pub fn scopes_with_timeout(
+        &self,
+        session_id: &DebugSessionId,
+        frame_id: u64,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
         self.with_stopped_session(session_id, |session| {
-            session.adapter.scopes(frame_id, session.timeout)
+            OperationBudget::new(timeout.or(session.timeout))?;
+            session
+                .adapter
+                .scopes(frame_id, timeout.or(session.timeout))
         })
     }
 
@@ -427,10 +561,20 @@ impl SessionManager {
         session_id: &DebugSessionId,
         variables_reference: u64,
     ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
+        self.variables_with_timeout(session_id, variables_reference, None)
+    }
+
+    pub fn variables_with_timeout(
+        &self,
+        session_id: &DebugSessionId,
+        variables_reference: u64,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
         self.with_stopped_session(session_id, |session| {
+            OperationBudget::new(timeout.or(session.timeout))?;
             session
                 .adapter
-                .variables(variables_reference, session.timeout)
+                .variables(variables_reference, timeout.or(session.timeout))
         })
     }
 
@@ -440,10 +584,21 @@ impl SessionManager {
         frame_id: u64,
         expression: String,
     ) -> Result<DebugVariable, DebugRuntimeError> {
+        self.evaluate_with_timeout(session_id, frame_id, expression, None)
+    }
+
+    pub fn evaluate_with_timeout(
+        &self,
+        session_id: &DebugSessionId,
+        frame_id: u64,
+        expression: String,
+        timeout: Option<Duration>,
+    ) -> Result<DebugVariable, DebugRuntimeError> {
         self.with_stopped_session(session_id, |session| {
+            OperationBudget::new(timeout.or(session.timeout))?;
             session
                 .adapter
-                .evaluate(frame_id, &expression, session.timeout)
+                .evaluate(frame_id, &expression, timeout.or(session.timeout))
         })
     }
 
@@ -479,12 +634,23 @@ impl SessionManager {
                 return Err(session_not_found(session_id));
             };
             session.last_activity = Instant::now();
-            session.adapter.terminate(session.timeout)
+            session.adapter.terminate(LIFECYCLE_TIMEOUT)
         };
         if result.is_ok() {
             state.sessions.remove(&session_id.0);
         };
         result
+    }
+
+    pub fn reap_after_recipe_timeout(&self, session_id: &DebugSessionId) {
+        let session = {
+            let mut state = self.state.lock().unwrap();
+            self.cleanup_expired_locked(&mut state);
+            state.sessions.remove(&session_id.0)
+        };
+        if let Some(mut session) = session {
+            let _ = session.adapter.terminate(LIFECYCLE_TIMEOUT);
+        }
     }
 
     pub fn disconnect(&self, session_id: &DebugSessionId) -> Result<(), DebugRuntimeError> {
@@ -495,7 +661,7 @@ impl SessionManager {
                 return Err(session_not_found(session_id));
             };
             session.last_activity = Instant::now();
-            session.adapter.disconnect(session.timeout)
+            session.adapter.disconnect(LIFECYCLE_TIMEOUT)
         };
         if result.is_ok() {
             state.sessions.remove(&session_id.0);
@@ -522,7 +688,7 @@ impl SessionManager {
         let mut state = self.state.lock().unwrap();
         let sessions = std::mem::take(&mut state.sessions);
         for mut session in sessions.into_values() {
-            let _ = session.adapter.terminate(session.timeout);
+            let _ = session.adapter.terminate(LIFECYCLE_TIMEOUT);
         }
     }
 
@@ -532,7 +698,7 @@ impl SessionManager {
         timeout: Option<Duration>,
         resume: impl FnOnce(
             &mut dyn DebugAdapterSession,
-            Duration,
+            Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         let mut state = self.state.lock().unwrap();
@@ -540,9 +706,10 @@ impl SessionManager {
         let Some(session) = state.sessions.get_mut(&session_id.0) else {
             return Err(session_not_found(session_id));
         };
+        let timeout = timeout.or(session.timeout);
+        OperationBudget::new(timeout)?;
         session.last_activity = Instant::now();
         session.state = DebugSessionState::Running;
-        let timeout = timeout.unwrap_or(session.timeout);
         match resume(session.adapter.as_mut(), timeout) {
             Ok(stop) => {
                 update_session_stop(session, &stop);
@@ -551,14 +718,15 @@ impl SessionManager {
             Err(DebugRuntimeError::AdapterExited(_)) => {
                 Err(Self::reap_adapter_exit_locked(&mut state, session_id))
             }
-            Err(DebugRuntimeError::DebugTimeout(_)) => {
+            Err(DebugRuntimeError::DebugTimeout { message, detail }) => {
                 let stop = DebugStop {
                     state: DebugSessionState::Running,
-                    reason: None,
+                    reason: Some("timeout".to_owned()),
                     thread_id: None,
                     top_frame: None,
                     hit_breakpoint_ids: Vec::new(),
                     timed_out: true,
+                    error: Some(timeout_failure(message, detail)),
                     exit_code: None,
                     output_since: Vec::new(),
                 };
@@ -601,9 +769,10 @@ impl SessionManager {
         timeout: Option<Duration>,
         resume: impl FnOnce(
             &mut dyn DebugAdapterSession,
-            Duration,
+            Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError>,
     ) -> Result<DebugStop, DebugRuntimeError> {
+        OperationBudget::new(timeout)?;
         let mut session = {
             let mut state = self.state.lock().unwrap();
             self.cleanup_expired_locked(&mut state);
@@ -620,7 +789,7 @@ impl SessionManager {
         let previous_state = session.state.clone();
         let previous_stop = session.last_stop.clone();
         session.state = DebugSessionState::Running;
-        let timeout = timeout.unwrap_or(session.timeout);
+        let timeout = timeout.or(session.timeout);
 
         let result = match resume(session.adapter.as_mut(), timeout) {
             Ok(stop) => {
@@ -628,11 +797,11 @@ impl SessionManager {
                 Ok(stop)
             }
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                let _ = session.adapter.terminate(session.timeout);
+                let _ = session.adapter.terminate(LIFECYCLE_TIMEOUT);
                 Err(session_not_found(session_id))
             }
-            Err(DebugRuntimeError::DebugTimeout(_)) => {
-                let stop = timeout_stop();
+            Err(DebugRuntimeError::DebugTimeout { message, detail }) => {
+                let stop = timeout_stop(message, detail);
                 update_session_stop(&mut session, &stop);
                 Ok(stop)
             }
@@ -674,7 +843,7 @@ impl SessionManager {
         let result = match operation(&mut session) {
             Ok(result) => Ok(result),
             Err(DebugRuntimeError::AdapterExited(_)) => {
-                let _ = session.adapter.terminate(session.timeout);
+                let _ = session.adapter.terminate(LIFECYCLE_TIMEOUT);
                 Err(session_not_found(session_id))
             }
             Err(error) => Err(error),
@@ -693,7 +862,7 @@ impl SessionManager {
         session_id: &DebugSessionId,
     ) -> DebugRuntimeError {
         if let Some(mut session) = state.sessions.remove(&session_id.0) {
-            let _ = session.adapter.terminate(session.timeout);
+            let _ = session.adapter.terminate(LIFECYCLE_TIMEOUT);
         }
         session_not_found(session_id)
     }
@@ -709,7 +878,7 @@ impl SessionManager {
 
         for session_id in expired {
             if let Some(mut session) = state.sessions.remove(&session_id) {
-                let _ = session.adapter.terminate(session.timeout);
+                let _ = session.adapter.terminate(LIFECYCLE_TIMEOUT);
             }
         }
     }
@@ -733,16 +902,25 @@ fn update_session_stop(session: &mut SessionEntry, stop: &DebugStop) {
     session.last_activity = Instant::now();
 }
 
-fn timeout_stop() -> DebugStop {
+fn timeout_stop(message: String, detail: extension_protocol::TimeoutDetail) -> DebugStop {
     DebugStop {
         state: DebugSessionState::Running,
-        reason: None,
+        reason: Some("timeout".to_owned()),
         thread_id: None,
         top_frame: None,
         hit_breakpoint_ids: Vec::new(),
         timed_out: true,
+        error: Some(timeout_failure(message, detail)),
         exit_code: None,
         output_since: Vec::new(),
+    }
+}
+
+fn timeout_failure(message: String, detail: extension_protocol::TimeoutDetail) -> RuntimeFailure {
+    RuntimeFailure {
+        code: "debug-timeout".to_owned(),
+        message,
+        data: Some(serde_json::to_value(detail).expect("serialize timeout detail")),
     }
 }
 
@@ -762,54 +940,58 @@ pub trait DebugAdapterFactory: Send + Sync {
 }
 
 pub trait DebugAdapterSession: Send {
-    fn initialize(&mut self, timeout: Duration) -> Result<(), DebugRuntimeError>;
+    fn initialize(&mut self, timeout: Option<Duration>) -> Result<(), DebugRuntimeError>;
     fn launch(
         &mut self,
         request: &LaunchRequest,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<(), DebugRuntimeError>;
     fn set_breakpoints(
         &mut self,
         breakpoints: &[DebugBreakpoint],
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError>;
-    fn continue_session(&mut self, timeout: Duration) -> Result<DebugStop, DebugRuntimeError>;
+    fn continue_session(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<DebugStop, DebugRuntimeError>;
     fn step(
         &mut self,
         thread_id: Option<u64>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError>;
     fn pause(
         &mut self,
         thread_id: Option<u64>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError>;
-    fn threads(&mut self, timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError>;
+    fn threads(&mut self, timeout: Option<Duration>)
+    -> Result<Vec<DebugThread>, DebugRuntimeError>;
     fn stack(
         &mut self,
         thread_id: u64,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError>;
     fn scopes(
         &mut self,
         frame_id: u64,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugScope>, DebugRuntimeError>;
     fn variables(
         &mut self,
         variables_reference: u64,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugVariable>, DebugRuntimeError>;
     fn evaluate(
         &mut self,
         frame_id: u64,
         expression: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugVariable, DebugRuntimeError>;
     fn reverse_continue(
         &mut self,
         _thread_id: Option<u64>,
-        _timeout: Duration,
+        _timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         Err(reverse_unsupported())
     }
@@ -817,21 +999,21 @@ pub trait DebugAdapterSession: Send {
         &mut self,
         _thread_id: Option<u64>,
         _granularity: StepBackGranularity,
-        _timeout: Duration,
+        _timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         Err(reverse_unsupported())
     }
     fn set_watchpoint(
         &mut self,
         _watchpoint: WatchpointSpec,
-        _timeout: Duration,
+        _timeout: Option<Duration>,
     ) -> Result<WatchpointResult, DebugRuntimeError> {
         Err(reverse_unsupported())
     }
     fn seek_replay(
         &mut self,
         _target: ReplaySeekTarget,
-        _timeout: Duration,
+        _timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         Err(reverse_unsupported())
     }
@@ -960,10 +1142,13 @@ mod tests {
         WatchpointSpec,
     };
 
+    type RecordedTimeouts = Arc<Mutex<Vec<(&'static str, Option<Duration>)>>>;
+
     #[derive(Default)]
     struct FakeAdapterFactory {
         starts: Arc<Mutex<Vec<LaunchRequest>>>,
         calls: Arc<Mutex<Vec<FakeAdapterCall>>>,
+        timeouts: RecordedTimeouts,
         lost_on_threads: bool,
         lost_on_evaluate: bool,
         launch_error: bool,
@@ -971,6 +1156,8 @@ mod tests {
         disconnect_error: bool,
         reverse_adapter_exit: bool,
         reverse_unsupported: bool,
+        stage_delay: Duration,
+        stack_timeout: bool,
     }
 
     impl FakeAdapterFactory {
@@ -1045,6 +1232,7 @@ mod tests {
             self.starts.lock().unwrap().push(request.clone());
             Ok(Box::new(FakeAdapterSession {
                 calls: Arc::clone(&self.calls),
+                timeouts: Arc::clone(&self.timeouts),
                 lost_on_threads: self.lost_on_threads,
                 lost_on_evaluate: self.lost_on_evaluate,
                 launch_error: self.launch_error,
@@ -1052,6 +1240,8 @@ mod tests {
                 disconnect_error: self.disconnect_error,
                 reverse_adapter_exit: self.reverse_adapter_exit,
                 reverse_unsupported: self.reverse_unsupported,
+                stage_delay: self.stage_delay,
+                stack_timeout: self.stack_timeout,
                 ..FakeAdapterSession::default()
             }))
         }
@@ -1060,6 +1250,7 @@ mod tests {
     #[derive(Default)]
     struct FakeAdapterSession {
         calls: Arc<Mutex<Vec<FakeAdapterCall>>>,
+        timeouts: RecordedTimeouts,
         initialized: bool,
         launched: bool,
         configured: bool,
@@ -1073,10 +1264,41 @@ mod tests {
         reverse_timeout: bool,
         reverse_adapter_exit: bool,
         reverse_unsupported: bool,
+        stage_delay: Duration,
+        stack_timeout: bool,
+    }
+
+    impl FakeAdapterSession {
+        fn stage(
+            &self,
+            operation: &'static str,
+            timeout: Option<Duration>,
+        ) -> Result<(), DebugRuntimeError> {
+            self.record_timeout(operation, timeout);
+            if timeout.is_some_and(|timeout| timeout <= self.stage_delay)
+                || (operation == "stack" && self.stack_timeout)
+            {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: operation.to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: u64::try_from(timeout.unwrap().as_millis()).unwrap(),
+                    },
+                });
+            }
+            std::thread::sleep(self.stage_delay);
+            Ok(())
+        }
+
+        fn record_timeout(&self, operation: &'static str, timeout: Option<Duration>) {
+            self.timeouts.lock().unwrap().push((operation, timeout));
+        }
     }
 
     impl DebugAdapterSession for FakeAdapterSession {
-        fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+        fn initialize(&mut self, timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
+            self.stage("initialize", timeout)?;
             self.calls.lock().unwrap().push(FakeAdapterCall::Initialize);
             self.initialized = true;
             Ok(())
@@ -1085,8 +1307,9 @@ mod tests {
         fn launch(
             &mut self,
             _request: &LaunchRequest,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<(), DebugRuntimeError> {
+            self.stage("launch", timeout)?;
             self.calls.lock().unwrap().push(FakeAdapterCall::Launch);
             if self.launch_error {
                 return Err(DebugRuntimeError::LaunchFailed(
@@ -1100,8 +1323,9 @@ mod tests {
         fn set_breakpoints(
             &mut self,
             breakpoints: &[DebugBreakpoint],
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
+            self.stage("set_breakpoints", timeout)?;
             self.calls
                 .lock()
                 .unwrap()
@@ -1123,11 +1347,21 @@ mod tests {
                 .collect())
         }
 
-        fn continue_session(&mut self, timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
-            if timeout <= Duration::from_millis(1) {
-                return Err(DebugRuntimeError::DebugTimeout(
-                    "fake adapter timed out waiting for stop".to_owned(),
-                ));
+        fn continue_session(
+            &mut self,
+            timeout: Option<Duration>,
+        ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("continue", timeout);
+            if timeout.is_some_and(|timeout| timeout <= Duration::from_millis(1)) {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "continue".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: u64::try_from(timeout.expect("finite fake timeout").as_millis())
+                            .unwrap(),
+                    },
+                });
             }
 
             Ok(DebugStop {
@@ -1139,16 +1373,18 @@ mod tests {
         fn step(
             &mut self,
             _thread_id: Option<u64>,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("step", timeout);
             Ok(stopped_at_breakpoint())
         }
 
         fn pause(
             &mut self,
             thread_id: Option<u64>,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("pause", timeout);
             Ok(DebugStop {
                 thread_id,
                 reason: Some("pause".to_owned()),
@@ -1159,16 +1395,18 @@ mod tests {
         fn stack(
             &mut self,
             _thread_id: u64,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
+            self.stage("stack", timeout)?;
             Ok(vec![top_frame()])
         }
 
         fn scopes(
             &mut self,
             _frame_id: u64,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
+            self.record_timeout("scopes", timeout);
             Ok(vec![DebugScope {
                 name: "Locals".to_owned(),
                 variables_reference: 100,
@@ -1179,8 +1417,9 @@ mod tests {
         fn variables(
             &mut self,
             _variables_reference: u64,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
+            self.record_timeout("variables", timeout);
             Ok(vec![DebugVariable {
                 name: "answer".to_owned(),
                 value: "42".to_owned(),
@@ -1193,8 +1432,9 @@ mod tests {
             &mut self,
             _frame_id: u64,
             expression: &str,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugVariable, DebugRuntimeError> {
+            self.record_timeout("evaluate", timeout);
             if self.lost_on_evaluate {
                 return Err(DebugRuntimeError::AdapterExited(
                     "fake adapter exited before evaluate response".to_owned(),
@@ -1211,8 +1451,9 @@ mod tests {
         fn reverse_continue(
             &mut self,
             thread_id: Option<u64>,
-            timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("reverse_continue", timeout);
             self.calls
                 .lock()
                 .unwrap()
@@ -1225,10 +1466,18 @@ mod tests {
             if self.reverse_unsupported {
                 return Err(super::reverse_unsupported());
             }
-            if self.reverse_timeout || timeout <= Duration::from_millis(1) {
-                return Err(DebugRuntimeError::DebugTimeout(
-                    "fake replay adapter timed out during reverse continue".to_owned(),
-                ));
+            if self.reverse_timeout
+                || timeout.is_some_and(|timeout| timeout <= Duration::from_millis(1))
+            {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "reverse_continue".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: u64::try_from(timeout.expect("finite fake timeout").as_millis())
+                            .unwrap(),
+                    },
+                });
             }
             Ok(DebugStop {
                 reason: Some("reverse".to_owned()),
@@ -1240,8 +1489,9 @@ mod tests {
             &mut self,
             thread_id: Option<u64>,
             granularity: StepBackGranularity,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("step_back", timeout);
             self.calls
                 .lock()
                 .unwrap()
@@ -1255,8 +1505,9 @@ mod tests {
         fn set_watchpoint(
             &mut self,
             watchpoint: WatchpointSpec,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<WatchpointResult, DebugRuntimeError> {
+            self.record_timeout("set_watchpoint", timeout);
             self.calls
                 .lock()
                 .unwrap()
@@ -1274,16 +1525,23 @@ mod tests {
         fn seek_replay(
             &mut self,
             target: ReplaySeekTarget,
-            timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("seek_replay", timeout);
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeAdapterCall::SeekReplay(target));
-            if timeout <= Duration::from_millis(1) {
-                return Err(DebugRuntimeError::DebugTimeout(
-                    "fake replay adapter timed out during seek replay".to_owned(),
-                ));
+            if timeout.is_some_and(|timeout| timeout <= Duration::from_millis(1)) {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "seek_replay".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: u64::try_from(timeout.expect("finite fake timeout").as_millis())
+                            .unwrap(),
+                    },
+                });
             }
             if self.reverse_unsupported {
                 return Err(super::reverse_unsupported());
@@ -1316,7 +1574,11 @@ mod tests {
             Ok(())
         }
 
-        fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+        fn threads(
+            &mut self,
+            timeout: Option<Duration>,
+        ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+            self.record_timeout("threads", timeout);
             if self.lost_on_threads {
                 return Err(DebugRuntimeError::AdapterExited(
                     "fake adapter exited before threads request".to_owned(),
@@ -1344,7 +1606,7 @@ mod tests {
                     args: Vec::new(),
                     adapter_type: "fake".to_owned(),
                     launch: Map::new(),
-                    default_timeout_secs: 1,
+                    default_timeout_secs: Some(1),
                     idle_ttl_secs: 1,
                 },
             )]),
@@ -1398,6 +1660,7 @@ mod tests {
             top_frame: Some(top_frame()),
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         }
@@ -1593,8 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_timeout_returns_running_state_and_timed_out_true_while_leaving_session_controllable()
-    {
+    fn resume_timeout_returns_running_state_and_leaves_session_controllable() {
         let manager = manager();
         let result = manager.launch(launch_request()).unwrap();
 
@@ -1607,7 +1869,277 @@ mod tests {
 
         assert_eq!(timeout.state, DebugSessionState::Running);
         assert!(timeout.timed_out);
+        assert_eq!(
+            serde_json::to_value(&timeout).unwrap(),
+            json!({
+                "state": "running",
+                "reason": "timeout",
+                "thread_id": null,
+                "top_frame": null,
+                "hit_breakpoint_ids": [],
+                "timed_out": true,
+                "error": {
+                    "code": "debug-timeout",
+                    "message": "debug operation timed out",
+                    "data": {
+                        "operation": "continue",
+                        "layer": "dap",
+                        "budget_ms": 1
+                    }
+                },
+                "output_since": []
+            })
+        );
         assert_eq!(pause.state, DebugSessionState::Stopped);
+    }
+
+    #[test]
+    fn debug_operations_preserve_absent_and_explicit_timeouts_to_the_adapter() {
+        let mut unlimited_config = config();
+        unlimited_config
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .default_timeout_secs = None;
+        let unlimited_factory = Arc::new(FakeAdapterFactory::default());
+        let unlimited = SessionManager::new(unlimited_config, unlimited_factory.clone());
+        let unlimited_session = unlimited
+            .launch(launch_request())
+            .expect("an absent adapter timeout must remain unlimited");
+        unlimited
+            .set_breakpoints(&unlimited_session.session_id, vec![source_breakpoint(12)])
+            .expect("unlimited breakpoint update");
+        unlimited
+            .continue_session(&unlimited_session.session_id, None)
+            .expect("unlimited continue");
+        unlimited
+            .step(&unlimited_session.session_id, Some(1), None)
+            .expect("unlimited step");
+        unlimited
+            .pause(&unlimited_session.session_id, Some(1))
+            .expect("unlimited pause");
+        unlimited
+            .threads(&unlimited_session.session_id)
+            .expect("threads");
+        unlimited
+            .stack(&unlimited_session.session_id, 10)
+            .expect("stack");
+        unlimited
+            .scopes(&unlimited_session.session_id, 10)
+            .expect("scopes");
+        unlimited
+            .variables(&unlimited_session.session_id, 100)
+            .expect("variables");
+        unlimited
+            .evaluate(&unlimited_session.session_id, 10, "answer".to_owned())
+            .expect("evaluate");
+
+        assert_eq!(
+            *unlimited_factory.timeouts.lock().unwrap(),
+            vec![
+                ("initialize", None),
+                ("launch", None),
+                ("set_breakpoints", None),
+                ("stack", None),
+                ("set_breakpoints", None),
+                ("continue", None),
+                ("step", None),
+                ("pause", None),
+                ("threads", None),
+                ("stack", None),
+                ("scopes", None),
+                ("variables", None),
+                ("evaluate", None),
+            ],
+            "every ordinary session operation must pass an absent default unchanged to the adapter"
+        );
+
+        let explicit_factory = Arc::new(FakeAdapterFactory::default());
+        let explicit = SessionManager::new(config(), explicit_factory.clone());
+        let explicit_session = explicit.launch(launch_request()).expect("explicit launch");
+        explicit
+            .set_breakpoints(&explicit_session.session_id, vec![source_breakpoint(24)])
+            .expect("explicit breakpoint update");
+        explicit
+            .continue_session(&explicit_session.session_id, None)
+            .expect("explicit continue");
+        explicit
+            .step(&explicit_session.session_id, Some(1), None)
+            .expect("explicit step");
+        explicit
+            .pause(&explicit_session.session_id, Some(1))
+            .expect("explicit pause");
+        explicit
+            .threads(&explicit_session.session_id)
+            .expect("threads");
+        explicit
+            .stack(&explicit_session.session_id, 10)
+            .expect("stack");
+        explicit
+            .scopes(&explicit_session.session_id, 10)
+            .expect("scopes");
+        explicit
+            .variables(&explicit_session.session_id, 100)
+            .expect("variables");
+        explicit
+            .evaluate(&explicit_session.session_id, 10, "answer".to_owned())
+            .expect("evaluate");
+
+        let timeouts = explicit_factory.timeouts.lock().unwrap();
+        assert_eq!(
+            timeouts
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            vec![
+                "initialize",
+                "launch",
+                "set_breakpoints",
+                "stack",
+                "set_breakpoints",
+                "continue",
+                "step",
+                "pause",
+                "threads",
+                "stack",
+                "scopes",
+                "variables",
+                "evaluate"
+            ]
+        );
+        let mut previous = Duration::from_secs(1);
+        for (_, timeout) in &timeouts[..4] {
+            let timeout = timeout.expect("configured launch stays finite");
+            assert!(timeout <= previous && !timeout.is_zero());
+            previous = timeout;
+        }
+        for (_, timeout) in &timeouts[4..] {
+            assert_eq!(*timeout, Some(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn launch_and_replay_consume_one_budget_across_staged_adapter_calls() {
+        for replay in [false, true] {
+            for explicit in [false, true] {
+                let factory = Arc::new(FakeAdapterFactory {
+                    stage_delay: Duration::from_millis(10),
+                    ..FakeAdapterFactory::default()
+                });
+                let manager = SessionManager::new(config(), factory.clone());
+                if replay {
+                    let mut request = replay_open_request();
+                    request.timeout_secs = explicit.then_some(2);
+                    manager.open_replay(request).unwrap();
+                } else {
+                    manager
+                        .launch_with_initial_breakpoints_timeout(
+                            launch_request(),
+                            vec![source_breakpoint(12)],
+                            explicit.then_some(Duration::from_secs(2)),
+                        )
+                        .unwrap();
+                }
+                let timeouts = factory.timeouts.lock().unwrap();
+                let budget = Duration::from_secs(if explicit { 2 } else { 1 });
+                assert!(timeouts[0].1.unwrap() <= budget);
+                for pair in timeouts.windows(2) {
+                    assert!(
+                        pair[1].1.unwrap() < pair[0].1.unwrap(),
+                        "each completed stage must consume the same budget: {timeouts:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cumulative_startup_expiry_cleans_up_before_a_partial_session_is_registered() {
+        for replay in [false, true] {
+            let factory = Arc::new(FakeAdapterFactory {
+                stage_delay: Duration::from_millis(400),
+                ..FakeAdapterFactory::default()
+            });
+            let manager = SessionManager::new(config(), factory.clone());
+            let error = if replay {
+                let mut request = replay_open_request();
+                request.timeout_secs = None;
+                manager.open_replay(request).unwrap_err()
+            } else {
+                manager
+                    .launch_with_initial_breakpoints(launch_request(), vec![source_breakpoint(12)])
+                    .unwrap_err()
+            };
+            assert!(
+                matches!(error, DebugRuntimeError::DebugTimeout { detail, .. } if detail.budget_ms == 1000)
+            );
+            assert!(manager.sessions().is_empty());
+            assert_eq!(
+                factory.calls.lock().unwrap().last(),
+                Some(&FakeAdapterCall::Terminate)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_and_replay_stack_expiry_preserves_original_budget_and_cleans_up() {
+        for replay in [false, true] {
+            let factory = Arc::new(FakeAdapterFactory {
+                stage_delay: Duration::from_millis(5),
+                stack_timeout: true,
+                ..FakeAdapterFactory::default()
+            });
+            let manager = SessionManager::new(config(), factory.clone());
+            let error = if replay {
+                let mut request = replay_open_request();
+                request.timeout_secs = None;
+                manager.open_replay(request).unwrap_err()
+            } else {
+                manager.launch(launch_request()).unwrap_err()
+            };
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                json!({"code":"debug-timeout", "message":{"message":"debug operation timed out", "detail":{"operation":"stack", "layer":"dap", "budget_ms":1000}}})
+            );
+            assert!(manager.sessions().is_empty());
+            assert_eq!(
+                factory.calls.lock().unwrap().last(),
+                Some(&FakeAdapterCall::Terminate)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_direct_session_budgets_are_rejected_before_adapter_dispatch() {
+        for timeout in [Duration::ZERO, Duration::from_secs(u64::MAX)] {
+            let factory = Arc::new(FakeAdapterFactory::default());
+            let manager = SessionManager::new(config(), factory.clone());
+            assert!(matches!(
+                manager.launch_with_initial_breakpoints_timeout(
+                    launch_request(),
+                    vec![],
+                    Some(timeout)
+                ),
+                Err(DebugRuntimeError::InvalidParams(_))
+            ));
+            assert!(factory.starts.lock().unwrap().is_empty());
+            let session = manager.launch(launch_request()).unwrap();
+            let before = factory.timeouts.lock().unwrap().len();
+            assert!(matches!(
+                manager.continue_session(&session.session_id, Some(timeout)),
+                Err(DebugRuntimeError::InvalidParams(_))
+            ));
+            assert_eq!(factory.timeouts.lock().unwrap().len(), before);
+            assert_eq!(manager.sessions()[0].state, DebugSessionState::Stopped);
+            let mut request = replay_open_request();
+            request.timeout_secs = Some(timeout.as_secs());
+            let before = factory.starts.lock().unwrap().len();
+            assert!(matches!(
+                manager.open_replay(request),
+                Err(DebugRuntimeError::InvalidParams(_))
+            ));
+            assert_eq!(factory.starts.lock().unwrap().len(), before);
+        }
     }
 
     #[test]
@@ -1954,7 +2486,7 @@ mod tests {
 
         assert_eq!(
             session
-                .reverse_continue(Some(7), Duration::from_millis(50))
+                .reverse_continue(Some(7), Some(Duration::from_millis(50)))
                 .unwrap()
                 .reason,
             Some("reverse".to_owned())
@@ -1964,7 +2496,7 @@ mod tests {
                 .step_back(
                     Some(7),
                     StepBackGranularity::Instruction,
-                    Duration::from_millis(50),
+                    Some(Duration::from_millis(50)),
                 )
                 .unwrap()
                 .reason,
@@ -1972,14 +2504,14 @@ mod tests {
         );
         assert_eq!(
             session
-                .set_watchpoint(watchpoint_spec(), Duration::from_millis(50))
+                .set_watchpoint(watchpoint_spec(), Some(Duration::from_millis(50)))
                 .unwrap()
                 .watchpoint_id,
             "watch-1"
         );
         assert_eq!(
             session
-                .seek_replay(ReplaySeekTarget::Crash, Duration::from_millis(50))
+                .seek_replay(ReplaySeekTarget::Crash, Some(Duration::from_millis(50)))
                 .unwrap()
                 .reason,
             Some("seek".to_owned())
@@ -2123,14 +2655,14 @@ mod tests {
         struct LiveOnlyAdapter;
 
         impl DebugAdapterSession for LiveOnlyAdapter {
-            fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            fn initialize(&mut self, _timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
                 Ok(())
             }
 
             fn launch(
                 &mut self,
                 _request: &LaunchRequest,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<(), DebugRuntimeError> {
                 Ok(())
             }
@@ -2138,14 +2670,14 @@ mod tests {
             fn set_breakpoints(
                 &mut self,
                 breakpoints: &[DebugBreakpoint],
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
                 Ok(breakpoints.to_vec())
             }
 
             fn continue_session(
                 &mut self,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugStop, DebugRuntimeError> {
                 Ok(stopped_at_breakpoint())
             }
@@ -2153,7 +2685,7 @@ mod tests {
             fn step(
                 &mut self,
                 _thread_id: Option<u64>,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugStop, DebugRuntimeError> {
                 Ok(stopped_at_breakpoint())
             }
@@ -2161,14 +2693,14 @@ mod tests {
             fn pause(
                 &mut self,
                 _thread_id: Option<u64>,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugStop, DebugRuntimeError> {
                 Ok(stopped_at_breakpoint())
             }
 
             fn threads(
                 &mut self,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -2176,7 +2708,7 @@ mod tests {
             fn stack(
                 &mut self,
                 _thread_id: u64,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -2184,7 +2716,7 @@ mod tests {
             fn scopes(
                 &mut self,
                 _frame_id: u64,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -2192,7 +2724,7 @@ mod tests {
             fn variables(
                 &mut self,
                 _variables_reference: u64,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -2201,7 +2733,7 @@ mod tests {
                 &mut self,
                 _frame_id: u64,
                 expression: &str,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugVariable, DebugRuntimeError> {
                 Ok(DebugVariable {
                     name: expression.to_owned(),
@@ -2223,15 +2755,19 @@ mod tests {
         let mut adapter = LiveOnlyAdapter;
 
         assert_reverse_unsupported(
-            DebugAdapterSession::reverse_continue(&mut adapter, None, Duration::from_millis(1))
-                .unwrap_err(),
+            DebugAdapterSession::reverse_continue(
+                &mut adapter,
+                None,
+                Some(Duration::from_millis(1)),
+            )
+            .unwrap_err(),
         );
         assert_reverse_unsupported(
             DebugAdapterSession::step_back(
                 &mut adapter,
                 None,
                 StepBackGranularity::Line,
-                Duration::from_millis(1),
+                Some(Duration::from_millis(1)),
             )
             .unwrap_err(),
         );
@@ -2239,7 +2775,7 @@ mod tests {
             DebugAdapterSession::set_watchpoint(
                 &mut adapter,
                 watchpoint_spec(),
-                Duration::from_millis(1),
+                Some(Duration::from_millis(1)),
             )
             .unwrap_err(),
         );
@@ -2247,7 +2783,7 @@ mod tests {
             DebugAdapterSession::seek_replay(
                 &mut adapter,
                 ReplaySeekTarget::Crash,
-                Duration::from_millis(1),
+                Some(Duration::from_millis(1)),
             )
             .unwrap_err(),
         );

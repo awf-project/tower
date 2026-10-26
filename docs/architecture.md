@@ -223,7 +223,7 @@ stdin (newline-delimited JSON-RPC 2.0)
            Mutex<Box<dyn ExtensionInstance>>::lock [per-instance, not global]
              SidecarHostAdapter::call_tool
                JSON-RPC invokeTool over stdio to the child process
-               per-call timeout; capability callbacks routed to outbound ports
+               optional per-call timeout; capability callbacks routed to outbound ports
                ExtensionFault (Timeout/Crashed/ProtocolError/Quarantined)
                  → InvokeError → -32603; host process and MCP link survive any fault
   │
@@ -303,7 +303,7 @@ Discovery (adapters/extension/discovery.rs)
 
 Sidecar adapter (adapters/extension/ — SidecarHostAdapter : ExtensionInstance)
   spawn child process; send Initialize, read Initialized (tools/events/capabilities)
-  call_tool(name, params)  → JSON-RPC invokeTool over stdio, bounded by request_timeout
+  call_tool(name, params)  → JSON-RPC invokeTool over stdio, optionally bounded by request_timeout
   deliver_event(Event)     → JSON-RPC deliverEvent notification
   capability callbacks (HostCall) routed to existing outbound ports — no privileged path:
     ReadFile / ListFiles    → FileSystemPort
@@ -339,7 +339,7 @@ MCP tool merging (adapters/mcp/extension_merged_registry.rs — ExtensionMergedR
 
 Event kinds: `event/fileIndexed`, `event/fileChanged`, `event/fileDeleted`. Unsubscribed extensions
 incur zero overhead. A delivery error from one extension does not block others. Isolation is the OS
-process boundary — a crash, hang (timeout), or protocol violation in a child never crashes the host or
+process boundary — a crash, configured timeout, or protocol violation in a child never crashes the host or
 severs the MCP link.
 
 ## Non-negotiable invariants
@@ -350,7 +350,7 @@ severs the MCP link.
 | **Generational FileId**: `struct FileId { index: u32, generation: u32 }`. A reused slot bumps generation; stale id never silently resolves to a different file                              | `domain/file_id.rs`; only `ProjectWorkspace` mints ids                                           |
 | **Atomic file writes**: write to `<path>.tmp_write` → flush → `fs::rename`. No torn files on crash. `.tmp_write` files are never indexed                                                    | `FileMutationService`, `GlobalReplaceService`; `FileSystemPort::rename` contract                 |
 | **Zero lock contention**: `EngineState` behind `Arc<RwLock<EngineState>>`; critical sections are short and contain no blocking I/O; watcher (writer) must not starve MCP handlers (readers) | `main.rs` wiring; per-extension `Mutex` so one slow extension stalls only itself                 |
-| **Extension fault isolation**: a child crash, hang (timeout), or protocol violation must not crash the host or sever the MCP link                                                           | OS process boundary + `SidecarHostAdapter` (per-call timeout/kill) → `ExtensionFault` → `-32603` |
+| **Extension fault isolation**: a child crash, configured timeout, or protocol violation must not crash the host or sever the MCP link                                                     | OS process boundary + `SidecarHostAdapter` (optional per-call timeout/kill) → `ExtensionFault` → `-32603` |
 | **Capability security**: extensions reach the workspace only via declared capability callbacks routed to outbound ports; an undeclared `HostCall` is rejected                               | `SidecarHostAdapter` capability gating + `path_validation` (rejects `..`/absolute/empty paths)   |
 | **Protocol version guard**: the host compares the extension's `protocol_version` against `PROTOCOL_VERSION` (currently 1) at `initialize`                                                   | `extension_protocol::PROTOCOL_VERSION`; sidecar `initialize` handshake                           |
 | **Quarantine**: an extension is quarantined after `MAX_CONSECUTIVE_FAILURES` (=3) consecutive faults; a success resets the counter                                                          | `ExtensionRegistry` (domain policy)                                                              |

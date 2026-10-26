@@ -68,6 +68,7 @@ fn eval_at_request_defaults_and_result_serialization() {
         finished: EvalAtFinished::Stopped,
         exit_code: None,
         condition_unsupported: None,
+        error: None,
     };
 
     let result_json = serde_json::to_value(result).unwrap();
@@ -88,7 +89,7 @@ fn eval_at_captured_variable_serialization_and_truncation_semantics_remain_compa
  {
     let captured = CapturedVariable {
         name: "root".to_owned(),
-        value: "{...}".to_owned(),
+        value: "{children}".to_owned(),
         r#type: Some("Fixture".to_owned()),
         children: vec![CapturedVariable {
             name: "child".to_owned(),
@@ -106,7 +107,7 @@ fn eval_at_captured_variable_serialization_and_truncation_semantics_remain_compa
         value,
         json!({
             "name": "root",
-            "value": "{...}",
+            "value": "{children}",
             "type": "Fixture",
             "children": [{
                 "name": "child",

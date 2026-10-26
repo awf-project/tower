@@ -47,7 +47,7 @@ pub mod fault;
 pub mod manifest;
 pub mod messages;
 
-pub use fault::{ExtensionFault, ProtocolError};
+pub use fault::{ExtensionFault, ProtocolError, TimeoutDetail};
 pub use manifest::{Activation, Capability, EventKind, ExtensionManifest, ToolDecl};
 pub use messages::{
     AnchoredSymbolEditError, AnchoredSymbolEditErrorCode, AnchoredSymbolEditRequest,

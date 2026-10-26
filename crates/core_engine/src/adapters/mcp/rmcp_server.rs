@@ -63,7 +63,7 @@ use crate::adapters::mcp::types::{ToolDesc, ToolError};
 pub struct TowerMcpHandler {
     /// The unified tool registry (native tower_* + sidecar extension tools).
     /// Wrapped in a plain Mutex: registry calls are sync/non-blocking.
-    registry: Mutex<Box<dyn ToolRegistry + Send>>,
+    registry: Arc<Mutex<Box<dyn ToolRegistry + Send>>>,
 
     /// Diagnostics provider for resources/read. No-op in the extension model.
     diag_reader: Arc<dyn DiagnosticsReader>,
@@ -94,7 +94,7 @@ impl TowerMcpHandler {
         R: ToolRegistry + Send + 'static,
     {
         Self {
-            registry: Mutex::new(Box::new(registry)),
+            registry: Arc::new(Mutex::new(Box::new(registry))),
             diag_reader,
             sub_reg,
             resource_uris,
@@ -153,7 +153,7 @@ impl ServerHandler for TowerMcpHandler {
     async fn call_tool(
         &self,
         req: CallToolRequestParams,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let name = req.name.as_ref().to_owned();
         // arguments may be absent; default to empty object per MCP spec.
@@ -162,11 +162,21 @@ impl ServerHandler for TowerMcpHandler {
             .map(Value::Object)
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
-        let result = self
-            .registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .call(&name, args);
+        // Registry dispatch is synchronous and extension calls may be
+        // unlimited. Keep it off the async runtime so rmcp can process the
+        // matching cancellation notification and cancel `ctx.ct`.
+        let registry = Arc::clone(&self.registry);
+        let result = tokio::task::spawn_blocking(move || {
+            registry.lock().unwrap_or_else(|p| p.into_inner()).call(
+                &name,
+                args,
+                &RmcpCancellationSignal(ctx),
+            )
+        })
+        .await
+        .map_err(|error| {
+            McpError::internal_error(format!("tool dispatch task failed: {error}"), None)
+        })?;
 
         match result {
             Ok(value) => {
@@ -280,6 +290,9 @@ pub(super) fn tool_error_to_rmcp(error: ToolError) -> Result<CallToolResult, Mcp
         ToolError::ExecutionFailed(msg) => Ok(CallToolResult::error(vec![Content::text(format!(
             "execution failed: {msg}"
         ))])),
+        ToolError::Cancelled => Ok(CallToolResult::error(vec![Content::text(
+            "tool invocation cancelled",
+        )])),
         ToolError::Application {
             code: _,
             message,
@@ -352,4 +365,11 @@ pub fn spawn_push_task(
             }
         })
         .expect("failed to spawn mcp-push-forwarder thread");
+}
+struct RmcpCancellationSignal(RequestContext<RoleServer>);
+
+impl crate::domain::CancellationSignal for RmcpCancellationSignal {
+    fn is_cancelled(&self) -> bool {
+        self.0.ct.is_cancelled()
+    }
 }

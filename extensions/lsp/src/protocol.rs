@@ -47,11 +47,20 @@ pub(crate) fn send_read_only_outcome_error(
     out: &Arc<Mutex<impl Write>>,
     id: &Option<Value>,
     outcome: extension_protocol::LspOutcome,
+    diagnostics: Vec<serde_json::Value>,
 ) {
+    let is_diagnostics = outcome.operation == Some(extension_protocol::LspOperation::Diagnostics);
+    let mut data = serde_json::json!({ "outcome": outcome });
+    if is_diagnostics {
+        data["diagnostics"] = serde_json::Value::Array(diagnostics);
+    }
     let error = ProtocolError {
         code: -32000,
-        message: outcome.message.clone(),
-        data: Some(serde_json::json!({ "outcome": outcome })),
+        message: data["outcome"]["message"]
+            .as_str()
+            .unwrap_or("language server request failed")
+            .to_owned(),
+        data: Some(data),
     };
     send_protocol_error(out, id, &error);
 }

@@ -83,6 +83,12 @@ prevents startup and requires manual migration. `tower init` never overwrites an
 existing configuration or ignore file; see
 [Configuration](docs/user-guide/configuration.md) for the schema and migration steps.
 
+Tower does not impose a finite duration limit on operations by default. Configure an explicit
+positive timeout when a bounded operation is required; shutdown, cancellation, crash detection,
+and child-process cleanup safeguards remain bounded independently. See
+[operation timeout migration](docs/user-guide/configuration.md#operation-timeout-migration) if
+you relied on a previous implicit limit.
+
 Secrets and generated output should be excluded in `.towerignore` before exposing a workspace to an
 agent. If `.towerignore` is missing, Tower warns and indexes all non-hidden files except `.git/`.
 
@@ -171,7 +177,7 @@ stable error codes.
 | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | [docs/getting-started.md](docs/getting-started.md)                                                                               | Build, first MCP session, quality gate, and copy-paste examples.                     |
 | [docs/towerignore.md](docs/towerignore.md)                                                                                       | `.towerignore` behavior, defaults, migration notes, and watcher limits.              |
-| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)                                                             | Canonical configuration, formatter tools, extension disabling, and legacy migration. |
+| [docs/user-guide/configuration.md](docs/user-guide/configuration.md)                                                             | Canonical configuration, operation timeouts, formatter tools, and migration.         |
 | [docs/architecture.md](docs/architecture.md)                                                                                     | Hexagonal boundary, staged daemon startup, readiness gates, and invariants.          |
 | [docs/extensions.md](docs/extensions.md)                                                                                         | Native sidecar extension protocol, manifests, capabilities, and supervision.         |
 | [docs/mcp-tools.md](docs/mcp-tools.md)                                                                                           | Complete MCP tool reference and JSON-RPC details.                                    |

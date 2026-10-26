@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -204,7 +205,7 @@ pub trait SessionSpawner: Send + Sync {
         root: PathBuf,
         workspace_root: &std::path::Path,
         push_tx: Option<DiagnosticsSender>,
-        diagnostics_deadline: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Result<Arc<dyn PooledSession>, LspSessionError>;
 }
 
@@ -222,7 +223,7 @@ impl SessionSpawner for RealSpawner {
         root: PathBuf,
         workspace_root: &std::path::Path,
         push_tx: Option<DiagnosticsSender>,
-        diagnostics_deadline: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
         use crate::lsp_adapter::LspClientAdapter;
 
@@ -239,7 +240,7 @@ impl SessionSpawner for RealSpawner {
             language_id.to_owned(),
             root,
             push_tx,
-            diagnostics_deadline,
+            operation_timeout,
         )?;
         Ok(Arc::new(adapter))
     }
@@ -254,6 +255,26 @@ impl SessionSpawner for RealSpawner {
 struct PoolEntry {
     session: Arc<dyn PooledSession>,
     last_used: Instant,
+    active_operations: Arc<AtomicUsize>,
+}
+
+struct PooledSessionLease {
+    session: Arc<dyn PooledSession>,
+    active_operations: Arc<AtomicUsize>,
+}
+
+impl std::ops::Deref for PooledSessionLease {
+    type Target = dyn PooledSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.session.as_ref()
+    }
+}
+
+impl Drop for PooledSessionLease {
+    fn drop(&mut self) {
+        self.active_operations.fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -278,10 +299,15 @@ pub struct SessionPool {
     workspace_root: PathBuf,
     idle_timeout: Option<Duration>,
     push_tx: Option<DiagnosticsSender>,
-    diagnostics_deadline: Duration,
+    operation_timeout: Option<Duration>,
 }
 
 impl SessionPool {
+    #[must_use]
+    pub(crate) fn operation_timeout(&self) -> Option<Duration> {
+        self.operation_timeout
+    }
+
     pub fn plan_safe_delete(
         &self,
         request: &SafeDeleteSemanticRequest,
@@ -317,13 +343,17 @@ impl SessionPool {
     /// Production constructor: uses `RealSpawner` and no push channel.
     #[allow(dead_code)]
     #[must_use]
-    pub fn new(config: LspConfig, workspace_root: PathBuf, diagnostics_deadline: Duration) -> Self {
+    pub fn new(
+        config: LspConfig,
+        workspace_root: PathBuf,
+        operation_timeout: Option<Duration>,
+    ) -> Self {
         Self::with_spawner(
             config,
             workspace_root,
             Arc::new(RealSpawner),
             None,
-            diagnostics_deadline,
+            operation_timeout,
         )
     }
 
@@ -334,7 +364,7 @@ impl SessionPool {
         workspace_root: PathBuf,
         spawner: Arc<dyn SessionSpawner>,
         push_tx: Option<DiagnosticsSender>,
-        diagnostics_deadline: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Self {
         let mut lang_index = HashMap::new();
         let mut ext_index = HashMap::new();
@@ -352,7 +382,7 @@ impl SessionPool {
             workspace_root,
             idle_timeout: config.idle_timeout,
             push_tx,
-            diagnostics_deadline,
+            operation_timeout,
         }
     }
 
@@ -373,7 +403,7 @@ impl SessionPool {
         &self,
         lang: &str,
         path: &RelativePath,
-    ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
+    ) -> Result<PooledSessionLease, LspSessionError> {
         let absolute_path = self.workspace_root.join(path.as_str());
         let file_dir = absolute_path.parent().unwrap_or(&self.workspace_root);
         let root = discover_workspace_root(
@@ -393,13 +423,19 @@ impl SessionPool {
                 let dead = entry.session.is_dead();
                 let idle = self
                     .idle_timeout
-                    .is_some_and(|t| entry.last_used.elapsed() > t);
+                    .is_some_and(|t| entry.last_used.elapsed() > t)
+                    && entry.active_operations.load(Ordering::Acquire) == 0;
                 if !dead && !idle {
                     // Fast path: reuse the live session.
                     let session = Arc::clone(&entry.session);
+                    let active_operations = Arc::clone(&entry.active_operations);
+                    active_operations.fetch_add(1, Ordering::Relaxed);
                     // Update last_used while we still hold the lock.
                     sessions.get_mut(&key).unwrap().last_used = Instant::now();
-                    return Ok(session);
+                    return Ok(PooledSessionLease {
+                        session,
+                        active_operations,
+                    });
                 }
                 // Evict dead or idle entry.
                 sessions.remove(&key);
@@ -416,27 +452,38 @@ impl SessionPool {
             root,
             &self.workspace_root,
             self.push_tx.clone(),
-            self.diagnostics_deadline,
+            self.operation_timeout,
         )?;
 
         // Phase 3: re-acquire to insert; discard concurrent loser.
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let (selected, loser) = match sessions.entry(key) {
+        let (selected, active_operations, loser) = match sessions.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().last_used = Instant::now();
-                (Arc::clone(&entry.get().session), Some(session))
+                let active_operations = Arc::clone(&entry.get().active_operations);
+                active_operations.fetch_add(1, Ordering::Relaxed);
+                (
+                    Arc::clone(&entry.get().session),
+                    active_operations,
+                    Some(session),
+                )
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let active_operations = Arc::new(AtomicUsize::new(1));
                 entry.insert(PoolEntry {
                     session: Arc::clone(&session),
                     last_used: Instant::now(),
+                    active_operations: Arc::clone(&active_operations),
                 });
-                (session, None)
+                (session, active_operations, None)
             }
         };
         drop(sessions);
         drop(loser);
-        Ok(selected)
+        Ok(PooledSessionLease {
+            session: selected,
+            active_operations,
+        })
     }
 
     /// Return the last published diagnostics for the given LSP URI.
@@ -459,6 +506,11 @@ impl SessionPool {
                 (!diagnostics.is_empty()).then_some(diagnostics)
             })
             .unwrap_or_default()
+    }
+
+    pub fn diagnostics_for_path(&self, path: &RelativePath) -> Vec<Diagnostic> {
+        let uri = super::path_to_uri(&self.workspace_root.join(path.as_str()));
+        self.diagnostics_for_uri(&uri)
     }
 
     /// Whether the pool is configured to handle files with this path's extension.
@@ -719,10 +771,7 @@ impl SessionPool {
             .rename_lsp(path, text, position, new_name)
     }
 
-    fn session_for_lsp(
-        &self,
-        path: &RelativePath,
-    ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
+    fn session_for_lsp(&self, path: &RelativePath) -> Result<PooledSessionLease, LspSessionError> {
         let lang = self
             .lang_for_path(path)
             .ok_or(LspSessionError::Unconfigured)?
@@ -883,7 +932,7 @@ mod tests {
                 "rust".to_owned(),
                 workspace.path().to_path_buf(),
                 None,
-                TEST_DIAGNOSTICS_DEADLINE,
+                Some(TEST_DIAGNOSTICS_DEADLINE),
             )
             .expect("scripted language server must initialize"),
             requests,
@@ -1495,7 +1544,7 @@ mod tests {
             _root: PathBuf,
             _workspace_root: &std::path::Path,
             _push_tx: Option<DiagnosticsSender>,
-            _diagnostics_deadline: Duration,
+            _operation_timeout: Option<Duration>,
         ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
             self.total_spawn_attempts.fetch_add(1, Ordering::Relaxed);
             let session = match self.per_lang.lock().unwrap().get_mut(language_id) {
@@ -1575,14 +1624,14 @@ mod tests {
             PathBuf::from("/workspace"),
             spawner,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         )
     }
 
     #[test]
-    fn diagnostics_deadline_reaches_spawned_sessions() {
+    fn operation_timeout_reaches_spawned_sessions() {
         struct CapturingSpawner {
-            deadlines: Mutex<Vec<Duration>>,
+            timeouts: Mutex<Vec<Option<Duration>>>,
             session: Arc<FakeSession>,
         }
 
@@ -1594,16 +1643,16 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                diagnostics_deadline: Duration,
+                operation_timeout: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
-                self.deadlines.lock().unwrap().push(diagnostics_deadline);
+                self.timeouts.lock().unwrap().push(operation_timeout);
                 Ok(Arc::clone(&self.session) as Arc<dyn PooledSession>)
             }
         }
 
         let expected = Duration::from_millis(137);
         let spawner = Arc::new(CapturingSpawner {
-            deadlines: Mutex::new(Vec::new()),
+            timeouts: Mutex::new(Vec::new()),
             session: FakeSession::new(),
         });
         let pool = SessionPool::with_spawner(
@@ -1611,19 +1660,19 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
-            expected,
+            Some(expected),
         );
         let path = RelativePath::new("src/main.rs");
 
         pool.check_lsp(&path, "").unwrap();
         pool.check_lsp(&path, "").unwrap();
 
-        assert_eq!(*spawner.deadlines.lock().unwrap(), vec![expected]);
+        assert_eq!(*spawner.timeouts.lock().unwrap(), vec![Some(expected)]);
         assert_eq!(spawner.session.calls(), 2);
     }
 
     #[test]
-    fn session_pool_new_retains_the_diagnostics_deadline() {
+    fn session_pool_new_retains_the_operation_timeout() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         let mut config = rust_config();
         let server = config.servers.get_mut("rust").unwrap();
@@ -1632,7 +1681,7 @@ mod tests {
             .into_owned();
         server.args = vec!["diagnostics_timeout".to_owned()];
         let budget = Duration::from_millis(40);
-        let pool = SessionPool::new(config, workspace.path().to_path_buf(), budget);
+        let pool = SessionPool::new(config, workspace.path().to_path_buf(), Some(budget));
 
         let started = Instant::now();
         let error = pool
@@ -1846,7 +1895,7 @@ mod tests {
         let pool = SessionPool::new(
             config,
             workspace.path().to_path_buf(),
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
 
         pool.get_or_spawn("rust", &RelativePath::new("crates/app/src/main.rs"))
@@ -1880,7 +1929,7 @@ mod tests {
         let error = SessionPool::new(
             config,
             workspace.path().to_path_buf(),
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         )
         .check_lsp(&RelativePath::new("src/main.rs"), "")
         .unwrap_err();
@@ -1894,7 +1943,7 @@ mod tests {
         let error = SessionPool::new(
             config,
             workspace.path().to_path_buf(),
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         )
         .check_lsp(&RelativePath::new("src/main.rs"), "")
         .unwrap_err();
@@ -1908,7 +1957,7 @@ mod tests {
         let error = SessionPool::new(
             config,
             workspace.path().to_path_buf(),
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         )
         .check_lsp(&RelativePath::new("src/main.rs"), "")
         .unwrap_err();
@@ -1928,7 +1977,7 @@ mod tests {
             workspace.path().join("missing-working-directory"),
             workspace.path(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         ) {
             Ok(_) => panic!("a missing working directory must fail process launch"),
             Err(error) => error,
@@ -1955,7 +2004,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                _: Duration,
+                _: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.started.send(()).expect("report that spawn started");
                 self.release
@@ -1979,7 +2028,7 @@ mod tests {
             PathBuf::from("/workspace"),
             spawner,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         ));
         let spawned_pool = Arc::clone(&pool);
         let spawned_request = std::thread::spawn(move || {
@@ -2017,7 +2066,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                _: Duration,
+                _: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(LspSessionError::Backend(
@@ -2037,7 +2086,7 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let path = RelativePath::new("src/main.rs");
 
@@ -2068,7 +2117,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                _: Duration,
+                _: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 let index = self.next.fetch_add(1, Ordering::SeqCst);
                 self.barrier.wait();
@@ -2088,7 +2137,7 @@ mod tests {
             PathBuf::from("/workspace"),
             spawner,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         ));
 
         let requests: Vec<_> = (0..2)
@@ -2133,7 +2182,7 @@ mod tests {
                 idle_timeout: None,
             },
             workspace.path().to_path_buf(),
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
 
         let error = pool
@@ -2161,7 +2210,7 @@ mod tests {
         let pool = SessionPool::new(
             LspConfig::default(),
             PathBuf::from("/workspace"),
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let rel = RelativePath::new("src/main.rs");
         assert!(!pool.serves(&rel));
@@ -2227,7 +2276,7 @@ mod tests {
                 root: PathBuf,
                 workspace_root: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                _: Duration,
+                _: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.roots
                     .lock()
@@ -2251,7 +2300,7 @@ mod tests {
             workspace.path().to_path_buf(),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
 
         pool.check(&RelativePath::new("crates/alpha/src/lib.rs"), "")
@@ -2314,7 +2363,7 @@ mod tests {
                 _root: PathBuf,
                 _workspace_root: &std::path::Path,
                 _push_tx: Option<DiagnosticsSender>,
-                _diagnostics_deadline: Duration,
+                _operation_timeout: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 *self
                     .counts
@@ -2345,7 +2394,7 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let rel = RelativePath::new("src/main.rs");
 
@@ -2390,7 +2439,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                _: Duration,
+                _: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.queue
@@ -2417,7 +2466,7 @@ mod tests {
             PathBuf::from("/workspace"),
             spawner_arc,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let rel = RelativePath::new("lib.rs");
 
@@ -2438,6 +2487,51 @@ mod tests {
             1,
             "second session must handle the post-eviction request"
         );
+    }
+
+    #[test]
+    fn idle_eviction_does_not_close_an_in_flight_session() {
+        let first = FakeSession::new();
+        let second = FakeSession::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        first.block_next_type_hierarchy_call(entered_tx, release_rx);
+
+        let spawner = FakeSpawner::new();
+        spawner.register("rust", Arc::clone(&first));
+        spawner.enqueue("rust", Arc::clone(&second));
+        let mut config = rust_config();
+        config.idle_timeout = Some(Duration::from_millis(1));
+        let pool = Arc::new(pool_with_spawner(
+            config,
+            Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
+        ));
+
+        let in_flight_pool = Arc::clone(&pool);
+        let in_flight = std::thread::spawn(move || {
+            in_flight_pool.type_hierarchy_lsp(
+                &TypeHierarchyQuery {
+                    path: "src/main.rs".to_owned(),
+                    line: 0,
+                    character: 0,
+                    direction: extension_protocol::TypeHierarchyDirection::Both,
+                },
+                "",
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request must enter the session");
+        pool.backdate_last_used_for_test("rust", Duration::from_millis(10));
+
+        pool.check_lsp(&RelativePath::new("src/main.rs"), "")
+            .expect("a concurrent request must reuse the active session");
+
+        assert_eq!(spawner.spawn_count("rust"), 1);
+        assert_eq!(first.calls(), 1);
+        assert_eq!(second.calls(), 0);
+        release_tx.send(()).unwrap();
+        in_flight.join().unwrap().unwrap();
     }
 
     // Multi-language routing.
@@ -2733,7 +2827,7 @@ mod tests {
                 _: PathBuf,
                 _: &std::path::Path,
                 _: Option<DiagnosticsSender>,
-                _: Duration,
+                _: Option<Duration>,
             ) -> Result<Arc<dyn PooledSession>, LspSessionError> {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.queue
@@ -2762,7 +2856,7 @@ mod tests {
             PathBuf::from("/workspace"),
             Arc::clone(&spawner) as Arc<dyn SessionSpawner>,
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let rel = RelativePath::new("src/main.rs");
         let pos = Position {

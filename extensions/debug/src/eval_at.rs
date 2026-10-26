@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
@@ -10,7 +10,7 @@ use crate::protocol::{DebugToolError, DebugToolErrorCode};
 use crate::session::{LaunchRequest, SessionManager};
 use crate::types::{
     DebugBreakpoint, DebugOutput, DebugRuntimeError, DebugScope, DebugSessionId, DebugSessionState,
-    DebugStackFrame, DebugStop, DebugVariable,
+    DebugStackFrame, DebugStop, DebugVariable, RuntimeFailure,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,13 +124,18 @@ pub struct EvalAtResult {
     pub finished: EvalAtFinished,
     pub exit_code: Option<i64>,
     pub condition_unsupported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RuntimeFailure>,
 }
 
 pub fn run_eval_at(
     request: EvalAtRequest,
     sessions: &SessionManager,
 ) -> Result<EvalAtResult, DebugToolError> {
-    let timeout = request.timeout_ms.map(Duration::from_millis);
+    let original_budget = request.timeout_ms.map(Duration::from_millis).or(sessions
+        .default_timeout_for_language(&request.lang)
+        .map_err(runtime_tool_error)?);
+    let deadline = RecipeDeadline::new(original_budget).ok_or_else(invalid_params)?;
     let initial_breakpoints = request
         .breakpoint
         .as_ref()
@@ -145,19 +150,24 @@ pub fn run_eval_at(
             }]
         })
         .unwrap_or_default();
-    let (launch, configured_breakpoints) = sessions
-        .launch_with_initial_breakpoints(
-            LaunchRequest {
-                language: request.lang.clone(),
-                program: request.program.clone(),
-                cwd: request.cwd.clone(),
-                args: request.args.clone(),
-                env: request.env.clone(),
-                launch_overrides: Map::new(),
-            },
-            initial_breakpoints,
-        )
-        .map_err(runtime_tool_error)?;
+    let (launch, configured_breakpoints) = match sessions.launch_with_initial_breakpoints_timeout(
+        LaunchRequest {
+            language: request.lang.clone(),
+            program: request.program.clone(),
+            cwd: request.cwd.clone(),
+            args: request.args.clone(),
+            env: request.env.clone(),
+            launch_overrides: Map::new(),
+        },
+        initial_breakpoints,
+        deadline.remaining(),
+    ) {
+        Ok(result) => result,
+        Err(DebugRuntimeError::DebugTimeout { .. }) => {
+            return Ok(timeout_result(Vec::new(), Vec::new(), None, deadline));
+        }
+        Err(error) => return Err(runtime_tool_error(error)),
+    };
 
     let session_id = launch.session_id;
     if let Some(probe) = &request.breakpoint {
@@ -170,11 +180,11 @@ pub fn run_eval_at(
             request,
             sessions,
             session_id,
-            timeout,
+            deadline,
             condition_unsupported,
         )
     } else {
-        run_eval_at_loop(request, sessions, session_id, timeout, None)
+        run_eval_at_loop(request, sessions, session_id, deadline, None)
     }
 }
 
@@ -182,7 +192,7 @@ fn run_eval_at_loop(
     request: EvalAtRequest,
     sessions: &SessionManager,
     session_id: DebugSessionId,
-    timeout: Option<Duration>,
+    deadline: RecipeDeadline,
     condition_unsupported: Option<bool>,
 ) -> Result<EvalAtResult, DebugToolError> {
     let max_hits = request.max_hits;
@@ -190,17 +200,26 @@ fn run_eval_at_loop(
     let mut output = Vec::new();
 
     loop {
-        let stop = match sessions.continue_session(&session_id, timeout) {
+        let Some(remaining) = deadline.remaining_or_unlimited() else {
+            return finish_timeout_after_cleanup(
+                sessions,
+                &session_id,
+                hits,
+                output,
+                condition_unsupported,
+                deadline,
+            );
+        };
+        let stop = match sessions.continue_session(&session_id, remaining) {
             Ok(stop) => stop,
-            Err(DebugRuntimeError::DebugTimeout(_)) => {
-                return finish_after_cleanup(
+            Err(DebugRuntimeError::DebugTimeout { .. }) => {
+                return finish_timeout_after_cleanup(
                     sessions,
                     &session_id,
                     hits,
                     output,
-                    EvalAtFinished::Timeout,
-                    None,
                     condition_unsupported,
+                    deadline,
                 );
             }
             Err(error) if is_adapter_gone(&error) => {
@@ -220,20 +239,19 @@ fn run_eval_at_loop(
         output.extend(stop.output_since.iter().cloned());
 
         if stop.timed_out {
-            return finish_after_cleanup(
+            return finish_timeout_after_cleanup(
                 sessions,
                 &session_id,
                 hits,
                 output,
-                EvalAtFinished::Timeout,
-                None,
                 condition_unsupported,
+                deadline,
             );
         }
 
         match stop.state {
             DebugSessionState::Stopped => {
-                match capture_hit(&request, sessions, &session_id, &stop) {
+                match capture_hit(&request, sessions, &session_id, &stop, deadline) {
                     Ok(hit) => hits.push(hit),
                     Err(CaptureError::AdapterGone) => {
                         return finish_after_cleanup(
@@ -244,6 +262,16 @@ fn run_eval_at_loop(
                             EvalAtFinished::AdapterExited,
                             None,
                             condition_unsupported,
+                        );
+                    }
+                    Err(CaptureError::Timeout) => {
+                        return finish_timeout_after_cleanup(
+                            sessions,
+                            &session_id,
+                            hits,
+                            output,
+                            condition_unsupported,
+                            deadline,
                         );
                     }
                     Err(CaptureError::Runtime(error)) => {
@@ -275,14 +303,13 @@ fn run_eval_at_loop(
                 );
             }
             DebugSessionState::Running | DebugSessionState::Initializing => {
-                return finish_after_cleanup(
+                return finish_timeout_after_cleanup(
                     sessions,
                     &session_id,
                     hits,
                     output,
-                    EvalAtFinished::Timeout,
-                    None,
                     condition_unsupported,
+                    deadline,
                 );
             }
         }
@@ -291,6 +318,7 @@ fn run_eval_at_loop(
 
 pub(crate) enum CaptureError {
     AdapterGone,
+    Timeout,
     Runtime(DebugRuntimeError),
 }
 
@@ -299,11 +327,16 @@ fn capture_hit(
     sessions: &SessionManager,
     session_id: &DebugSessionId,
     stop: &DebugStop,
+    deadline: RecipeDeadline,
 ) -> Result<EvalAtHit, CaptureError> {
     let frame = stop.top_frame.clone();
     let stack = if request.capture.stack {
         match stop.thread_id {
-            Some(thread_id) => inspect(sessions.stack(session_id, thread_id))?,
+            Some(thread_id) => inspect(sessions.stack_with_timeout(
+                session_id,
+                thread_id,
+                required_remaining(deadline)?,
+            ))?,
             None => Vec::new(),
         }
     } else {
@@ -313,13 +346,13 @@ fn capture_hit(
 
     let (locals, args) = match frame_for_inspection.as_ref() {
         Some(frame) if request.capture.locals || request.capture.args => {
-            capture_scopes(request, sessions, session_id, frame.id)?
+            capture_scopes(request, sessions, session_id, frame.id, deadline)?
         }
         _ => (Vec::new(), Vec::new()),
     };
 
     let evaluated = match frame_for_inspection.as_ref() {
-        Some(frame) => evaluate_expressions(request, sessions, session_id, frame.id)?,
+        Some(frame) => evaluate_expressions(request, sessions, session_id, frame.id, deadline)?,
         None => BTreeMap::new(),
     };
 
@@ -338,27 +371,31 @@ fn capture_scopes(
     sessions: &SessionManager,
     session_id: &DebugSessionId,
     frame_id: u64,
+    deadline: RecipeDeadline,
 ) -> Result<(Vec<CapturedVariable>, Vec<CapturedVariable>), CaptureError> {
-    let scopes = inspect(sessions.scopes(session_id, frame_id))?;
+    let scopes =
+        inspect(sessions.scopes_with_timeout(session_id, frame_id, required_remaining(deadline)?))?;
     let mut locals = Vec::new();
     let mut args = Vec::new();
 
     for scope in scopes {
         if request.capture.locals && is_local_scope(&scope) {
-            locals.extend(capture_variables(
+            locals.extend(capture_variables_with_deadline(
                 sessions,
                 session_id,
                 scope.variables_reference,
                 request.max_depth,
                 request.max_children,
+                deadline,
             )?);
         } else if request.capture.args && is_argument_scope(&scope) {
-            args.extend(capture_variables(
+            args.extend(capture_variables_with_deadline(
                 sessions,
                 session_id,
                 scope.variables_reference,
                 request.max_depth,
                 request.max_children,
+                deadline,
             )?);
         }
     }
@@ -366,6 +403,7 @@ fn capture_scopes(
     Ok((locals, args))
 }
 
+#[allow(dead_code)]
 pub(crate) fn capture_variables(
     sessions: &SessionManager,
     session_id: &DebugSessionId,
@@ -373,18 +411,44 @@ pub(crate) fn capture_variables(
     max_depth: usize,
     max_children: usize,
 ) -> Result<Vec<CapturedVariable>, CaptureError> {
-    inspect(sessions.variables(session_id, variables_reference))?
-        .into_iter()
-        .map(|variable| {
-            expand_variable(
-                sessions,
-                session_id,
-                variable,
-                max_depth.saturating_sub(1),
-                max_children,
-            )
-        })
-        .collect()
+    capture_variables_with_deadline(
+        sessions,
+        session_id,
+        variables_reference,
+        max_depth,
+        max_children,
+        RecipeDeadline {
+            budget: None,
+            expires_at: None,
+        },
+    )
+}
+
+fn capture_variables_with_deadline(
+    sessions: &SessionManager,
+    session_id: &DebugSessionId,
+    variables_reference: u64,
+    max_depth: usize,
+    max_children: usize,
+    deadline: RecipeDeadline,
+) -> Result<Vec<CapturedVariable>, CaptureError> {
+    inspect(sessions.variables_with_timeout(
+        session_id,
+        variables_reference,
+        required_remaining(deadline)?,
+    ))?
+    .into_iter()
+    .map(|variable| {
+        expand_variable(
+            sessions,
+            session_id,
+            variable,
+            max_depth.saturating_sub(1),
+            max_children,
+            deadline,
+        )
+    })
+    .collect()
 }
 
 fn expand_variable(
@@ -393,6 +457,7 @@ fn expand_variable(
     variable: DebugVariable,
     remaining_depth: usize,
     max_children: usize,
+    deadline: RecipeDeadline,
 ) -> Result<CapturedVariable, CaptureError> {
     let mut children = Vec::new();
     let mut truncated = false;
@@ -401,8 +466,11 @@ fn expand_variable(
         if remaining_depth == 0 {
             truncated = true;
         } else {
-            let raw_children =
-                inspect(sessions.variables(session_id, variable.variables_reference))?;
+            let raw_children = inspect(sessions.variables_with_timeout(
+                session_id,
+                variable.variables_reference,
+                required_remaining(deadline)?,
+            ))?;
             truncated = raw_children.len() > max_children;
             for child in raw_children.into_iter().take(max_children) {
                 children.push(expand_variable(
@@ -411,6 +479,7 @@ fn expand_variable(
                     child,
                     remaining_depth.saturating_sub(1),
                     max_children,
+                    deadline,
                 )?);
             }
         }
@@ -430,14 +499,21 @@ fn evaluate_expressions(
     sessions: &SessionManager,
     session_id: &DebugSessionId,
     frame_id: u64,
+    deadline: RecipeDeadline,
 ) -> Result<BTreeMap<String, EvalAtExpressionResult>, CaptureError> {
     let mut evaluated = BTreeMap::new();
     for expression in &request.expressions {
-        let result = match sessions.evaluate(session_id, frame_id, expression.clone()) {
+        let result = match sessions.evaluate_with_timeout(
+            session_id,
+            frame_id,
+            expression.clone(),
+            required_remaining(deadline)?,
+        ) {
             Ok(variable) => EvalAtExpressionResult::Value {
                 value: variable.value,
                 r#type: variable.r#type,
             },
+            Err(DebugRuntimeError::DebugTimeout { .. }) => return Err(CaptureError::Timeout),
             Err(error) if is_adapter_gone(&error) => return Err(CaptureError::AdapterGone),
             Err(error) => EvalAtExpressionResult::Error {
                 error: runtime_message(error),
@@ -464,10 +540,102 @@ fn finish_after_cleanup(
         finished,
         exit_code,
         condition_unsupported,
+        error: None,
     };
     match sessions.terminate(session_id) {
         Ok(()) | Err(DebugRuntimeError::SessionNotFound(_)) => Ok(result),
         Err(error) => Err(runtime_tool_error(error)),
+    }
+}
+
+fn finish_timeout_after_cleanup(
+    sessions: &SessionManager,
+    session_id: &DebugSessionId,
+    hits: Vec<EvalAtHit>,
+    output: Vec<DebugOutput>,
+    condition_unsupported: Option<bool>,
+    deadline: RecipeDeadline,
+) -> Result<EvalAtResult, DebugToolError> {
+    let result = timeout_result(hits, output, condition_unsupported, deadline);
+    sessions.reap_after_recipe_timeout(session_id);
+    Ok(result)
+}
+
+fn timeout_result(
+    hits: Vec<EvalAtHit>,
+    output: Vec<DebugOutput>,
+    condition_unsupported: Option<bool>,
+    deadline: RecipeDeadline,
+) -> EvalAtResult {
+    EvalAtResult {
+        hit: !hits.is_empty(),
+        hits,
+        output,
+        finished: EvalAtFinished::Timeout,
+        exit_code: None,
+        condition_unsupported,
+        error: Some(RuntimeFailure {
+            code: "debug-timeout".to_owned(),
+            message: "debug operation timed out".to_owned(),
+            data: Some(serde_json::json!({
+                "operation": "eval_at",
+                "layer": "debug_recipe",
+                "budget_ms": deadline.budget_ms(),
+            })),
+        }),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RecipeDeadline {
+    budget: Option<Duration>,
+    expires_at: Option<Instant>,
+}
+
+impl RecipeDeadline {
+    fn new(budget: Option<Duration>) -> Option<Self> {
+        let expires_at = match budget {
+            Some(budget) if budget.is_zero() || budget.as_nanos() > u128::from(u64::MAX) => {
+                return None;
+            }
+            Some(budget) => Some(Instant::now().checked_add(budget)?),
+            None => None,
+        };
+        Some(Self { budget, expires_at })
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.expires_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn remaining_or_unlimited(self) -> Option<Option<Duration>> {
+        match self.expires_at {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                (!remaining.is_zero()).then_some(Some(remaining))
+            }
+            None => Some(None),
+        }
+    }
+
+    fn budget_ms(self) -> u64 {
+        self.budget
+            .and_then(|budget| u64::try_from(budget.as_millis()).ok())
+            .unwrap_or(u64::MAX)
+    }
+}
+
+fn required_remaining(deadline: RecipeDeadline) -> Result<Option<Duration>, CaptureError> {
+    deadline
+        .remaining_or_unlimited()
+        .ok_or(CaptureError::Timeout)
+}
+
+fn invalid_params() -> DebugToolError {
+    DebugToolError {
+        code: DebugToolErrorCode::InvalidParams,
+        message: "InvalidParams".to_owned(),
     }
 }
 
@@ -482,7 +650,9 @@ fn fail_after_cleanup<T>(
 
 fn inspect<T>(result: Result<T, DebugRuntimeError>) -> Result<T, CaptureError> {
     result.map_err(|error| {
-        if is_adapter_gone(&error) {
+        if matches!(error, DebugRuntimeError::DebugTimeout { .. }) {
+            CaptureError::Timeout
+        } else if is_adapter_gone(&error) {
             CaptureError::AdapterGone
         } else {
             CaptureError::Runtime(error)
@@ -511,9 +681,10 @@ fn is_adapter_gone(error: &DebugRuntimeError) -> bool {
 fn runtime_tool_error(error: DebugRuntimeError) -> DebugToolError {
     DebugToolError {
         code: match error {
+            DebugRuntimeError::InvalidParams(_) => DebugToolErrorCode::InvalidParams,
             DebugRuntimeError::SessionNotFound(_) => DebugToolErrorCode::SessionNotFound,
             DebugRuntimeError::NotStopped(_) => DebugToolErrorCode::NotStopped,
-            DebugRuntimeError::DebugTimeout(_) => DebugToolErrorCode::DebugTimeout,
+            DebugRuntimeError::DebugTimeout { .. } => DebugToolErrorCode::DebugTimeout,
             DebugRuntimeError::AdapterExited(_)
             | DebugRuntimeError::LaunchFailed(_)
             | DebugRuntimeError::ReverseUnsupported(_) => DebugToolErrorCode::InvalidParams,
@@ -524,9 +695,10 @@ fn runtime_tool_error(error: DebugRuntimeError) -> DebugToolError {
 
 fn runtime_message(error: DebugRuntimeError) -> String {
     match error {
+        DebugRuntimeError::InvalidParams(message) => message,
         DebugRuntimeError::SessionNotFound(message)
         | DebugRuntimeError::NotStopped(message)
-        | DebugRuntimeError::DebugTimeout(message)
+        | DebugRuntimeError::DebugTimeout { message, .. }
         | DebugRuntimeError::AdapterExited(message)
         | DebugRuntimeError::LaunchFailed(message)
         | DebugRuntimeError::ReverseUnsupported(message) => message,
@@ -557,11 +729,13 @@ mod tests {
         BreakpointProbe, CaptureOptions, CapturedVariable, EvalAtExpressionResult, EvalAtFinished,
         EvalAtHit, EvalAtHitMode, EvalAtRequest, EvalAtResult, run_eval_at,
     };
+
+    type TimeoutCalls = Arc<Mutex<Vec<(&'static str, Option<Duration>)>>>;
     use crate::protocol::{DebugAdapterConfig, DebugInitializeConfig, DebugToolErrorCode};
     use crate::session::{DebugAdapterFactory, DebugAdapterSession, LaunchRequest, SessionManager};
     use crate::types::{
         DebugBreakpoint, DebugOutput, DebugRuntimeError, DebugScope, DebugSessionState,
-        DebugStackFrame, DebugStop, DebugThread, DebugVariable,
+        DebugStackFrame, DebugStop, DebugThread, DebugVariable, RuntimeFailure,
     };
 
     #[test]
@@ -793,6 +967,7 @@ mod tests {
             finished: EvalAtFinished::Stopped,
             exit_code: None,
             condition_unsupported: None,
+            error: None,
         };
 
         let value = serde_json::to_value(result).unwrap();
@@ -885,6 +1060,7 @@ mod tests {
             finished: EvalAtFinished::Exited,
             exit_code: Some(0),
             condition_unsupported: Some(false),
+            error: None,
         };
 
         assert_eq!(
@@ -912,6 +1088,7 @@ mod tests {
             finished: EvalAtFinished::Timeout,
             exit_code: None,
             condition_unsupported: None,
+            error: None,
         })
         .unwrap();
         assert_optional_null_or_absent(&no_optional_values, "exit_code");
@@ -927,6 +1104,7 @@ mod tests {
             finished: EvalAtFinished::Timeout,
             exit_code: None,
             condition_unsupported: None,
+            error: None,
         };
 
         let value = serde_json::to_value(result).unwrap();
@@ -990,11 +1168,10 @@ mod tests {
             initial_position < configuration_position && configuration_position < continue_position,
             "eval-at must install breakpoints before configurationDone and continue; got {calls:?}"
         );
-        assert!(
-            factory
-                .calls()
-                .contains(&FakeEvalAtCall::Continue(Duration::from_millis(250)))
-        );
+        assert!(factory.calls().iter().any(|call| matches!(
+            call,
+            FakeEvalAtCall::Continue(Some(timeout)) if *timeout <= Duration::from_millis(250)
+        )));
         assert!(factory.calls().contains(&FakeEvalAtCall::Terminate));
     }
 
@@ -1023,11 +1200,10 @@ mod tests {
         assert_eq!(result.finished, EvalAtFinished::Exited);
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(factory.source_breakpoint_calls().len(), 0);
-        assert!(
-            factory
-                .calls()
-                .contains(&FakeEvalAtCall::Continue(Duration::from_secs(1)))
-        );
+        assert!(factory.calls().iter().any(|call| matches!(
+            call,
+            FakeEvalAtCall::Continue(Some(timeout)) if *timeout <= Duration::from_secs(1)
+        )));
         assert!(factory.calls().contains(&FakeEvalAtCall::Terminate));
     }
 
@@ -1275,17 +1451,112 @@ mod tests {
     }
 
     #[test]
-    fn eval_at_timeout_and_adapter_exit_paths_return_successful_finished_states_and_attempt_cleanup()
-     {
+    fn eval_at_timeout_returns_structured_evidence_and_reaps_the_session() {
         let timeout_factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario::timeout()));
         let timeout_sessions = SessionManager::new(debug_config(), timeout_factory.clone());
-        let timeout = run_eval_at(base_request(), &timeout_sessions)
-            .expect("timeout is probe evidence, not a JSON-RPC failure");
+        let timeout = run_eval_at(
+            EvalAtRequest {
+                timeout_ms: Some(250),
+                ..base_request()
+            },
+            &timeout_sessions,
+        )
+        .expect("timeout is probe evidence, not a JSON-RPC failure");
 
         assert!(!timeout.hit);
         assert_eq!(timeout.finished, EvalAtFinished::Timeout);
+        assert_eq!(
+            timeout.error,
+            Some(RuntimeFailure {
+                code: "debug-timeout".to_owned(),
+                message: "debug operation timed out".to_owned(),
+                data: Some(json!({
+                    "operation": "eval_at",
+                    "layer": "debug_recipe",
+                    "budget_ms": 250
+                })),
+            })
+        );
+        let timeout_calls = timeout_factory.timeout_calls();
+        assert!(
+            timeout_calls.iter().all(|(_, timeout)| {
+                timeout.is_some_and(|timeout| timeout <= Duration::from_millis(250))
+            }),
+            "the request override must bound launch, breakpoint setup, resume, and inspection: {timeout_calls:?}"
+        );
+        let continue_timeout = timeout_calls
+            .iter()
+            .find_map(|(operation, timeout)| (*operation == "continue").then_some(*timeout))
+            .expect("eval-at must resume the session");
+        assert!(
+            continue_timeout.is_some_and(|timeout| timeout < Duration::from_millis(250)),
+            "resume must receive the remaining portion of one absolute 250ms recipe budget: {timeout_calls:?}"
+        );
         assert!(timeout_factory.calls().contains(&FakeEvalAtCall::Terminate));
+        assert!(timeout_sessions.sessions().is_empty());
+        assert_object_has_no_key_recursively(
+            &serde_json::to_value(&timeout).unwrap(),
+            "session_id",
+        );
 
+        let configured_default_factory =
+            Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario::timeout()));
+        let configured_default_sessions =
+            SessionManager::new(debug_config(), configured_default_factory.clone());
+        let configured_default = run_eval_at(base_request(), &configured_default_sessions)
+            .expect("a configured timeout remains probe evidence");
+        assert_eq!(configured_default.finished, EvalAtFinished::Timeout);
+        assert_eq!(
+            configured_default.error,
+            Some(RuntimeFailure {
+                code: "debug-timeout".to_owned(),
+                message: "debug operation timed out".to_owned(),
+                data: Some(json!({
+                    "operation": "eval_at",
+                    "layer": "debug_recipe",
+                    "budget_ms": 1_000
+                })),
+            })
+        );
+        assert!(
+            configured_default_factory.timeout_calls().iter().all(
+                |(_, timeout)| timeout.is_some_and(|timeout| timeout <= Duration::from_secs(1))
+            )
+        );
+        assert!(
+            configured_default_factory
+                .calls()
+                .contains(&FakeEvalAtCall::Terminate)
+        );
+        assert!(configured_default_sessions.sessions().is_empty());
+
+        let unlimited_factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario::single_hit()));
+        let mut unlimited_config = debug_config();
+        unlimited_config
+            .languages
+            .get_mut("rust")
+            .expect("rust test adapter configuration")
+            .default_timeout_secs = None;
+        let unlimited_sessions = SessionManager::new(unlimited_config, unlimited_factory.clone());
+        let unlimited = run_eval_at(base_request(), &unlimited_sessions)
+            .expect("an omitted request and language default leave the probe unbounded");
+        assert_eq!(unlimited.finished, EvalAtFinished::Stopped);
+        assert!(
+            unlimited_factory
+                .timeout_calls()
+                .iter()
+                .all(|(_, timeout)| timeout.is_none())
+        );
+        assert!(
+            unlimited_factory
+                .calls()
+                .contains(&FakeEvalAtCall::Terminate)
+        );
+        assert!(unlimited_sessions.sessions().is_empty());
+    }
+
+    #[test]
+    fn eval_at_adapter_exit_returns_successful_evidence_and_attempts_cleanup() {
         let exited_factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario::adapter_exited()));
         let exited_sessions = SessionManager::new(debug_config(), exited_factory.clone());
         let exited = run_eval_at(base_request(), &exited_sessions)
@@ -1380,27 +1651,61 @@ mod tests {
         ));
         let sessions = SessionManager::new(debug_config(), factory.clone());
 
-        let error = run_eval_at(base_request(), &sessions)
-            .expect_err("setBreakpoints runtime failure should remain a tool error");
+        let result = run_eval_at(base_request(), &sessions)
+            .expect("setBreakpoints timeout should remain structured probe evidence");
 
-        assert_eq!(error.code, DebugToolErrorCode::DebugTimeout);
+        assert_eq!(result.finished, EvalAtFinished::Timeout);
+        assert_eq!(result.error.unwrap().code, "debug-timeout");
         assert!(factory.calls().contains(&FakeEvalAtCall::Terminate));
         assert!(sessions.sessions().is_empty());
     }
 
     #[test]
-    fn eval_at_capture_runtime_error_attempts_cleanup_before_returning_error() {
-        let factory = Arc::new(FakeEvalAtFactory::new(
-            FakeEvalAtScenario::variables_timeout(),
-        ));
-        let sessions = SessionManager::new(debug_config(), factory.clone());
+    fn eval_at_inspection_and_expression_timeouts_are_recipe_timeouts() {
+        for (operation, scenario, expressions) in [
+            ("stack", FakeEvalAtScenario::stack_timeout(), Vec::new()),
+            ("scopes", FakeEvalAtScenario::scopes_timeout(), Vec::new()),
+            (
+                "variables",
+                FakeEvalAtScenario::variables_timeout(),
+                Vec::new(),
+            ),
+            (
+                "evaluate",
+                FakeEvalAtScenario::evaluate_timeout(),
+                vec!["slow_expression".to_owned()],
+            ),
+        ] {
+            let factory = Arc::new(FakeEvalAtFactory::new(scenario));
+            let sessions = SessionManager::new(debug_config(), factory.clone());
 
-        let error = run_eval_at(base_request(), &sessions)
-            .expect_err("capture runtime failure should remain a tool error");
+            let result = run_eval_at(
+                EvalAtRequest {
+                    timeout_ms: Some(250),
+                    expressions,
+                    ..base_request()
+                },
+                &sessions,
+            )
+            .unwrap_or_else(|error| panic!("{operation} timeout became a tool error: {error:?}"));
 
-        assert_eq!(error.code, DebugToolErrorCode::DebugTimeout);
-        assert!(factory.calls().contains(&FakeEvalAtCall::Terminate));
-        assert!(sessions.sessions().is_empty());
+            assert_eq!(result.finished, EvalAtFinished::Timeout, "{operation}");
+            assert_eq!(
+                result.error,
+                Some(RuntimeFailure {
+                    code: "debug-timeout".to_owned(),
+                    message: "debug operation timed out".to_owned(),
+                    data: Some(json!({
+                        "operation": "eval_at",
+                        "layer": "debug_recipe",
+                        "budget_ms": 250
+                    })),
+                }),
+                "{operation}"
+            );
+            assert!(factory.calls().contains(&FakeEvalAtCall::Terminate));
+            assert!(sessions.sessions().is_empty(), "{operation}");
+        }
     }
 
     #[test]
@@ -1475,7 +1780,7 @@ mod tests {
                     args: Vec::new(),
                     adapter_type: "fake".to_owned(),
                     launch: Map::new(),
-                    default_timeout_secs: 1,
+                    default_timeout_secs: Some(1),
                     idle_ttl_secs: 60,
                 },
             )]),
@@ -1511,6 +1816,7 @@ mod tests {
             top_frame: Some(top_frame()),
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: vec![DebugOutput {
                 sequence: 1,
@@ -1528,6 +1834,7 @@ mod tests {
             top_frame: None,
             hit_breakpoint_ids: Vec::new(),
             timed_out: false,
+            error: None,
             exit_code: Some(exit_code),
             output_since: vec![DebugOutput {
                 sequence: 1,
@@ -1542,6 +1849,7 @@ mod tests {
         scenario: FakeEvalAtScenario,
         starts: Arc<Mutex<Vec<LaunchRequest>>>,
         calls: Arc<Mutex<Vec<FakeEvalAtCall>>>,
+        timeout_calls: TimeoutCalls,
     }
 
     impl FakeEvalAtFactory {
@@ -1550,11 +1858,16 @@ mod tests {
                 scenario,
                 starts: Arc::new(Mutex::new(Vec::new())),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                timeout_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn calls(&self) -> Vec<FakeEvalAtCall> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn timeout_calls(&self) -> Vec<(&'static str, Option<Duration>)> {
+            self.timeout_calls.lock().unwrap().clone()
         }
 
         fn continue_count(&self) -> usize {
@@ -1586,6 +1899,7 @@ mod tests {
             Ok(Box::new(FakeEvalAtSession {
                 scenario: self.scenario.clone(),
                 calls: self.calls.clone(),
+                timeout_calls: self.timeout_calls.clone(),
             }))
         }
     }
@@ -1595,11 +1909,25 @@ mod tests {
         stops: Arc<Mutex<VecDeque<Result<DebugStop, DebugRuntimeError>>>>,
         expression_errors: Vec<String>,
         expression_adapter_exits: Vec<String>,
+        expression_timeouts: Vec<String>,
         set_breakpoints_error: Option<DebugRuntimeError>,
+        stack_error: Option<DebugRuntimeError>,
+        scopes_error: Option<DebugRuntimeError>,
         variables_error: Option<DebugRuntimeError>,
         unsupported_condition: bool,
         launch_error: Option<String>,
         terminate_error: Option<String>,
+    }
+
+    fn timeout_error(operation: &str) -> DebugRuntimeError {
+        DebugRuntimeError::DebugTimeout {
+            message: "debug operation timed out".to_owned(),
+            detail: extension_protocol::TimeoutDetail {
+                operation: operation.to_owned(),
+                layer: "dap".to_owned(),
+                budget_ms: 1,
+            },
+        }
     }
 
     impl FakeEvalAtScenario {
@@ -1616,9 +1944,14 @@ mod tests {
         }
 
         fn timeout() -> Self {
-            Self::with_stops([Err(DebugRuntimeError::DebugTimeout(
-                "timed out waiting for debug stop".to_owned(),
-            ))])
+            Self::with_stops([Err(DebugRuntimeError::DebugTimeout {
+                message: "debug operation timed out".to_owned(),
+                detail: extension_protocol::TimeoutDetail {
+                    operation: "continue".to_owned(),
+                    layer: "dap".to_owned(),
+                    budget_ms: 1,
+                },
+            })])
         }
 
         fn adapter_exited() -> Self {
@@ -1663,18 +1996,49 @@ mod tests {
 
         fn set_breakpoints_timeout() -> Self {
             Self {
-                set_breakpoints_error: Some(DebugRuntimeError::DebugTimeout(
-                    "fake setBreakpoints timed out".to_owned(),
-                )),
+                set_breakpoints_error: Some(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "set_breakpoints".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: 1,
+                    },
+                }),
                 ..Self::single_hit()
             }
         }
 
         fn variables_timeout() -> Self {
             Self {
-                variables_error: Some(DebugRuntimeError::DebugTimeout(
-                    "fake variables timed out".to_owned(),
-                )),
+                variables_error: Some(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "variables".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: 1,
+                    },
+                }),
+                ..Self::single_hit()
+            }
+        }
+
+        fn stack_timeout() -> Self {
+            Self {
+                stack_error: Some(timeout_error("stack")),
+                ..Self::single_hit()
+            }
+        }
+
+        fn scopes_timeout() -> Self {
+            Self {
+                scopes_error: Some(timeout_error("scopes")),
+                ..Self::single_hit()
+            }
+        }
+
+        fn evaluate_timeout() -> Self {
+            Self {
+                expression_timeouts: vec!["slow_expression".to_owned()],
                 ..Self::single_hit()
             }
         }
@@ -1691,7 +2055,10 @@ mod tests {
                 stops: Arc::new(Mutex::new(VecDeque::from(stops))),
                 expression_errors: Vec::new(),
                 expression_adapter_exits: Vec::new(),
+                expression_timeouts: Vec::new(),
                 set_breakpoints_error: None,
+                stack_error: None,
+                scopes_error: None,
                 variables_error: None,
                 unsupported_condition: false,
                 launch_error: None,
@@ -1703,20 +2070,26 @@ mod tests {
     struct FakeEvalAtSession {
         scenario: FakeEvalAtScenario,
         calls: Arc<Mutex<Vec<FakeEvalAtCall>>>,
+        timeout_calls: TimeoutCalls,
     }
 
     impl DebugAdapterSession for FakeEvalAtSession {
-        fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+        fn initialize(&mut self, timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
             self.calls.lock().unwrap().push(FakeEvalAtCall::Initialize);
+            self.timeout_calls
+                .lock()
+                .unwrap()
+                .push(("initialize", timeout));
             Ok(())
         }
 
         fn launch(
             &mut self,
             _request: &LaunchRequest,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<(), DebugRuntimeError> {
             self.calls.lock().unwrap().push(FakeEvalAtCall::Launch);
+            self.timeout_calls.lock().unwrap().push(("launch", timeout));
             if let Some(message) = &self.scenario.launch_error {
                 return Err(DebugRuntimeError::LaunchFailed(message.clone()));
             }
@@ -1726,12 +2099,16 @@ mod tests {
         fn set_breakpoints(
             &mut self,
             breakpoints: &[DebugBreakpoint],
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeEvalAtCall::SetBreakpoints(breakpoints.to_vec()));
+            self.timeout_calls
+                .lock()
+                .unwrap()
+                .push(("set_breakpoints", timeout));
             if let Some(error) = &self.scenario.set_breakpoints_error {
                 return Err(error.clone());
             }
@@ -1745,11 +2122,18 @@ mod tests {
                 .collect())
         }
 
-        fn continue_session(&mut self, timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+        fn continue_session(
+            &mut self,
+            timeout: Option<Duration>,
+        ) -> Result<DebugStop, DebugRuntimeError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeEvalAtCall::Continue(timeout));
+            self.timeout_calls
+                .lock()
+                .unwrap()
+                .push(("continue", timeout));
             self.scenario
                 .stops
                 .lock()
@@ -1761,7 +2145,7 @@ mod tests {
         fn step(
             &mut self,
             _thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             Ok(stopped_hit())
         }
@@ -1769,12 +2153,15 @@ mod tests {
         fn pause(
             &mut self,
             _thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             Ok(stopped_hit())
         }
 
-        fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+        fn threads(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
             Ok(vec![DebugThread {
                 id: 1,
                 name: "main".to_owned(),
@@ -1784,24 +2171,32 @@ mod tests {
         fn stack(
             &mut self,
             thread_id: u64,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeEvalAtCall::Stack(thread_id));
+            self.timeout_calls.lock().unwrap().push(("stack", timeout));
+            if let Some(error) = &self.scenario.stack_error {
+                return Err(error.clone());
+            }
             Ok(vec![top_frame(), caller_frame()])
         }
 
         fn scopes(
             &mut self,
             frame_id: u64,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeEvalAtCall::Scopes(frame_id));
+            self.timeout_calls.lock().unwrap().push(("scopes", timeout));
+            if let Some(error) = &self.scenario.scopes_error {
+                return Err(error.clone());
+            }
             Ok(vec![
                 DebugScope {
                     name: "Locals".to_owned(),
@@ -1819,12 +2214,16 @@ mod tests {
         fn variables(
             &mut self,
             variables_reference: u64,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeEvalAtCall::Variables(variables_reference));
+            self.timeout_calls
+                .lock()
+                .unwrap()
+                .push(("variables", timeout));
             if let Some(error) = &self.scenario.variables_error {
                 return Err(error.clone());
             }
@@ -1871,12 +2270,16 @@ mod tests {
             &mut self,
             frame_id: u64,
             expression: &str,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugVariable, DebugRuntimeError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(FakeEvalAtCall::Evaluate(frame_id, expression.to_owned()));
+            self.timeout_calls
+                .lock()
+                .unwrap()
+                .push(("evaluate", timeout));
             if self
                 .scenario
                 .expression_errors
@@ -1896,6 +2299,14 @@ mod tests {
                 return Err(DebugRuntimeError::AdapterExited(format!(
                     "adapter exited while evaluating {expression}"
                 )));
+            }
+            if self
+                .scenario
+                .expression_timeouts
+                .iter()
+                .any(|timeout_expression| timeout_expression == expression)
+            {
+                return Err(timeout_error("evaluate"));
             }
             Ok(DebugVariable {
                 name: expression.to_owned(),
@@ -1929,7 +2340,7 @@ mod tests {
         Initialize,
         Launch,
         SetBreakpoints(Vec<DebugBreakpoint>),
-        Continue(Duration),
+        Continue(Option<Duration>),
         Stack(u64),
         Scopes(u64),
         Variables(u64),

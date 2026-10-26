@@ -254,6 +254,7 @@ pub fn tower_debug_replay(
     rr_runtime: &RrRuntime,
 ) -> Result<Value, DebugToolError> {
     let params: ReplayParams = parse_params(params)?;
+    let timeout = timeout(params.timeout_secs)?;
     let trace = match rr_runtime.store.trace(&params.trace_id) {
         Ok(trace) => trace,
         Err(error) => {
@@ -267,7 +268,7 @@ pub fn tower_debug_replay(
         trace_id: params.trace_id,
         trace_path: Some(trace.path),
         language: params.language,
-        timeout_secs: params.timeout_secs,
+        timeout_secs: timeout.map(|duration| duration.as_secs()),
         adapter: None,
         adapter_args: Vec::new(),
     }))
@@ -302,7 +303,7 @@ pub fn tower_debug_continue(
     sessions: &SessionManager,
 ) -> Result<Value, DebugToolError> {
     let params: ContinueParams = parse_params(params)?;
-    tool_result(sessions.continue_session(&params.session_id, timeout(params.timeout_secs)))
+    tool_result(sessions.continue_session(&params.session_id, timeout(params.timeout_secs)?))
 }
 
 pub fn tower_debug_step(params: Value, sessions: &SessionManager) -> Result<Value, DebugToolError> {
@@ -310,7 +311,7 @@ pub fn tower_debug_step(params: Value, sessions: &SessionManager) -> Result<Valu
     tool_result(sessions.step(
         &params.session_id,
         params.thread_id,
-        timeout(params.timeout_secs),
+        timeout(params.timeout_secs)?,
     ))
 }
 
@@ -330,7 +331,7 @@ pub fn tower_debug_reverse_continue(
     tool_result(sessions.reverse_continue(
         &params.session_id,
         params.thread_id,
-        timeout(params.timeout_secs),
+        timeout(params.timeout_secs)?,
     ))
 }
 
@@ -343,7 +344,7 @@ pub fn tower_debug_step_back(
         &params.session_id,
         params.thread_id,
         params.granularity.unwrap_or(StepBackGranularity::Line),
-        timeout(params.timeout_secs),
+        timeout(params.timeout_secs)?,
     ))
 }
 
@@ -358,7 +359,8 @@ pub fn tower_debug_watchpoint(
         kind: params.kind,
         enabled: params.enabled.unwrap_or(true),
     };
-    match sessions.set_watchpoint(&params.session_id, watchpoint) {
+    let timeout = timeout(params.timeout_secs)?;
+    match sessions.set_watchpoint_with_timeout(&params.session_id, watchpoint, timeout) {
         Ok(watchpoint) => serialize(WatchpointToolResult {
             ok: true,
             watchpoint: Some(watchpoint),
@@ -428,6 +430,7 @@ pub fn tower_debug_eval_at(
     sessions: &SessionManager,
 ) -> Result<Value, DebugToolError> {
     let params: EvalAtRequest = parse_params(params)?;
+    validate_millis_timeout(params.timeout_ms)?;
     match run_eval_at(params, sessions) {
         Ok(result) => serialize(result),
         Err(error) => serialize(tool_error_failure(error)),
@@ -439,6 +442,9 @@ pub fn tower_debug_record(
     rr_runtime: &mut RrRuntime,
 ) -> Result<Value, DebugToolError> {
     let params: RecordParams = parse_params(params)?;
+    if params.timeout_ms == Some(0) {
+        return Err(invalid_params());
+    }
     let request = RrRecordRequest {
         language: params.language,
         program: params.program,
@@ -553,8 +559,34 @@ fn invalid_params() -> DebugToolError {
     }
 }
 
-fn timeout(timeout_secs: Option<u64>) -> Option<Duration> {
-    timeout_secs.map(Duration::from_secs)
+fn timeout(timeout_secs: Option<u64>) -> Result<Option<Duration>, DebugToolError> {
+    timeout_secs
+        .map(|seconds| {
+            let duration = Duration::from_secs(seconds);
+            if invalid_duration(duration) {
+                Err(invalid_params())
+            } else {
+                Ok(duration)
+            }
+        })
+        .transpose()
+}
+
+fn validate_millis_timeout(timeout_ms: Option<u64>) -> Result<(), DebugToolError> {
+    if timeout_ms.is_some_and(|milliseconds| {
+        let duration = Duration::from_millis(milliseconds);
+        invalid_duration(duration)
+    }) {
+        Err(invalid_params())
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_duration(duration: Duration) -> bool {
+    duration.is_zero()
+        || duration.as_nanos() > u128::from(u64::MAX)
+        || std::time::Instant::now().checked_add(duration).is_none()
 }
 
 fn tool_result<T>(result: Result<T, DebugRuntimeError>) -> Result<Value, DebugToolError>
@@ -578,6 +610,17 @@ where
 }
 
 fn runtime_failure(error: DebugRuntimeError) -> RuntimeFailureResult {
+    if let DebugRuntimeError::DebugTimeout { message, detail } = error {
+        return RuntimeFailureResult {
+            ok: false,
+            error: RuntimeFailure {
+                code: "debug-timeout".to_owned(),
+                message,
+                data: Some(serde_json::to_value(detail).expect("serialize debug timeout detail")),
+            },
+        };
+    }
+
     let serialized = serde_json::to_value(error).expect("serialize DebugRuntimeError");
     let code = serialized
         .get("code")
@@ -646,13 +689,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::{Map, Value, json};
 
     use crate::protocol::{DebugAdapterConfig, DebugInitializeConfig, DebugToolError};
-    use crate::rr::{FakeRrPreflight, FakeRrRecorder, RrPreflightStatus, RrRuntime};
+    use crate::rr::{FakeRrPreflight, FakeRrRecorder, RrPreflight, RrPreflightStatus, RrRuntime};
     use crate::session::{
         DebugAdapterFactory, DebugAdapterSession, LaunchRequest, SessionManager,
         StepBackGranularity, WatchpointResult, WatchpointSpec,
@@ -666,13 +710,248 @@ mod tests {
     use super::{
         FindOriginRequest, FindOriginResult, RecordAndFindOriginRequest, RecordAndFindOriginResult,
         RecordParams, ReplayParams, ReverseContinueParams, StepBackParams, TracesParams,
-        WatchpointParams, tower_debug_continue, tower_debug_disconnect, tower_debug_eval_at,
-        tower_debug_evaluate, tower_debug_find_origin, tower_debug_launch, tower_debug_pause,
-        tower_debug_record, tower_debug_record_and_find_origin, tower_debug_replay,
-        tower_debug_reverse_continue, tower_debug_sessions, tower_debug_set_breakpoints,
-        tower_debug_stack, tower_debug_step, tower_debug_step_back, tower_debug_terminate,
-        tower_debug_threads, tower_debug_traces, tower_debug_variables, tower_debug_watchpoint,
+        WatchpointParams, runtime_failure, tower_debug_continue, tower_debug_disconnect,
+        tower_debug_eval_at, tower_debug_evaluate, tower_debug_find_origin, tower_debug_launch,
+        tower_debug_pause, tower_debug_record, tower_debug_record_and_find_origin,
+        tower_debug_replay, tower_debug_reverse_continue, tower_debug_sessions,
+        tower_debug_set_breakpoints, tower_debug_stack, tower_debug_step, tower_debug_step_back,
+        tower_debug_terminate, tower_debug_threads, tower_debug_traces, tower_debug_variables,
+        tower_debug_watchpoint,
     };
+
+    type TimeoutCalls = Arc<Mutex<Vec<(&'static str, Option<Duration>)>>>;
+
+    struct CountingPreflight {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RrPreflight for CountingPreflight {
+        fn check(&self) -> RrPreflightStatus {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            RrPreflightStatus::Supported
+        }
+    }
+
+    #[test]
+    fn runtime_failure_preserves_structured_debug_timeout_detail() {
+        let failure = runtime_failure(DebugRuntimeError::DebugTimeout {
+            message: "debug operation timed out".to_owned(),
+            detail: extension_protocol::TimeoutDetail {
+                operation: "variables".to_owned(),
+                layer: "dap".to_owned(),
+                budget_ms: 275,
+            },
+        });
+
+        assert_eq!(
+            serde_json::to_value(failure).unwrap(),
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "debug-timeout",
+                    "message": "debug operation timed out",
+                    "data": {
+                        "operation": "variables",
+                        "layer": "dap",
+                        "budget_ms": 275
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn debug_tool_requests_preserve_absent_and_explicit_timeout_mappings() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = config_with_rr();
+        config
+            .languages
+            .get_mut("rust")
+            .unwrap()
+            .default_timeout_secs = None;
+        let sessions = SessionManager::new(
+            config,
+            Arc::new(FakeAdapterFactory::recording_timeouts(Arc::clone(&calls))),
+        );
+        let live_session_id = launch_session(&sessions);
+        let mut runtime = rr_runtime("timeout-mapping");
+        let trace = register_trace(&mut runtime.store, "target/debug/app", 10);
+        let baseline_replay = tower_debug_replay(
+            json!({ "trace_id": trace.trace_id, "language": "rust" }),
+            &sessions,
+            &runtime,
+        )
+        .unwrap();
+        let baseline_replay_id = baseline_replay["session_id"].as_str().unwrap().to_owned();
+
+        for (include_field, expected) in [
+            (false, None),
+            (true, None),
+            (true, Some(Duration::from_secs(2))),
+        ] {
+            let mut params = json!({ "session_id": live_session_id.0, "thread_id": 1 });
+            if include_field {
+                params["timeout_secs"] = expected.map_or(Value::Null, |d| json!(d.as_secs()));
+            }
+            calls.lock().unwrap().clear();
+            tower_debug_continue(params.clone(), &sessions).unwrap();
+            assert_eq!(calls.lock().unwrap().as_slice(), [("continue", expected)]);
+
+            calls.lock().unwrap().clear();
+            tower_debug_step(params, &sessions).unwrap();
+            assert_eq!(calls.lock().unwrap().as_slice(), [("step", expected)]);
+
+            let mut replay_params = json!({
+                "trace_id": trace.trace_id,
+                "language": "rust"
+            });
+            if include_field {
+                replay_params["timeout_secs"] =
+                    expected.map_or(Value::Null, |d| json!(d.as_secs()));
+            }
+            calls.lock().unwrap().clear();
+            let replay = tower_debug_replay(replay_params, &sessions, &runtime).unwrap();
+            let observed = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(operation, timeout)| (*operation == "initialize").then_some(*timeout))
+                .expect("replay must initialize the adapter");
+            match (observed, expected) {
+                (Some(observed), Some(expected)) => {
+                    assert!(observed <= expected && !observed.is_zero())
+                }
+                (None, None) => {}
+                values => panic!("replay must preserve timeout presence: {values:?}"),
+            }
+            assert!(replay["session_id"].is_string());
+
+            let mut reverse = json!({ "session_id": baseline_replay_id, "thread_id": 1 });
+            if include_field {
+                reverse["timeout_secs"] = expected.map_or(Value::Null, |d| json!(d.as_secs()));
+            }
+            calls.lock().unwrap().clear();
+            tower_debug_reverse_continue(reverse.clone(), &sessions).unwrap();
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                [("reverse_continue", expected)]
+            );
+
+            calls.lock().unwrap().clear();
+            tower_debug_step_back(reverse, &sessions).unwrap();
+            assert_eq!(calls.lock().unwrap().as_slice(), [("step_back", expected)]);
+
+            let mut watchpoint = json!({
+                "session_id": baseline_replay_id,
+                "expression": "answer",
+                "kind": "write"
+            });
+            if include_field {
+                watchpoint["timeout_secs"] = expected.map_or(Value::Null, |d| json!(d.as_secs()));
+            }
+            calls.lock().unwrap().clear();
+            tower_debug_watchpoint(watchpoint, &sessions).unwrap();
+            assert_eq!(calls.lock().unwrap().as_slice(), [("watchpoint", expected)]);
+        }
+
+        for (include_field, expected) in [
+            (false, None),
+            (true, None),
+            (true, Some(Duration::from_millis(250))),
+        ] {
+            let mut params = eval_at_params();
+            params.as_object_mut().unwrap().remove("timeout_ms");
+            if include_field {
+                params["timeout_ms"] =
+                    expected.map_or(Value::Null, |d| json!(d.as_millis() as u64));
+            }
+            calls.lock().unwrap().clear();
+            tower_debug_eval_at(params, &sessions).unwrap();
+            let observed = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(operation, timeout)| (*operation == "continue").then_some(*timeout))
+                .expect("eval-at must dispatch continue");
+            match expected {
+                Some(expected) => assert!(
+                    observed.is_some_and(|observed| observed <= expected),
+                    "eval-at must preserve the request budget as one decreasing deadline"
+                ),
+                None => assert_eq!(observed, None),
+            }
+        }
+    }
+
+    #[test]
+    fn debug_tool_requests_reject_invalid_timeout_values_before_adapter_creation() {
+        for invalid_timeout in [json!(0), json!(u64::MAX), json!(-1), json!("soon")] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let sessions = manager_with_factory(FakeAdapterFactory::recording(Arc::clone(&calls)));
+            let session_params = json!({ "session_id": "debug-uncreated", "thread_id": 1 });
+
+            let mut continue_params = session_params.clone();
+            continue_params["timeout_secs"] = invalid_timeout.clone();
+            assert_invalid_params(
+                tower_debug_continue(continue_params, &sessions),
+                "tower_debug_continue timeout_secs",
+            );
+
+            let mut step_params = session_params.clone();
+            step_params["timeout_secs"] = invalid_timeout.clone();
+            assert_invalid_params(
+                tower_debug_step(step_params, &sessions),
+                "tower_debug_step timeout_secs",
+            );
+
+            let mut replay_params = json!({
+                "trace_id": "trace-invalid-timeout",
+                "language": "rust"
+            });
+            replay_params["timeout_secs"] = invalid_timeout.clone();
+            let runtime = rr_runtime("invalid-timeout-replay");
+            assert_invalid_params(
+                tower_debug_replay(replay_params, &sessions, &runtime),
+                "tower_debug_replay timeout_secs",
+            );
+
+            let mut reverse_continue_params = session_params.clone();
+            reverse_continue_params["timeout_secs"] = invalid_timeout.clone();
+            assert_invalid_params(
+                tower_debug_reverse_continue(reverse_continue_params, &sessions),
+                "tower_debug_reverse_continue timeout_secs",
+            );
+
+            let mut step_back_params = session_params;
+            step_back_params["timeout_secs"] = invalid_timeout.clone();
+            assert_invalid_params(
+                tower_debug_step_back(step_back_params, &sessions),
+                "tower_debug_step_back timeout_secs",
+            );
+
+            let mut watchpoint_params = json!({
+                "session_id": "debug-uncreated",
+                "expression": "answer",
+                "kind": "write"
+            });
+            watchpoint_params["timeout_secs"] = invalid_timeout.clone();
+            assert_invalid_params(
+                tower_debug_watchpoint(watchpoint_params, &sessions),
+                "tower_debug_watchpoint timeout_secs",
+            );
+
+            let mut eval_at = eval_at_params();
+            eval_at["timeout_ms"] = invalid_timeout.clone();
+            assert_invalid_params(
+                tower_debug_eval_at(eval_at, &sessions),
+                "tower_debug_eval_at timeout_ms",
+            );
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "invalid timeout {invalid_timeout} must be rejected before adapter or session creation"
+            );
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Default)]
     enum ResumeBehavior {
@@ -686,6 +965,7 @@ mod tests {
         supports_breakpoint_conditions: bool,
         fail_evaluate: bool,
         calls: Option<Arc<Mutex<Vec<String>>>>,
+        timeout_calls: Option<TimeoutCalls>,
     }
 
     impl Default for FakeAdapterFactory {
@@ -695,6 +975,7 @@ mod tests {
                 supports_breakpoint_conditions: true,
                 fail_evaluate: false,
                 calls: None,
+                timeout_calls: None,
             }
         }
     }
@@ -706,6 +987,7 @@ mod tests {
                 supports_breakpoint_conditions: true,
                 fail_evaluate: false,
                 calls: None,
+                timeout_calls: None,
             }
         }
 
@@ -726,6 +1008,14 @@ mod tests {
         fn recording(calls: Arc<Mutex<Vec<String>>>) -> Self {
             Self {
                 calls: Some(calls),
+                timeout_calls: None,
+                ..Self::default()
+            }
+        }
+
+        fn recording_timeouts(calls: TimeoutCalls) -> Self {
+            Self {
+                timeout_calls: Some(calls),
                 ..Self::default()
             }
         }
@@ -741,6 +1031,7 @@ mod tests {
                 supports_breakpoint_conditions: self.supports_breakpoint_conditions,
                 fail_evaluate: self.fail_evaluate,
                 calls: self.calls.clone(),
+                timeout_calls: self.timeout_calls.clone(),
             }))
         }
     }
@@ -751,10 +1042,12 @@ mod tests {
         supports_breakpoint_conditions: bool,
         fail_evaluate: bool,
         calls: Option<Arc<Mutex<Vec<String>>>>,
+        timeout_calls: Option<TimeoutCalls>,
     }
 
     impl DebugAdapterSession for FakeAdapterSession {
-        fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+        fn initialize(&mut self, timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
+            self.record_timeout("initialize", timeout);
             self.record("initialize");
             Ok(())
         }
@@ -762,8 +1055,9 @@ mod tests {
         fn launch(
             &mut self,
             _request: &LaunchRequest,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<(), DebugRuntimeError> {
+            self.record_timeout("launch", timeout);
             self.record("launch");
             Ok(())
         }
@@ -771,7 +1065,7 @@ mod tests {
         fn set_breakpoints(
             &mut self,
             breakpoints: &[DebugBreakpoint],
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
             let conditions = breakpoints
                 .iter()
@@ -790,12 +1084,22 @@ mod tests {
                 .collect())
         }
 
-        fn continue_session(&mut self, timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+        fn continue_session(
+            &mut self,
+            timeout: Option<Duration>,
+        ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("continue", timeout);
             self.record("continue");
-            if timeout <= Duration::from_millis(1) {
-                return Err(DebugRuntimeError::DebugTimeout(
-                    "fake adapter timed out".to_owned(),
-                ));
+            if timeout.is_some_and(|timeout| timeout <= Duration::from_millis(1)) {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "continue".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: u64::try_from(timeout.expect("finite fake timeout").as_millis())
+                            .unwrap(),
+                    },
+                });
             }
             Ok(resume_stop(self.resume_behavior, "breakpoint"))
         }
@@ -803,13 +1107,20 @@ mod tests {
         fn step(
             &mut self,
             _thread_id: Option<u64>,
-            timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("step", timeout);
             self.record("step");
-            if timeout <= Duration::from_millis(1) {
-                return Err(DebugRuntimeError::DebugTimeout(
-                    "fake adapter timed out".to_owned(),
-                ));
+            if timeout.is_some_and(|timeout| timeout <= Duration::from_millis(1)) {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "step".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: u64::try_from(timeout.expect("finite fake timeout").as_millis())
+                            .unwrap(),
+                    },
+                });
             }
             Ok(resume_stop(self.resume_behavior, "step"))
         }
@@ -817,7 +1128,7 @@ mod tests {
         fn pause(
             &mut self,
             thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             self.record("pause");
             Ok(DebugStop {
@@ -827,7 +1138,10 @@ mod tests {
             })
         }
 
-        fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+        fn threads(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
             self.record("threads");
             Ok(vec![DebugThread {
                 id: 1,
@@ -838,7 +1152,7 @@ mod tests {
         fn stack(
             &mut self,
             _thread_id: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
             self.record("stack");
             Ok(vec![top_frame()])
@@ -847,7 +1161,7 @@ mod tests {
         fn scopes(
             &mut self,
             _frame_id: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
             self.record("scopes");
             Ok(vec![DebugScope {
@@ -860,7 +1174,7 @@ mod tests {
         fn variables(
             &mut self,
             _variables_reference: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
             self.record("variables");
             Ok(vec![DebugVariable {
@@ -875,7 +1189,7 @@ mod tests {
             &mut self,
             _frame_id: u64,
             expression: &str,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugVariable, DebugRuntimeError> {
             self.record(format!("evaluate:{expression}"));
             if self.fail_evaluate {
@@ -894,8 +1208,9 @@ mod tests {
         fn reverse_continue(
             &mut self,
             thread_id: Option<u64>,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("reverse_continue", timeout);
             self.record("reverse_continue");
             Ok(DebugStop {
                 reason: Some("reverse_continue".to_owned()),
@@ -908,8 +1223,9 @@ mod tests {
             &mut self,
             thread_id: Option<u64>,
             granularity: StepBackGranularity,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
+            self.record_timeout("step_back", timeout);
             self.record(format!("step_back:{granularity:?}"));
             Ok(DebugStop {
                 reason: Some("step_back".to_owned()),
@@ -921,8 +1237,9 @@ mod tests {
         fn set_watchpoint(
             &mut self,
             watchpoint: WatchpointSpec,
-            _timeout: Duration,
+            timeout: Option<Duration>,
         ) -> Result<WatchpointResult, DebugRuntimeError> {
+            self.record_timeout("watchpoint", timeout);
             self.record("watchpoint");
             Ok(WatchpointResult {
                 watchpoint_id: "watchpoint-7".to_owned(),
@@ -952,6 +1269,12 @@ mod tests {
                     .lock()
                     .expect("call log lock should not be poisoned")
                     .push(call.into());
+            }
+        }
+
+        fn record_timeout(&self, operation: &'static str, timeout: Option<Duration>) {
+            if let Some(calls) = &self.timeout_calls {
+                calls.lock().unwrap().push((operation, timeout));
             }
         }
     }
@@ -1038,11 +1361,13 @@ mod tests {
             ),
             "tower_debug_step",
         );
-        let timed_out = tower_debug_continue(
-            json!({ "session_id": session_id.0, "thread_id": 1, "timeout_secs": 0 }),
-            &sessions,
-        )
-        .expect("resume timeout should be returned as a running stop result");
+        assert_invalid_params(
+            tower_debug_continue(
+                json!({ "session_id": session_id.0, "thread_id": 1, "timeout_secs": 0 }),
+                &sessions,
+            ),
+            "tower_debug_continue",
+        );
         let terminated_sessions = manager_with_factory(FakeAdapterFactory::terminated_on_resume());
         let terminated_continue_id = launch_session(&terminated_sessions);
         let terminated_step_id = launch_session(&terminated_sessions);
@@ -1068,19 +1393,15 @@ mod tests {
         assert_eq!(terminated_step["state"], "terminated");
         assert_eq!(terminated_step["timed_out"], false);
         assert_eq!(terminated_step["output_since"], json!(fake_output()));
-        assert_eq!(timed_out["state"], "running");
-        assert_eq!(timed_out["timed_out"], true);
     }
 
     #[test]
     fn tower_debug_pause_regains_control_of_a_running_session_or_returns_a_stable_session_error() {
         let sessions = manager();
         let session_id = launch_session(&sessions);
-        tower_debug_continue(
-            json!({ "session_id": session_id.0, "thread_id": 1, "timeout_secs": 0 }),
-            &sessions,
-        )
-        .expect("timeout leaves session running");
+        sessions
+            .continue_session(&session_id, Some(Duration::from_millis(1)))
+            .expect("session timeout leaves session running");
 
         let paused = tower_debug_pause(
             json!({ "session_id": session_id.0, "thread_id": 1 }),
@@ -1233,7 +1554,7 @@ mod tests {
             json!({
                 "lang": "rust",
                 "program": "target/debug/app",
-                "timeout_ms": 0
+                "timeout_ms": 1
             }),
             &timeout_sessions,
         )
@@ -1295,11 +1616,9 @@ mod tests {
     fn unknown_session_ids_return_session_not_found_and_running_inspection_returns_not_stopped() {
         let sessions = manager();
         let session_id = launch_session(&sessions);
-        tower_debug_continue(
-            json!({ "session_id": session_id.0, "thread_id": 1, "timeout_secs": 0 }),
-            &sessions,
-        )
-        .expect("timeout leaves session running");
+        sessions
+            .continue_session(&session_id, Some(Duration::from_millis(1)))
+            .expect("session timeout leaves session running");
 
         let unknown = tower_debug_threads(json!({ "session_id": "missing-session" }), &sessions)
             .expect("missing sessions are structured tool results");
@@ -1429,6 +1748,38 @@ mod tests {
     #[test]
     fn tower_debug_record_is_declared_only_with_rr_accepts_record_params_and_returns_rr_record_result()
      {
+        for (timeout, expected) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!(1000)), Some(1000)),
+        ] {
+            let mut value = json!({
+                "language": "rust",
+                "program": "target/debug/app"
+            });
+            if let Some(timeout) = timeout {
+                value["timeout_ms"] = timeout;
+            }
+            let row: RecordParams =
+                serde_json::from_value(value).expect("valid record timeout mapping row");
+            assert_eq!(row.timeout_ms, expected);
+        }
+
+        for invalid_timeout in [json!(0), json!(-1), json!("soon")] {
+            let mut runtime = rr_runtime("invalid-record-timeout");
+            assert_invalid_params(
+                tower_debug_record(
+                    json!({
+                        "language": "rust",
+                        "program": "target/debug/app",
+                        "timeout_ms": invalid_timeout
+                    }),
+                    &mut runtime,
+                ),
+                "tower_debug_record timeout_ms",
+            );
+        }
+
         let params: RecordParams = serde_json::from_value(json!({
             "language": "rust",
             "program": "target/debug/app",
@@ -1470,6 +1821,39 @@ mod tests {
         assert_eq!(result["recordable"], true);
         assert_eq!(result["trace_id"], "trace-record");
         assert_eq!(result["error"], Value::Null);
+    }
+
+    #[test]
+    fn tower_debug_record_rejects_unrepresentable_deadline_before_preflight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = rr_runtime("record-invalid-deadline");
+        runtime.preflight = Box::new(CountingPreflight {
+            calls: Arc::clone(&calls),
+        });
+
+        let result = tower_debug_record(
+            json!({
+                "language": "rust",
+                "program": "target/debug/app",
+                "timeout_ms": u64::MAX
+            }),
+            &mut runtime,
+        )
+        .expect("invalid deadline is a structured record result");
+
+        assert_eq!(
+            result["error"],
+            json!({
+                "code": "record_timeout",
+                "message": "invalid record timeout",
+                "data": {
+                    "reason": "invalid_timeout",
+                    "field": "timeout_ms",
+                    "value": u64::MAX
+                }
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1751,7 +2135,7 @@ mod tests {
                     args: Vec::new(),
                     adapter_type: "fake".to_owned(),
                     launch: Map::new(),
-                    default_timeout_secs: 1,
+                    default_timeout_secs: Some(1),
                     idle_ttl_secs: 60,
                 },
             )]),
@@ -1814,7 +2198,7 @@ mod tests {
             trace_root: temp_trace_root(name),
             ttl_secs: None,
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         }
     }
 
@@ -1920,6 +2304,7 @@ mod tests {
             top_frame: Some(top_frame()),
             hit_breakpoint_ids: vec![1],
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         }
@@ -1939,6 +2324,7 @@ mod tests {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                error: None,
                 exit_code: None,
                 output_since: fake_output(),
             },

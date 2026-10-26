@@ -12,19 +12,32 @@ use thiserror::Error;
 /// # Example
 ///
 /// ```rust
-/// use extension_protocol::ExtensionFault;
+/// use extension_protocol::{ExtensionFault, TimeoutDetail};
 ///
-/// let f = ExtensionFault::Timeout;
+/// let f = ExtensionFault::Timeout {
+///     detail: TimeoutDetail {
+///         operation: "invokeTool".to_owned(),
+///         layer: "host".to_owned(),
+///         budget_ms: 250,
+///     },
+/// };
 /// let json = serde_json::to_string(&f).unwrap();
 /// let back: ExtensionFault = serde_json::from_str(&json).unwrap();
-/// assert!(matches!(back, ExtensionFault::Timeout));
+/// assert!(matches!(back, ExtensionFault::Timeout { .. }));
 /// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutDetail {
+    pub operation: String,
+    pub layer: String,
+    pub budget_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Error)]
 #[serde(tag = "type")]
 pub enum ExtensionFault {
     /// The extension did not respond within the configured deadline.
     #[error("extension timed out")]
-    Timeout,
+    Timeout { detail: TimeoutDetail },
     /// The extension process exited unexpectedly.
     #[error("extension crashed (exit code: {code:?})")]
     Crashed {

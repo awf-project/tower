@@ -1,6 +1,6 @@
 use extension_protocol::{
     Activation, Capability, Event, ExtensionFault, ExtensionManifest, HostCall, InitParams,
-    InitResult, PROTOCOL_VERSION, ProtocolError, Request, Response, ToolDecl,
+    InitResult, PROTOCOL_VERSION, ProtocolError, Request, Response, TimeoutDetail, ToolDecl,
 };
 
 fn workspace_root() -> std::path::PathBuf {
@@ -853,11 +853,52 @@ fn protocol_version_carried_in_initialize() {
 // ── ExtensionFault round-trips ────────────────────────────────────────────────
 
 #[test]
-fn extension_fault_timeout_round_trips_json() {
-    let fault = ExtensionFault::Timeout;
-    let json = serde_json::to_string(&fault).expect("serialize");
-    let decoded: ExtensionFault = serde_json::from_str(&json).expect("deserialize");
-    assert!(matches!(decoded, ExtensionFault::Timeout));
+fn extension_fault_timeout_round_trips_exact_structured_json() {
+    let expected = serde_json::json!({
+        "type": "Timeout",
+        "detail": {
+            "operation": "invokeTool",
+            "layer": "host",
+            "budget_ms": 250
+        }
+    });
+    let fault = ExtensionFault::Timeout {
+        detail: TimeoutDetail {
+            operation: "invokeTool".to_owned(),
+            layer: "host".to_owned(),
+            budget_ms: 250,
+        },
+    };
+
+    assert_eq!(serde_json::to_value(&fault).expect("serialize"), expected);
+    assert_eq!(
+        serde_json::from_value::<ExtensionFault>(expected.clone()).expect("deserialize"),
+        fault
+    );
+
+    let malformed = [
+        serde_json::json!({"type": "Timeout"}),
+        serde_json::json!({"type": "Timeout", "detail": {"layer": "host", "budget_ms": 250}}),
+        serde_json::json!({"type": "Timeout", "detail": {"operation": "invokeTool", "budget_ms": 250}}),
+        serde_json::json!({"type": "Timeout", "detail": {"operation": "invokeTool", "layer": "host"}}),
+        serde_json::json!({"type": "Timeout", "detail": {"operation": 1, "layer": "host", "budget_ms": 250}}),
+        serde_json::json!({"type": "Timeout", "detail": {"operation": "invokeTool", "layer": false, "budget_ms": 250}}),
+        serde_json::json!({"type": "Timeout", "detail": {"operation": "invokeTool", "layer": "host", "budget_ms": "250"}}),
+        serde_json::json!({"type": "Timeout", "detail": {"operation": "invokeTool", "layer": "host", "budget_ms": -1}}),
+    ];
+    for value in malformed {
+        assert!(
+            serde_json::from_value::<ExtensionFault>(value).is_err(),
+            "malformed timeout detail must be rejected"
+        );
+    }
+    assert!(
+        serde_json::from_str::<ExtensionFault>(
+            r#"{"type":"Timeout","detail":{"operation":"invokeTool","layer":"host","budget_ms":18446744073709551616}}"#,
+        )
+        .is_err(),
+        "u64 overflow must be rejected"
+    );
 }
 
 #[test]

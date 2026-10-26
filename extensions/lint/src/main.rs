@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_engine::adapters::config::{self, LintConfig};
 use core_engine::domain::mutation::compute_content_version;
@@ -118,10 +118,53 @@ where
         return Ok(unsupported_result());
     }
 
-    if let Some(path) = request.path {
-        check_one(&path, &config, workspace_root, lines, out, next_id, queued)
+    let timeout_secs = if let Some(path) = request.path.as_deref() {
+        config
+            .command_for_path(path)
+            .and_then(|(_, command)| command.timeout_secs)
     } else {
-        check_workspace(&config, workspace_root, lines, out, next_id, queued)
+        config
+            .commands
+            .values()
+            .filter_map(|command| command.timeout_secs)
+            .min()
+    };
+    let deadline = match OperationDeadline::from_timeout_secs(timeout_secs) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            return Ok(CheckResult {
+                supported: false,
+                diagnostics: Vec::new(),
+                error: Some(LintToolErrorResponse {
+                    code: "lint_invalid_config".to_owned(),
+                    message: error.message,
+                    detail: None,
+                }),
+            });
+        }
+    };
+
+    if let Some(path) = request.path {
+        check_one_with_deadline(
+            &path,
+            &config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+            deadline,
+        )
+    } else {
+        check_workspace_with_deadline(
+            &config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+            deadline,
+        )
     }
 }
 
@@ -156,14 +199,18 @@ fn diagnostic_to_dto(diagnostic: LintDiagnostic) -> LintDiagnosticDto {
 
 fn lint_tool_error_response(error: LintToolError) -> LintToolErrorResponse {
     let code = error.code().to_owned();
-    let message = match error {
-        LintToolError::MissingBinary { .. } => "lint command is unavailable".to_owned(),
-        LintToolError::UnparseableOutput => "lint output could not be parsed".to_owned(),
-        LintToolError::NonzeroExit { .. } => "lint command exited with errors".to_owned(),
-        LintToolError::Timeout => "lint command timed out".to_owned(),
-        LintToolError::InvalidConfig(message) => message,
+    let (message, detail) = match error {
+        LintToolError::MissingBinary { .. } => ("lint command is unavailable".to_owned(), None),
+        LintToolError::UnparseableOutput => ("lint output could not be parsed".to_owned(), None),
+        LintToolError::NonzeroExit { .. } => ("lint command exited with errors".to_owned(), None),
+        LintToolError::Timeout { detail } => ("lint command timed out".to_owned(), Some(detail)),
+        LintToolError::InvalidConfig(message) => (message, None),
     };
-    LintToolErrorResponse { code, message }
+    LintToolErrorResponse {
+        code,
+        message,
+        detail,
+    }
 }
 
 fn next_frame<R>(lines: &mut R, queued: &mut VecDeque<QueuedFrame>) -> Option<QueuedFrame>
@@ -319,6 +366,7 @@ fn invoke_fix_tool<R>(
                 &Response::ToolResult(fix_error_result(
                     "lint_fix_invalid_request",
                     format!("bad FixRequest: {error}"),
+                    None,
                 )),
             );
             return;
@@ -337,7 +385,7 @@ fn invoke_fix_tool<R>(
             let _ = send_response(
                 out,
                 id,
-                &Response::ToolResult(fix_error_result(error.code, error.message)),
+                &Response::ToolResult(fix_error_result(error.code, error.message, error.detail)),
             );
         }
     }
@@ -347,6 +395,68 @@ fn invoke_fix_tool<R>(
 struct FixFailure {
     code: &'static str,
     message: String,
+    detail: Option<extension_protocol::TimeoutDetail>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OperationDeadline {
+    deadline: Option<Instant>,
+    budget_ms: Option<u64>,
+}
+
+impl OperationDeadline {
+    fn from_timeout_secs(timeout_secs: Option<u64>) -> Result<Self, FixFailure> {
+        let Some(seconds) = timeout_secs else {
+            return Ok(Self {
+                deadline: None,
+                budget_ms: None,
+            });
+        };
+        let timeout = Duration::from_secs(seconds);
+        let budget_ms = seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| fix_unavailable("lint timeout is too large"))?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| fix_unavailable("lint timeout deadline is not representable"))?;
+        Ok(Self {
+            deadline: Some(deadline),
+            budget_ms: Some(budget_ms),
+        })
+    }
+
+    fn remaining(self, operation: &'static str) -> Result<Option<Duration>, FixFailure> {
+        let Some(deadline) = self.deadline else {
+            return Ok(None);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(self.timeout_failure(operation));
+        }
+        Ok(Some(remaining))
+    }
+
+    fn map_runner_error(self, operation: &'static str, error: LintToolError) -> FixFailure {
+        if matches!(error, LintToolError::Timeout { .. }) {
+            self.timeout_failure(operation)
+        } else {
+            fix_unavailable(lint_fix_unavailable_message(error))
+        }
+    }
+
+    fn timeout_failure(self, operation: &'static str) -> FixFailure {
+        FixFailure {
+            code: "lint_timeout",
+            message: "lint command timed out".to_owned(),
+            detail: Some(extension_protocol::TimeoutDetail {
+                operation: operation.to_owned(),
+                layer: "subprocess".to_owned(),
+                budget_ms: self
+                    .budget_ms
+                    .expect("an expired fix deadline has an original budget"),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +524,19 @@ where
         return Err(fix_unavailable("missing lint configuration"));
     }
 
+    let fix_deadline = if let Some(path) = request.path.as_deref() {
+        config
+            .command_for_path(path)
+            .and_then(|(_, command)| command.timeout_secs)
+    } else {
+        config
+            .commands
+            .values()
+            .filter_map(|command| command.timeout_secs)
+            .min()
+    };
+    let fix_deadline = OperationDeadline::from_timeout_secs(fix_deadline)?;
+
     let mut result = FixResult::default();
     let mut changed_files = BTreeSet::new();
 
@@ -421,9 +544,16 @@ where
     // Applying the prepared plans still uses per-file CAS rather than a batch transaction.
     let mut plans = Vec::new();
     for path in fix_target_paths(&request, lines, out, next_id, queued)? {
-        if let Some(plan) =
-            collect_fix_plan(path, &config, workspace_root, lines, out, next_id, queued)?
-        {
+        if let Some(plan) = collect_fix_plan(
+            path,
+            &config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+            fix_deadline,
+        )? {
             plans.push(plan);
         }
     }
@@ -455,6 +585,7 @@ where
             out,
             next_id,
             queued,
+            fix_deadline,
         )?;
     }
     sort_diagnostics(&mut result.remaining_diagnostics);
@@ -480,6 +611,7 @@ where
     Ok(paths)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_fix_plan<R>(
     path: String,
     config: &LintConfig,
@@ -488,6 +620,7 @@ fn collect_fix_plan<R>(
     out: &Arc<Mutex<impl Write>>,
     next_id: &mut u64,
     queued: &mut VecDeque<QueuedFrame>,
+    deadline: OperationDeadline,
 ) -> Result<Option<FileFixPlan>, FixFailure>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
@@ -502,9 +635,9 @@ where
         workspace_root,
         target_path: Some(&path),
         stdin_content: Some(&content),
-        timeout: Duration::from_secs(runner_config.timeout_secs),
+        timeout: deadline.remaining("fix")?,
     })
-    .map_err(|error| fix_unavailable(lint_fix_unavailable_message(error)))?;
+    .map_err(|error| deadline.map_runner_error("fix", error))?;
 
     Ok(outcome.supported.then(|| FileFixPlan {
         path,
@@ -715,6 +848,7 @@ fn skipped_fix(fix: &LintFix, reason: SkippedFixReason, supported_fix: bool) -> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_follow_up_check<R>(
     path: Option<String>,
     config: &LintConfig,
@@ -723,17 +857,41 @@ fn run_follow_up_check<R>(
     out: &Arc<Mutex<impl Write>>,
     next_id: &mut u64,
     queued: &mut VecDeque<QueuedFrame>,
+    deadline: OperationDeadline,
 ) -> Result<Vec<LintDiagnosticDto>, FixFailure>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
 {
     let check = if let Some(path) = path {
-        check_one(&path, config, workspace_root, lines, out, next_id, queued)
+        check_one_with_timeout(
+            &path,
+            config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+            deadline.remaining("fix")?,
+        )
     } else {
-        check_workspace(config, workspace_root, lines, out, next_id, queued)
+        check_workspace_with_deadline(
+            config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+            deadline,
+        )
     };
 
-    map_follow_up_check(check)
+    map_follow_up_check(check).map_err(|failure| {
+        if failure.code == "lint_timeout" {
+            deadline.timeout_failure("fix")
+        } else {
+            failure
+        }
+    })
 }
 
 fn map_follow_up_check(
@@ -741,6 +899,13 @@ fn map_follow_up_check(
 ) -> Result<Vec<LintDiagnosticDto>, FixFailure> {
     let check = check.map_err(follow_up_failed)?;
     if let Some(error) = check.error {
+        if error.code == "lint_timeout" && error.detail.is_some() {
+            return Err(FixFailure {
+                code: "lint_timeout",
+                message: "lint command timed out".to_owned(),
+                detail: error.detail,
+            });
+        }
         return Err(follow_up_failed(format!(
             "{}: {}",
             error.code, error.message
@@ -776,7 +941,7 @@ fn lint_fix_unavailable_message(error: LintToolError) -> String {
         LintToolError::MissingBinary { .. } => "lint command is unavailable".to_owned(),
         LintToolError::UnparseableOutput => "lint output could not be parsed".to_owned(),
         LintToolError::NonzeroExit { .. } => "lint command exited with errors".to_owned(),
-        LintToolError::Timeout => "lint command timed out".to_owned(),
+        LintToolError::Timeout { .. } => "lint command timed out".to_owned(),
         LintToolError::InvalidConfig(message) => message,
     }
 }
@@ -785,6 +950,7 @@ fn fix_invalid_request(message: impl Into<String>) -> FixFailure {
     FixFailure {
         code: "lint_fix_invalid_request",
         message: message.into(),
+        detail: None,
     }
 }
 
@@ -792,6 +958,7 @@ fn fix_unavailable(message: impl Into<String>) -> FixFailure {
     FixFailure {
         code: "lint_fix_unavailable",
         message: message.into(),
+        detail: None,
     }
 }
 
@@ -799,18 +966,25 @@ fn fix_apply_failed(message: impl Into<String>) -> FixFailure {
     FixFailure {
         code: "lint_fix_apply_failed",
         message: message.into(),
+        detail: None,
     }
 }
 
-fn fix_error_result(code: &'static str, message: impl Into<String>) -> Value {
+fn fix_error_result(
+    code: &'static str,
+    message: impl Into<String>,
+    detail: Option<extension_protocol::TimeoutDetail>,
+) -> Value {
     let error = FixToolErrorResponse {
         code: code.to_owned(),
         message: message.into(),
+        detail,
     };
     json!({ "error": error })
 }
 
-fn check_one<R>(
+#[allow(clippy::too_many_arguments)]
+fn check_one_with_deadline<R>(
     path: &str,
     config: &LintConfig,
     workspace_root: &Path,
@@ -818,6 +992,39 @@ fn check_one<R>(
     out: &Arc<Mutex<impl Write>>,
     next_id: &mut u64,
     queued: &mut VecDeque<QueuedFrame>,
+    deadline: OperationDeadline,
+) -> Result<CheckResult, String>
+where
+    R: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let timeout = match deadline.remaining("check") {
+        Ok(timeout) => timeout,
+        Err(failure) => return Ok(check_timeout_result(failure)),
+    };
+    let mut result = check_one_with_timeout(
+        path,
+        config,
+        workspace_root,
+        lines,
+        out,
+        next_id,
+        queued,
+        timeout,
+    )?;
+    normalize_check_timeout(&mut result, deadline);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_one_with_timeout<R>(
+    path: &str,
+    config: &LintConfig,
+    workspace_root: &Path,
+    lines: &mut R,
+    out: &Arc<Mutex<impl Write>>,
+    next_id: &mut u64,
+    queued: &mut VecDeque<QueuedFrame>,
+    timeout_override: Option<Duration>,
 ) -> Result<CheckResult, String>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
@@ -827,16 +1034,24 @@ where
     };
     let runner_config = RunnerLintConfig::from(command);
     let stdin_content = read_file(path, lines, out, next_id, queued)?;
-    run_configured_linter(&runner_config, workspace_root, path, Some(&stdin_content))
+    run_configured_linter(
+        &runner_config,
+        workspace_root,
+        path,
+        Some(&stdin_content),
+        timeout_override.or_else(|| runner_config.timeout_secs.map(Duration::from_secs)),
+    )
 }
 
-fn check_workspace<R>(
+#[allow(clippy::too_many_arguments)]
+fn check_workspace_with_deadline<R>(
     config: &LintConfig,
     workspace_root: &Path,
     lines: &mut R,
     out: &Arc<Mutex<impl Write>>,
     next_id: &mut u64,
     queued: &mut VecDeque<QueuedFrame>,
+    deadline: OperationDeadline,
 ) -> Result<CheckResult, String>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
@@ -847,17 +1062,23 @@ where
     let mut ran_linter = false;
 
     for path in paths {
-        let Some((_, command)) = config.command_for_path(&path) else {
+        if config.command_for_path(&path).is_none() {
             continue;
-        };
-        let runner_config = RunnerLintConfig::from(command);
-        let stdin_content = read_file(&path, lines, out, next_id, queued)?;
-        let result =
-            run_configured_linter(&runner_config, workspace_root, &path, Some(&stdin_content))?;
+        }
+        let result = check_one_with_deadline(
+            &path,
+            config,
+            workspace_root,
+            lines,
+            out,
+            next_id,
+            queued,
+            deadline,
+        )?;
         if result.error.is_some() {
             return Ok(result);
         }
-        ran_linter = ran_linter || result.supported;
+        ran_linter |= result.supported;
         diagnostics.extend(result.diagnostics);
     }
 
@@ -869,18 +1090,41 @@ where
     })
 }
 
+fn normalize_check_timeout(result: &mut CheckResult, deadline: OperationDeadline) {
+    if result
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == "lint_timeout")
+    {
+        *result = check_timeout_result(deadline.timeout_failure("check"));
+    }
+}
+
+fn check_timeout_result(failure: FixFailure) -> CheckResult {
+    CheckResult {
+        supported: false,
+        diagnostics: Vec::new(),
+        error: Some(LintToolErrorResponse {
+            code: failure.code.to_owned(),
+            message: failure.message,
+            detail: failure.detail,
+        }),
+    }
+}
+
 fn run_configured_linter(
     config: &RunnerLintConfig,
     workspace_root: &Path,
     target_path: &str,
     stdin_content: Option<&str>,
+    timeout: Option<Duration>,
 ) -> Result<CheckResult, String> {
     match run_linter(RunRequest {
         config,
         workspace_root,
         target_path: Some(target_path),
         stdin_content,
-        timeout: Duration::from_secs(config.timeout_secs),
+        timeout,
     }) {
         Ok(outcome) => Ok(check_result_from_run_outcome(outcome)),
         Err(error) => Ok(CheckResult {
@@ -1023,6 +1267,7 @@ mod tests {
                 error: Some(LintToolErrorResponse {
                     code: code.to_owned(),
                     message: message.to_owned(),
+                    detail: None,
                 }),
             }))
             .expect_err("tool error must fail after edits");

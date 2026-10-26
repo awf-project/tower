@@ -215,6 +215,27 @@ fn fmt_process_file_changed_event_enqueues_path() {
     );
 }
 
+#[test]
+fn fmt_public_event_uses_unlimited_host_budget() {
+    let recording = RecordingFormatQueue::new();
+    let mut adapter = SidecarHostAdapter::spawn(
+        fmt_manifest(&fmt_extension_bin()),
+        make_deps_with_recording(recording.clone()),
+        None,
+        None,
+    )
+    .expect("fmt must initialize without a host request deadline");
+
+    adapter
+        .deliver_event(Event::FileChanged {
+            file_id: 1,
+            path: "src/main.rs".to_owned(),
+        })
+        .expect("fmt fileChanged must complete without a host request deadline");
+    adapter.shutdown();
+    assert_eq!(recording.recorded(), vec!["src/main.rs"]);
+}
+
 // ── EV2: .tmp_write paths are filtered ───────────────────────────────────────
 
 /// EV2: A `.tmp_write` path is NOT forwarded to `requestFormat`.
@@ -260,7 +281,11 @@ fn fmt_tool_with_path_enqueues_one_file() {
         .expect("fmt_extension must spawn");
 
     let result = adapter
-        .call_tool("format", serde_json::json!({ "path": "src/lib.rs" }))
+        .call_tool(
+            "format",
+            serde_json::json!({ "path": "src/lib.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("format tool must not error");
 
     adapter.shutdown();
@@ -317,7 +342,11 @@ fn fmt_tool_without_path_enqueues_all_files() {
         .expect("fmt_extension must spawn");
 
     let result = adapter
-        .call_tool("format", serde_json::json!({}))
+        .call_tool(
+            "format",
+            serde_json::json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("format tool must not error");
 
     adapter.shutdown();

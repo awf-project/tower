@@ -43,7 +43,7 @@ The protocol is JSON-RPC 2.0 over stdio. Each message is a newline-delimited JSO
 the JSON-RPC 2.0 envelope:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{ ... }}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":1,"client_info":"tower-host/0.1.0"}}
 ```
 
 When `id` is present the message is a request; when absent it is a notification (used for event
@@ -219,8 +219,9 @@ the host or sever the MCP link.
 
 ### Timeout
 
-Every `invokeTool` and `deliverEvent` is bounded by `request_timeout_secs` (default **30 s**, set in
-`[extensions]` config). Exceeding the deadline kills the child and returns `Timeout` to the caller.
+Initialization, `invokeTool`, and `deliverEvent` use the optional `request_timeout_secs` budget from
+`[extensions]`. When it is omitted, the operation has no Tower-controlled duration limit. When it is
+configured and exceeded, the host kills the child and returns `Timeout` to the caller.
 
 ### Restart with backoff
 
@@ -230,10 +231,10 @@ does not quarantine — it keeps offering to respawn as long as the registry kee
 
 ### Quarantine
 
-The domain registry tracks consecutive faults per extension. After **3** consecutive faults
-(`MAX_CONSECUTIVE_FAILURES`) the extension is marked `Quarantined`: subsequent tool invocations and
-event deliveries return `Quarantined` immediately without contacting the instance. A single successful
-call before the threshold resets the counter to zero.
+The domain registry tracks consecutive crash and protocol faults per extension. After **3** such
+faults (`MAX_CONSECUTIVE_FAILURES`) the extension is marked `Quarantined`: subsequent tool
+invocations and event deliveries return `Quarantined` immediately without contacting the instance.
+A configured timeout does not add a quarantine strike. A successful call resets the counter to zero.
 
 This is a **runtime-agnostic policy** that lives in the domain (`ExtensionRegistry`), while the actual
 process spawn/kill/respawn lives in the adapter (`SidecarHostAdapter` + `ExtensionSupervisor`).
@@ -247,14 +248,14 @@ table:
 
 ```toml
 [extensions]
-# Wall-clock deadline for a single tool call or event delivery, in seconds (default 30).
+# Optional wall-clock deadline for a single tool call or event delivery, in seconds.
 request_timeout_secs = 30
 # Extension manifest names to skip loading entirely (matched on `name`, not path).
 disabled = ["lsp"]
 ```
 
 A disabled extension is never spawned — the check happens before any process starts. An absent config
-file means defaults (30 s timeout, nothing disabled); a malformed config file fails startup (exit 1).
+file means no operation timeout and nothing disabled; a malformed config file fails startup (exit 1).
 
 ### Opt-in debug configuration
 
@@ -289,7 +290,7 @@ record_timeout_secs = 60
 | `args`                 | Optional adapter arguments.                                                                                   |
 | `adapter_type`         | DAP adapter identifier sent during initialize, for example `lldb`, `go`, or `python`.                         |
 | `launch`               | Adapter-specific default launch arguments. Tool-level `launch_overrides` are merged into this object.         |
-| `default_timeout_secs` | Positive per-operation timeout used by launch, resume, inspect, and cleanup calls unless a tool overrides it. |
+| `default_timeout_secs` | Optional positive per-operation timeout used by launch, resume, and inspect calls unless a tool overrides it; omitted means no Tower-controlled operation deadline. |
 | `idle_ttl_secs`        | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it.              |
 
 Add `[debug.record] backend = "rr"` only when rr record/replay tools should be exposed. The host
@@ -302,7 +303,7 @@ does not reread `.tower/config.toml`.
 | `trace_dir`           | Optional workspace-relative trace root. Defaults to `.tower/traces`; absolute paths and `..` traversal are rejected. |
 | `ttl_secs`            | Optional positive trace TTL in seconds. Omit for no TTL expiry.                                                      |
 | `max_traces`          | Optional positive retained trace limit. Defaults to `20`; pruning still applies without TTL.                         |
-| `record_timeout_secs` | Optional positive default record timeout. Defaults to `60`; tool calls may pass `timeout_ms`.                        |
+| `record_timeout_secs` | Optional positive default record timeout; omitted means no Tower-controlled record deadline. Tool calls may pass `timeout_ms`. |
 
 The debug sidecar declares no workspace mutation capabilities. A discovered extension named `debug`
 takes priority over the bundled fallback. It owns adapter and debuggee process lifecycle inside the
@@ -324,7 +325,8 @@ The reference extensions live in `extensions/`:
 | `extensions/lint`  | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`request_apply_edits`/`log`, runs configured external linters read-only, returns LSP-shaped diagnostics, and applies structured fixes through the host. Tools: `check`, `fix`.                                                                                                                      |
 
 The `lint` extension is configured from `<workspace>/.tower/config.toml` under `[lint.<language>]`.
-Each entry declares a command, optional positive `timeout_secs` (default `2`), file extensions,
+Each entry declares a command, optional positive `timeout_secs` (omitted for no Tower-controlled
+duration limit), file extensions,
 parser format, and target mode:
 
 ```toml

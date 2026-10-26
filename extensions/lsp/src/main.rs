@@ -81,6 +81,142 @@ fn invalid_lsp_initialize_error(error: LspInitializeError) -> ProtocolError {
     }
 }
 
+fn tool_manifest() -> InitResult {
+    InitResult {
+                    tools: vec![
+                        ToolDecl {
+                            name: "_tower_catch_up_fence".to_owned(),
+                            description: "Host-internal catch-up ordering fence.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"epoch":{"type":"integer","minimum":0},"delivered_events":{"type":"integer","minimum":0}},"required":["epoch","delivered_events"],"additionalProperties":false}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "diagnostics".to_owned(),
+                            description: "Run the configured language server over a file's current content and return compiler/linter diagnostics (errors and warnings). Use after editing a file to verify the change did not break it.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to analyze"}},"required":["path"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "definition".to_owned(),
+                            description: "Go to the definition of the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "references".to_owned(),
+                            description: "Find all references to the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "hover".to_owned(),
+                            description: "Return hover information for the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "implementations".to_owned(),
+                            description: "Find implementations for the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "type_hierarchy".to_owned(),
+                            description: "Find supertypes, subtypes, or both for the symbol at the given position in a workspace-relative source file.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"direction":{"type":"string","enum":["supertypes","subtypes","both"],"description":"Hierarchy direction"}},"required":["path","line","character","direction"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "rename".to_owned(),
+                            description: "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}"#.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "plan_path_rename".to_owned(),
+                            description: "Plan semantic source edits for workspace path moves without applying filesystem mutations.".to_owned(),
+                            schema_json: PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON.to_owned(),
+                        },
+                        ToolDecl {
+                            name: "plan_safe_delete".to_owned(),
+                            description: "Plan semantic reference cleanup for a declaration without applying workspace mutations.".to_owned(),
+                            schema_json: r#"{"type":"object","properties":{"declaration":{"type":"object","properties":{"path":{"type":"string"},"symbol_name":{"type":"string"},"kind":{"type":"string"},"position":{"type":"object","properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}},"required":["line","character"],"additionalProperties":false},"deletion_span":{"type":"object","properties":{"start_byte":{"type":"integer","minimum":0},"end_byte":{"type":"integer","minimum":0}},"required":["start_byte","end_byte"],"additionalProperties":false},"base_hash":{"type":"string"}},"required":["path","symbol_name","kind","position","deletion_span","base_hash"],"additionalProperties":false}},"required":["declaration"],"additionalProperties":false}"#.to_owned(),
+                        },
+                    ],
+                    events: vec![
+                        "event/fileChanged".to_owned(),
+                        "event/fileDeleted".to_owned(),
+                    ],
+                    capabilities: vec![
+                        Capability::ReadFile,
+                        Capability::Notify,
+                        Capability::Log,
+                        Capability::RequestApplyEdits,
+                    ],
+                }
+}
+
+fn initialize(
+    params_val: Value,
+    stdout_lock: &Arc<Mutex<io::Stdout>>,
+) -> Result<(LspSessionPool, PathBuf, bool), ProtocolError> {
+    // Preserve field presence because `Option<Value>` deserializes both
+    // an absent field and an explicit JSON null as `None`.
+    let extension_config = params_val.get("extension_config").cloned();
+    let init_params: InitParams = match serde_json::from_value(params_val) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(ProtocolError {
+                code: -32602,
+                message: format!("bad InitParams: {e}"),
+                data: None,
+            });
+        }
+    };
+
+    if init_params.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError {
+            code: -32600,
+            message: format!(
+                "protocol version mismatch: host={} extension={}",
+                init_params.protocol_version, PROTOCOL_VERSION
+            ),
+            data: None,
+        });
+    }
+
+    let lsp_config = match decode_lsp_initialize_config(extension_config.as_ref()) {
+        Ok(config) => config,
+        Err(error) => {
+            return Err(invalid_lsp_initialize_error(error));
+        }
+    };
+    let operation_timeout = match decode_diagnostics_timeout(extension_config.as_ref()) {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            return Err(invalid_lsp_initialize_error(error));
+        }
+    };
+    let backend_configured = !lsp_config.servers.is_empty();
+
+    // Read workspace root from environment or default to CWD.
+    let workspace_root = std::env::var("TOWER_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // Build the push channel: LSP adapter sends DiagnosticsEvent → we
+    // forward as `notify/resourceUpdated` HostCall.
+    let (push_tx, push_rx) = std::sync::mpsc::channel::<crate::lsp_adapter::DiagnosticsEvent>();
+
+    // Spawn the push forwarder thread.
+    let stdout_clone = Arc::clone(stdout_lock);
+    std::thread::spawn(move || {
+        push::run_push_forwarder(push_rx, stdout_clone);
+    });
+
+    // Build the session pool with push wired in.
+    let pool = LspSessionPool::new(
+        lsp_config,
+        workspace_root.clone(),
+        Some(push_tx),
+        operation_timeout,
+    );
+
+    Ok((pool, workspace_root, backend_configured))
+}
+
 fn main() {
     // Wrap Stdout in a Mutex so it is Send + 'static and can be shared with the
     // push forwarder thread without holding a lifetime-bounded lock.
@@ -150,150 +286,19 @@ fn main() {
 
         match method.as_str() {
             "initialize" => {
-                // Preserve field presence because `Option<Value>` deserializes both
-                // an absent field and an explicit JSON null as `None`.
-                let extension_config = params_val.get("extension_config").cloned();
-                let init_params: InitParams = match serde_json::from_value(params_val) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        protocol::send_error(
-                            &stdout_lock,
-                            &id,
-                            -32602,
-                            &format!("bad InitParams: {e}"),
-                        );
+                match initialize(params_val, &stdout_lock) {
+                    Ok((new_pool, root, configured)) => {
+                        pool = Some(new_pool);
+                        workspace_root = root;
+                        backend_configured = configured;
+                    }
+                    Err(error) => {
+                        protocol::send_protocol_error(&stdout_lock, &id, &error);
                         continue;
                     }
-                };
-
-                if init_params.protocol_version != PROTOCOL_VERSION {
-                    protocol::send_error(
-                        &stdout_lock,
-                        &id,
-                        -32600,
-                        &format!(
-                            "protocol version mismatch: host={} extension={}",
-                            init_params.protocol_version, PROTOCOL_VERSION
-                        ),
-                    );
-                    continue;
                 }
 
-                let lsp_config = match decode_lsp_initialize_config(extension_config.as_ref()) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        protocol::send_protocol_error(
-                            &stdout_lock,
-                            &id,
-                            &invalid_lsp_initialize_error(error),
-                        );
-                        continue;
-                    }
-                };
-                let diagnostics_deadline =
-                    match decode_diagnostics_timeout(extension_config.as_ref()) {
-                        Ok(timeout) => timeout,
-                        Err(error) => {
-                            protocol::send_protocol_error(
-                                &stdout_lock,
-                                &id,
-                                &invalid_lsp_initialize_error(error),
-                            );
-                            continue;
-                        }
-                    };
-                backend_configured = !lsp_config.servers.is_empty();
-
-                // Read workspace root from environment or default to CWD.
-                workspace_root = std::env::var("TOWER_WORKSPACE")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                    });
-
-                // Build the push channel: LSP adapter sends DiagnosticsEvent → we
-                // forward as `notify/resourceUpdated` HostCall.
-                let (push_tx, push_rx) =
-                    std::sync::mpsc::channel::<crate::lsp_adapter::DiagnosticsEvent>();
-
-                // Spawn the push forwarder thread.
-                let stdout_clone = Arc::clone(&stdout_lock);
-                std::thread::spawn(move || {
-                    push::run_push_forwarder(push_rx, stdout_clone);
-                });
-
-                // Build the session pool with push wired in.
-                pool = Some(LspSessionPool::new(
-                    lsp_config,
-                    workspace_root.clone(),
-                    Some(push_tx),
-                    diagnostics_deadline,
-                ));
-
-                let result = InitResult {
-                    tools: vec![
-                        ToolDecl {
-                            name: "_tower_catch_up_fence".to_owned(),
-                            description: "Host-internal catch-up ordering fence.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"epoch":{"type":"integer","minimum":0},"delivered_events":{"type":"integer","minimum":0}},"required":["epoch","delivered_events"],"additionalProperties":false}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "diagnostics".to_owned(),
-                            description: "Run the configured language server over a file's current content and return compiler/linter diagnostics (errors and warnings). Use after editing a file to verify the change did not break it.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to analyze"}},"required":["path"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "definition".to_owned(),
-                            description: "Go to the definition of the symbol at the given position in a workspace-relative source file.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "references".to_owned(),
-                            description: "Find all references to the symbol at the given position in a workspace-relative source file.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "hover".to_owned(),
-                            description: "Return hover information for the symbol at the given position in a workspace-relative source file.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "implementations".to_owned(),
-                            description: "Find implementations for the symbol at the given position in a workspace-relative source file.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"}},"required":["path","line","character"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "type_hierarchy".to_owned(),
-                            description: "Find supertypes, subtypes, or both for the symbol at the given position in a workspace-relative source file.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"direction":{"type":"string","enum":["supertypes","subtypes","both"],"description":"Hierarchy direction"}},"required":["path","line","character","direction"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "rename".to_owned(),
-                            description: "Rename the symbol at the given position using the configured language server and workspace apply-edits host capability.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based UTF-16 character offset"},"new_name":{"type":"string","description":"New symbol name"},"dry_run":{"type":"boolean","description":"Return host preview data without mutating files"}},"required":["path","line","character","new_name"]}"#.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "plan_path_rename".to_owned(),
-                            description: "Plan semantic source edits for workspace path moves without applying filesystem mutations.".to_owned(),
-                            schema_json: PATH_RENAME_PLANNING_REQUEST_SCHEMA_JSON.to_owned(),
-                        },
-                        ToolDecl {
-                            name: "plan_safe_delete".to_owned(),
-                            description: "Plan semantic reference cleanup for a declaration without applying workspace mutations.".to_owned(),
-                            schema_json: r#"{"type":"object","properties":{"declaration":{"type":"object","properties":{"path":{"type":"string"},"symbol_name":{"type":"string"},"kind":{"type":"string"},"position":{"type":"object","properties":{"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}},"required":["line","character"],"additionalProperties":false},"deletion_span":{"type":"object","properties":{"start_byte":{"type":"integer","minimum":0},"end_byte":{"type":"integer","minimum":0}},"required":["start_byte","end_byte"],"additionalProperties":false},"base_hash":{"type":"string"}},"required":["path","symbol_name","kind","position","deletion_span","base_hash"],"additionalProperties":false}},"required":["declaration"],"additionalProperties":false}"#.to_owned(),
-                        },
-                    ],
-                    events: vec![
-                        "event/fileChanged".to_owned(),
-                        "event/fileDeleted".to_owned(),
-                    ],
-                    capabilities: vec![
-                        Capability::ReadFile,
-                        Capability::Notify,
-                        Capability::Log,
-                        Capability::RequestApplyEdits,
-                    ],
-                };
+                let result = tool_manifest();
 
                 let resp = Response::Initialized(result);
                 protocol::send_response(&stdout_lock, &id, &resp);
@@ -347,8 +352,16 @@ fn main() {
                     Err(tools::ToolDispatchError::Legacy(err_msg)) => {
                         protocol::send_error(&stdout_lock, &id, -32000, &err_msg);
                     }
-                    Err(tools::ToolDispatchError::ReadOnlyOutcome(outcome)) => {
-                        protocol::send_read_only_outcome_error(&stdout_lock, &id, outcome);
+                    Err(tools::ToolDispatchError::ReadOnlyOutcome {
+                        outcome,
+                        diagnostics,
+                    }) => {
+                        protocol::send_read_only_outcome_error(
+                            &stdout_lock,
+                            &id,
+                            *outcome,
+                            diagnostics,
+                        );
                     }
                 }
             }
@@ -477,11 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn initialize_rejects_invalid_diagnostics_deadline_before_session_construction() {
+    fn initialize_rejects_invalid_diagnostics_timeout_before_session_construction() {
         let mut extension = LspExtensionProcess::spawn();
         let invalid = [
-            serde_json::json!({"servers": {}, "idle_timeout_secs": null}),
-            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": null}),
             serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": 0}),
             serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": -1}),
             serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": 1.5}),

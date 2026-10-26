@@ -17,11 +17,13 @@ use serde_json::{Value, json};
 pub enum DiagnosticsMode {
     PushEmpty,
     PushNonempty,
+    PushOnce,
     PushAbsent,
     PullFull,
     PullTimeout,
     PullUnchanged,
     ByContent,
+    Released,
 }
 
 impl DiagnosticsMode {
@@ -29,11 +31,13 @@ impl DiagnosticsMode {
         match mode {
             "diagnostics_push_empty" => Some(Self::PushEmpty),
             "diagnostics_push_nonempty" => Some(Self::PushNonempty),
+            "diagnostics_push_once" => Some(Self::PushOnce),
             "diagnostics_push_absent" => Some(Self::PushAbsent),
             "diagnostics_pull_full" => Some(Self::PullFull),
             "diagnostics_pull_timeout" => Some(Self::PullTimeout),
             "diagnostics_pull_unchanged" => Some(Self::PullUnchanged),
             "diagnostics_by_content" => Some(Self::ByContent),
+            "diagnostics_released" => Some(Self::Released),
             _ => None,
         }
     }
@@ -46,6 +50,8 @@ struct Server {
     log: Option<PathBuf>,
     documents: HashMap<String, String>,
     safe_delete_requests: usize,
+    release: Option<PathBuf>,
+    diagnostics_published: bool,
 }
 
 impl Server {
@@ -147,7 +153,7 @@ impl Server {
         }))
     }
 
-    fn publish_after_sync(&self, uri: &str) -> io::Result<()> {
+    fn publish_after_sync(&mut self, uri: &str) -> io::Result<()> {
         match self.diagnostics_mode {
             Some(DiagnosticsMode::PushEmpty) => self.publish_diagnostics(uri, json!([])),
             Some(DiagnosticsMode::PushNonempty) => self.publish_diagnostics(
@@ -159,6 +165,18 @@ impl Server {
                     "fixture syntax error",
                 )]),
             ),
+            Some(DiagnosticsMode::PushOnce) if !self.diagnostics_published => {
+                self.diagnostics_published = true;
+                self.publish_diagnostics(
+                    uri,
+                    json!([Self::fixture_diagnostic(
+                        1,
+                        "fixture-syntax",
+                        "fixture-lsp",
+                        "fixture syntax error",
+                    )]),
+                )
+            }
             Some(DiagnosticsMode::PullFull) => self.publish_diagnostics(
                 uri,
                 json!([Self::fixture_diagnostic(
@@ -186,6 +204,24 @@ impl Server {
                 self.publish_diagnostics(uri, diagnostics)?;
                 self.publish_quiescent()?;
                 Ok(())
+            }
+            Some(DiagnosticsMode::Released) => {
+                let release = self.release.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "expected release path")
+                })?;
+                while !release.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.publish_diagnostics(
+                    uri,
+                    json!([Self::fixture_diagnostic(
+                        1,
+                        "fixture-released",
+                        "fixture-lsp",
+                        "released diagnostic",
+                    )]),
+                )?;
+                self.publish_quiescent()
             }
             _ => Ok(()),
         }
@@ -600,6 +636,7 @@ fn run() -> io::Result<()> {
     if let Some(pids) = args.next().filter(|value| value != "-") {
         append_line(pids, &std::process::id().to_string())?;
     }
+    let release = args.next().filter(|value| value != "-").map(PathBuf::from);
     let dispatch_profile = mode.starts_with("dispatch_");
     let diagnostics_mode = if mode.starts_with("diagnostics_") {
         DiagnosticsMode::from_fixture_mode(&mode)
@@ -613,6 +650,8 @@ fn run() -> io::Result<()> {
         log,
         documents: HashMap::new(),
         safe_delete_requests: 0,
+        release,
+        diagnostics_published: false,
     }
     .run()
 }
@@ -638,6 +677,7 @@ mod tests {
             ("diagnostics_pull_timeout", DiagnosticsMode::PullTimeout),
             ("diagnostics_pull_unchanged", DiagnosticsMode::PullUnchanged),
             ("diagnostics_by_content", DiagnosticsMode::ByContent),
+            ("diagnostics_released", DiagnosticsMode::Released),
         ];
 
         for (mode, expected) in cases {
@@ -655,11 +695,13 @@ mod tests {
         let cases = [
             ("diagnostics_push_empty", false),
             ("diagnostics_push_nonempty", false),
+            ("diagnostics_push_once", false),
             ("diagnostics_push_absent", false),
             ("diagnostics_pull_full", true),
             ("diagnostics_pull_timeout", true),
             ("diagnostics_pull_unchanged", true),
             ("diagnostics_by_content", false),
+            ("diagnostics_released", false),
         ];
 
         for (mode, advertises_pull_diagnostics) in cases {
@@ -670,6 +712,8 @@ mod tests {
                 log: None,
                 documents: Default::default(),
                 safe_delete_requests: 0,
+                release: None,
+                diagnostics_published: false,
             };
             assert_eq!(
                 server.capabilities().get("diagnosticProvider").is_some(),

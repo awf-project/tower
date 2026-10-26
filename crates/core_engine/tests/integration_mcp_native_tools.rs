@@ -915,7 +915,11 @@ fn call_native_rename(
     state: Arc<RwLock<EngineState>>,
     args: Value,
 ) -> Result<Value, core_engine::adapters::mcp::ToolError> {
-    NativeToolRegistry::new(state).call("tower_rename_path", args)
+    NativeToolRegistry::new(state).call(
+        "tower_rename_path",
+        args,
+        &core_engine::domain::NeverCancelled,
+    )
 }
 
 /// Canonical public examples.  Keep these literals independent of the
@@ -1094,6 +1098,7 @@ fn rename_path_is_registered_with_the_exact_public_schema_and_dispatch() {
         .call(
             "tower_rename_path",
             json!({"source": "missing.rs", "destination": "renamed.rs", "semantic_policy": "none"}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("domain rejection must be a successful structured payload");
     assert_eq!(error, rename_result_fixture("rejected"));

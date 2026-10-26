@@ -374,42 +374,52 @@ impl ReadinessController {
         publish(&self.shared, &state)
     }
 
-    pub fn wait_until_ready(
+    pub fn wait_until_ready<T: Into<Option<Duration>>>(
         &self,
         dependency: CapabilityDependency,
-        deadline: Duration,
+        deadline: T,
     ) -> Result<ReadinessSnapshot, ReadinessWaitError> {
-        let end = Instant::now().checked_add(deadline);
+        let end = deadline
+            .into()
+            .and_then(|deadline| Instant::now().checked_add(deadline));
         let mut state = lock_state(&self.shared.state);
         loop {
             match wait_outcome(&state.snapshot, dependency) {
                 Ok(()) => return Ok(state.snapshot.clone()),
                 Err(WaitStatus::Terminal(error)) => return Err(error),
                 Err(WaitStatus::Preparing(phase)) => {
-                    let Some(remaining) = remaining(end) else {
-                        return Err(ReadinessWaitError::Timeout { dependency, phase });
-                    };
-                    let waited = self
-                        .shared
-                        .changed
-                        .wait_timeout(state, remaining)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state = waited.0;
-                    if waited.1.timed_out()
-                        && let Err(WaitStatus::Preparing(phase)) =
-                            wait_outcome(&state.snapshot, dependency)
-                    {
-                        return Err(ReadinessWaitError::Timeout { dependency, phase });
+                    if let Some(end) = end {
+                        let Some(remaining) = remaining(Some(end)) else {
+                            return Err(ReadinessWaitError::Timeout { dependency, phase });
+                        };
+                        let waited = self
+                            .shared
+                            .changed
+                            .wait_timeout(state, remaining)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state = waited.0;
+                        if waited.1.timed_out()
+                            && let Err(WaitStatus::Preparing(phase)) =
+                                wait_outcome(&state.snapshot, dependency)
+                        {
+                            return Err(ReadinessWaitError::Timeout { dependency, phase });
+                        }
+                    } else {
+                        state = self
+                            .shared
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
                 }
             }
         }
     }
 
-    pub fn admit_dispatch(
+    pub fn admit_dispatch<T: Into<Option<Duration>>>(
         &self,
         dependencies: &[CapabilityDependency],
-        deadline: Duration,
+        deadline: T,
     ) -> Result<DispatchPermit, ReadinessWaitError> {
         let mut dependencies = dependencies.to_vec();
         dependencies.sort_unstable();
@@ -418,7 +428,9 @@ impl ReadinessController {
             .first()
             .copied()
             .unwrap_or(CapabilityDependency::Workspace);
-        let end = Instant::now().checked_add(deadline);
+        let end = deadline
+            .into()
+            .and_then(|deadline| Instant::now().checked_add(deadline));
         let mut state = lock_state(&self.shared.state);
         loop {
             if state.snapshot.lifecycle == DaemonLifecycle::Stopping {
@@ -443,20 +455,28 @@ impl ReadinessController {
                     shared: Arc::clone(&self.shared),
                 });
             };
-            let Some(remaining) = remaining(end) else {
-                return Err(ReadinessWaitError::Timeout { dependency, phase });
-            };
             #[cfg(test)]
             {
                 state.readiness_waiters += 1;
                 self.shared.changed.notify_all();
             }
-            let waited = self
-                .shared
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = waited.0;
+            if let Some(end) = end {
+                let Some(remaining) = remaining(Some(end)) else {
+                    return Err(ReadinessWaitError::Timeout { dependency, phase });
+                };
+                state = self
+                    .shared
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            } else {
+                state = self
+                    .shared
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
             #[cfg(test)]
             {
                 state.readiness_waiters -= 1;

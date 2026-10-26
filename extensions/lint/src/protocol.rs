@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use extension_protocol::HostCall;
+use extension_protocol::{HostCall, TimeoutDetail};
 use extension_sidecar_harness::jsonrpc::HarnessError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +35,7 @@ pub struct CheckResult {
 pub struct LintToolErrorResponse {
     pub code: String,
     pub message: String,
+    pub detail: Option<TimeoutDetail>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -82,6 +83,7 @@ pub struct FixPreviewEditDto {
 pub struct FixToolErrorResponse {
     pub code: String,
     pub message: String,
+    pub detail: Option<TimeoutDetail>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

@@ -64,6 +64,7 @@ fn protocol_rs_defines_the_lint_tool_dtos_and_skips_absent_error() {
         error: Some(LintToolErrorResponse {
             code: "lint_missing_binary".to_owned(),
             message: "lint command is unavailable".to_owned(),
+            detail: None,
         }),
     };
     assert_eq!(
@@ -73,7 +74,8 @@ fn protocol_rs_defines_the_lint_tool_dtos_and_skips_absent_error() {
             "diagnostics": [],
             "error": {
                 "code": "lint_missing_binary",
-                "message": "lint command is unavailable"
+                "message": "lint command is unavailable",
+                "detail": null
             }
         })
     );
@@ -162,5 +164,39 @@ fn protocol_rs_defines_queued_frame_for_inbound_host_requests_and_notifications(
             "method": "telemetry/event",
             "params": { "ok": true }
         })
+    );
+}
+
+#[test]
+fn lint_timeout_errors_round_trip_exact_check_and_fix_payloads() {
+    let expected = json!({"code":"lint_timeout", "message":"lint operation timed out", "detail":{"operation":"check", "layer":"subprocess", "budget_ms":1000}});
+    let error = LintToolErrorResponse {
+        code: "lint_timeout".to_owned(),
+        message: "lint operation timed out".to_owned(),
+        detail: Some(extension_protocol::TimeoutDetail {
+            operation: "check".to_owned(),
+            layer: "subprocess".to_owned(),
+            budget_ms: 1000,
+        }),
+    };
+    assert_eq!(serde_json::to_value(&error).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_value::<LintToolErrorResponse>(expected).unwrap(),
+        error
+    );
+    let expected = json!({"code":"lint_timeout", "message":"lint operation timed out", "detail":{"operation":"fix", "layer":"subprocess", "budget_ms":2000}});
+    let error = lint_extension::protocol::FixToolErrorResponse {
+        code: "lint_timeout".to_owned(),
+        message: "lint operation timed out".to_owned(),
+        detail: Some(extension_protocol::TimeoutDetail {
+            operation: "fix".to_owned(),
+            layer: "subprocess".to_owned(),
+            budget_ms: 2000,
+        }),
+    };
+    assert_eq!(serde_json::to_value(&error).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_value::<lint_extension::protocol::FixToolErrorResponse>(expected).unwrap(),
+        error
     );
 }

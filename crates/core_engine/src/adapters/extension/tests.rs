@@ -13,17 +13,20 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use std::{
     fs,
-    process::{Command, Stdio},
+    io::{BufRead, BufReader, Write},
+    process::{Child, Command, Stdio},
 };
 
 use serde_json::json;
 
 use super::host_deps::{ApplyEditsHostPort, HostDeps, UnsupportedApplyEditsHost};
-use super::sidecar::SidecarHostAdapter;
+use super::sidecar::{SidecarHostAdapter, with_request_timeout_test_cap};
 use crate::adapters::cli::GlobalOpts;
 use crate::adapters::config::TowerConfig;
 use crate::adapters::daemon::engine::build_engine;
@@ -45,6 +48,7 @@ use extension_protocol::{ExtensionFault, ExtensionManifest};
 /// Default timeout for spec 23 tests — long enough that cooperative extensions
 /// always respond well within it.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEADLINE_PROOF_CAP: Duration = Duration::from_millis(25);
 
 // ── Binary path helper ────────────────────────────────────────────────────────
 
@@ -238,6 +242,166 @@ fn make_manifest(bin: &str, caps: Vec<String>) -> ExtensionManifest {
     }
 }
 
+fn gated_test_helper_manifest(
+    bin: &str,
+    phase: &str,
+    control_dir: Option<&Path>,
+) -> ExtensionManifest {
+    let mut manifest = make_manifest(bin, vec![]);
+    let mut command = vec!["env".to_owned(), format!("TOWER_TEST_HELPER_GATE={phase}")];
+    if let Some(control_dir) = control_dir {
+        command.push(format!(
+            "TOWER_TEST_HELPER_CONTROL_DIR={}",
+            control_dir.display()
+        ));
+    }
+    command.push(bin.to_owned());
+    manifest.command = command;
+    manifest
+}
+
+fn await_gate_marker(control_dir: &Path, marker: &str) {
+    let marker = control_dir.join(marker);
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !marker.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "test-helper did not create gate marker {}",
+            marker.display()
+        );
+        thread::yield_now();
+    }
+}
+
+fn release_gate(control_dir: &Path, marker: &str) {
+    let staged = control_dir.join(format!(".{marker}.tmp"));
+    let released = control_dir.join(marker);
+    fs::write(&staged, []).expect("stage gate release marker");
+    fs::rename(staged, released).expect("atomically publish gate release marker");
+}
+
+fn read_fixture_frame(
+    frames: &mpsc::Receiver<Result<serde_json::Value, String>>,
+    child: &mut Child,
+    expected: &str,
+) -> serde_json::Value {
+    match frames.recv_timeout(TEST_TIMEOUT) {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture did not produce {expected}: {error}");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture did not produce {expected} before deadline");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture reader disconnected before producing {expected}");
+        }
+    }
+}
+
+fn assert_test_helper_queues_event_while_host_call_pending(bin: &str) {
+    let mut child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn raw test-helper fixture");
+    let mut stdin = child.stdin.take().expect("fixture stdin");
+    let stdout = child.stdout.take().expect("fixture stdout");
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    let frame = serde_json::from_str::<serde_json::Value>(line.trim())
+                        .map_err(|error| format!("invalid fixture JSON-RPC: {error}"));
+                    if frame_tx.send(frame).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = frame_tx.send(Err(format!("read fixture frame: {error}")));
+                    return;
+                }
+            }
+        }
+    });
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocol_version": extension_protocol::PROTOCOL_VERSION,
+                "client_info": "queued-frame-contract"
+            }
+        })
+    )
+    .expect("send initialize");
+    stdin.flush().expect("flush initialize");
+    let initialized = read_fixture_frame(&frame_rx, &mut child, "initialize response");
+    assert_eq!(initialized["result"]["type"], "Initialized");
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "invokeTool",
+            "params": {"name": "read_file", "params": {"path": "src/lib.rs"}}
+        })
+    )
+    .expect("send read_file request");
+    stdin.flush().expect("flush read_file request");
+    let host_call = read_fixture_frame(&frame_rx, &mut child, "workspace/readFile HostCall");
+    assert_eq!(host_call["method"], "workspace/readFile");
+    assert_eq!(host_call["id"], 9001);
+
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9001,
+            "method": "deliverEvent",
+            "params": {"type": "FileChanged", "data": {"file_id": 7, "path": "src/lib.rs"}}
+        })
+    )
+    .expect("queue event during HostCall");
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 9001, "result": "fixture contents"})
+    )
+    .expect("answer HostCall");
+    stdin
+        .flush()
+        .expect("flush queued event and HostCall response");
+
+    let tool_result = read_fixture_frame(&frame_rx, &mut child, "invokeTool response");
+    assert_eq!(tool_result["id"], 1);
+    assert_eq!(tool_result["result"]["type"], "ToolResult");
+    assert_eq!(tool_result["result"]["data"], "fixture contents");
+    let event_ack = read_fixture_frame(&frame_rx, &mut child, "deliverEvent response");
+    assert_eq!(event_ack["id"], 9001);
+    assert_eq!(event_ack["result"]["type"], "Ack");
+    child.kill().expect("stop raw test-helper fixture");
+    child.wait().expect("reap raw test-helper fixture");
+    reader.join().expect("fixture reader");
+}
+
 fn scripted_invoke_response_manifest(response: &str) -> ExtensionManifest {
     let script = format!(
         r#"
@@ -285,6 +449,61 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"type":"Ack"}}}}'
         events: EventsSection::default(),
         capabilities: CapabilitiesSection::default(),
     }
+}
+
+#[test]
+fn already_cancelled_sidecar_request_is_not_dispatched() {
+    struct AlreadyCancelled;
+
+    impl crate::domain::CancellationSignal for AlreadyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let marker_dir = tempfile::tempdir().expect("marker tempdir");
+    let marker = marker_dir.path().join("invoke-received");
+    let script = r#"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[],"events":[],"capabilities":[]}}}'
+read -r invoke
+case "$invoke" in
+  *invokeTool*)
+    : > "$1"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"ToolResult","data":{"value":"dispatched"}}}'
+    ;;
+  *shutdown*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"Ack"}}'
+    ;;
+esac
+"#;
+    let manifest = ExtensionManifest {
+        name: "pre_cancel_fixture".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "pre_cancel_fixture".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        ],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    };
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), TEST_TIMEOUT, None)
+            .expect("spawn must succeed");
+
+    let result = instance.call_tool("side_effect", json!({}), &AlreadyCancelled);
+
+    assert_eq!(result, Err(ExtensionCallError::Cancelled));
+    assert!(
+        !marker.exists(),
+        "an already-cancelled request must not reach the child"
+    );
+    instance.shutdown();
 }
 
 fn make_apply_edits_script_manifest(name: &str, caps: Vec<String>) -> ExtensionManifest {
@@ -360,7 +579,7 @@ fn invoke_apply_edits_host_call_as(
     let mut instance =
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
     let result = instance
-        .call_tool("apply_edits", params)
+        .call_tool("apply_edits", params, &crate::domain::NeverCancelled)
         .expect("apply_edits helper must return the host response");
     instance.shutdown();
     result
@@ -702,7 +921,7 @@ fn u3_call_tool_echo_round_trip() {
 
     let params = json!({"message": "hello"});
     let result = instance
-        .call_tool("echo", params.clone())
+        .call_tool("echo", params.clone(), &crate::domain::NeverCancelled)
         .expect("echo must succeed");
 
     assert_eq!(result, params, "echo must return params unchanged");
@@ -719,7 +938,7 @@ fn f008_application_maps_valid_json_rpc_error_with_code_message_and_data() {
             .expect("structured error fixture must initialize");
 
     let error = instance
-        .call_tool("rename", json!({}))
+        .call_tool("rename", json!({}), &crate::domain::NeverCancelled)
         .expect_err("JSON-RPC errors must remain application errors");
 
     assert_eq!(
@@ -743,7 +962,7 @@ fn f008_application_maps_response_error_with_code_message_and_data() {
             .expect("structured error fixture must initialize");
 
     let error = instance
-        .call_tool("rename", json!({}))
+        .call_tool("rename", json!({}), &crate::domain::NeverCancelled)
         .expect_err("Response::Error must remain an application error");
 
     assert_eq!(
@@ -770,7 +989,7 @@ fn f008_application_malformed_frame_and_sidecar_exit_remain_faults() {
         .unwrap_or_else(|error| panic!("{fixture} must initialize: {error:?}"));
 
         let error = instance
-            .call_tool("run", json!({}))
+            .call_tool("run", json!({}), &crate::domain::NeverCancelled)
             .expect_err("transport failures must remain faults");
 
         assert!(
@@ -808,7 +1027,7 @@ fn f008_application_rejects_malformed_or_mismatched_json_rpc_error_envelopes() {
                 .unwrap_or_else(|error| panic!("{case} fixture must initialize: {error:?}"));
 
         let error = instance
-            .call_tool("rename", json!({}))
+            .call_tool("rename", json!({}), &crate::domain::NeverCancelled)
             .expect_err("invalid JSON-RPC envelopes must remain transport faults");
 
         assert!(
@@ -833,7 +1052,7 @@ fn f008_application_keeps_first_response_when_two_frames_arrive_rapidly() {
             .expect("rapid response fixture must initialize");
 
     let error = instance
-        .call_tool("rename", json!({}))
+        .call_tool("rename", json!({}), &crate::domain::NeverCancelled)
         .expect_err("the first matching response must complete the request");
 
     assert_eq!(
@@ -868,7 +1087,11 @@ fn ac2_read_file_capability_through_filesystem_port() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
     let result = instance
-        .call_tool("read_file", json!({"path": "hello.txt"}))
+        .call_tool(
+            "read_file",
+            json!({"path": "hello.txt"}),
+            &crate::domain::NeverCancelled,
+        )
         .expect("read_file tool must succeed");
 
     assert_eq!(
@@ -899,7 +1122,11 @@ fn read_file_capability_rejects_a_symlink_escape_at_the_host_boundary() {
 
     let mut instance =
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
-    let result = instance.call_tool("read_file", json!({"path": "escape.txt"}));
+    let result = instance.call_tool(
+        "read_file",
+        json!({"path": "escape.txt"}),
+        &crate::domain::NeverCancelled,
+    );
 
     assert!(result.is_err(), "symlink escape must be denied");
     instance.shutdown();
@@ -922,7 +1149,11 @@ fn ac3_dotdot_traversal_path_is_denied() {
 
     // The "read_bad_path" tool calls readFile with whatever path we give it.
     // With "../secret" the host should deny it.
-    let result = instance.call_tool("read_bad_path", json!({"path": "../secret"}));
+    let result = instance.call_tool(
+        "read_bad_path",
+        json!({"path": "../secret"}),
+        &crate::domain::NeverCancelled,
+    );
 
     // The tool returns Response::Error when the host denies the path.
     assert!(
@@ -951,7 +1182,11 @@ fn ac3_absolute_path_is_denied() {
     let mut instance =
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
-    let result = instance.call_tool("read_bad_path", json!({"path": "/etc/passwd"}));
+    let result = instance.call_tool(
+        "read_bad_path",
+        json!({"path": "/etc/passwd"}),
+        &crate::domain::NeverCancelled,
+    );
 
     assert!(
         result.is_err(),
@@ -970,7 +1205,11 @@ fn ac3_empty_path_is_denied() {
     let mut instance =
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("spawn must succeed");
 
-    let result = instance.call_tool("read_bad_path", json!({"path": ""}));
+    let result = instance.call_tool(
+        "read_bad_path",
+        json!({"path": ""}),
+        &crate::domain::NeverCancelled,
+    );
 
     assert!(
         result.is_err(),
@@ -1059,6 +1298,7 @@ fn ac5_index_put_get_round_trip_through_ast_index_port() {
         .call_tool(
             "index_roundtrip",
             json!({"key": "my-cache-key", "value": "stored-bytes"}),
+            &crate::domain::NeverCancelled,
         )
         .expect("index_roundtrip must succeed");
 
@@ -1366,7 +1606,7 @@ fn engine_apply_edits_host_returns_one_per_file_result_for_every_targeted_file()
     write_batch_apply_edits_extension(&extensions_dir, &first_file_version);
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = 2;
+    config.extensions.request_timeout_secs = Some(2);
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.path().to_path_buf()),
@@ -1378,7 +1618,11 @@ fn engine_apply_edits_host_returns_one_per_file_result_for_every_targeted_file()
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     let result = registry
-        .call("tower_ast_replace", json!({}))
+        .call(
+            "tower_ast_replace",
+            json!({}),
+            &crate::domain::NeverCancelled,
+        )
         .expect("daemon apply-edits host dependency must return a tool result");
     let per_file = result["host_response"]["result"]["per_file"]
         .as_array()
@@ -1472,7 +1716,7 @@ fn successful_file_mutations_fan_out_filechanged_callbacks_only_after_locks_are_
     );
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = 2;
+    config.extensions.request_timeout_secs = Some(2);
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.path().to_path_buf()),
@@ -1484,10 +1728,18 @@ fn successful_file_mutations_fan_out_filechanged_callbacks_only_after_locks_are_
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_ast_replace", json!({}))
+        .call(
+            "tower_ast_replace",
+            json!({}),
+            &crate::domain::NeverCancelled,
+        )
         .expect("fileChanged-triggered apply-edits HostCall must not deadlock original apply");
     let read = registry
-        .call("tower_read_file", json!({ "path": "src/lint_target.txt" }))
+        .call(
+            "tower_read_file",
+            json!({ "path": "src/lint_target.txt" }),
+            &crate::domain::NeverCancelled,
+        )
         .expect("read twice-mutated file through shared engine state");
 
     assert_eq!(
@@ -1601,6 +1853,207 @@ fn adapter_tests_cover_empty_edit_list_as_a_batch_result_error() {
 // Deliver event round-trip
 // ═════════════════════════════════════════════════════════════════════════════
 
+#[test]
+fn unlimited_initialization_waits_for_fixture_release() {
+    let bin = test_helper_bin();
+    let invalid = match SidecarHostAdapter::spawn(
+        gated_test_helper_manifest(&bin, "initialize", None),
+        make_deps(InMemoryFs::new()),
+        None,
+        None,
+    ) {
+        Ok(_) => panic!("a selected gate without a control directory must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        invalid,
+        ExtensionFault::ProtocolError {
+            message:
+                "initialize rejected: invalid test-helper gate control directory (code -32602)"
+                    .to_owned(),
+        }
+    );
+
+    let unknown = SidecarHostAdapter::spawn(
+        gated_test_helper_manifest(&bin, "unknown", None),
+        make_deps(InMemoryFs::new()),
+        Some(TEST_TIMEOUT),
+        None,
+    )
+    .expect("an unknown gate value must leave the fixture ungated");
+    drop(unknown);
+
+    let control_dir = tempfile::tempdir().expect("gate control tempdir");
+    let manifest = gated_test_helper_manifest(&bin, "initialize", Some(control_dir.path()));
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = with_request_timeout_test_cap(DEADLINE_PROOF_CAP, || {
+            SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), None, None)
+        });
+        completed_tx.send(result).expect("report initialize result");
+    });
+
+    await_gate_marker(control_dir.path(), "initialize_entered");
+    assert!(
+        matches!(
+            completed_rx.recv_timeout(DEADLINE_PROOF_CAP * 2),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "unlimited initialization must remain pending beyond the finite-budget proof cap"
+    );
+    release_gate(control_dir.path(), "initialize_release");
+    let mut instance = completed_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("initialization must complete after release")
+        .expect("fixture must return Response::Initialized after release");
+    instance.shutdown();
+    worker.join().expect("initialize worker");
+}
+
+#[test]
+fn unlimited_event_delivery_waits_for_fixture_release() {
+    let bin = test_helper_bin();
+    let mut invalid_instance = SidecarHostAdapter::spawn(
+        gated_test_helper_manifest(&bin, "deliverEvent", None),
+        make_deps(InMemoryFs::new()),
+        None,
+        None,
+    )
+    .expect("deliverEvent gate must initialize without a control directory");
+    let invalid = invalid_instance
+        .deliver_event(extension_protocol::Event::FileIndexed {
+            file_id: 42,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect_err("a selected deliverEvent gate without a control directory must be rejected");
+    assert_eq!(
+        invalid,
+        ExtensionFault::ProtocolError {
+            message: "deliverEvent error: invalid test-helper gate control directory (code -32602)"
+                .to_owned(),
+        }
+    );
+    invalid_instance.shutdown();
+
+    let control_dir = tempfile::tempdir().expect("gate control tempdir");
+    let manifest = gated_test_helper_manifest(&bin, "deliverEvent", Some(control_dir.path()));
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), None, None)
+            .expect("fixture initialization must succeed");
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = with_request_timeout_test_cap(DEADLINE_PROOF_CAP, || {
+            instance.deliver_event(extension_protocol::Event::FileIndexed {
+                file_id: 42,
+                path: "src/lib.rs".to_owned(),
+            })
+        });
+        completed_tx.send(result).expect("report event result");
+        instance.shutdown();
+    });
+
+    await_gate_marker(control_dir.path(), "deliver_event_entered");
+    assert!(
+        matches!(
+            completed_rx.recv_timeout(DEADLINE_PROOF_CAP * 2),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "unlimited event delivery must remain pending beyond the finite-budget proof cap"
+    );
+    release_gate(control_dir.path(), "deliver_event_release");
+    completed_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("event delivery must complete after release")
+        .expect("fixture must return Response::Ack after release");
+    worker.join().expect("event worker");
+}
+
+#[test]
+fn test_helper_public_request_and_event_use_unlimited_host_budget() {
+    let bin = test_helper_bin();
+    let mut invalid_instance = SidecarHostAdapter::spawn(
+        gated_test_helper_manifest(&bin, "invokeTool", None),
+        make_deps(InMemoryFs::new()),
+        None,
+        None,
+    )
+    .expect("invokeTool gate must initialize without a control directory");
+    let invalid = invalid_instance
+        .call_tool(
+            "echo",
+            json!({"message": "hello"}),
+            &crate::domain::NeverCancelled,
+        )
+        .expect_err("a selected invokeTool gate without a control directory must be rejected");
+    assert_eq!(
+        invalid,
+        ExtensionCallError::Application(ExtensionApplicationError {
+            code: -32_602,
+            message: "invalid test-helper gate control directory".to_owned(),
+            data: None,
+        })
+    );
+    invalid_instance.shutdown();
+
+    let control_dir = tempfile::tempdir().expect("gate control tempdir");
+    let manifest = gated_test_helper_manifest(&bin, "invokeTool", Some(control_dir.path()));
+    let mut instance =
+        SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), None, None)
+            .expect("fixture initialization must succeed");
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = with_request_timeout_test_cap(DEADLINE_PROOF_CAP, || {
+            instance.call_tool(
+                "echo",
+                json!({"message": "hello"}),
+                &crate::domain::NeverCancelled,
+            )
+        });
+        completed_tx.send(result).expect("report request result");
+        instance.shutdown();
+    });
+
+    await_gate_marker(control_dir.path(), "invoke_tool_entered");
+    assert!(
+        matches!(
+            completed_rx.recv_timeout(DEADLINE_PROOF_CAP * 2),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "unlimited tool request must remain pending beyond the finite-budget proof cap"
+    );
+    release_gate(control_dir.path(), "invoke_tool_release");
+    let result = completed_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("tool request must complete after release")
+        .expect("fixture must return Response::ToolResult after release");
+    assert_eq!(result, json!({"message": "hello"}));
+    worker.join().expect("request worker");
+
+    let event_dir = tempfile::tempdir().expect("event gate control tempdir");
+    let event_manifest = gated_test_helper_manifest(&bin, "deliverEvent", Some(event_dir.path()));
+    let mut event_instance =
+        SidecarHostAdapter::spawn(event_manifest, make_deps(InMemoryFs::new()), None, None)
+            .expect("event fixture initialization must succeed");
+    let (event_tx, event_rx) = mpsc::channel();
+    let event_worker = thread::spawn(move || {
+        let result = event_instance.deliver_event(extension_protocol::Event::FileChanged {
+            file_id: 7,
+            path: "src/main.rs".to_owned(),
+        });
+        event_tx.send(result).expect("report public event result");
+        event_instance.shutdown();
+    });
+    await_gate_marker(event_dir.path(), "deliver_event_entered");
+    assert!(event_rx.try_recv().is_err());
+    release_gate(event_dir.path(), "deliver_event_release");
+    event_rx
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("public event must complete after release")
+        .expect("public event must receive Response::Ack");
+    event_worker.join().expect("public event worker");
+    assert_test_helper_queues_event_while_host_call_pending(&bin);
+}
+
 /// U3: deliver_event forwards subscribed events and receives Ack.
 #[test]
 fn u3_deliver_event_receives_ack() {
@@ -1619,4 +2072,24 @@ fn u3_deliver_event_receives_ack() {
         .deliver_event(event)
         .expect("deliver_event must return Ok");
     instance.shutdown();
+}
+
+#[test]
+fn invalid_direct_sidecar_budgets_are_rejected_before_spawn() {
+    for timeout in [Duration::ZERO, Duration::from_secs(u64::MAX)] {
+        let error = SidecarHostAdapter::spawn(
+            make_manifest("/nonexistent-sidecar-must-not-be-spawned", vec![]),
+            make_deps(InMemoryFs::new()),
+            Some(timeout),
+            None,
+        )
+        .err()
+        .expect("invalid timeout must fail before process admission");
+        assert_eq!(
+            error,
+            ExtensionFault::ProtocolError {
+                message: "invalid extension request timeout".to_owned(),
+            }
+        );
+    }
 }

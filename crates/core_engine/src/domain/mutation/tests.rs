@@ -958,6 +958,7 @@ fn edit_range_broadcasts_on_file_changed_and_refreshes_vfs() {
             &self,
             tool_name: &str,
             _params: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<serde_json::Value, crate::domain::InvokeError> {
             Err(crate::domain::InvokeError::ToolNotFound(
                 tool_name.to_owned(),

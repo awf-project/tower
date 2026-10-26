@@ -12,7 +12,8 @@ mod lint_support;
 use core_engine::adapters::config;
 use lint_support::{
     SEVERITY_CODE_GENERIC_REGEX, TestWorkspace, block_on, configure_lint_timeout_and_host_budget,
-    handler, handler_with_timeout, lint_extension_bin, start_server,
+    handler, handler_with_timeout, handler_with_timeout_and_host_call_log, lint_extension_bin,
+    start_server,
 };
 use rmcp::RoleClient;
 use rmcp::model::CallToolRequestParams;
@@ -191,6 +192,58 @@ fn lint_check_returns_structured_error_for_missing_linter_without_mcp_error() {
 }
 
 #[test]
+fn lint_check_non_timeout_errors_map_to_null_timeout_detail() {
+    for (name, expected_code) in [
+        ("missing", "lint_missing_binary"),
+        ("unparseable", "lint_unparseable_output"),
+        ("nonzero", "lint_nonzero_exit"),
+        ("invalid_config", "lint_invalid_config"),
+    ] {
+        let workspace = TestWorkspace::new();
+        let script = workspace.script(
+            "error.sh",
+            match name {
+                "unparseable" => "#!/bin/sh\nprintf 'not a lint diagnostic\\n'\n",
+                "nonzero" => "#!/bin/sh\nexit 1\n",
+                _ => "#!/bin/sh\nprintf 'src/main.txt:1:1: warning: T001: harmless\\n'\n",
+            },
+        );
+        if name == "missing" {
+            workspace.write_lint_config_with_regex(
+                &workspace.root().join("missing-linter"),
+                &["txt"],
+                SEVERITY_CODE_GENERIC_REGEX,
+            );
+        } else if name == "unparseable" {
+            // Generic regex output may contain unmatched lines; malformed JSON is an error.
+            workspace.write_lint_config_with_format(
+                &script,
+                &["txt"],
+                "rustc-json",
+                "append",
+                None,
+            );
+        } else if name == "invalid_config" {
+            workspace.write_invalid_generic_lint_config_without_regex(&script);
+        } else {
+            workspace.write_lint_config_with_regex(&script, &["txt"], SEVERITY_CODE_GENERIC_REGEX);
+        }
+        workspace.write_file("src/main.txt", "content\n");
+
+        let payload = block_on(async {
+            let client = start_server(handler(&workspace, &["src/main.txt"])).await;
+            let result = call_lint_check(&client, json!({ "path": "src/main.txt" })).await;
+            let payload = result_json(&result);
+            client.cancel().await.expect("cancel client");
+            payload
+        });
+
+        assert_eq!(payload["error"]["code"], expected_code, "{name} error code");
+        assert_eq!(payload["error"]["detail"], Value::Null, "{name} detail");
+    }
+}
+
+#[test]
 fn tower_lint_check_honors_configured_command_timeout() {
     const RUNNER_TIMEOUT: Duration = Duration::from_secs(6);
     const END_TO_END_LIMIT: Duration = Duration::from_secs(8);
@@ -246,13 +299,13 @@ fn tower_lint_check_honors_configured_command_timeout() {
 }
 
 #[test]
-fn tower_lint_check_preserves_omitted_timeout_behavior() {
+fn tower_lint_check_completes_without_an_implicit_timeout() {
     const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     let workspace = TestWorkspace::new();
     let script = workspace.script(
         "omitted-timeout-check.sh",
-        "#!/bin/sh\nprintf '%s:1:1: warning: D200: default timeout remains usable\\n' \"$1\"\n",
+        "#!/bin/sh\nsleep 2\nprintf '%s:1:1: warning: D200: default timeout remains usable\\n' \"$1\"\n",
     );
     workspace.write_lint_config_with_regex(&script, &["txt"], SEVERITY_CODE_GENERIC_REGEX);
     let host_timeout = configure_lint_timeout_and_host_budget(&workspace, None);
@@ -263,16 +316,11 @@ fn tower_lint_check_preserves_omitted_timeout_behavior() {
         .next()
         .expect("lint section");
     assert!(!lint_section.contains("timeout_secs"));
-    assert_eq!(host_timeout, Duration::from_secs(5));
+    assert_eq!(host_timeout, Duration::from_secs(1));
     workspace.write_file("src/default.txt", "content\n");
 
     let payload = block_on(async {
-        let client = start_server(handler_with_timeout(
-            &workspace,
-            &["src/default.txt"],
-            host_timeout,
-        ))
-        .await;
+        let client = start_server(handler(&workspace, &["src/default.txt"])).await;
         let result = tokio::time::timeout(
             MCP_REQUEST_TIMEOUT,
             call_lint_check(&client, json!({ "path": "src/default.txt" })),
@@ -290,6 +338,91 @@ fn tower_lint_check_preserves_omitted_timeout_behavior() {
         payload["diagnostics"][0]["message"],
         "default timeout remains usable"
     );
+}
+
+#[test]
+fn tower_lint_check_configured_timeout_reports_operation_layer_budget_and_reaps_process_tree() {
+    let workspace = TestWorkspace::new();
+    let script = workspace.script(
+        "timeout-then-recover.sh",
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+printf 'STDOUT_SENTINEL STDERR_SENTINEL DIAGNOSTICS_SENTINEL ARGV_SENTINEL ENVIRONMENT_SENTINEL\n' >&2
+if [ ! -f "$dir/.tower/check-timeout-observed" ]; then
+  touch "$dir/.tower/check-timeout-observed"
+  sh -c 'trap "" TERM; while :; do sleep 1; done' &
+  echo $! > "$dir/.tower/check-descendant.pid"
+  wait
+fi
+printf '%s:1:1: warning: R100: recovered\n' "$1"
+"#,
+    );
+    workspace.write_lint_config_with_regex(&script, &["txt"], SEVERITY_CODE_GENERIC_REGEX);
+    let host_timeout = configure_lint_timeout_and_host_budget(&workspace, Some(1));
+    workspace.write_file(
+        "src/main.txt",
+        "SOURCE_SENTINEL STDIN_SENTINEL DIAGNOSTICS_SENTINEL ARGV_SENTINEL ENVIRONMENT_SENTINEL\n",
+    );
+
+    let host_call_log = lint_support::HostCallLog::default();
+    let (timeout_payload, recovery_payload) = block_on(async {
+        let client = start_server(handler_with_timeout_and_host_call_log(
+            &workspace,
+            &["src/main.txt"],
+            host_timeout,
+            host_call_log.clone(),
+        ))
+        .await;
+        let timeout =
+            result_json(&call_lint_check(&client, json!({ "path": "src/main.txt" })).await);
+        let recovery =
+            result_json(&call_lint_check(&client, json!({ "path": "src/main.txt" })).await);
+        let descendant = fs::read_to_string(workspace.root().join(".tower/check-descendant.pid"))
+            .expect("read descendant pid");
+        assert!(
+            !Command::new("kill")
+                .args(["-0", descendant.trim()])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "timed-out descendant must be dead before sidecar shutdown"
+        );
+        client.cancel().await.expect("cancel client");
+        (timeout, recovery)
+    });
+
+    assert_eq!(
+        timeout_payload,
+        json!({
+            "supported": false,
+            "diagnostics": [],
+            "error": {
+                "code": "lint_timeout",
+                "message": "lint command timed out",
+                "detail": {"operation": "check", "layer": "subprocess", "budget_ms": 1000}
+            }
+        })
+    );
+    let public_payload = timeout_payload.to_string();
+    for sentinel in [
+        "SOURCE_SENTINEL",
+        "STDIN_SENTINEL",
+        "DIAGNOSTICS_SENTINEL",
+        "ARGV_SENTINEL",
+        "ENVIRONMENT_SENTINEL",
+        "STDOUT_SENTINEL",
+        "STDERR_SENTINEL",
+    ] {
+        assert!(
+            !public_payload.contains(sentinel),
+            "public timeout payload leaked {sentinel}: {public_payload}"
+        );
+        let host_calls = host_call_log.joined();
+        assert!(
+            !host_calls.contains(sentinel),
+            "captured HostCall log leaked {sentinel}: {host_calls}"
+        );
+    }
+    assert_eq!(recovery_payload["diagnostics"][0]["code"], "R100");
 }
 
 const GOLANGCI_PROBE: &str =
@@ -661,7 +794,8 @@ timeout_secs = {internal_timeout_secs}
         let host_timeout = config::load(workspace.root())
             .expect("load operational lint config")
             .lint_request_timeout()
-            .expect("derive operational host deadline");
+            .expect("derive operational host deadline")
+            .expect("fixture configures an operational host deadline");
         let client_timeout = host_timeout + CLIENT_TIMEOUT_ALLOWANCE;
         assert!(Duration::from_secs(Self::INTERNAL_TIMEOUT_SECS) < host_timeout);
         assert!(host_timeout < client_timeout);

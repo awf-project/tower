@@ -36,7 +36,7 @@ use session::{DebugAdapterFactory, DebugAdapterSession, LaunchRequest, SessionMa
 use traces::{TracePolicy, TraceStore};
 use types::{
     DebugBreakpoint, DebugRuntimeError, DebugScope, DebugSessionState, DebugStackFrame, DebugStop,
-    DebugThread, DebugVariable,
+    DebugThread, DebugVariable, RuntimeFailure,
 };
 
 fn main() {
@@ -450,15 +450,20 @@ impl DapTransport for ProcessDapTransport {
         write_frame(&mut self.stdin, message)
     }
 
-    fn recv(&mut self, timeout: Duration) -> Result<Option<Value>, DapError> {
-        self.frames
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => DapError::Timeout {
-                    command: "recv".to_owned(),
-                },
-                mpsc::RecvTimeoutError::Disconnected => DapError::AdapterExited,
-            })?
+    fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<Value>, DapError> {
+        match timeout {
+            Some(timeout) => self
+                .frames
+                .recv_timeout(timeout)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => DapError::Timeout {
+                        command: "recv".to_owned(),
+                        budget_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    },
+                    mpsc::RecvTimeoutError::Disconnected => DapError::AdapterExited,
+                })?,
+            None => self.frames.recv().map_err(|_| DapError::AdapterExited)?,
+        }
     }
 }
 
@@ -479,7 +484,7 @@ struct ProcessDebugAdapterSession {
 }
 
 impl DebugAdapterSession for ProcessDebugAdapterSession {
-    fn initialize(&mut self, timeout: Duration) -> Result<(), DebugRuntimeError> {
+    fn initialize(&mut self, timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
         let response = self.client.request(
             "initialize",
             json!({
@@ -496,7 +501,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn launch(
         &mut self,
         request: &LaunchRequest,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<(), DebugRuntimeError> {
         let mut arguments = self.launch_defaults.clone();
         arguments.insert("program".to_owned(), Value::String(request.program.clone()));
@@ -532,12 +537,14 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn set_breakpoints(
         &mut self,
         breakpoints: &[DebugBreakpoint],
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
+        let budget = session::OperationBudget::from_remaining(timeout)?;
         if breakpoints.is_empty() {
             let response = self
                 .client
-                .request("configurationDone", json!({}), timeout)?;
+                .request("configurationDone", json!({}), budget.remaining())
+                .map_err(|error| budget.map_error(error.into()))?;
             ensure_success(response)?;
             return Ok(Vec::new());
         }
@@ -562,14 +569,17 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
                     })
                 })
                 .collect();
-            let response = self.client.request(
-                "setBreakpoints",
-                json!({
-                    "source": { "path": path },
-                    "breakpoints": dap_breakpoints
-                }),
-                timeout,
-            )?;
+            let response = self
+                .client
+                .request(
+                    "setBreakpoints",
+                    json!({
+                        "source": { "path": path },
+                        "breakpoints": dap_breakpoints
+                    }),
+                    budget.remaining(),
+                )
+                .map_err(|error| budget.map_error(error.into()))?;
             ensure_success(response.clone())?;
             let response_breakpoints = response
                 .body
@@ -595,14 +605,17 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         Ok(verified)
     }
 
-    fn continue_session(&mut self, timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+    fn continue_session(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume("continue", json!({}), timeout)
     }
 
     fn step(
         &mut self,
         thread_id: Option<u64>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume(
             "next",
@@ -614,7 +627,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn pause(
         &mut self,
         thread_id: Option<u64>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume(
             "pause",
@@ -623,7 +636,10 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         )
     }
 
-    fn threads(&mut self, timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+    fn threads(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
         let response = self.client.request("threads", json!({}), timeout)?;
         ensure_success(response.clone())?;
         Ok(response
@@ -644,7 +660,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn stack(
         &mut self,
         thread_id: u64,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
         let response =
             self.client
@@ -663,7 +679,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn scopes(
         &mut self,
         frame_id: u64,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
         let response = self
             .client
@@ -691,7 +707,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn variables(
         &mut self,
         variables_reference: u64,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
         let response = self.client.request(
             "variables",
@@ -713,7 +729,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         &mut self,
         frame_id: u64,
         expression: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugVariable, DebugRuntimeError> {
         let response = self.client.request(
             "evaluate",
@@ -731,7 +747,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn reverse_continue(
         &mut self,
         thread_id: Option<u64>,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume(
             "reverseContinue",
@@ -744,7 +760,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         &mut self,
         thread_id: Option<u64>,
         granularity: session::StepBackGranularity,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume(
             "stepBack",
@@ -759,7 +775,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn set_watchpoint(
         &mut self,
         watchpoint: session::WatchpointSpec,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<session::WatchpointResult, DebugRuntimeError> {
         let response = self.client.request(
             "setDataBreakpoints",
@@ -800,7 +816,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     fn seek_replay(
         &mut self,
         target: session::ReplaySeekTarget,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
         let target = serde_json::to_value(target).map_err(|error| {
             DebugRuntimeError::LaunchFailed(format!(
@@ -826,16 +842,33 @@ impl ProcessDebugAdapterSession {
         &mut self,
         command: &str,
         arguments: Value,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
-        let response = self.client.request(command, arguments, timeout)?;
+        let budget = session::OperationBudget::from_remaining(timeout)?;
+        let response = match self.client.request(command, arguments, budget.remaining()) {
+            Err(DapError::Timeout { .. }) => {
+                return Err(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: operation_label(command).to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: timeout
+                            .map(|budget| u64::try_from(budget.as_millis()).unwrap_or(u64::MAX))
+                            .unwrap_or(0),
+                    },
+                });
+            }
+            result => result?,
+        };
         ensure_success(response)?;
         match self
             .client
-            .wait_for_event(&["stopped", "exited", "terminated"], timeout)
+            .wait_for_event(&["stopped", "exited", "terminated"], budget.remaining())
         {
-            Ok(Some(event)) => Ok(self.stop_from_event(event, timeout)),
-            Ok(None) | Err(DapError::Timeout { .. }) => Ok(self.timeout_stop()),
+            Ok(Some(event)) => Ok(self.stop_from_event(event, budget.remaining())),
+            Ok(None) | Err(DapError::Timeout { .. }) => {
+                Ok(self.timeout_stop(operation_label(command), timeout))
+            }
             Err(DapError::AdapterExited) => Ok(DebugStop {
                 state: DebugSessionState::Terminated,
                 reason: Some("adapter_exited".to_owned()),
@@ -843,6 +876,7 @@ impl ProcessDebugAdapterSession {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                error: None,
                 exit_code: None,
                 output_since: self.drain_output_events(),
             }),
@@ -850,7 +884,7 @@ impl ProcessDebugAdapterSession {
         }
     }
 
-    fn stop_from_event(&mut self, event: DapEvent, timeout: Duration) -> DebugStop {
+    fn stop_from_event(&mut self, event: DapEvent, timeout: Option<Duration>) -> DebugStop {
         let output_since = self.drain_output_events();
         match event.event.as_str() {
             "stopped" => {
@@ -875,6 +909,7 @@ impl ProcessDebugAdapterSession {
                     top_frame,
                     hit_breakpoint_ids: Vec::new(),
                     timed_out: false,
+                    error: None,
                     exit_code: None,
                     output_since,
                 }
@@ -886,6 +921,7 @@ impl ProcessDebugAdapterSession {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                error: None,
                 exit_code: event.body.get("exitCode").and_then(Value::as_i64),
                 output_since,
             },
@@ -896,6 +932,7 @@ impl ProcessDebugAdapterSession {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                error: None,
                 exit_code: None,
                 output_since,
             },
@@ -906,20 +943,33 @@ impl ProcessDebugAdapterSession {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: true,
+                error: None,
                 exit_code: None,
                 output_since,
             },
         }
     }
 
-    fn timeout_stop(&mut self) -> DebugStop {
+    fn timeout_stop(&mut self, operation: &str, timeout: Option<Duration>) -> DebugStop {
+        let budget_ms = timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
         DebugStop {
             state: DebugSessionState::Running,
-            reason: None,
+            reason: Some("timeout".to_owned()),
             thread_id: None,
             top_frame: None,
             hit_breakpoint_ids: Vec::new(),
             timed_out: true,
+            error: Some(RuntimeFailure {
+                code: "debug-timeout".to_owned(),
+                message: "debug operation timed out".to_owned(),
+                data: Some(json!({
+                    "operation": operation,
+                    "layer": "dap",
+                    "budget_ms": budget_ms,
+                })),
+            }),
             exit_code: None,
             output_since: self.drain_output_events(),
         }
@@ -945,6 +995,16 @@ impl ProcessDebugAdapterSession {
                 Some(output)
             })
             .collect()
+    }
+}
+
+fn operation_label(command: &str) -> &str {
+    match command {
+        "next" => "step",
+        "reverseContinue" => "reverse_continue",
+        "stepBack" => "step_back",
+        "seekReplay" => "seek_replay",
+        operation => operation,
     }
 }
 
@@ -991,13 +1051,21 @@ fn variable_from_value(variable: &Value) -> Option<DebugVariable> {
 impl From<DapError> for DebugRuntimeError {
     fn from(error: DapError) -> Self {
         match error {
+            DapError::InvalidTimeout => {
+                DebugRuntimeError::InvalidParams("invalid debug operation timeout".to_owned())
+            }
             DapError::Io(error) => DebugRuntimeError::LaunchFailed(error.to_string()),
             DapError::MalformedFrame(error) | DapError::MalformedMessage(error) => {
                 DebugRuntimeError::LaunchFailed(error)
             }
-            DapError::Timeout { command } => {
-                DebugRuntimeError::DebugTimeout(format!("debug adapter timed out during {command}"))
-            }
+            DapError::Timeout { command, budget_ms } => DebugRuntimeError::DebugTimeout {
+                message: "debug operation timed out".to_owned(),
+                detail: extension_protocol::TimeoutDetail {
+                    operation: command,
+                    layer: "dap".to_owned(),
+                    budget_ms,
+                },
+            },
             DapError::AdapterExited => {
                 DebugRuntimeError::AdapterExited("debug adapter exited".to_owned())
             }
@@ -1074,7 +1142,7 @@ fn process_debug_adapter_session_maps_exited_event_with_exit_code() {
             Ok(())
         }
 
-        fn recv(&mut self, _timeout: Duration) -> Result<Option<Value>, DapError> {
+        fn recv(&mut self, _timeout: Option<Duration>) -> Result<Option<Value>, DapError> {
             self.frames.pop_front().unwrap_or(Ok(None))
         }
     }
@@ -1105,7 +1173,7 @@ fn process_debug_adapter_session_maps_exited_event_with_exit_code() {
     };
 
     let stop = session
-        .continue_session(Duration::from_millis(50))
+        .continue_session(Some(Duration::from_millis(50)))
         .expect("exited event should produce a terminated stop");
 
     assert_eq!(stop.state, DebugSessionState::Terminated);
@@ -1140,14 +1208,14 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
     struct ExactEvalAtSession;
 
     impl DebugAdapterSession for ExactEvalAtSession {
-        fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+        fn initialize(&mut self, _timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
             Ok(())
         }
 
         fn launch(
             &mut self,
             _request: &LaunchRequest,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<(), DebugRuntimeError> {
             Ok(())
         }
@@ -1155,7 +1223,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
         fn set_breakpoints(
             &mut self,
             breakpoints: &[DebugBreakpoint],
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
             Ok(breakpoints
                 .iter()
@@ -1168,7 +1236,10 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
                 .collect())
         }
 
-        fn continue_session(&mut self, _timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+        fn continue_session(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> Result<DebugStop, DebugRuntimeError> {
             Ok(DebugStop {
                 state: DebugSessionState::Stopped,
                 reason: Some("breakpoint".to_owned()),
@@ -1182,6 +1253,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
                 }),
                 hit_breakpoint_ids: vec![1],
                 timed_out: false,
+                error: None,
                 exit_code: None,
                 output_since: vec![DebugOutput {
                     sequence: 1,
@@ -1194,7 +1266,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
         fn step(
             &mut self,
             _thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             Err(DebugRuntimeError::LaunchFailed(
                 "unexpected eval_at step call".to_owned(),
@@ -1204,14 +1276,17 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
         fn pause(
             &mut self,
             _thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             Err(DebugRuntimeError::LaunchFailed(
                 "unexpected eval_at pause call".to_owned(),
             ))
         }
 
-        fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+        fn threads(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
             Ok(vec![DebugThread {
                 id: 1,
                 name: "main".to_owned(),
@@ -1221,7 +1296,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
         fn stack(
             &mut self,
             _thread_id: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
             Ok(vec![DebugStackFrame {
                 id: 10,
@@ -1235,7 +1310,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
         fn scopes(
             &mut self,
             _frame_id: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
             Ok(Vec::new())
         }
@@ -1243,7 +1318,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
         fn variables(
             &mut self,
             _variables_reference: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
             Ok(Vec::new())
         }
@@ -1252,7 +1327,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
             &mut self,
             _frame_id: u64,
             expression: &str,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugVariable, DebugRuntimeError> {
             Ok(DebugVariable {
                 name: expression.to_owned(),
@@ -1301,7 +1376,7 @@ fn tower_debug_eval_at_maps_params_and_never_exposes_session_id() {
                     args: Vec::new(),
                     adapter_type: "fake".to_owned(),
                     launch: Map::new(),
-                    default_timeout_secs: 1,
+                    default_timeout_secs: Some(1),
                     idle_ttl_secs: 60,
                 },
             )]),
@@ -1379,7 +1454,7 @@ mod tests {
                         args: Vec::new(),
                         adapter_type: "fake".to_owned(),
                         launch: serde_json::Map::new(),
-                        default_timeout_secs: 1,
+                        default_timeout_secs: Some(1),
                         idle_ttl_secs: 60,
                     },
                 )]),
@@ -1442,14 +1517,14 @@ mod tests {
         }
 
         impl DebugAdapterSession for LiveAdapter {
-            fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+            fn initialize(&mut self, _timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
                 Ok(())
             }
 
             fn launch(
                 &mut self,
                 _request: &LaunchRequest,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<(), DebugRuntimeError> {
                 Ok(())
             }
@@ -1457,14 +1532,14 @@ mod tests {
             fn set_breakpoints(
                 &mut self,
                 breakpoints: &[DebugBreakpoint],
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
                 Ok(breakpoints.to_vec())
             }
 
             fn continue_session(
                 &mut self,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugStop, DebugRuntimeError> {
                 Ok(stopped())
             }
@@ -1472,7 +1547,7 @@ mod tests {
             fn step(
                 &mut self,
                 _thread_id: Option<u64>,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugStop, DebugRuntimeError> {
                 Ok(stopped())
             }
@@ -1480,14 +1555,14 @@ mod tests {
             fn pause(
                 &mut self,
                 _thread_id: Option<u64>,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugStop, DebugRuntimeError> {
                 Ok(stopped())
             }
 
             fn threads(
                 &mut self,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -1495,7 +1570,7 @@ mod tests {
             fn stack(
                 &mut self,
                 _thread_id: u64,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -1503,7 +1578,7 @@ mod tests {
             fn scopes(
                 &mut self,
                 _frame_id: u64,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -1511,7 +1586,7 @@ mod tests {
             fn variables(
                 &mut self,
                 _variables_reference: u64,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
                 Ok(Vec::new())
             }
@@ -1520,7 +1595,7 @@ mod tests {
                 &mut self,
                 _frame_id: u64,
                 expression: &str,
-                _timeout: Duration,
+                _timeout: Option<Duration>,
             ) -> Result<DebugVariable, DebugRuntimeError> {
                 Ok(DebugVariable {
                     name: expression.to_owned(),
@@ -1547,6 +1622,7 @@ mod tests {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                error: None,
                 exit_code: None,
                 output_since: Vec::new(),
             }
@@ -1562,7 +1638,7 @@ mod tests {
                         args: Vec::new(),
                         adapter_type: "fake".to_owned(),
                         launch: serde_json::Map::new(),
-                        default_timeout_secs: 1,
+                        default_timeout_secs: Some(1),
                         idle_ttl_secs: 60,
                     },
                 )]),
@@ -1614,7 +1690,7 @@ mod tests {
                 trace_root: std::env::temp_dir().join("tower-record-dispatch-test"),
                 ttl_secs: Some(60),
                 max_traces: 20,
-                record_timeout_secs: 60,
+                record_timeout_secs: Some(60),
             }),
         );
 
@@ -1676,7 +1752,7 @@ mod tests {
                 trace_root: std::env::temp_dir().join("tower-rr-tool-dispatch-test"),
                 ttl_secs: Some(60),
                 max_traces: 20,
-                record_timeout_secs: 60,
+                record_timeout_secs: Some(60),
             }),
         );
         let sessions = SessionManager::new(
@@ -1756,6 +1832,8 @@ mod tests {
     struct ScriptedTransport {
         frames: VecDeque<Result<Option<Value>, DapError>>,
         sent: Arc<Mutex<Vec<Value>>>,
+        receive_delay: Duration,
+        received_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
     }
 
     impl ScriptedTransport {
@@ -1763,6 +1841,8 @@ mod tests {
             Self {
                 frames: frames.into(),
                 sent: Arc::new(Mutex::new(Vec::new())),
+                receive_delay: Duration::ZERO,
+                received_timeouts: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1777,9 +1857,42 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self, _timeout: Duration) -> Result<Option<Value>, DapError> {
+        fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<Value>, DapError> {
+            self.received_timeouts.lock().unwrap().push(timeout);
+            std::thread::sleep(self.receive_delay);
             self.frames.pop_front().unwrap_or(Ok(None))
         }
+    }
+
+    #[test]
+    fn breakpoint_sources_share_one_deadline_and_report_the_original_budget() {
+        let mut transport = ScriptedTransport::new(vec![
+            Ok(Some(
+                json!({"seq":10,"type":"response","request_seq":1,"command":"setBreakpoints","success":true,"body":{"breakpoints":[]}}),
+            )),
+            Err(DapError::Timeout {
+                command: "setBreakpoints".to_owned(),
+                budget_ms: 1,
+            }),
+        ]);
+        transport.receive_delay = Duration::from_millis(10);
+        let received = Arc::clone(&transport.received_timeouts);
+        let mut session = process_session(transport);
+        let error = session
+            .set_breakpoints(
+                &[source_breakpoint("a.rs", 1), source_breakpoint("b.rs", 2)],
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, DebugRuntimeError::DebugTimeout { detail, .. } if detail.budget_ms == 1000 && detail.operation == "setBreakpoints")
+        );
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert!(
+            received[1].unwrap() < received[0].unwrap(),
+            "second source must consume the first source's elapsed time"
+        );
     }
 
     #[test]
@@ -1806,7 +1919,7 @@ mod tests {
                     source_breakpoint("src/main.rs", 12),
                     source_breakpoint("src/main.rs", 24),
                 ],
-                Duration::from_millis(50),
+                Some(Duration::from_millis(50)),
             )
             .expect("setBreakpoints should succeed");
 
@@ -1873,7 +1986,7 @@ mod tests {
         let mut session = process_session(transport);
 
         let stop = session
-            .continue_session(Duration::from_millis(50))
+            .continue_session(Some(Duration::from_millis(50)))
             .expect("continue should stop after output event");
 
         assert_eq!(stop.output_since.len(), 1);
@@ -1904,7 +2017,7 @@ mod tests {
         let mut session = process_session(transport);
 
         let stop = session
-            .continue_session(Duration::from_millis(50))
+            .continue_session(Some(Duration::from_millis(50)))
             .expect("exited event should produce a terminated stop");
 
         assert_eq!(stop.state, DebugSessionState::Terminated);
@@ -1941,7 +2054,7 @@ mod tests {
         let mut session = process_session(transport);
 
         let stop = session
-            .continue_session(Duration::from_millis(50))
+            .continue_session(Some(Duration::from_millis(50)))
             .expect("exited event should preserve buffered output");
 
         assert_eq!(stop.output_since.len(), 1);
@@ -1964,12 +2077,13 @@ mod tests {
             }))),
             Err(DapError::Timeout {
                 command: "recv".to_owned(),
+                budget_ms: 50,
             }),
         ]);
         let mut session = process_session(transport);
 
         let stop = session
-            .continue_session(Duration::from_millis(50))
+            .continue_session(Some(Duration::from_millis(50)))
             .expect("timeout should be reported as a DebugStop");
 
         assert_eq!(stop.state, DebugSessionState::Running);
@@ -2000,7 +2114,7 @@ mod tests {
         let mut session = process_session(transport);
 
         let stop = session
-            .continue_session(Duration::from_millis(50))
+            .continue_session(Some(Duration::from_millis(50)))
             .expect("adapter EOF after response is a terminated stop");
 
         assert_eq!(stop.state, DebugSessionState::Terminated);

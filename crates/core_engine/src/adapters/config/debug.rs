@@ -207,7 +207,8 @@ struct RawDebugLanguageConfig {
     adapter_type: String,
     #[serde(default)]
     launch: serde_json::Map<String, serde_json::Value>,
-    default_timeout_secs: toml::Value,
+    #[serde(default)]
+    default_timeout_secs: Option<toml::Value>,
     idle_ttl_secs: toml::Value,
 }
 
@@ -256,10 +257,10 @@ impl RawDebugLanguageConfig {
             args: self.args,
             adapter_type: self.adapter_type,
             launch: self.launch,
-            default_timeout_secs: positive_duration_secs(
+            default_timeout_secs: optional_positive_duration_secs(
                 language,
                 "default_timeout_secs",
-                &self.default_timeout_secs,
+                self.default_timeout_secs.as_ref(),
             )?,
             idle_ttl_secs: positive_duration_secs(language, "idle_ttl_secs", &self.idle_ttl_secs)?,
         })
@@ -291,6 +292,19 @@ where
         .ok_or_else(|| E::custom(format!("{field_name} must be a positive integer")))
 }
 
+fn optional_positive_duration_secs<E>(
+    language: Option<&str>,
+    field: &str,
+    value: Option<&toml::Value>,
+) -> Result<Option<u64>, E>
+where
+    E: de::Error,
+{
+    value
+        .map(|value| positive_duration_secs(language, field, value))
+        .transpose()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugLanguageConfig {
@@ -301,7 +315,7 @@ pub struct DebugLanguageConfig {
     pub adapter_type: String,
     #[serde(default)]
     pub launch: serde_json::Map<String, serde_json::Value>,
-    pub default_timeout_secs: u64,
+    pub default_timeout_secs: Option<u64>,
     pub idle_ttl_secs: u64,
 }
 
@@ -316,13 +330,15 @@ impl<'de> Deserialize<'de> for DebugLanguageConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use super::{
         DebugLanguageConfig, DebugRecordConfig, DebugRecordConfigError, RawDebugRecordConfig,
     };
-    use crate::adapters::config::TowerConfig;
+    use crate::adapters::config::{ConfigError, TowerConfig, load};
     use serde_json::json;
+    use tempfile::tempdir;
 
     fn parse_tower_config(src: &str) -> Result<TowerConfig, toml::de::Error> {
         toml::from_str(src)
@@ -330,6 +346,96 @@ mod tests {
 
     fn parse_debug_language_config(src: &str) -> Result<DebugLanguageConfig, toml::de::Error> {
         toml::from_str(src)
+    }
+
+    fn assert_parse_error_names(body: &str, field: &str, value: &str) {
+        let tmp = tempdir().unwrap();
+        let config_dir = tmp.path().join(".tower");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("config.toml"), body).unwrap();
+
+        let error = load(tmp.path()).expect_err("invalid timeout must be rejected");
+        match error {
+            ConfigError::Parse { source, .. } => {
+                let rendered = source.to_string();
+                assert!(rendered.contains(field), "{rendered}");
+                assert!(rendered.contains(value), "{rendered}");
+            }
+            other => panic!("expected ConfigError::Parse, got {other:?}"),
+        }
+    }
+
+    fn load_tower_config(body: &str) -> TowerConfig {
+        let tmp = tempdir().unwrap();
+        let config_dir = tmp.path().join(".tower");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("config.toml"), body).unwrap();
+        load(tmp.path()).expect("valid timeout configuration must load")
+    }
+
+    #[test]
+    fn debug_timeout_absence_and_positive_value_are_preserved() {
+        let absent = load_tower_config(
+            "[debug.rust]\nextensions = [\"rs\"]\ncommand = \"lldb-dap\"\nadapter_type = \"lldb\"\nidle_ttl_secs = 300\n",
+        );
+        assert_eq!(absent.debug.languages["rust"].default_timeout_secs, None);
+
+        let configured = load_tower_config(
+            "[debug.rust]\nextensions = [\"rs\"]\ncommand = \"lldb-dap\"\nadapter_type = \"lldb\"\ndefault_timeout_secs = 17\nidle_ttl_secs = 300\n",
+        );
+        assert_eq!(
+            configured.debug.languages["rust"].default_timeout_secs,
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn debug_timeout_rejects_zero_negative_non_integer_and_u64_overflow() {
+        for value in [
+            "0",
+            "-1",
+            "\"2\"",
+            "9223372036854775808",
+            "9223372036854775807",
+        ] {
+            assert_parse_error_names(
+                &format!(
+                    "[debug.rust]\nextensions = [\"rs\"]\ncommand = \"lldb-dap\"\nadapter_type = \"lldb\"\ndefault_timeout_secs = {value}\nidle_ttl_secs = 300\n"
+                ),
+                "debug.rust.default_timeout_secs",
+                value.trim_matches('"'),
+            );
+        }
+    }
+
+    #[test]
+    fn record_timeout_absence_and_positive_value_are_preserved() {
+        let absent = load_tower_config("[debug.record]\nbackend = \"rr\"\n");
+        assert_eq!(absent.debug.record.unwrap().record_timeout_secs, None);
+
+        let configured =
+            load_tower_config("[debug.record]\nbackend = \"rr\"\nrecord_timeout_secs = 17\n");
+        assert_eq!(
+            configured.debug.record.unwrap().record_timeout_secs,
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn record_timeout_rejects_zero_negative_non_integer_and_u64_overflow() {
+        for value in [
+            "0",
+            "-1",
+            "\"2\"",
+            "9223372036854775808",
+            "9223372036854775807",
+        ] {
+            assert_parse_error_names(
+                &format!("[debug.record]\nbackend = \"rr\"\nrecord_timeout_secs = {value}\n"),
+                "debug.record.record_timeout_secs",
+                value.trim_matches('"'),
+            );
+        }
     }
 
     #[test]
@@ -377,7 +483,7 @@ idle_ttl_secs = 120
         assert_eq!(rust.adapter_type, "lldb");
         assert_eq!(rust.launch["request"], json!("launch"));
         assert_eq!(rust.launch["program"], json!("target/debug/app"));
-        assert_eq!(rust.default_timeout_secs, 15);
+        assert_eq!(rust.default_timeout_secs, Some(15));
         assert_eq!(rust.idle_ttl_secs, 300);
 
         let go = cfg
@@ -390,7 +496,7 @@ idle_ttl_secs = 120
         assert_eq!(go.args, vec!["dap"]);
         assert_eq!(go.adapter_type, "go");
         assert_eq!(go.launch["mode"], json!("debug"));
-        assert_eq!(go.default_timeout_secs, 20);
+        assert_eq!(go.default_timeout_secs, Some(20));
         assert_eq!(go.idle_ttl_secs, 120);
 
         assert_eq!(

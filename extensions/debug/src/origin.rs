@@ -446,6 +446,10 @@ fn map_capture_error(error: CaptureError) -> (OriginFailureCode, String) {
             OriginFailureCode::CaptureFailed,
             "debug adapter exited during capture".to_owned(),
         ),
+        CaptureError::Timeout => (
+            OriginFailureCode::CaptureFailed,
+            "debug operation timed out during capture".to_owned(),
+        ),
         CaptureError::Runtime(error) => (OriginFailureCode::CaptureFailed, runtime_message(error)),
     }
 }
@@ -455,7 +459,8 @@ fn map_runtime_error(
     default_code: OriginFailureCode,
 ) -> (OriginFailureCode, String) {
     let code = match error {
-        DebugRuntimeError::DebugTimeout(_) => OriginFailureCode::OriginTimeout,
+        DebugRuntimeError::InvalidParams(_) => default_code,
+        DebugRuntimeError::DebugTimeout { .. } => OriginFailureCode::OriginTimeout,
         DebugRuntimeError::ReverseUnsupported(_) => OriginFailureCode::ReverseUnsupported,
         DebugRuntimeError::SessionNotFound(_)
         | DebugRuntimeError::NotStopped(_)
@@ -467,9 +472,10 @@ fn map_runtime_error(
 
 fn runtime_message(error: DebugRuntimeError) -> String {
     match error {
+        DebugRuntimeError::InvalidParams(message) => message,
         DebugRuntimeError::SessionNotFound(message)
         | DebugRuntimeError::NotStopped(message)
-        | DebugRuntimeError::DebugTimeout(message)
+        | DebugRuntimeError::DebugTimeout { message, .. }
         | DebugRuntimeError::AdapterExited(message)
         | DebugRuntimeError::LaunchFailed(message)
         | DebugRuntimeError::ReverseUnsupported(message) => message,
@@ -1165,7 +1171,7 @@ mod tests {
                     args: Vec::new(),
                     adapter_type: "fake".to_owned(),
                     launch: Map::new(),
-                    default_timeout_secs: 1,
+                    default_timeout_secs: Some(1),
                     idle_ttl_secs: 60,
                 },
             )]),
@@ -1187,7 +1193,7 @@ mod tests {
                 trace_root: std::env::temp_dir().join("tower-origin-test-traces"),
                 ttl_secs: Some(60),
                 max_traces: 20,
-                record_timeout_secs: 60,
+                record_timeout_secs: Some(60),
             }),
         )
     }
@@ -1365,6 +1371,7 @@ mod tests {
                 top_frame: None,
                 hit_breakpoint_ids: Vec::new(),
                 timed_out: false,
+                error: None,
                 exit_code: None,
                 output_since: Vec::new(),
             }))
@@ -1372,9 +1379,14 @@ mod tests {
 
         fn seek_timeout() -> Self {
             Self {
-                seek_error: Some(DebugRuntimeError::DebugTimeout(
-                    "seek replay timed out".to_owned(),
-                )),
+                seek_error: Some(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "seek_replay".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: 1,
+                    },
+                }),
                 ..Self::last_write_found()
             }
         }
@@ -1408,9 +1420,14 @@ mod tests {
 
         fn capture_failed() -> Self {
             Self {
-                variables_error: Some(DebugRuntimeError::DebugTimeout(
-                    "variables timed out".to_owned(),
-                )),
+                variables_error: Some(DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "variables".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: 1,
+                    },
+                }),
                 ..Self::last_write_found()
             }
         }
@@ -1447,7 +1464,7 @@ mod tests {
     }
 
     impl DebugAdapterSession for FakeOriginSession {
-        fn initialize(&mut self, _timeout: Duration) -> Result<(), DebugRuntimeError> {
+        fn initialize(&mut self, _timeout: Option<Duration>) -> Result<(), DebugRuntimeError> {
             self.calls.lock().unwrap().push(FakeOriginCall::Initialize);
             Ok(())
         }
@@ -1455,7 +1472,7 @@ mod tests {
         fn launch(
             &mut self,
             _request: &LaunchRequest,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<(), DebugRuntimeError> {
             self.calls.lock().unwrap().push(FakeOriginCall::Launch);
             Ok(())
@@ -1464,19 +1481,22 @@ mod tests {
         fn set_breakpoints(
             &mut self,
             breakpoints: &[DebugBreakpoint],
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError> {
             Ok(breakpoints.to_vec())
         }
 
-        fn continue_session(&mut self, _timeout: Duration) -> Result<DebugStop, DebugRuntimeError> {
+        fn continue_session(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> Result<DebugStop, DebugRuntimeError> {
             Ok(stopped())
         }
 
         fn step(
             &mut self,
             _thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             Ok(stopped())
         }
@@ -1484,7 +1504,7 @@ mod tests {
         fn pause(
             &mut self,
             thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             Ok(DebugStop {
                 thread_id,
@@ -1492,7 +1512,10 @@ mod tests {
             })
         }
 
-        fn threads(&mut self, _timeout: Duration) -> Result<Vec<DebugThread>, DebugRuntimeError> {
+        fn threads(
+            &mut self,
+            _timeout: Option<Duration>,
+        ) -> Result<Vec<DebugThread>, DebugRuntimeError> {
             Ok(vec![DebugThread {
                 id: 1,
                 name: "main".to_owned(),
@@ -1502,7 +1525,7 @@ mod tests {
         fn stack(
             &mut self,
             thread_id: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugStackFrame>, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1514,7 +1537,7 @@ mod tests {
         fn scopes(
             &mut self,
             frame_id: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugScope>, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1537,7 +1560,7 @@ mod tests {
         fn variables(
             &mut self,
             variables_reference: u64,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<Vec<DebugVariable>, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1581,7 +1604,7 @@ mod tests {
             &mut self,
             frame_id: u64,
             expression: &str,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugVariable, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1601,7 +1624,7 @@ mod tests {
         fn reverse_continue(
             &mut self,
             thread_id: Option<u64>,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1618,7 +1641,7 @@ mod tests {
         fn set_watchpoint(
             &mut self,
             watchpoint: WatchpointSpec,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<WatchpointResult, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1640,7 +1663,7 @@ mod tests {
         fn seek_replay(
             &mut self,
             target: ReplaySeekTarget,
-            _timeout: Duration,
+            _timeout: Option<Duration>,
         ) -> Result<DebugStop, DebugRuntimeError> {
             self.calls
                 .lock()
@@ -1673,6 +1696,7 @@ mod tests {
             top_frame: Some(write_frame()),
             hit_breakpoint_ids: Vec::new(),
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         }

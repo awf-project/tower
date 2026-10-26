@@ -108,7 +108,11 @@ fn ast_engine(files: &[(&str, &str)]) -> FunctionalEngine {
         build_functional_engine(files, &[("ast", "ast_extension")], TowerConfig::default());
     engine
         .registry
-        .call("tower_ast_reindex", json!({}))
+        .call(
+            "tower_ast_reindex",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("seed AST index through public reindex tool");
     engine
 }
@@ -181,6 +185,7 @@ fn ast_delete_symbol_mutates_workspace_file_through_public_mcp_tool() {
                 "symbol_name": "remove_me",
                 "kind": "function"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("delete symbol through public MCP tool");
 
@@ -206,6 +211,7 @@ fn ast_replace_symbol_body_dry_run_returns_preview_without_writing_file() {
                 "replacement": "\n    2\n",
                 "dry_run": true
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("dry-run replace through public MCP tool");
 
@@ -236,6 +242,7 @@ fn ast_insert_after_symbol_reports_ambiguous_symbol_without_writing_file() {
                 "kind": "function",
                 "replacement": "\npub fn added() {}\n"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("ambiguous symbol error is returned as a structured result");
 
@@ -256,6 +263,7 @@ fn lsp_implementations_returns_locations_through_configured_language_server() {
                 "line": 0,
                 "character": 3
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("implementation lookup through public MCP tool");
 
@@ -284,6 +292,7 @@ fn lsp_rename_dry_run_returns_preview_without_writing_file() {
                 "new_name": "new_name",
                 "dry_run": true
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("rename dry-run through public MCP tool");
 
@@ -315,6 +324,7 @@ fn lsp_rename_reports_not_renameable_without_writing_file() {
                 "character": 3,
                 "new_name": "new_name"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("not-renameable result through public MCP tool");
 

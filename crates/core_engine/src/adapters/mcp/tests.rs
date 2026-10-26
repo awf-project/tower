@@ -16,6 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use rmcp::model::Content;
+use rmcp::service::PeerRequestOptions;
 use rmcp::{RoleClient, ServerHandler, ServiceExt};
 use serde_json::json;
 
@@ -72,6 +73,90 @@ fn make_native_registry() -> ExtensionMergedRegistry {
         crate::domain::extension_host::ExtensionRegistry::new(),
     ));
     ExtensionMergedRegistry::new(make_empty_engine_state(), ext_reg)
+}
+
+fn make_cancellable_sidecar_registry(marker: &std::path::Path) -> ExtensionMergedRegistry {
+    use crate::adapters::InMemoryAstIndex;
+    use crate::adapters::extension::host_deps::UnsupportedApplyEditsHost;
+    use crate::adapters::extension::{ExtensionSupervisor, HostDeps};
+    use crate::adapters::formatter::NoOpFormatQueue;
+    use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
+    use extension_protocol::{ExtensionManifest, ToolDecl};
+
+    let script = r#"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[{"name":"wait","description":"wait until cancelled","schema_json":"{}"}],"events":[],"capabilities":[]}}}'
+read -r invoke
+if [ -f "$1" ]; then
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"ToolResult","data":{"recovered":true}}}'
+  read -r shutdown
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"type":"Ack"}}'
+else
+  sleep 20 &
+  descendant=$!
+  marker_tmp="${1}.tmp.$$"
+  printf '%s %s\n' "$$" "$descendant" > "$marker_tmp"
+  mv "$marker_tmp" "$1"
+  while read -r ignored; do :; done
+  sleep 20
+fi
+"#;
+    let manifest = ExtensionManifest {
+        name: "cancellable".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "cancellable-sidecar".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        ],
+        activation: Activation::Lazy,
+        tools: vec![ToolDecl {
+            name: "wait".to_owned(),
+            description: "wait until cancelled".to_owned(),
+            schema_json: "{}".to_owned(),
+        }],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    };
+    let deps = HostDeps {
+        fs: Arc::new(Mutex::new(InMemoryFs::new())),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
+        push_tx: None,
+    };
+    let supervisor = ExtensionSupervisor::new(manifest, deps, None, None);
+    let mut extensions = crate::domain::extension_host::ExtensionRegistry::new();
+    extensions
+        .register(Box::new(supervisor))
+        .expect("register cancellable sidecar");
+    ExtensionMergedRegistry::new(
+        make_empty_engine_state(),
+        Arc::new(std::sync::RwLock::new(extensions)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    !status
+        .lines()
+        .any(|line| line.starts_with("State:") && line.contains("Z (zombie)"))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_process_death(pid: u32) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+        while process_is_alive(pid) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process {pid} must be dead before registry shutdown"));
 }
 
 // ── In-process server helper ──────────────────────────────────────────────────
@@ -328,6 +413,74 @@ fn ac3_call_tool_dispatches_and_returns_result() {
                 .and_then(serde_json::Value::as_array)
                 .is_some(),
             "payload must carry a 'paths' array; got: {text}"
+        );
+        client.cancel().await.expect("cancel failed");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancelling_an_unlimited_extension_call_reaps_the_child_and_the_next_call_recovers() {
+    block_on(async {
+        let temp = tempfile::tempdir().expect("temporary cancellation fixture directory");
+        let marker = temp.path().join("first-child-entered");
+        let handler = make_handler_from_merged(make_cancellable_sidecar_registry(&marker), vec![]);
+        let client = start_server(handler).await;
+
+        let request = rmcp::model::ClientRequest::CallToolRequest(rmcp::model::Request::new(
+            rmcp::model::CallToolRequestParams::new("tower_cancellable_wait"),
+        ));
+        let pending = client
+            .peer()
+            .send_cancellable_request(request, PeerRequestOptions::no_options())
+            .await
+            .expect("send cancellable tools/call request");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first sidecar child must enter the unlimited call");
+        let pids = std::fs::read_to_string(&marker).expect("sidecar must publish its process ids");
+        let mut pids = pids.split_whitespace().map(|pid| {
+            pid.parse::<u32>()
+                .expect("published process id must be numeric")
+        });
+        let child_pid = pids
+            .next()
+            .expect("sidecar must publish its direct child pid");
+        let descendant_pid = pids
+            .next()
+            .expect("sidecar must publish its descendant pid");
+        assert!(process_is_alive(child_pid));
+        assert!(process_is_alive(descendant_pid));
+        pending
+            .cancel(Some("test cancellation".to_owned()))
+            .await
+            .expect("send rmcp cancellation notification");
+
+        wait_for_process_death(child_pid).await;
+        wait_for_process_death(descendant_pid).await;
+
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client
+                .peer()
+                .call_tool(rmcp::model::CallToolRequestParams::new(
+                    "tower_cancellable_wait",
+                )),
+        )
+        .await
+        .expect("cancelled child must be reaped so the next call cannot remain blocked")
+        .expect("the restarted sidecar call must succeed");
+
+        assert_eq!(recovered.is_error, Some(false));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&extract_first_text(&recovered.content))
+                .expect("recovery result must be JSON"),
+            json!({"recovered": true})
         );
         client.cancel().await.expect("cancel failed");
     });

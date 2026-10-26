@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::worker::FormatWorker;
+use super::worker::{FormatJob, FormatWorker};
 use crate::adapters::config::FormatterConfig;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -268,7 +268,8 @@ impl FormatQueue {
                         config: Arc::clone(&config),
                         workspace_root: Arc::clone(&workspace_root),
                     };
-                    let succeeded = worker.run(&path_clone);
+                    let job = format_job(&config, path_clone.clone());
+                    let succeeded = worker.run(&job);
 
                     // On completion: update state, handle dirty, dispatch next.
                     let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -353,12 +354,13 @@ fn spawn_worker(
     std::thread::Builder::new()
         .name(format!("tower-fmt-{path}"))
         .spawn(move || {
+            let job = format_job(&config2, path2.clone());
             let worker = FormatWorker {
                 echo_set: echo_set2,
                 config: config2,
                 workspace_root: workspace_root2,
             };
-            let succeeded = worker.run(&path2);
+            let succeeded = worker.run(&job);
 
             let mut st = state_arc2.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -403,6 +405,19 @@ fn spawn_worker(
             }
         })
         .expect("failed to spawn format worker thread");
+}
+
+fn format_job(config: &FormatterConfig, path: String) -> FormatJob {
+    let extension = PathBuf::from(&path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_owned();
+    let timeout = config
+        .tool_for_extension(&extension)
+        .and_then(|tool| tool.timeout_secs)
+        .map(Duration::from_secs);
+    FormatJob { path, timeout }
 }
 
 impl FormatQueuePort for FormatQueue {

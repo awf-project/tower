@@ -1107,10 +1107,11 @@ format = "eslint-json"
 target = "append"
 ```
 
-`timeout_secs` is an optional positive integer in seconds and defaults to `2`. It applies to each
-lint command, including fix preparation and the follow-up check after edits. Tower derives a
-lint-specific host budget so this inner deadline can elapse without being pre-empted by the base
-extension deadline. Invalid values are configuration errors naming
+`timeout_secs` is an optional positive integer in seconds. When omitted, the lint command has no
+Tower-controlled duration limit. When present, it applies to each lint command, including fix
+preparation and the follow-up check after edits. Tower derives a lint-specific host budget so this
+inner deadline can elapse without being pre-empted by the base extension deadline. Invalid values
+are configuration errors naming
 `lint.<language>.timeout_secs`.
 
 Supported `format` values are `rustc-json`, `eslint-json`, and `generic-regex`. Supported `target`
@@ -1213,7 +1214,8 @@ Stable lint error codes are `lint_missing_binary`, `lint_unparseable_output`, `l
 
 When a lint command reaches its configured deadline, Tower terminates and reaps the command's
 process tree and returns `lint_timeout` in the successful tool payload. The timeout is not a JSON-RPC
-transport error.
+transport error. Timeout detail identifies the operation, layer, and original configured budget in
+milliseconds (`operation`, `layer`, `budget_ms`).
 
 ### tower_lint_fix
 
@@ -1370,7 +1372,7 @@ record_timeout_secs = 60
 
 `trace_dir` is workspace-relative and defaults to `.tower/traces`. `ttl_secs`,
 `max_traces`, and `record_timeout_secs` must be positive when present; the defaults are no TTL,
-`20` retained traces, and `60` seconds.
+`20` retained traces, and no Tower-controlled record timeout.
 
 Record/replay tools are omitted from `tools/list` unless `[debug.record] backend = "rr"` is present.
 rr itself is preflighted at record time, so unsupported hosts return a structured payload instead of

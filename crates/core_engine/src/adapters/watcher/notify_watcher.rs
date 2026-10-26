@@ -647,6 +647,7 @@ mod tests {
             &self,
             tool_name: &str,
             _params: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<serde_json::Value, crate::domain::InvokeError> {
             Err(crate::domain::InvokeError::ToolNotFound(
                 tool_name.to_owned(),
@@ -1023,6 +1024,7 @@ mod tests {
             &self,
             name: &str,
             _: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<serde_json::Value, crate::domain::InvokeError> {
             Err(crate::domain::InvokeError::ToolNotFound(name.to_owned()))
         }
@@ -1112,7 +1114,7 @@ mod tests {
         *probe.sender.lock().unwrap() = watcher.sender.clone();
         let _sender_cleanup = ProbeSenderCleanup(Arc::clone(&probe));
         let result = NativeToolRegistry::with_rename_coordinator(Arc::clone(&state), Arc::clone(&probe.coordinator))
-            .call("tower_rename_path", serde_json::json!({"source":"src/old.rs", "destination":"src/new.rs", "semantic_policy":"none"})).unwrap();
+            .call("tower_rename_path", serde_json::json!({"source":"src/old.rs", "destination":"src/new.rs", "semantic_policy":"none"}), &crate::domain::NeverCancelled).unwrap();
         assert_eq!(
             result["status"],
             if fail_persistence {

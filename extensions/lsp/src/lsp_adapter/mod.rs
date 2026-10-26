@@ -149,9 +149,6 @@ pub type DiagnosticsSender = mpsc::Sender<DiagnosticsEvent>;
 #[cfg(test)]
 const DIAGNOSTIC_PUBLICATION_HISTORY: usize = 64;
 
-/// How long a navigation request waits for its response before erroring.
-const REQUEST_BUDGET: Duration = Duration::from_secs(10);
-
 /// LSP `ContentModified` error code — the document changed while the request was
 /// in flight. Per the LSP spec this is transient: re-request rather than fail.
 const CONTENT_MODIFIED: i64 = -32801;
@@ -408,12 +405,6 @@ fn parse_rename_provider(value: Option<&Value>) -> Result<RenameCapability, LspS
     }
 }
 
-/// Provisional cross-file settle delay used before a workspace query
-/// (`references`) until spec 14c lands the real index-readiness signal
-/// (`serverStatus`/`$/progress`). A bounded wait so a half-built index is not
-/// returned as a complete result (EV3).
-const REFERENCES_SETTLE_FALLBACK: Duration = Duration::from_millis(1500);
-
 /// Correlates request ids to the full response message the reader thread parsed.
 type ResponseCache = Arc<(Mutex<HashMap<i64, Option<Value>>>, Condvar)>;
 
@@ -458,6 +449,7 @@ struct Writer {
 
 struct WriteJob {
     message: Value,
+    deadline: Option<Instant>,
     result: mpsc::SyncSender<std::io::Result<()>>,
 }
 
@@ -466,18 +458,33 @@ impl Writer {
         let (tx, rx) = mpsc::channel::<WriteJob>();
         std::thread::spawn(move || {
             for job in rx {
-                let result = jsonrpc::write_message(&mut *output, &job.message);
+                let result = if job
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "LSP write deadline elapsed before emission",
+                    ))
+                } else {
+                    jsonrpc::write_message(&mut *output, &job.message)
+                };
                 let _ = job.result.send(result);
             }
         });
         Self { tx }
     }
 
-    fn submit(&self, message: &Value) -> std::io::Result<mpsc::Receiver<std::io::Result<()>>> {
+    fn submit(
+        &self,
+        message: &Value,
+        deadline: Option<Instant>,
+    ) -> std::io::Result<mpsc::Receiver<std::io::Result<()>>> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         self.tx
             .send(WriteJob {
                 message: message.clone(),
+                deadline,
                 result: result_tx,
             })
             .map_err(|_| broken_writer())?;
@@ -485,7 +492,7 @@ impl Writer {
     }
 
     fn write(&self, message: &Value) -> std::io::Result<()> {
-        let result_rx = self.submit(message)?;
+        let result_rx = self.submit(message, None)?;
         result_rx.recv().map_err(|_| broken_writer())?
     }
 
@@ -497,7 +504,7 @@ impl Writer {
                 "LSP write deadline elapsed",
             ));
         }
-        let result_rx = self.submit(message)?;
+        let result_rx = self.submit(message, Some(deadline))?;
         result_rx
             .recv_timeout(remaining)
             .map_err(|error| match error {
@@ -506,6 +513,13 @@ impl Writer {
                 }
                 mpsc::RecvTimeoutError::Disconnected => broken_writer(),
             })?
+    }
+
+    fn write_until(&self, message: &Value, deadline: Option<Instant>) -> std::io::Result<()> {
+        match deadline {
+            Some(deadline) => self.write_before(message, deadline),
+            None => self.write(message),
+        }
     }
 }
 
@@ -889,7 +903,7 @@ pub struct LspClientAdapter {
     responses: ResponseCache,
     /// Semantic provider capabilities reported by the initialized server.
     semantic_capabilities: Mutex<SemanticCapabilities>,
-    diagnostics_deadline: Duration,
+    operation_timeout: Option<Duration>,
     /// Root `.towerignore` policy applied to navigation results.
     ignore: Gitignore,
     next_id: AtomicI64,
@@ -1035,7 +1049,7 @@ impl LspClientAdapter {
         language_id: String,
         workspace_root: std::path::PathBuf,
         push_tx: Option<DiagnosticsSender>,
-        diagnostics_deadline: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Result<Self, CodeIntelError> {
         Self::spawn_resolved(
             Path::new(command),
@@ -1044,7 +1058,7 @@ impl LspClientAdapter {
             language_id,
             workspace_root,
             push_tx,
-            diagnostics_deadline,
+            operation_timeout,
         )
         .map_err(session_to_code_intel_error)
     }
@@ -1056,7 +1070,7 @@ impl LspClientAdapter {
         language_id: String,
         root: PathBuf,
         push_tx: Option<DiagnosticsSender>,
-        diagnostics_deadline: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Result<Self, LspSessionError> {
         if !root.is_dir() {
             return Err(LspSessionError::Backend(
@@ -1112,8 +1126,14 @@ impl LspClientAdapter {
             }
             // Reader thread exits on EOF (server died, crashed, or was killed).
             // Release publishes the exit cause before waking every waiter.
-            dead_flag_clone.store(true, Ordering::Release);
-            state_clone.1.notify_all();
+            {
+                // Synchronize the terminal predicate with readiness waiters so
+                // EOF cannot be lost between their predicate check and wait.
+                let _state = state_clone.0.lock().unwrap_or_else(|p| p.into_inner());
+                dead_flag_clone.store(true, Ordering::Release);
+                state_clone.1.notify_all();
+            }
+            let _responses = responses_clone.0.lock().unwrap_or_else(|p| p.into_inner());
             responses_clone.1.notify_all();
         });
 
@@ -1140,7 +1160,7 @@ impl LspClientAdapter {
                 safe_delete: ProviderCapability::Unavailable,
                 diagnostics: DiagnosticsCapability::Push,
             }),
-            diagnostics_deadline,
+            operation_timeout,
             ignore,
             next_id: AtomicI64::new(1),
             dead_flag,
@@ -1158,6 +1178,7 @@ impl LspClientAdapter {
     }
 
     fn handshake(&self) -> Result<(), LspSessionError> {
+        let deadline = self.operation_deadline()?;
         let root_uri = path_to_uri(&self.workspace_root);
         let initialize_params = initialize_params(std::process::id(), &root_uri);
         let initialized = json!({
@@ -1165,16 +1186,51 @@ impl LspClientAdapter {
             "method": "initialized",
             "params": {}
         });
-        let initialize_result = self.send_request("initialize", initialize_params)?;
+        let initialize_result =
+            self.send_request_until("initialize", initialize_params, deadline)?;
         let capabilities = SemanticCapabilities::from_initialize_result(&initialize_result)?;
         *self
             .semantic_capabilities
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = capabilities;
-        write_framed(&self.writer, &initialized).map_err(|_| {
+        self.write_until(&initialized, deadline).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                return LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout);
+            }
             LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTransportError)
         })?;
         Ok(())
+    }
+
+    fn operation_deadline(&self) -> Result<Option<Instant>, LspSessionError> {
+        self.operation_timeout
+            .map(|timeout| {
+                Instant::now()
+                    .checked_add(timeout)
+                    .ok_or(LspSessionError::Backend(
+                        extension_protocol::LspOutcomeCode::ServerTimeout,
+                    ))
+            })
+            .transpose()
+    }
+
+    fn write_until(&self, message: &Value, deadline: Option<Instant>) -> std::io::Result<()> {
+        let result = self.writer.write_until(message, deadline);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+        {
+            self.terminate_after_write_timeout();
+        }
+        result
+    }
+
+    fn terminate_after_write_timeout(&self) {
+        self.dead_flag.store(true, Ordering::Release);
+        self.state.1.notify_all();
+        self.responses.1.notify_all();
+        let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = session.child.kill();
     }
 
     fn uri_for(&self, path: &RelativePath) -> String {
@@ -1242,10 +1298,10 @@ impl LspClientAdapter {
         }
 
         let uri = self.uri_for(&path);
-        self.acquire_doc(&uri, text)?;
+        let deadline = self.operation_deadline()?;
+        self.acquire_doc_until(&uri, text, deadline)?;
         let result = (|| {
-            let deadline = Instant::now() + REQUEST_BUDGET;
-            let prepared = self.send_request_before(
+            let prepared = self.send_request_until(
                 "textDocument/prepareTypeHierarchy",
                 json!({
                     "textDocument": { "uri": uri },
@@ -1283,7 +1339,7 @@ impl LspClientAdapter {
                 }
                 for item in &prepared {
                     let response =
-                        self.send_request_before(method, json!({ "item": item }), deadline)?;
+                        self.send_request_until(method, json!({ "item": item }), deadline)?;
                     append_unique(items, self.normalize_type_hierarchy_items(&response)?);
                 }
             }
@@ -1308,18 +1364,44 @@ impl LspClientAdapter {
 
     /// Acquire a scoped hold on `uri` (a navigation request) and emit the
     /// resulting `didOpen`/`didChange`. Pair with [`release_doc`](Self::release_doc).
-    fn acquire_doc(&self, uri: &str, text: &str) -> Result<(), LspSessionError> {
+    fn acquire_doc_until(
+        &self,
+        uri: &str,
+        text: &str,
+        deadline: Option<Instant>,
+    ) -> Result<(), LspSessionError> {
+        self.acquire_doc_with_sync_until(uri, text, deadline)
+            .map(|_| ())
+    }
+
+    fn acquire_doc_with_sync_until(
+        &self,
+        uri: &str,
+        text: &str,
+        deadline: Option<Instant>,
+    ) -> Result<bool, LspSessionError> {
         let mut session = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let (sync, rollback) = session
             .docs
             .acquire_with_rollback(uri, &self.language_id, text);
+        let emitted_sync = sync.is_some();
         if let Some(sync) = sync
-            && write_doc_sync(&self.writer, uri, &sync).is_err()
+            && let Err(error) = write_doc_sync_until(&self.writer, uri, &sync, deadline)
         {
             session.docs.rollback_acquire(uri, rollback);
-            return Err(self.transport_failure());
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                self.dead_flag.store(true, Ordering::Release);
+                self.state.1.notify_all();
+                self.responses.1.notify_all();
+                let _ = session.child.kill();
+            }
+            return Err(if error.kind() == std::io::ErrorKind::TimedOut {
+                LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+            } else {
+                self.transport_failure()
+            });
         }
-        Ok(())
+        Ok(emitted_sync)
     }
 
     /// Release a scoped hold on `uri`, emitting `didClose` if it was the last
@@ -1341,12 +1423,36 @@ impl LspClientAdapter {
     /// query) is **retried** a bounded number of times, per the LSP spec which
     /// defines it as a transient "re-request" signal rather than a real failure.
     fn send_request(&self, method: &str, params: Value) -> Result<Value, LspSessionError> {
+        let deadline = self.operation_deadline()?;
+        self.send_request_until(method, params, deadline)
+    }
+
+    fn send_request_until(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Option<Instant>,
+    ) -> Result<Value, LspSessionError> {
         let mut attempt = 0;
         loop {
-            match self.send_request_once(method, params.clone())? {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(LspSessionError::Backend(
+                    extension_protocol::LspOutcomeCode::ServerTimeout,
+                ));
+            }
+            match self.send_request_once_until(method, params.clone(), deadline)? {
                 RequestOutcome::Ok(value) => return Ok(value),
                 RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
-                    std::thread::sleep(CONTENT_MODIFIED_BACKOFF);
+                    let backoff = deadline.map_or(CONTENT_MODIFIED_BACKOFF, |deadline| {
+                        CONTENT_MODIFIED_BACKOFF
+                            .min(deadline.saturating_duration_since(Instant::now()))
+                    });
+                    if backoff.is_zero() {
+                        return Err(LspSessionError::Backend(
+                            extension_protocol::LspOutcomeCode::ServerTimeout,
+                        ));
+                    }
+                    std::thread::sleep(backoff);
                     attempt += 1;
                 }
                 RequestOutcome::ContentModified => {
@@ -1363,56 +1469,11 @@ impl LspClientAdapter {
 
     /// Send one request and await its response, classifying the outcome so
     /// [`send_request`](Self::send_request) can retry transient failures.
-    fn send_request_once(
+    fn send_request_once_until(
         &self,
         method: &str,
         params: Value,
-    ) -> Result<RequestOutcome, LspSessionError> {
-        self.send_request_once_before(method, params, Instant::now() + REQUEST_BUDGET)
-    }
-
-    fn send_request_before(
-        &self,
-        method: &str,
-        params: Value,
-        deadline: Instant,
-    ) -> Result<Value, LspSessionError> {
-        let mut attempt = 0;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(LspSessionError::Backend(
-                    extension_protocol::LspOutcomeCode::ServerTimeout,
-                ));
-            }
-            match self.send_request_once_before(method, params.clone(), deadline)? {
-                RequestOutcome::Ok(value) => return Ok(value),
-                RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(LspSessionError::Backend(
-                            extension_protocol::LspOutcomeCode::ServerTimeout,
-                        ));
-                    }
-                    std::thread::sleep(CONTENT_MODIFIED_BACKOFF.min(remaining));
-                    attempt += 1;
-                }
-                RequestOutcome::ContentModified => {
-                    return Err(LspSessionError::Backend(
-                        extension_protocol::LspOutcomeCode::ServerError,
-                    ));
-                }
-                RequestOutcome::Error(failure) => {
-                    return Err(self.classify_request_failure(&failure));
-                }
-            }
-        }
-    }
-
-    fn send_request_once_before(
-        &self,
-        method: &str,
-        params: Value,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<RequestOutcome, LspSessionError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         if self.dead_flag.load(Ordering::Acquire) {
@@ -1421,15 +1482,13 @@ impl LspClientAdapter {
         let _pending = PendingRequest::new(&self.responses, id);
         let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         // The request does not touch `docs`, so we write directly without holding `inner`.
-        self.writer
-            .write_before(&request, deadline)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
-                } else {
-                    self.transport_failure()
-                }
-            })?;
+        self.write_until(&request, deadline).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
+            } else {
+                self.transport_failure()
+            }
+        })?;
 
         let (lock, cvar) = &*self.responses;
         let mut map = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1463,17 +1522,20 @@ impl LspClientAdapter {
                 }
                 return Ok(RequestOutcome::Ok(msg["result"].clone()));
             }
+            if self.dead_flag.load(Ordering::Acquire) {
+                return Err(self.reader_failure());
+            }
             let now = Instant::now();
-            if now >= deadline {
-                if self.dead_flag.load(Ordering::Acquire) {
-                    return Err(self.reader_failure());
-                }
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 return Ok(RequestOutcome::Error(RequestFailure::Timeout));
             }
-            let (next, _) = cvar
-                .wait_timeout(map, deadline - now)
-                .unwrap_or_else(|p| p.into_inner());
-            map = next;
+            map = if let Some(deadline) = deadline {
+                cvar.wait_timeout(map, deadline - now)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            } else {
+                cvar.wait(map).unwrap_or_else(|p| p.into_inner())
+            };
         }
     }
 
@@ -1499,7 +1561,7 @@ impl LspClientAdapter {
         uri: &str,
         waiter_id: u64,
         emitted_sync: bool,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Diagnostic>, LspSessionError> {
         let (lock, cvar) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1527,27 +1589,31 @@ impl LspClientAdapter {
                 remove_push_waiter(&mut state, uri, waiter_id);
                 return Ok(diagnostics);
             }
-            if now >= deadline {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 remove_push_waiter(&mut state, uri, waiter_id);
                 return Err(LspSessionError::Backend(
                     extension_protocol::LspOutcomeCode::ServerTimeout,
                 ));
             }
-            let (next, _) = cvar
-                .wait_timeout(state, deadline - now)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = next;
+            state = if let Some(deadline) = deadline {
+                cvar.wait_timeout(state, deadline - now)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0
+            } else {
+                cvar.wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            };
         }
     }
 
     fn pull_diagnostics(
         &self,
         uri: &str,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<Vec<Diagnostic>, LspSessionError> {
         use lsp_types::{DocumentDiagnosticReport, DocumentDiagnosticReportResult};
 
-        let value = self.send_request_before(
+        let value = self.send_request_until(
             "textDocument/diagnostic",
             json!({ "textDocument": { "uri": uri } }),
             deadline,
@@ -1590,25 +1656,37 @@ impl LspClientAdapter {
 
     /// Cross-file settle gate (EV3): block until the server emits a quiescent
     /// signal that is **newer** than `pre_open_ready_gen` (captured before the
-    /// documents were synced), bounded by `REFERENCES_SETTLE_FALLBACK` so a
-    /// server that never re-signals does not hang the request.
+    /// documents were synced). Only the configured operation deadline bounds
+    /// this wait; an absent deadline waits for readiness or reader exit.
     ///
     /// Waiting for `ready_gen > pre_open_ready_gen` (not just `ready`) ensures
     /// we see a fresh settled notification from after the current document open,
     /// rather than returning immediately on a stale signal from a prior cycle.
-    fn await_index_settled(&self, pre_open_ready_gen: u64) {
+    fn await_index_settled(
+        &self,
+        pre_open_ready_gen: u64,
+        deadline: Option<Instant>,
+    ) -> Result<(), LspSessionError> {
         let (lock, cvar) = &*self.state;
         let mut s = lock.lock().unwrap_or_else(|p| p.into_inner());
-        let deadline = Instant::now() + REFERENCES_SETTLE_FALLBACK;
-        while s.ready_gen <= pre_open_ready_gen {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
+        loop {
+            if self.dead_flag.load(Ordering::Acquire) {
+                return Err(self.reader_failure());
             }
-            let (next, _) = cvar
-                .wait_timeout(s, deadline - now)
-                .unwrap_or_else(|p| p.into_inner());
-            s = next;
+            if s.ready_gen > pre_open_ready_gen {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout));
+            }
+            s = if let Some(deadline) = deadline {
+                cvar.wait_timeout(s, deadline - now)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0
+            } else {
+                cvar.wait(s).unwrap_or_else(|p| p.into_inner())
+            };
         }
     }
 
@@ -1625,8 +1703,9 @@ impl LspClientAdapter {
             return Err(LspSessionError::CapabilityUnavailable);
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)?;
-        let result = self.send_request(method, params);
+        let deadline = self.operation_deadline()?;
+        self.acquire_doc_until(&uri, text, deadline)?;
+        let result = self.send_request_until(method, params, deadline);
         self.release_doc(&uri);
         let raws = decode_locations_typed(&result?)?;
         Ok(workspace_locations(
@@ -1655,24 +1734,56 @@ impl LspClientAdapter {
         if !self.supports(path) {
             return Err(LspSessionError::CapabilityUnavailable);
         }
+        let deadline = self.operation_deadline()?;
+        self.prepare_rename_value_until(path, text, position, deadline)
+    }
+
+    fn prepare_rename_value_until(
+        &self,
+        path: &RelativePath,
+        text: &str,
+        position: Position,
+        deadline: Option<Instant>,
+    ) -> Result<Value, LspSessionError> {
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)?;
-        let result = self.send_prepare_rename_request(json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": position.line, "character": position.character }
-        }));
+        self.acquire_doc_until(&uri, text, deadline)?;
+        let result = self.send_prepare_rename_request(
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": position.line, "character": position.character }
+            }),
+            deadline,
+        );
         self.release_doc(&uri);
         result
     }
 
-    fn send_prepare_rename_request(&self, params: Value) -> Result<Value, LspSessionError> {
+    fn send_prepare_rename_request(
+        &self,
+        params: Value,
+        deadline: Option<Instant>,
+    ) -> Result<Value, LspSessionError> {
         let method = "textDocument/prepareRename";
         let mut attempt = 0;
         loop {
-            match self.send_request_once(method, params.clone())? {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(LspSessionError::Backend(
+                    extension_protocol::LspOutcomeCode::ServerTimeout,
+                ));
+            }
+            match self.send_request_once_until(method, params.clone(), deadline)? {
                 RequestOutcome::Ok(value) => return Ok(value),
                 RequestOutcome::ContentModified if attempt < CONTENT_MODIFIED_RETRIES => {
-                    std::thread::sleep(CONTENT_MODIFIED_BACKOFF);
+                    let backoff = deadline.map_or(CONTENT_MODIFIED_BACKOFF, |deadline| {
+                        CONTENT_MODIFIED_BACKOFF
+                            .min(deadline.saturating_duration_since(Instant::now()))
+                    });
+                    if backoff.is_zero() {
+                        return Err(LspSessionError::Backend(
+                            extension_protocol::LspOutcomeCode::ServerTimeout,
+                        ));
+                    }
+                    std::thread::sleep(backoff);
                     attempt += 1;
                 }
                 RequestOutcome::ContentModified => {
@@ -1754,11 +1865,15 @@ impl NavigationPort for LspClientAdapter {
             return Err(CodeIntelError::Unsupported);
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)
+        let deadline = self
+            .operation_deadline()
             .map_err(session_to_code_intel_error)?;
-        let result = self.send_request(
+        self.acquire_doc_until(&uri, text, deadline)
+            .map_err(session_to_code_intel_error)?;
+        let result = self.send_request_until(
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": uri } }),
+            deadline,
         );
         self.release_doc(&uri);
         Ok(decode::decode_document_symbols(
@@ -1800,6 +1915,7 @@ impl LspClientAdapter {
         if !self.supports(path) {
             return Err(LspSessionError::CapabilityUnavailable);
         }
+        let deadline = self.operation_deadline()?;
         match self
             .semantic_capabilities
             .lock()
@@ -1810,7 +1926,7 @@ impl LspClientAdapter {
                 return Err(LspSessionError::CapabilityUnavailable);
             }
             RenameCapability::RenameWithPrepare => {
-                let prepared = self.prepare_rename_value(path, text, position)?;
+                let prepared = self.prepare_rename_value_until(path, text, position, deadline)?;
                 if let Err(error) = decode_prepare_rename_typed(prepared.clone()) {
                     if looks_like_workspace_edit(&prepared) {
                         return decode_workspace_edit_typed(prepared);
@@ -1821,14 +1937,15 @@ impl LspClientAdapter {
             RenameCapability::RenameOnly => {}
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)?;
-        let result = self.send_request(
+        self.acquire_doc_until(&uri, text, deadline)?;
+        let result = self.send_request_until(
             "textDocument/rename",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": position.line, "character": position.character },
                 "newName": new_name
             }),
+            deadline,
         );
         self.release_doc(&uri);
         decode_workspace_edit_typed(result?)
@@ -1948,9 +2065,7 @@ impl pool::PooledSession for LspClientAdapter {
         if self.dead_flag.load(Ordering::Acquire) {
             return Err(self.reader_failure());
         }
-        let deadline = Instant::now()
-            .checked_add(self.diagnostics_deadline)
-            .ok_or(LspSessionError::Backend(LspOutcomeCode::ServerTimeout))?;
+        let deadline = self.operation_deadline()?;
         let uri = self.uri_for(path);
         let diagnostics = self
             .semantic_capabilities
@@ -1968,7 +2083,7 @@ impl pool::PooledSession for LspClientAdapter {
             };
             let emitted_sync = sync.is_some();
             if let Some(sync) = sync
-                && let Err(error) = write_doc_sync_before(&self.writer, &uri, &sync, deadline)
+                && let Err(error) = write_doc_sync_until(&self.writer, &uri, &sync, deadline)
             {
                 if let Some(waiter_id) = push_waiter {
                     let (lock, _) = &*self.state;
@@ -2040,16 +2155,25 @@ impl pool::PooledSession for LspClientAdapter {
         }
         let uri = self.uri_for(path);
         let pre_open_ready_gen = current_ready_gen(&self.state);
-        self.acquire_doc(&uri, text)?;
-        self.await_index_settled(pre_open_ready_gen);
-        let result = self.send_request(
-            "textDocument/references",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": position.line, "character": position.character },
-                "context": { "includeDeclaration": true }
-            }),
-        );
+        let deadline = self.operation_deadline()?;
+        let emitted_sync = self.acquire_doc_with_sync_until(&uri, text, deadline)?;
+        let result = (|| {
+            // Readiness notifications are optional in LSP. Only servers that
+            // actually signal readiness can participate in this extra gate;
+            // otherwise the semantic response itself establishes completion.
+            if emitted_sync && (pre_open_ready_gen > 0 || is_server_status_active(&self.state)) {
+                self.await_index_settled(pre_open_ready_gen, deadline)?;
+            }
+            self.send_request_until(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": position.line, "character": position.character },
+                    "context": { "includeDeclaration": true }
+                }),
+                deadline,
+            )
+        })();
         self.release_doc(&uri);
         let raws = decode_locations_typed(&result?)?;
         Ok(workspace_locations(
@@ -2103,13 +2227,15 @@ impl pool::PooledSession for LspClientAdapter {
             return Err(LspSessionError::CapabilityUnavailable);
         }
         let uri = self.uri_for(path);
-        self.acquire_doc(&uri, text)?;
-        let result = self.send_request(
+        let deadline = self.operation_deadline()?;
+        self.acquire_doc_until(&uri, text, deadline)?;
+        let result = self.send_request_until(
             "textDocument/hover",
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": position.line, "character": position.character }
             }),
+            deadline,
         );
         self.release_doc(&uri);
         decode_hover_typed(&result?)
@@ -2238,8 +2364,9 @@ impl LspClientAdapter {
         }
 
         let uri = self.uri_for(&path);
-        if self.acquire_doc(&uri, &declaration_text).is_err() {
-            return Ok(SafeDeleteSemanticOutcome::BackendCrashed);
+        let deadline = self.operation_deadline()?;
+        if let Err(error) = self.acquire_doc_until(&uri, &declaration_text, deadline) {
+            return Ok(safe_delete_error_outcome(error));
         }
         let outcome = (|| {
             let params = json!({
@@ -2250,16 +2377,17 @@ impl LspClientAdapter {
                 },
                 "context": { "includeDeclaration": false }
             });
-            let references = match self.send_request("textDocument/references", params) {
-                Err(error @ LspSessionError::Backend(LspOutcomeCode::ServerError)) => {
-                    return Err(error);
-                }
-                Err(error) => return Ok(safe_delete_error_outcome(error)),
-                Ok(value) => match self.decode_safe_delete_references(value, read_content) {
-                    Ok(references) => references,
-                    Err(outcome) => return Ok(outcome),
-                },
-            };
+            let references =
+                match self.send_request_until("textDocument/references", params, deadline) {
+                    Err(error @ LspSessionError::Backend(LspOutcomeCode::ServerError)) => {
+                        return Err(error);
+                    }
+                    Err(error) => return Ok(safe_delete_error_outcome(error)),
+                    Ok(value) => match self.decode_safe_delete_references(value, read_content) {
+                        Ok(references) => references,
+                        Err(outcome) => return Ok(outcome),
+                    },
+                };
             if capabilities.safe_delete == ProviderCapability::Unavailable {
                 // A complete reference lookup needs no cleanup capability when
                 // every usage disappears with the validated declaration span.
@@ -2292,7 +2420,7 @@ impl LspClientAdapter {
                     incomplete_safe_delete(references)
                 });
             }
-            match self.send_request(
+            match self.send_request_until(
                 "experimental/tower/safeDelete",
                 json!({
                     "textDocument": { "uri": uri },
@@ -2301,6 +2429,7 @@ impl LspClientAdapter {
                         "character": declaration.position.character,
                     }
                 }),
+                deadline,
             ) {
                 Err(error @ LspSessionError::Backend(LspOutcomeCode::ServerError)) => Err(error),
                 Err(error) => Ok(safe_delete_error_outcome(error)),
@@ -2576,13 +2705,13 @@ fn write_doc_sync(writer: &Writer, uri: &str, sync: &DocSync) -> std::io::Result
     write_doc_sync_message(uri, sync, |message| write_framed(writer, message))
 }
 
-fn write_doc_sync_before(
+fn write_doc_sync_until(
     writer: &Writer,
     uri: &str,
     sync: &DocSync,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> std::io::Result<()> {
-    write_doc_sync_message(uri, sync, |message| writer.write_before(message, deadline))
+    write_doc_sync_message(uri, sync, |message| writer.write_until(message, deadline))
 }
 
 fn write_doc_sync_message(
@@ -2805,7 +2934,7 @@ mod tests {
         LspOutcomeCode, TypeHierarchyDirection, TypeHierarchyQuery, TypeHierarchyRange,
     };
 
-    const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+    const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
     #[test]
     fn initialize_advertises_pull_diagnostics_client_capability() {
@@ -3140,7 +3269,7 @@ mod tests {
                 safe_delete: ProviderCapability::Unavailable,
                 diagnostics: DiagnosticsCapability::Push,
             }),
-            diagnostics_deadline: CHECK_TIMEOUT,
+            operation_timeout: Some(TEST_OPERATION_TIMEOUT),
             ignore: empty_ignore(),
             next_id: AtomicI64::new(1),
             dead_flag: Arc::new(AtomicBool::new(false)),
@@ -3728,40 +3857,69 @@ mod tests {
     }
 
     #[test]
-    fn type_hierarchy_combined_requests_share_one_timeout_budget() {
-        let (adapter, sink, responses) = test_adapter();
+    fn combined_lsp_requests_share_one_configured_deadline() {
+        let (mut adapter, sink, responses) = test_adapter();
         enable_type_hierarchy(&adapter);
-        let delayed_responses = Arc::clone(&responses);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(6));
-            let (lock, cvar) = &*delayed_responses;
+        // Admission gates make the two nested protocol turns observable.  The
+        // second response deliberately remains withheld: a fresh relative
+        // budget may not be allocated after the prepare response is admitted.
+        adapter.operation_timeout = Some(Duration::from_millis(50));
+        let (first_admitted_tx, first_admitted_rx) = std::sync::mpsc::channel();
+        let (second_admitted_tx, second_admitted_rx) = std::sync::mpsc::channel();
+        let responder_responses = Arc::clone(&responses);
+        let responder = std::thread::spawn(move || {
+            first_admitted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("prepare request must reach its admission gate");
+            let (lock, cvar) = &*responder_responses;
             lock.lock().unwrap().insert(
                 1,
                 Some(json!({"id": 1, "result": [hierarchy_item("Root", 5, "file:///workspace/src/main.rs", 4, 9)]})),
             );
             cvar.notify_all();
-            std::thread::sleep(Duration::from_secs(6));
-            lock.lock()
-                .unwrap()
-                .insert(2, Some(json!({"id": 2, "result": []})));
-            cvar.notify_all();
+            second_admitted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("nested hierarchy request must be admitted after prepare");
         });
 
-        let started = std::time::Instant::now();
-        let error = adapter
-            .type_hierarchy_lsp(
+        let worker = std::thread::spawn(move || {
+            adapter.type_hierarchy_lsp(
                 &hierarchy_query(TypeHierarchyDirection::Both),
                 "private source text",
             )
+        });
+        let request_count = |method| method_count(&written_messages(&sink), method);
+        let admission_deadline = Instant::now() + Duration::from_secs(1);
+        while request_count("textDocument/prepareTypeHierarchy") != 1 {
+            assert!(
+                Instant::now() < admission_deadline,
+                "prepare request was not admitted before the test gate"
+            );
+            std::thread::yield_now();
+        }
+        first_admitted_tx
+            .send(())
+            .expect("release prepare response after its admission");
+        while request_count("typeHierarchy/supertypes") != 1 {
+            assert!(
+                Instant::now() < admission_deadline,
+                "nested request was not admitted after the prepare response"
+            );
+            std::thread::yield_now();
+        }
+        second_admitted_tx
+            .send(())
+            .expect("record nested request admission");
+        let error = worker
+            .join()
+            .expect("compound hierarchy request worker joins")
             .unwrap_err();
-        let elapsed = started.elapsed();
+        responder.join().expect("admission responder joins");
 
         assert_eq!(
             error,
             LspSessionError::Backend(LspOutcomeCode::ServerTimeout)
         );
-        assert!(elapsed >= Duration::from_secs(9));
-        assert!(elapsed < Duration::from_secs(12));
         assert_eq!(
             method_count(&written_messages(&sink), "textDocument/didClose"),
             1
@@ -3781,7 +3939,7 @@ mod tests {
             "rust".to_owned(),
             std::env::current_dir().expect("test process has a current directory"),
             None,
-            CHECK_TIMEOUT,
+            Some(TEST_OPERATION_TIMEOUT),
         )
         .expect("the valid initialize response must allow the session to start")
     }
@@ -3859,9 +4017,9 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_deadline_overflow_returns_typed_error_without_unwinding() {
+    fn operation_timeout_overflow_returns_typed_error_without_unwinding() {
         let (mut adapter, _sink, _responses) = test_adapter();
-        adapter.diagnostics_deadline = Duration::MAX;
+        adapter.operation_timeout = Some(Duration::MAX);
 
         let result = std::panic::catch_unwind(|| {
             PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}")
@@ -3877,7 +4035,7 @@ mod tests {
     fn push_diagnostics_distinguish_explicit_empty_from_absent_publication() {
         for expected in [Vec::new(), vec![diag("fresh diagnostic")]] {
             let (mut adapter, sink, _responses) = test_adapter();
-            adapter.diagnostics_deadline = Duration::from_millis(250);
+            adapter.operation_timeout = Some(Duration::from_millis(250));
             let uri = "file:///workspace/src/main.rs";
             record_diagnostics(
                 &adapter.state,
@@ -3928,7 +4086,7 @@ mod tests {
         }
 
         let (mut adapter, _sink, _responses) = test_adapter();
-        adapter.diagnostics_deadline = Duration::from_millis(20);
+        adapter.operation_timeout = Some(Duration::from_millis(20));
         assert_eq!(
             PooledSession::check_lsp(
                 &adapter,
@@ -3942,7 +4100,7 @@ mod tests {
     #[test]
     fn pull_diagnostics_decode_full_reports_and_reject_ungrounded_unchanged_reports() {
         let (mut adapter, sink, responses) = test_adapter();
-        adapter.diagnostics_deadline = Duration::from_millis(250);
+        adapter.operation_timeout = Some(Duration::from_millis(250));
         enable_pull_diagnostics(&adapter);
         record_diagnostics(
             &adapter.state,
@@ -3964,7 +4122,7 @@ mod tests {
             json!({"relatedDocuments": {}}),
         ] {
             let (mut adapter, _sink, responses) = test_adapter();
-            adapter.diagnostics_deadline = Duration::from_millis(250);
+            adapter.operation_timeout = Some(Duration::from_millis(250));
             enable_pull_diagnostics(&adapter);
             complete_response(
                 responses,
@@ -3990,7 +4148,7 @@ mod tests {
         let uri = "file:///workspace/src/main.rs";
 
         let (mut push_adapter, push_sink, _push_responses) = test_adapter();
-        push_adapter.diagnostics_deadline = Duration::from_millis(250);
+        push_adapter.operation_timeout = Some(Duration::from_millis(250));
         push_adapter
             .inner
             .lock()
@@ -4029,7 +4187,7 @@ mod tests {
         );
 
         let (mut pull_adapter, pull_sink, pull_responses) = test_adapter();
-        pull_adapter.diagnostics_deadline = Duration::from_millis(250);
+        pull_adapter.operation_timeout = Some(Duration::from_millis(250));
         enable_pull_diagnostics(&pull_adapter);
         pull_adapter
             .inner
@@ -4083,7 +4241,7 @@ mod tests {
     #[test]
     fn diagnostics_timeout_preserves_the_live_session() {
         let (mut adapter, sink, responses) = test_adapter();
-        adapter.diagnostics_deadline = Duration::from_millis(20);
+        adapter.operation_timeout = Some(Duration::from_millis(20));
         enable_pull_diagnostics(&adapter);
         let path = RelativePath::new("src/main.rs");
 
@@ -4102,7 +4260,7 @@ mod tests {
                 .is_none()
         );
 
-        adapter.diagnostics_deadline = Duration::from_millis(250);
+        adapter.operation_timeout = Some(Duration::from_millis(250));
         complete_response(responses, full_diagnostic_response(2, "session survived"));
         let diagnostics = PooledSession::check_lsp(&adapter, &path, "fn second() {}").unwrap();
 
@@ -4121,6 +4279,58 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn diagnostics_without_configured_timeout_waits_for_readiness() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let trace = workspace.path().join("diagnostics.log");
+        let release = workspace.path().join("diagnostics.release");
+        let adapter = LspClientAdapter::spawn(
+            fixture_lsp_server::binary_path()
+                .to_str()
+                .expect("fixture path is UTF-8"),
+            &[
+                "diagnostics_released".to_owned(),
+                trace.display().to_string(),
+                "-".to_owned(),
+                release.display().to_string(),
+            ],
+            vec!["rs".to_owned()],
+            "rust".to_owned(),
+            workspace.path().to_path_buf(),
+            None,
+            None,
+        )
+        .expect("fixture language server initializes without an operation timeout");
+
+        let result = std::thread::scope(|scope| {
+            let check = scope.spawn(|| {
+                PooledSession::check_lsp(
+                    &adapter,
+                    &RelativePath::new("src/main.rs"),
+                    "fn main() {}",
+                )
+            });
+            for _ in 0..200 {
+                if std::fs::read_to_string(format!("{}.trace", trace.display()))
+                    .unwrap_or_default()
+                    .contains("didOpen")
+                {
+                    std::fs::write(&release, "release").expect("release diagnostics fixture");
+                    return check.join().expect("diagnostics worker joins");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::write(&release, "release")
+                .expect("release diagnostics fixture during teardown");
+            let _ = check.join();
+            panic!("diagnostics fixture did not reach its release gate")
+        })
+        .expect("released diagnostics request completes");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message, "released diagnostic");
     }
 
     #[test]
@@ -4143,16 +4353,45 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_blocked_pull_write_times_out_and_recovers() {
+    fn queued_write_is_not_emitted_after_its_deadline() {
+        let sink = SharedSink::default();
+        let blocker = BlockingWriter::new(sink.clone());
+        let writer = blocker.writer();
+        let first_writer = writer.clone();
+        let first = std::thread::spawn(move || first_writer.write(&json!({"sequence": 1})));
+        assert!(blocker.wait_until_write_starts());
+
+        assert_eq!(
+            writer
+                .write_before(
+                    &json!({"sequence": 2}),
+                    Instant::now() + Duration::from_millis(20),
+                )
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        blocker.release();
+        first.join().unwrap().unwrap();
+        writer.write(&json!({"sequence": 3})).unwrap();
+
+        let messages = written_messages(&sink);
+        assert!(messages.iter().any(|message| message["sequence"] == 1));
+        assert!(messages.iter().any(|message| message["sequence"] == 3));
+        assert!(!messages.iter().any(|message| message["sequence"] == 2));
+    }
+
+    #[test]
+    fn diagnostics_blocked_pull_write_timeout_terminates_the_session() {
         let (mut adapter, sink, responses) = test_adapter();
         enable_pull_diagnostics(&adapter);
         // Open first: the blocked operation must be the pull request, not didOpen.
         adapter
-            .acquire_doc("file:///workspace/src/main.rs", "fn main() {}")
+            .acquire_doc_until("file:///workspace/src/main.rs", "fn main() {}", None)
             .unwrap();
         let writer = BlockingWriter::new(sink.clone());
         adapter.writer = writer.writer();
-        adapter.diagnostics_deadline = Duration::from_millis(50);
+        adapter.operation_timeout = Some(Duration::from_millis(50));
         std::thread::scope(|scope| {
             let (tx, rx) = std::sync::mpsc::channel();
             let adapter_ref = &adapter;
@@ -4177,22 +4416,23 @@ mod tests {
             );
             assert!(responses.0.lock().unwrap().is_empty());
         });
-        adapter.diagnostics_deadline = Duration::from_secs(1);
-        complete_response(
-            Arc::clone(&responses),
-            full_diagnostic_response(2, "recovered"),
-        );
+        // The timed-out caller can finish before the released writer has
+        // emitted its frame. A queued write acknowledges all preceding writes
+        // before the sink is parsed, including their headers and bodies.
+        adapter
+            .writer
+            .write(&json!({"test_barrier": true}))
+            .unwrap();
         assert_eq!(
-            PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}")
-                .unwrap(),
-            vec![diag("recovered")]
+            PooledSession::check_lsp(&adapter, &RelativePath::new("src/main.rs"), "fn main() {}"),
+            Err(LspSessionError::Backend(LspOutcomeCode::ServerCrashed))
         );
         assert!(responses.0.lock().unwrap().is_empty());
         assert_eq!(
             method_count(&written_messages(&sink), "textDocument/diagnostic"),
-            2
+            1
         );
-        assert!(!adapter.dead_flag.load(Ordering::Acquire));
+        assert!(adapter.dead_flag.load(Ordering::Acquire));
     }
 
     #[test]
@@ -4201,10 +4441,10 @@ mod tests {
         let dispatcher = super::Dispatcher::new(Arc::clone(&responses));
         for id in 1..=32 {
             let result = adapter
-                .send_request_once_before(
+                .send_request_once_until(
                     "textDocument/diagnostic",
                     json!({}),
-                    Instant::now() + Duration::from_millis(1),
+                    Some(Instant::now() + Duration::from_millis(1)),
                 )
                 .unwrap();
             assert!(matches!(
@@ -4228,9 +4468,9 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_deadline_bounds_blocked_document_synchronization() {
+    fn operation_timeout_bounds_blocked_document_synchronization() {
         let (mut adapter, sink, _responses) = test_adapter();
-        adapter.diagnostics_deadline = Duration::from_millis(20);
+        adapter.operation_timeout = Some(Duration::from_millis(20));
         let writer = BlockingWriter::new(sink);
         adapter.writer = writer.writer();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -4248,6 +4488,255 @@ mod tests {
         assert_eq!(
             result_rx.recv_timeout(Duration::from_millis(250)),
             Ok(Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout)))
+        );
+    }
+
+    fn written_method_count(sink: &SharedSink, method: &str) -> usize {
+        let bytes = sink.0.lock().unwrap();
+        String::from_utf8_lossy(&bytes)
+            .matches(&format!("\"method\":\"{method}\""))
+            .count()
+    }
+
+    #[test]
+    fn unlimited_references_do_not_require_optional_or_repeated_readiness_notifications() {
+        for already_open in [false, true] {
+            let (mut adapter, sink, responses) = test_adapter();
+            adapter.operation_timeout = None;
+            let path = RelativePath::new("src/main.rs");
+            if already_open {
+                adapter
+                    .acquire_doc_until(&adapter.uri_for(&path), "fn main() {}", None)
+                    .unwrap();
+                mark_ready(&adapter.state);
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let result = PooledSession::references_lsp(
+                        &adapter,
+                        &path,
+                        "fn main() {}",
+                        Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    );
+                    let _ = tx.send(result);
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while written_method_count(&sink, "textDocument/references") == 0
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                let dispatched = written_method_count(&sink, "textDocument/references") == 1;
+                super::Dispatcher::new(Arc::clone(&responses))
+                    .dispatch(&json!({"id":1,"result":[]}));
+                let result = rx.recv_timeout(Duration::from_secs(2));
+                {
+                    let _state = adapter.state.0.lock().unwrap();
+                    adapter.dead_flag.store(true, Ordering::Release);
+                    adapter.state.1.notify_all();
+                }
+                {
+                    let _responses = responses.0.lock().unwrap();
+                    responses.1.notify_all();
+                }
+                worker.join().unwrap();
+                assert!(
+                    dispatched,
+                    "optional readiness signals must not prevent protocol dispatch"
+                );
+                assert_eq!(result, Ok(Ok(Vec::new())));
+            });
+        }
+    }
+
+    #[test]
+    fn unlimited_request_response_wait_observes_reader_exit() {
+        let (mut adapter, sink, responses) = test_adapter();
+        adapter.operation_timeout = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let result = PooledSession::definition_lsp(
+                    &adapter,
+                    &RelativePath::new("src/main.rs"),
+                    "fn main() {}",
+                    Position {
+                        line: 0,
+                        character: 0,
+                    },
+                );
+                let _ = tx.send(result);
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while written_method_count(&sink, "textDocument/definition") == 0
+                && Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let dispatched = written_method_count(&sink, "textDocument/definition") == 1;
+            {
+                let _state = adapter.state.0.lock().unwrap();
+                adapter.dead_flag.store(true, Ordering::Release);
+                adapter.state.1.notify_all();
+            }
+            {
+                let _responses = responses.0.lock().unwrap();
+                responses.1.notify_all();
+            }
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            // If a regression ignores EOF, release its pending response too so
+            // the harness can fail without stranding a scoped thread.
+            super::Dispatcher::new(Arc::clone(&responses)).dispatch(&json!({"id":1,"result":[]}));
+            worker.join().unwrap();
+            assert!(dispatched);
+            assert_eq!(
+                result,
+                Ok(Err(LspSessionError::Backend(LspOutcomeCode::ServerCrashed)))
+            );
+        });
+    }
+
+    #[test]
+    fn references_without_configured_timeout_wait_for_fresh_readiness() {
+        let (mut adapter, sink, responses) = test_adapter();
+        adapter.operation_timeout = None;
+        mark_ready(&adapter.state);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let result = PooledSession::references_lsp(
+                    &adapter,
+                    &RelativePath::new("src/main.rs"),
+                    "fn main() {}",
+                    Position {
+                        line: 0,
+                        character: 0,
+                    },
+                );
+                let _ = tx.send(result);
+            });
+            let entered_deadline = Instant::now() + Duration::from_secs(2);
+            while written_method_count(&sink, "textDocument/didOpen") == 0
+                && Instant::now() < entered_deadline
+            {
+                std::thread::yield_now();
+            }
+            let entered = written_method_count(&sink, "textDocument/didOpen") == 1;
+            // Exceed the removed 1.5s production fallback. This is a harness
+            // watchdog only; readiness remains controlled by the explicit release.
+            let pending = rx.recv_timeout(Duration::from_millis(1600));
+            let requests_before_release = written_method_count(&sink, "textDocument/references");
+            mark_ready(&adapter.state);
+            let request_deadline = Instant::now() + Duration::from_secs(2);
+            while written_method_count(&sink, "textDocument/references") == 0
+                && Instant::now() < request_deadline
+            {
+                std::thread::yield_now();
+            }
+            super::Dispatcher::new(Arc::clone(&responses)).dispatch(&json!({"id":1,"result":[]}));
+            let completed = rx.recv_timeout(Duration::from_secs(2));
+            // Always wake and join on assertion failures as well.
+            {
+                let _state = adapter.state.0.lock().unwrap();
+                adapter.dead_flag.store(true, Ordering::Release);
+                adapter.state.1.notify_all();
+            }
+            {
+                let _responses = responses.0.lock().unwrap();
+                responses.1.notify_all();
+            }
+            worker.join().unwrap();
+            assert!(entered, "references must reach document synchronization");
+            assert!(matches!(
+                pending,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(
+                requests_before_release, 0,
+                "elapsed time must not bypass readiness"
+            );
+            assert_eq!(completed, Ok(Ok(Vec::new())));
+        });
+    }
+
+    #[test]
+    fn unlimited_reference_readiness_wait_observes_reader_exit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let adapter = Arc::new(
+            LspClientAdapter::spawn(
+                fixture_lsp_server::binary_path().to_str().unwrap(),
+                &["server_crashed".to_owned()],
+                vec!["rs".to_owned()],
+                "rust".to_owned(),
+                workspace.path().to_path_buf(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let worker_adapter = Arc::clone(&adapter);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = PooledSession::references_lsp(
+                worker_adapter.as_ref(),
+                &RelativePath::new("src/main.rs"),
+                "fn main() {}",
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+            );
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        {
+            let _state = adapter.state.0.lock().unwrap();
+            adapter.dead_flag.store(true, Ordering::Release);
+            adapter.state.1.notify_all();
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(Err(LspSessionError::Backend(LspOutcomeCode::ServerCrashed)))
+        );
+    }
+
+    #[test]
+    fn references_readiness_timeout_releases_document_hold() {
+        let (mut adapter, sink, _responses) = test_adapter();
+        adapter.operation_timeout = Some(Duration::from_millis(20));
+        mark_ready(&adapter.state);
+        let path = RelativePath::new("src/main.rs");
+
+        assert_eq!(
+            PooledSession::references_lsp(
+                &adapter,
+                &path,
+                "fn main() {}",
+                Position {
+                    line: 0,
+                    character: 0,
+                },
+            ),
+            Err(LspSessionError::Backend(LspOutcomeCode::ServerTimeout))
+        );
+
+        let uri = adapter.uri_for(&path);
+        assert!(
+            !adapter
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .docs
+                .is_open(&uri)
+        );
+        assert_eq!(
+            method_count(&written_messages(&sink), "textDocument/didClose"),
+            1
         );
     }
 
@@ -4290,7 +4779,7 @@ mod tests {
             "rust".to_owned(),
             workspace.path().to_path_buf(),
             None,
-            CHECK_TIMEOUT,
+            Some(TEST_OPERATION_TIMEOUT),
         ) {
             Ok(_) => panic!("removed executable must not spawn"),
             Err(error) => error,
@@ -4311,7 +4800,7 @@ mod tests {
             "rust".to_owned(),
             workspace.path().to_path_buf(),
             None,
-            CHECK_TIMEOUT,
+            Some(TEST_OPERATION_TIMEOUT),
         ) {
             Ok(_) => panic!("non-executable file must not spawn"),
             Err(error) => error,
@@ -4339,7 +4828,7 @@ mod tests {
             "rust".to_owned(),
             removed_root,
             None,
-            CHECK_TIMEOUT,
+            Some(TEST_OPERATION_TIMEOUT),
         ) {
             Ok(_) => panic!("removed working directory must not permit spawn"),
             Err(error) => error,
@@ -5404,7 +5893,7 @@ mod tests {
     fn check_timeout_is_generous_safety_net_not_primary_gate() {
         // The constant exists and is far larger than the old 5s budget — it is a
         // safety net, not the mechanism. Guards against reintroducing a tight budget.
-        assert!(CHECK_TIMEOUT >= Duration::from_secs(30));
+        assert!(TEST_OPERATION_TIMEOUT >= Duration::from_secs(30));
     }
 
     #[test]

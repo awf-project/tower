@@ -21,7 +21,7 @@ use extension_protocol::ToolDecl;
 use serde_json::Value;
 
 use crate::domain::extension_host::{ExtensionId, InvokeError};
-use crate::domain::{FileId, RelativePath};
+use crate::domain::{CancellationSignal, FileId, RelativePath};
 
 /// Extension host lifecycle hook and tool-routing contract.
 ///
@@ -74,7 +74,12 @@ pub trait ExtensionHostPort {
     ///
     /// - [`InvokeError::ToolNotFound`] — no extension owns `tool_name`.
     /// - [`InvokeError::Fault`] — the owning extension returned a fault or is quarantined.
-    fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError>;
+    fn invoke(
+        &self,
+        tool_name: &str,
+        params: Value,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Value, InvokeError>;
 
     /// Invoke a declared tool on a specific extension instance.
     ///
@@ -86,6 +91,7 @@ pub trait ExtensionHostPort {
         _extension_id: &ExtensionId,
         tool_name: &str,
         _params: Value,
+        _cancellation: &dyn CancellationSignal,
     ) -> Result<Value, InvokeError> {
         Err(InvokeError::ToolNotFound(tool_name.to_owned()))
     }
@@ -125,7 +131,12 @@ impl ExtensionHostPort for NoOpExtensionHost {
     }
 
     #[inline]
-    fn invoke(&self, tool_name: &str, _params: Value) -> Result<Value, InvokeError> {
+    fn invoke(
+        &self,
+        tool_name: &str,
+        _params: Value,
+        _cancellation: &dyn CancellationSignal,
+    ) -> Result<Value, InvokeError> {
         Err(InvokeError::ToolNotFound(tool_name.to_owned()))
     }
 }
@@ -143,7 +154,12 @@ mod tests {
         fn declared_tools(&self) -> Vec<(ExtensionId, ToolDecl)> {
             Vec::new()
         }
-        fn invoke(&self, _: &str, _: Value) -> Result<Value, InvokeError> {
+        fn invoke(
+            &self,
+            _: &str,
+            _: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, InvokeError> {
             panic!("targeted calls must never fall back to bare-name routing")
         }
     }
@@ -155,7 +171,8 @@ mod tests {
             host.invoke_extension(
                 &ExtensionId::new("ast"),
                 "plan_safe_delete_declaration",
-                Value::Null
+                Value::Null,
+                &crate::domain::NeverCancelled
             ),
             Err(InvokeError::ToolNotFound(
                 "plan_safe_delete_declaration".to_owned()

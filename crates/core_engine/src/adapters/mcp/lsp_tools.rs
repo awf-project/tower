@@ -105,7 +105,12 @@ impl ToolRegistry for LspToolRegistry {
         vec![tool_lsp_diagnostics_desc()]
     }
 
-    fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: Value,
+        _cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ToolError> {
         if name != "tower_lsp_diagnostics" {
             return Err(ToolError::NotFound(name.to_owned()));
         }
@@ -202,7 +207,11 @@ mod tests {
     fn clean_file_reports_supported_no_diagnostics() {
         let mut reg = registry(state_with_file("src/a.rs", b"fn main() {}"));
         let val = reg
-            .call("tower_lsp_diagnostics", json!({ "path": "src/a.rs" }))
+            .call(
+                "tower_lsp_diagnostics",
+                json!({ "path": "src/a.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(val["supported"], true);
         assert!(val["diagnostics"].as_array().unwrap().is_empty());
@@ -212,7 +221,11 @@ mod tests {
     fn broken_file_reports_error_diagnostic() {
         let mut reg = registry(state_with_file("src/a.rs", b"fn main() { //!ERR\n}"));
         let val = reg
-            .call("tower_lsp_diagnostics", json!({ "path": "src/a.rs" }))
+            .call(
+                "tower_lsp_diagnostics",
+                json!({ "path": "src/a.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let diags = val["diagnostics"].as_array().unwrap();
         assert_eq!(diags.len(), 1);
@@ -226,7 +239,11 @@ mod tests {
         let mut reg = LspToolRegistry::new(state, Arc::new(InformationCodeIntel));
 
         let val = reg
-            .call("tower_lsp_diagnostics", json!({ "path": "src/a.rs" }))
+            .call(
+                "tower_lsp_diagnostics",
+                json!({ "path": "src/a.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let diags = val["diagnostics"].as_array().unwrap();
 
@@ -240,7 +257,11 @@ mod tests {
     fn unsupported_extension_reports_supported_false() {
         let mut reg = registry(state_with_file("notes.txt", b"//!ERR"));
         let val = reg
-            .call("tower_lsp_diagnostics", json!({ "path": "notes.txt" }))
+            .call(
+                "tower_lsp_diagnostics",
+                json!({ "path": "notes.txt" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(val["supported"], false);
         assert!(val["diagnostics"].as_array().unwrap().is_empty());
@@ -249,7 +270,13 @@ mod tests {
     #[test]
     fn missing_path_arg_is_invalid_args() {
         let mut reg = registry(state_with_file("src/a.rs", b"fn main() {}"));
-        let err = reg.call("tower_lsp_diagnostics", json!({})).unwrap_err();
+        let err = reg
+            .call(
+                "tower_lsp_diagnostics",
+                json!({}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap_err();
         assert!(matches!(
             err,
             crate::adapters::mcp::types::ToolError::InvalidArgs(_)
@@ -260,7 +287,11 @@ mod tests {
     fn missing_file_is_resource_not_found() {
         let mut reg = registry(state_with_file("src/a.rs", b"fn main() {}"));
         let err = reg
-            .call("tower_lsp_diagnostics", json!({ "path": "src/ghost.rs" }))
+            .call(
+                "tower_lsp_diagnostics",
+                json!({ "path": "src/ghost.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
         assert!(matches!(
             err,

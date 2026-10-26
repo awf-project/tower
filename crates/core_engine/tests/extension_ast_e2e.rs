@@ -507,6 +507,7 @@ fn catch_up_ast_fence_observes_updated_symbol_index() {
         .call_tool(
             "_tower_catch_up_fence",
             serde_json::json!({"epoch": 41, "delivered_events": 2}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("AST catch-up fence is declared and handled");
     assert_eq!(
@@ -518,6 +519,7 @@ fn catch_up_ast_fence_observes_updated_symbol_index() {
         .call_tool(
             "search_symbols",
             serde_json::json!({"query": "after_catch_up", "kind": "function"}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("query AST index after ready fence");
     assert!(
@@ -569,6 +571,7 @@ fn plan_safe_delete(
                 "symbol_name": symbol_name,
                 "kind": "function"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("safe-delete declaration planning must return a structured result")
 }
@@ -1023,6 +1026,7 @@ fn safe_delete_declaration_preserves_existing_delete_symbol_process_behavior() {
                 "symbol_name": "delete_me",
                 "kind": "function"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("existing delete_symbol process contract must still succeed");
     assert_eq!(delete["applied"], true);
@@ -1210,6 +1214,7 @@ fn t016_real_ast_sidecar_applies_each_anchored_edit_and_refreshes_symbol_index_a
                 "kind": "function",
                 "replacement": "\n    2\n"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("replace_symbol_body must succeed");
     assert_eq!(replace["applied"], true);
@@ -1229,6 +1234,7 @@ fn t016_real_ast_sidecar_applies_each_anchored_edit_and_refreshes_symbol_index_a
                 "kind": "function",
                 "replacement": "#[allow(dead_code)]\n"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("insert_before_symbol must succeed");
     assert_eq!(insert_before["applied"], true);
@@ -1248,6 +1254,7 @@ fn t016_real_ast_sidecar_applies_each_anchored_edit_and_refreshes_symbol_index_a
                 "kind": "function",
                 "replacement": "\n\npub fn added_after() -> u8 { 3 }\n"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("insert_after_symbol must succeed");
     assert_eq!(insert_after["applied"], true);
@@ -1266,6 +1273,7 @@ fn t016_real_ast_sidecar_applies_each_anchored_edit_and_refreshes_symbol_index_a
                 "symbol_name": "remove_me",
                 "kind": "function"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("delete_symbol must succeed");
     assert_eq!(delete["applied"], true);
@@ -1289,7 +1297,11 @@ fn t016_real_ast_sidecar_applies_each_anchored_edit_and_refreshes_symbol_index_a
         })
         .expect("fileChanged must refresh AST index");
     let search = adapter
-        .call_tool("search_symbols", serde_json::json!({"name": "added_after"}))
+        .call_tool(
+            "search_symbols",
+            serde_json::json!({"name": "added_after"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("search_symbols must succeed after fileChanged");
     assert!(
         search.to_string().contains("added_after"),
@@ -1330,6 +1342,7 @@ fn t016_dry_run_returns_preview_without_changing_file() {
                 "replacement": "// preview\n",
                 "dry_run": true
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("dry-run insert_before_symbol must succeed");
 
@@ -1433,7 +1446,11 @@ fn ac1_get_outline_rust_returns_structural_items() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
-        .call_tool("get_outline", serde_json::json!({"path": "src/counter.rs"}))
+        .call_tool(
+            "get_outline",
+            serde_json::json!({"path": "src/counter.rs"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("get_outline must succeed");
 
     let result_str = result.to_string();
@@ -1475,7 +1492,11 @@ fn ac1_get_outline_unsupported_language_returns_unsupported() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
-        .call_tool("get_outline", serde_json::json!({"path": "README.md"}))
+        .call_tool(
+            "get_outline",
+            serde_json::json!({"path": "README.md"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("get_outline must succeed (even for unsupported language)");
 
     let result_str = result.to_string();
@@ -1521,6 +1542,7 @@ fn ac2_file_indexed_event_updates_index() {
         .call_tool(
             "search_symbols",
             serde_json::json!({"name": "make_counter"}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("search_symbols must succeed");
 
@@ -1529,6 +1551,36 @@ fn ac2_file_indexed_event_updates_index() {
         result_str.contains("\"make_counter\""),
         "search_symbols must find make_counter after fileIndexed, got: {result_str}"
     );
+    adapter.shutdown();
+}
+
+#[test]
+fn ast_public_event_uses_unlimited_host_budget() {
+    let mut fs = InMemoryFs::new();
+    fs.write(RelativePath::new("src/lib.rs"), RUST_SOURCE.to_vec())
+        .expect("write AST fixture");
+    let mut adapter = SidecarHostAdapter::spawn(
+        ast_manifest(&ast_extension_bin()),
+        make_deps(fs),
+        None,
+        None,
+    )
+    .expect("AST must initialize without a host request deadline");
+
+    adapter
+        .deliver_event(Event::FileIndexed {
+            file_id: 1,
+            path: "src/lib.rs".to_owned(),
+        })
+        .expect("AST fileIndexed must complete without a host request deadline");
+    let result = adapter
+        .call_tool(
+            "search_symbols",
+            serde_json::json!({"name": "make_counter"}),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("search must order after fileIndexed processing");
+    assert!(result.to_string().contains("make_counter"));
     adapter.shutdown();
 }
 
@@ -1567,6 +1619,7 @@ fn ac2_file_changed_event_updates_index() {
                 "symbol_name": "Counter",
                 "kind": "struct"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("find_symbols must succeed");
 
@@ -1600,7 +1653,11 @@ fn ac3_get_outline_go_returns_structural_items() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
-        .call_tool("get_outline", serde_json::json!({"path": "main.go"}))
+        .call_tool(
+            "get_outline",
+            serde_json::json!({"path": "main.go"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("get_outline must succeed");
 
     let result_str = result.to_string();
@@ -1637,7 +1694,11 @@ fn ac3_get_outline_php_returns_structural_items() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("ast must spawn");
 
     let result = adapter
-        .call_tool("get_outline", serde_json::json!({"path": "app.php"}))
+        .call_tool(
+            "get_outline",
+            serde_json::json!({"path": "app.php"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("get_outline must succeed");
 
     let result_str = result.to_string();
@@ -1681,6 +1742,7 @@ fn ac3_find_symbols_go_finds_function() {
                 "symbol_name": "HelloWorld",
                 "kind": "function"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("find_symbols must succeed");
 
@@ -1717,6 +1779,7 @@ fn ac3_find_symbols_go_inapplicable_kind_returns_empty() {
                 "symbol_name": "Foo",
                 "kind": "impl"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("find_symbols with inapplicable kind must succeed");
 
@@ -1765,6 +1828,7 @@ fn u1_read_symbol_returns_symbol_content() {
                 "path": "src/counter.rs",
                 "symbol_name": "make_counter"
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("read_symbol must succeed");
 
@@ -1812,7 +1876,11 @@ fn un1_malformed_rust_file_does_not_crash_extension() {
 
     // Outline the broken file — must not crash, must return Parsed (partial).
     let result = adapter
-        .call_tool("get_outline", serde_json::json!({"path": "src/broken.rs"}))
+        .call_tool(
+            "get_outline",
+            serde_json::json!({"path": "src/broken.rs"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("get_outline must not crash on malformed input");
     // Result could be items:[] or items with partial content — not an error.
     assert!(
@@ -1822,7 +1890,11 @@ fn un1_malformed_rust_file_does_not_crash_extension() {
 
     // The extension must still serve the good file correctly after the failure.
     let good_result = adapter
-        .call_tool("get_outline", serde_json::json!({"path": "src/good.rs"}))
+        .call_tool(
+            "get_outline",
+            serde_json::json!({"path": "src/good.rs"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("get_outline on good file must succeed after malformed parse");
     let good_str = good_result.to_string();
     assert!(
@@ -1848,7 +1920,11 @@ fn ac4_hello_extension_greet_returns_greeting() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("hello must spawn");
 
     let result = adapter
-        .call_tool("greet", serde_json::json!({"name": "Tower"}))
+        .call_tool(
+            "greet",
+            serde_json::json!({"name": "Tower"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("greet must succeed");
 
     let result_str = result.to_string();
@@ -1860,6 +1936,27 @@ fn ac4_hello_extension_greet_returns_greeting() {
         result_str.contains("Hello"),
         "greet must say Hello, got: {result_str}"
     );
+    adapter.shutdown();
+}
+
+#[test]
+fn hello_public_request_uses_unlimited_host_budget() {
+    let mut adapter = SidecarHostAdapter::spawn(
+        hello_manifest(&hello_extension_bin()),
+        make_deps(InMemoryFs::new()),
+        None,
+        None,
+    )
+    .expect("hello must initialize without a host request deadline");
+
+    let result = adapter
+        .call_tool(
+            "greet",
+            serde_json::json!({"name": "Tower"}),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("hello request must complete without a host request deadline");
+    assert!(result.to_string().contains("Hello, Tower"));
     adapter.shutdown();
 }
 
@@ -1898,7 +1995,11 @@ fn ac4_hello_greet_default_name() {
         SidecarHostAdapter::spawn(manifest, deps, TEST_TIMEOUT, None).expect("hello must spawn");
 
     let result = adapter
-        .call_tool("greet", serde_json::json!({}))
+        .call_tool(
+            "greet",
+            serde_json::json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("greet with no name must succeed");
 
     let result_str = result.to_string();
@@ -1964,7 +2065,11 @@ fn reg_spawn_then_immediate_tool_call_never_deadlocks() {
 
         // Call a zero-I/O tool (search_symbols with empty index) immediately after
         // spawn, without any yield/sleep, to maximise scheduling interleave.
-        let result = adapter.call_tool("search_symbols", serde_json::json!({"name": "anything"}));
+        let result = adapter.call_tool(
+            "search_symbols",
+            serde_json::json!({"name": "anything"}),
+            &core_engine::domain::NeverCancelled,
+        );
         assert!(
             result.is_ok(),
             "iteration {iteration}: call_tool must not deadlock/timeout, got: {:?}",
@@ -2003,7 +2108,11 @@ fn ac5_ast_extension_via_registry() {
 
     // Invoke get_outline through the registry (routes by tool name).
     let result = registry
-        .invoke("get_outline", serde_json::json!({"path": "src/lib.rs"}))
+        .invoke(
+            "get_outline",
+            serde_json::json!({"path": "src/lib.rs"}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("registry invoke must succeed");
 
     let result_str = result.to_string();

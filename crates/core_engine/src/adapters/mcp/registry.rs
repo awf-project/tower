@@ -27,13 +27,20 @@
 //!
 //! impl ToolRegistry for EmptyRegistry {
 //!     fn list(&self) -> Vec<ToolDesc> { vec![] }
-//!     fn call(&mut self, name: &str, _args: Value) -> Result<Value, ToolError> {
+//!     fn call(
+//!         &mut self,
+//!         name: &str,
+//!         _args: Value,
+//!         _cancellation: &dyn core_engine::domain::CancellationSignal,
+//!     ) -> Result<Value, ToolError> {
 //!         Err(ToolError::NotFound(name.to_owned()))
 //!     }
 //! }
 //! ```
 
 use serde_json::Value;
+
+use crate::domain::CancellationSignal;
 
 use super::types::{ToolDesc, ToolError};
 
@@ -61,5 +68,10 @@ pub trait ToolRegistry {
     /// - [`ToolError::NotFound`] — `name` is not registered here.
     /// - [`ToolError::InvalidArgs`] — `args` are structurally wrong.
     /// - [`ToolError::ExecutionFailed`] — tool ran but encountered a runtime error.
-    fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError>;
+    fn call(
+        &mut self,
+        name: &str,
+        args: Value,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Value, ToolError>;
 }

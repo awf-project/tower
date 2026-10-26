@@ -129,7 +129,12 @@ impl core_engine::domain::ExtensionInstance for RecordingExtension {
         &self.manifest
     }
 
-    fn call_tool(&mut self, _name: &str, params: Value) -> Result<Value, ExtensionCallError> {
+    fn call_tool(
+        &mut self,
+        _name: &str,
+        params: Value,
+        _cancellation: &dyn core_engine::domain::CancellationSignal,
+    ) -> Result<Value, ExtensionCallError> {
         Ok(params)
     }
 

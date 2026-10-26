@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use extension_protocol::TimeoutDetail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -33,6 +34,8 @@ pub struct DebugStop {
     pub top_frame: Option<DebugStackFrame>,
     pub hit_breakpoint_ids: Vec<u64>,
     pub timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RuntimeFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
     pub output_since: Vec<DebugOutput>,
@@ -76,14 +79,14 @@ pub struct DebugOutput {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct RuntimeFailureResult {
     pub ok: bool,
     pub error: RuntimeFailure,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct RuntimeFailure {
     pub code: String,
@@ -94,12 +97,17 @@ pub struct RuntimeFailure {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", content = "message")]
 pub enum DebugRuntimeError {
+    #[serde(rename = "invalid-params")]
+    InvalidParams(String),
     #[serde(rename = "session-not-found")]
     SessionNotFound(String),
     #[serde(rename = "not-stopped")]
     NotStopped(String),
     #[serde(rename = "debug-timeout")]
-    DebugTimeout(String),
+    DebugTimeout {
+        message: String,
+        detail: TimeoutDetail,
+    },
     #[serde(rename = "adapter-exited")]
     AdapterExited(String),
     #[serde(rename = "launch-failed")]
@@ -110,6 +118,7 @@ pub enum DebugRuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use extension_protocol::TimeoutDetail;
     use serde_json::json;
 
     use super::{
@@ -143,6 +152,7 @@ mod tests {
             top_frame: Some(frame.clone()),
             hit_breakpoint_ids: vec![9],
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: vec![DebugOutput {
                 sequence: 1,
@@ -240,8 +250,25 @@ mod tests {
                 json!({ "code": "not-stopped", "message": "running" }),
             ),
             (
-                DebugRuntimeError::DebugTimeout("timeout".to_owned()),
-                json!({ "code": "debug-timeout", "message": "timeout" }),
+                DebugRuntimeError::DebugTimeout {
+                    message: "debug operation timed out".to_owned(),
+                    detail: TimeoutDetail {
+                        operation: "continue".to_owned(),
+                        layer: "dap".to_owned(),
+                        budget_ms: 250,
+                    },
+                },
+                json!({
+                    "code": "debug-timeout",
+                    "message": {
+                        "message": "debug operation timed out",
+                        "detail": {
+                            "operation": "continue",
+                            "layer": "dap",
+                            "budget_ms": 250
+                        }
+                    }
+                }),
             ),
             (
                 DebugRuntimeError::AdapterExited("exited".to_owned()),
@@ -271,6 +298,7 @@ mod tests {
             top_frame: None,
             hit_breakpoint_ids: Vec::new(),
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         };
@@ -295,6 +323,7 @@ mod tests {
             top_frame: None,
             hit_breakpoint_ids: vec![9],
             timed_out: false,
+            error: None,
             exit_code: None,
             output_since: Vec::new(),
         };
@@ -322,6 +351,7 @@ mod tests {
             top_frame: None,
             hit_breakpoint_ids: Vec::new(),
             timed_out: false,
+            error: None,
             exit_code: Some(0),
             output_since: Vec::new(),
         };
