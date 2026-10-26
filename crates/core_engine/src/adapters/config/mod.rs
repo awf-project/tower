@@ -41,31 +41,60 @@ pub enum ExtensionConfigurationReason {
 }
 
 /// Parsed `.tower/config.toml`. Unknown top-level keys are rejected.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 pub struct TowerConfig {
-    #[serde(default)]
     pub formatter: FormatterConfig,
     /// `[lsp]` section — language-server bindings (LSP plan 1, Task 8).
     ///
     /// Absent → `LspConfig::default()` (empty; no servers). Populated by
     /// wiring in `main.rs`; production code reads `config.lsp` directly
     /// rather than calling `parse_lsp_config` again.
-    #[serde(default)]
     pub lsp: LspConfig,
-    #[serde(default)]
     pub lint: LintConfig,
-    #[serde(default)]
     pub debug: DebugConfig,
     /// `[extensions]` section — sidecar extension runtime settings (spec 24).
     ///
-    /// Absent → `ExtensionConfig::default()` (30-second timeout).
-    #[serde(default)]
+    /// Absent → `ExtensionConfig::default()` (no request timeout).
     pub extensions: ExtensionConfig,
     /// `[daemon]` section — shared-daemon runtime settings.
     /// Absent → `DaemonConfig::default()` (30-second idle timeout).
-    #[serde(default)]
     pub daemon: DaemonConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTowerConfig {
+    #[serde(default)]
+    formatter: FormatterConfig,
+    #[serde(default)]
+    lsp: LspConfig,
+    #[serde(default)]
+    lint: LintConfig,
+    #[serde(default)]
+    debug: DebugConfig,
+    #[serde(default)]
+    extensions: ExtensionConfig,
+    #[serde(default)]
+    daemon: DaemonConfig,
+}
+
+impl<'de> Deserialize<'de> for TowerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Value::deserialize(deserializer)?;
+        validate_timeout_values(&value).map_err(serde::de::Error::custom)?;
+        let raw: RawTowerConfig = value.try_into().map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            formatter: raw.formatter,
+            lsp: raw.lsp,
+            lint: raw.lint,
+            debug: raw.debug,
+            extensions: raw.extensions,
+            daemon: raw.daemon,
+        })
+    }
 }
 
 impl TowerConfig {
@@ -73,34 +102,25 @@ impl TowerConfig {
         !self.lsp.servers.is_empty() && !self.extensions.disabled.iter().any(|name| name == "lsp")
     }
 
-    pub fn lint_request_timeout(&self) -> Result<std::time::Duration, ConfigError> {
-        let maximum: Option<(&String, &LintCommandConfig)> =
-            self.lint
-                .commands
-                .iter()
-                .fold(None, |maximum, entry| match maximum {
-                    Some((_, current)) if current.timeout_secs >= entry.1.timeout_secs => maximum,
-                    _ => Some(entry),
-                });
-        let Some((language, command)) = maximum else {
-            return Ok(self.extensions.request_timeout());
-        };
-
-        let invalid_deadline = || ConfigError::InvalidLintDeadline {
-            field: format!("lint.{language}.timeout_secs"),
-            value: command.timeout_secs,
-        };
-        let lint_secs = command
-            .timeout_secs
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(invalid_deadline)?;
-        let lint_timeout = std::time::Duration::from_secs(lint_secs);
-        std::time::Instant::now()
-            .checked_add(lint_timeout)
-            .ok_or_else(invalid_deadline)?;
-
-        Ok(self.extensions.request_timeout().max(lint_timeout))
+    pub fn lint_request_timeout(&self) -> Result<Option<std::time::Duration>, ConfigError> {
+        let mut maximum = self.extensions.request_timeout();
+        for (language, command) in &self.lint.commands {
+            let Some(seconds) = command.timeout_secs else {
+                continue;
+            };
+            let invalid_deadline = || ConfigError::InvalidLintDeadline {
+                field: format!("lint.{language}.timeout_secs"),
+                value: seconds,
+            };
+            let derived_seconds = seconds
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(invalid_deadline)?;
+            validate_deadline_seconds(derived_seconds).ok_or_else(invalid_deadline)?;
+            let derived = std::time::Duration::from_secs(derived_seconds);
+            maximum = Some(maximum.map_or(derived, |current| current.max(derived)));
+        }
+        Ok(maximum)
     }
 }
 
@@ -108,16 +128,11 @@ impl TowerConfig {
 ///
 /// Controls per-request timeout, respawn backoff, and which extensions are
 /// skipped at startup.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionConfig {
-    /// Wall-clock deadline for a single extension tool call or event delivery,
-    /// in seconds (default 30s, matching the old WASM epoch budget — spec 24 U1).
-    ///
-    /// If a call exceeds this deadline the child is killed and
-    /// `ExtensionFault::Timeout` is returned to the caller.
-    #[serde(default = "ExtensionConfig::default_request_timeout_secs")]
-    pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 
     /// Extension manifest names to skip loading, e.g. `["ast", "lsp"]`.
     ///
@@ -141,36 +156,24 @@ pub struct ExtensionConfig {
 impl ExtensionConfig {
     pub const LSP_SUPERVISION_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 
-    const fn default_request_timeout_secs() -> u64 {
-        30
-    }
-
-    /// Return the `request_timeout` as a [`std::time::Duration`].
     #[must_use]
-    pub fn request_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.request_timeout_secs)
+    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+        self.request_timeout_secs
+            .map(std::time::Duration::from_secs)
     }
 
-    pub fn lsp_diagnostics_timeout(&self) -> Result<std::time::Duration, ConfigError> {
-        self.request_timeout()
+    pub fn lsp_diagnostics_timeout(&self) -> Result<Option<std::time::Duration>, ConfigError> {
+        let Some(request_timeout_secs) = self.request_timeout_secs else {
+            return Ok(None);
+        };
+        let timeout = std::time::Duration::from_secs(request_timeout_secs)
             .checked_sub(Self::LSP_SUPERVISION_MARGIN)
             .filter(|timeout| !timeout.is_zero())
             .ok_or(ConfigError::InvalidLspDiagnosticsDeadline {
-                request_timeout_secs: self.request_timeout_secs,
+                request_timeout_secs,
                 required_margin_secs: Self::LSP_SUPERVISION_MARGIN.as_secs(),
-            })
-    }
-}
-
-impl Default for ExtensionConfig {
-    fn default() -> Self {
-        Self {
-            request_timeout_secs: Self::default_request_timeout_secs(),
-            disabled: Vec::new(),
-            readiness: BTreeMap::new(),
-            readiness_controls: BTreeMap::new(),
-            initialize: BTreeMap::new(),
-        }
+            })?;
+        Ok(Some(timeout))
     }
 }
 
@@ -182,23 +185,15 @@ pub struct DaemonConfig {
     /// Only `mcp`/`observer` connections count; `control` connections do not.
     #[serde(default = "DaemonConfig::default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
-    #[serde(default = "DaemonConfig::default_connection_timeout_secs")]
-    pub connection_timeout_secs: u64,
-    #[serde(default = "DaemonConfig::default_preparation_timeout_secs")]
-    pub preparation_timeout_secs: u64,
+    #[serde(default)]
+    pub connection_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub preparation_timeout_secs: Option<u64>,
 }
 
 impl DaemonConfig {
     const fn default_idle_timeout_secs() -> u64 {
         30
-    }
-
-    const fn default_connection_timeout_secs() -> u64 {
-        10
-    }
-
-    const fn default_preparation_timeout_secs() -> u64 {
-        10
     }
 
     /// Idle timeout as a [`std::time::Duration`].
@@ -208,13 +203,15 @@ impl DaemonConfig {
     }
 
     #[must_use]
-    pub fn connection_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.connection_timeout_secs)
+    pub fn connection_timeout(&self) -> Option<std::time::Duration> {
+        self.connection_timeout_secs
+            .map(std::time::Duration::from_secs)
     }
 
     #[must_use]
-    pub fn preparation_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.preparation_timeout_secs)
+    pub fn preparation_timeout(&self) -> Option<std::time::Duration> {
+        self.preparation_timeout_secs
+            .map(std::time::Duration::from_secs)
     }
 }
 
@@ -222,8 +219,8 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: Self::default_idle_timeout_secs(),
-            connection_timeout_secs: Self::default_connection_timeout_secs(),
-            preparation_timeout_secs: Self::default_preparation_timeout_secs(),
+            connection_timeout_secs: None,
+            preparation_timeout_secs: None,
         }
     }
 }
@@ -294,6 +291,8 @@ pub struct ToolConfig {
     /// File extensions (without leading `.`) handled by this tool.
     #[serde(default)]
     pub extensions: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Invocation contract for a formatter tool.
@@ -404,7 +403,7 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
 
     let raw: toml::Value = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
         path: path.clone(),
-        source,
+        source: timeout_parse_error(&contents, &source).unwrap_or(source),
     })?;
 
     if let Some(plugins) = raw.get("plugins") {
@@ -435,7 +434,7 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         });
     }
 
-    lint::validate_timeout_values(&raw).map_err(|source| ConfigError::Parse {
+    validate_timeout_values(&raw).map_err(|source| ConfigError::Parse {
         path: path.clone(),
         source,
     })?;
@@ -448,6 +447,108 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         config.extensions.lsp_diagnostics_timeout()?;
     }
     Ok(config)
+}
+
+fn timeout_parse_error(contents: &str, source: &toml::de::Error) -> Option<toml::de::Error> {
+    let offset = source.span()?.start.min(contents.len());
+    let prefix = &contents[..offset];
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let line_end = contents[offset..]
+        .find('\n')
+        .map_or(contents.len(), |index| offset + index);
+    let line = contents[line_start..line_end].trim();
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if !matches!(
+        key,
+        "request_timeout_secs" | "timeout_secs" | "default_timeout_secs" | "record_timeout_secs"
+    ) {
+        return None;
+    }
+    let table = prefix
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('[') && line.ends_with(']'))?
+        .trim_matches(['[', ']']);
+    let field = match (table, key) {
+        ("extensions", "request_timeout_secs") => "extensions.request_timeout_secs".to_string(),
+        (table, "timeout_secs") if table.starts_with("formatter.tools.") => {
+            format!("{table}.timeout_secs")
+        }
+        (table, "timeout_secs") if table.starts_with("lint.") => {
+            format!("{table}.timeout_secs")
+        }
+        (table, "default_timeout_secs") if table.starts_with("debug.") => {
+            format!("{table}.default_timeout_secs")
+        }
+        ("debug.record", "record_timeout_secs") => "debug.record.record_timeout_secs".to_string(),
+        _ => return None,
+    };
+    Some(<toml::de::Error as serde::de::Error>::custom(format!(
+        "{field}: invalid positive deadline value {}",
+        value.trim()
+    )))
+}
+
+fn validate_deadline_seconds(seconds: u64) -> Option<()> {
+    seconds.checked_mul(1_000)?;
+    std::time::Instant::now().checked_add(std::time::Duration::from_secs(seconds))?;
+    Some(())
+}
+
+fn validate_timeout_value(field: &str, value: &toml::Value) -> Result<(), toml::de::Error> {
+    let valid = value
+        .as_integer()
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .filter(|value| validate_deadline_seconds(*value).is_some())
+        .is_some();
+    if valid {
+        return Ok(());
+    }
+    Err(<toml::de::Error as serde::de::Error>::custom(format!(
+        "{field}: invalid positive deadline value {value}"
+    )))
+}
+
+fn validate_timeout_values(raw: &toml::Value) -> Result<(), toml::de::Error> {
+    if let Some(value) = raw
+        .get("extensions")
+        .and_then(|section| section.get("request_timeout_secs"))
+    {
+        validate_timeout_value("extensions.request_timeout_secs", value)?;
+    }
+    if let Some(tools) = raw
+        .get("formatter")
+        .and_then(|section| section.get("tools"))
+        .and_then(toml::Value::as_table)
+    {
+        for (id, tool) in tools {
+            if let Some(value) = tool.get("timeout_secs") {
+                validate_timeout_value(&format!("formatter.tools.{id}.timeout_secs"), value)?;
+            }
+        }
+    }
+    if let Some(debug) = raw.get("debug").and_then(toml::Value::as_table) {
+        for (language, config) in debug {
+            let (field, value) = if language == "record" {
+                (
+                    "debug.record.record_timeout_secs".to_string(),
+                    config.get("record_timeout_secs"),
+                )
+            } else {
+                (
+                    format!("debug.{language}.default_timeout_secs"),
+                    config.get("default_timeout_secs"),
+                )
+            };
+            if let Some(value) = value {
+                validate_timeout_value(&field, value)?;
+            }
+        }
+    }
+    lint::validate_timeout_values(raw, validate_timeout_value)
 }
 
 fn contains_non_json_toml_value(value: &toml::Value) -> bool {
@@ -465,7 +566,9 @@ fn validate_daemon_deadlines(config: &DaemonConfig) -> Result<(), ConfigError> {
         ("connection_timeout_secs", config.connection_timeout_secs),
         ("preparation_timeout_secs", config.preparation_timeout_secs),
     ] {
-        if value == 0 {
+        if let Some(value) = value
+            && (value == 0 || validate_deadline_seconds(value).is_none())
+        {
             return Err(ConfigError::InvalidDaemonDeadline { field, value });
         }
     }
@@ -599,6 +702,178 @@ mod tests {
         fs::write(dir.join("config.toml"), body).unwrap();
     }
 
+    fn assert_parse_error_names(body: &str, field: &str, value: &str) {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), body);
+        let error = load(tmp.path()).expect_err("invalid timeout must be rejected");
+        match error {
+            ConfigError::Parse { source, .. } => {
+                let rendered = source.to_string();
+                assert!(rendered.contains(field), "{rendered}");
+                assert!(rendered.contains(value), "{rendered}");
+            }
+            other => panic!("expected ConfigError::Parse, got {other:?}"),
+        }
+    }
+
+    fn max_seconds_with_representable_millis() -> u64 {
+        u64::MAX / 1_000
+    }
+
+    fn first_seconds_that_overflow_the_platform_deadline() -> u64 {
+        let maximum = max_seconds_with_representable_millis();
+        if std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(maximum))
+            .is_some()
+        {
+            return maximum + 1;
+        }
+
+        let mut lower = 1_u64;
+        let mut upper = maximum;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(middle))
+                .is_some()
+            {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+            }
+        }
+        lower
+    }
+
+    #[test]
+    fn direct_deserialization_rejects_invalid_explicit_timeout_deadlines() {
+        let invalid = max_seconds_with_representable_millis() + 1;
+        for (field, source) in [
+            (
+                "extensions.request_timeout_secs",
+                format!("[extensions]\nrequest_timeout_secs = {invalid}\n"),
+            ),
+            (
+                "formatter.tools.rustfmt.timeout_secs",
+                format!(
+                    "[formatter.tools.rustfmt]\nargv = [\"rustfmt\"]\nextensions = [\"rs\"]\ntimeout_secs = {invalid}\n"
+                ),
+            ),
+            (
+                "lint.rust.timeout_secs",
+                format!(
+                    "[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = {invalid}\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n"
+                ),
+            ),
+            (
+                "debug.rust.default_timeout_secs",
+                format!(
+                    "[debug.rust]\nextensions = [\"rs\"]\ncommand = \"lldb-dap\"\nadapter_type = \"lldb\"\ndefault_timeout_secs = {invalid}\nidle_ttl_secs = 300\n"
+                ),
+            ),
+            (
+                "debug.record.record_timeout_secs",
+                format!("[debug.record]\nbackend = \"rr\"\nrecord_timeout_secs = {invalid}\n"),
+            ),
+        ] {
+            let error = toml::from_str::<TowerConfig>(&source)
+                .expect_err("an invalid explicit deadline must be rejected");
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn extension_request_timeout_absence_and_positive_value_are_preserved() {
+        let absent = TowerConfig::default();
+        assert_eq!(absent.extensions.request_timeout_secs, None);
+        assert_eq!(absent.extensions.request_timeout(), None);
+
+        let configured: TowerConfig = toml::from_str("[extensions]\nrequest_timeout_secs = 17\n")
+            .expect("positive extension timeout parses");
+        assert_eq!(configured.extensions.request_timeout_secs, Some(17));
+        assert_eq!(
+            configured.extensions.request_timeout(),
+            Some(std::time::Duration::from_secs(17))
+        );
+    }
+
+    #[test]
+    fn extension_request_timeout_rejects_zero_negative_non_integer_and_u64_overflow() {
+        for value in [
+            "0",
+            "-1",
+            "\"2\"",
+            "9223372036854775808",
+            "9223372036854775807",
+        ] {
+            assert_parse_error_names(
+                &format!("[extensions]\nrequest_timeout_secs = {value}\n"),
+                "extensions.request_timeout_secs",
+                value.trim_matches('"'),
+            );
+        }
+    }
+
+    #[test]
+    fn extension_request_timeout_rejects_millisecond_and_platform_deadline_overflows() {
+        let millisecond_overflow = max_seconds_with_representable_millis() + 1;
+        let deadline_overflow = first_seconds_that_overflow_the_platform_deadline();
+
+        for (name, seconds) in [
+            ("millisecond representation", millisecond_overflow),
+            ("platform or millisecond deadline", deadline_overflow),
+        ] {
+            assert_parse_error_names(
+                &format!("[extensions]\nrequest_timeout_secs = {seconds}\n"),
+                "extensions.request_timeout_secs",
+                &seconds.to_string(),
+            );
+            assert_ne!(
+                seconds,
+                u64::MAX,
+                "{name} must be a representable u64 input"
+            );
+        }
+    }
+
+    #[test]
+    fn formatter_timeout_absence_and_positive_value_are_preserved() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[formatter.tools.rustfmt]\nargv = [\"rustfmt\"]\nextensions = [\"rs\"]\n",
+        );
+        let absent = load(tmp.path()).expect("formatter timeout may be absent");
+        assert_eq!(absent.formatter.tools["rustfmt"].timeout_secs, None);
+
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[formatter.tools.rustfmt]\nargv = [\"rustfmt\"]\nextensions = [\"rs\"]\ntimeout_secs = 17\n",
+        );
+        let configured = load(tmp.path()).expect("positive formatter timeout parses");
+        assert_eq!(configured.formatter.tools["rustfmt"].timeout_secs, Some(17));
+    }
+
+    #[test]
+    fn formatter_timeout_rejects_zero_negative_non_integer_and_u64_overflow() {
+        for value in [
+            "0",
+            "-1",
+            "\"2\"",
+            "9223372036854775808",
+            "9223372036854775807",
+        ] {
+            assert_parse_error_names(
+                &format!(
+                    "[formatter.tools.rustfmt]\nargv = [\"rustfmt\"]\nextensions = [\"rs\"]\ntimeout_secs = {value}\n"
+                ),
+                "formatter.tools.rustfmt.timeout_secs",
+                value.trim_matches('"'),
+            );
+        }
+    }
+
     #[test]
     fn canonical_default_config_is_parseable_and_contains_no_legacy_examples() {
         let tmp = tempdir().unwrap();
@@ -684,40 +959,43 @@ mod tests {
     }
 
     #[test]
-    fn lint_timeout_derives_sufficient_host_budget() {
+    fn lint_request_timeout_preserves_absence_and_derives_explicit_supervision_budgets() {
         for (host_secs, lint_entries, expected_secs) in [
-            (1, "", 1),
+            (None, "", None),
+            (Some(1), "", Some(1)),
             (
-                1,
-                "[lint.rust]\ncommand = \"cargo\"\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
-                5,
-            ),
-            (
-                2,
+                None,
                 "[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 2\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
-                5,
+                Some(5),
             ),
             (
-                4,
+                Some(2),
+                "[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 2\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+                Some(5),
+            ),
+            (
+                Some(4),
                 "[lint.go]\ncommand = \"golangci-lint\"\ntimeout_secs = 7\nextensions = [\"go\"]\nformat = \"generic-regex\"\ntarget = \"append\"\n[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 3\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
-                15,
+                Some(15),
             ),
             (
-                30,
+                Some(30),
                 "[lint.rust]\ncommand = \"cargo\"\ntimeout_secs = 7\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
-                30,
+                Some(30),
             ),
         ] {
-            let source =
-                format!("[extensions]\nrequest_timeout_secs = {host_secs}\n{lint_entries}");
+            let host = host_secs
+                .map(|seconds| format!("[extensions]\nrequest_timeout_secs = {seconds}\n"))
+                .unwrap_or_default();
+            let source = format!("{host}{lint_entries}");
             let config: TowerConfig = toml::from_str(&source).expect("valid timeout fixture");
 
             assert_eq!(
                 config
                     .lint_request_timeout()
                     .expect("representable lint deadline"),
-                std::time::Duration::from_secs(expected_secs),
-                "host={host_secs}, lint={lint_entries:?}"
+                expected_secs.map(std::time::Duration::from_secs),
+                "host={host_secs:?}, lint={lint_entries:?}"
             );
             assert_eq!(config.extensions.request_timeout_secs, host_secs);
         }
@@ -731,7 +1009,7 @@ mod tests {
             .commands
             .get_mut("rust")
             .unwrap()
-            .timeout_secs = u64::MAX;
+            .timeout_secs = Some(u64::MAX);
         let err = arithmetic_overflow
             .lint_request_timeout()
             .expect_err("u64 arithmetic overflow must be rejected");
@@ -748,24 +1026,61 @@ mod tests {
             )
         );
 
-        let instant_overflow = u64::MAX / 2;
+        let millisecond_overflow = max_seconds_with_representable_millis() / 2 + 1;
         let mut unrepresentable_deadline: TowerConfig = toml::from_str(
             "[lint.go]\ncommand = \"golangci-lint\"\nextensions = [\"go\"]\nformat = \"generic-regex\"\ntarget = \"append\"\n[lint.rust]\ncommand = \"cargo\"\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
         )
         .unwrap();
         for command in unrepresentable_deadline.lint.commands.values_mut() {
-            command.timeout_secs = instant_overflow;
+            command.timeout_secs = Some(millisecond_overflow);
         }
         assert!(matches!(
             unrepresentable_deadline.lint_request_timeout(),
             Err(ConfigError::InvalidLintDeadline { field, value })
-                if field == "lint.go.timeout_secs" && value == instant_overflow
+                if field == "lint.go.timeout_secs" && value == millisecond_overflow
+        ));
+
+        let deadline_overflow = first_seconds_that_overflow_the_platform_deadline();
+        let lint_seconds = deadline_overflow.div_ceil(2);
+        let mut platform_deadline_overflow: TowerConfig = toml::from_str(
+            "[lint.rust]\ncommand = \"cargo\"\nextensions = [\"rs\"]\nformat = \"rustc-json\"\ntarget = \"append\"\n",
+        )
+        .unwrap();
+        platform_deadline_overflow
+            .lint
+            .commands
+            .get_mut("rust")
+            .unwrap()
+            .timeout_secs = Some(lint_seconds);
+        assert!(matches!(
+            platform_deadline_overflow.lint_request_timeout(),
+            Err(ConfigError::InvalidLintDeadline { field, value })
+                if field == "lint.rust.timeout_secs" && value == lint_seconds
         ));
     }
 
     #[test]
-    fn lsp_request_timeout_rejects_a_budget_without_cleanup_margin() {
-        for request_timeout_secs in [0, 1] {
+    fn lsp_diagnostics_timeout_preserves_margin_and_exempts_inactive_lsp() {
+        assert_eq!(
+            ExtensionConfig::default()
+                .lsp_diagnostics_timeout()
+                .expect("absent host budget is unlimited"),
+            None
+        );
+
+        let configured = ExtensionConfig {
+            request_timeout_secs: Some(17),
+            ..ExtensionConfig::default()
+        };
+        assert_eq!(
+            configured
+                .lsp_diagnostics_timeout()
+                .expect("positive host budget leaves the LSP supervision margin"),
+            Some(std::time::Duration::from_secs(16))
+        );
+
+        {
+            let request_timeout_secs = 1;
             let tmp = tempdir().unwrap();
             write_config(
                 tmp.path(),
@@ -783,6 +1098,18 @@ mod tests {
                 }) if actual == request_timeout_secs
             ));
         }
+
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "[extensions]\nrequest_timeout_secs = 1\n");
+        load(tmp.path()).expect("an absent LSP configuration must not require its margin");
+
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            "[extensions]\nrequest_timeout_secs = 1\ndisabled = [\"lsp\"]\n\
+             [lsp.rust]\ncommand = \"rust-analyzer\"\nextensions = [\"rs\"]\n",
+        );
+        load(tmp.path()).expect("a disabled LSP configuration must not require its margin");
     }
 
     #[test]
@@ -988,31 +1315,16 @@ extensions = ["rs"]
 
     // ── Spec 24: [extensions] section ────────────────────────────────────────
 
-    /// Absent `[extensions]` section yields 30-second default timeout (spec 24 U1).
-    #[test]
-    fn absent_extensions_section_yields_default_timeout() {
-        let tmp = tempdir().unwrap();
-        let cfg = load(tmp.path()).expect("absent config is ok");
-        assert_eq!(
-            cfg.extensions.request_timeout_secs, 30,
-            "default timeout must be 30s"
-        );
-        assert_eq!(
-            cfg.extensions.request_timeout(),
-            std::time::Duration::from_secs(30)
-        );
-    }
-
     /// `[extensions] request_timeout = 5` is parsed correctly.
     #[test]
     fn parses_extensions_request_timeout() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), "[extensions]\nrequest_timeout_secs = 5\n");
         let cfg = load(tmp.path()).expect("valid extensions config");
-        assert_eq!(cfg.extensions.request_timeout_secs, 5);
+        assert_eq!(cfg.extensions.request_timeout_secs, Some(5));
         assert_eq!(
             cfg.extensions.request_timeout(),
-            std::time::Duration::from_secs(5)
+            Some(std::time::Duration::from_secs(5))
         );
     }
 
@@ -1068,7 +1380,7 @@ extensions = ["rs"]
 "#,
         );
         let cfg = load(tmp.path()).expect("combined config must load");
-        assert_eq!(cfg.extensions.request_timeout_secs, 60);
+        assert_eq!(cfg.extensions.request_timeout_secs, Some(60));
         assert_eq!(cfg.extensions.disabled, vec!["lsp"]);
         assert!(cfg.formatter.tools.contains_key("rustfmt"));
         assert!(cfg.lsp.for_extension("rs").is_some());
@@ -1184,19 +1496,13 @@ extensions = ["rs"]
     }
 
     #[test]
-    fn daemon_config_deadline_defaults_are_ten_seconds() {
+    fn daemon_connection_and_preparation_deadlines_are_unlimited_when_absent() {
         let cfg = TowerConfig::default();
 
-        assert_eq!(cfg.daemon.connection_timeout_secs, 10);
-        assert_eq!(cfg.daemon.preparation_timeout_secs, 10);
-        assert_eq!(
-            cfg.daemon.connection_timeout(),
-            std::time::Duration::from_secs(10)
-        );
-        assert_eq!(
-            cfg.daemon.preparation_timeout(),
-            std::time::Duration::from_secs(10)
-        );
+        assert_eq!(cfg.daemon.connection_timeout_secs, None);
+        assert_eq!(cfg.daemon.preparation_timeout_secs, None);
+        assert_eq!(cfg.daemon.connection_timeout(), None);
+        assert_eq!(cfg.daemon.preparation_timeout(), None);
     }
 
     #[test]
@@ -1208,11 +1514,11 @@ extensions = ["rs"]
 
         assert_eq!(
             cfg.daemon.connection_timeout(),
-            std::time::Duration::from_secs(3)
+            Some(std::time::Duration::from_secs(3))
         );
         assert_eq!(
             cfg.daemon.preparation_timeout(),
-            std::time::Duration::from_secs(17)
+            Some(std::time::Duration::from_secs(17))
         );
     }
 
@@ -1242,6 +1548,25 @@ extensions = ["rs"]
                 value: 0,
             })
         ));
+    }
+
+    #[test]
+    fn daemon_config_deadlines_reject_platform_deadline_overflow() {
+        let value = first_seconds_that_overflow_the_platform_deadline();
+        for field in ["connection_timeout_secs", "preparation_timeout_secs"] {
+            let tmp = tempdir().unwrap();
+            write_config(tmp.path(), &format!("[daemon]\n{field} = {value}\n"));
+            assert!(
+                matches!(
+                    load(tmp.path()),
+                    Err(ConfigError::InvalidDaemonDeadline {
+                        field: actual_field,
+                        value: actual_value,
+                    }) if actual_field == field && actual_value == value
+                ),
+                "{field} must reject an absolute deadline that the platform cannot represent"
+            );
+        }
     }
 
     #[test]

@@ -60,28 +60,32 @@ pub type ExtensionInitConfigMap = BTreeMap<String, Value>;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExtensionRequestTimeouts {
-    default: Duration,
+    default: Option<Duration>,
     lint: Option<Duration>,
 }
 
 impl ExtensionRequestTimeouts {
-    pub(crate) fn with_lint(default: Duration, lint: Duration) -> Self {
+    pub(crate) fn with_lint<D, L>(default: D, lint: L) -> Self
+    where
+        D: Into<Option<Duration>>,
+        L: Into<Option<Duration>>,
+    {
         Self {
-            default,
-            lint: Some(lint),
+            default: default.into(),
+            lint: lint.into(),
         }
     }
 
-    fn default_only(default: Duration) -> Self {
+    fn default_only<T: Into<Option<Duration>>>(default: T) -> Self {
         Self {
-            default,
+            default: default.into(),
             lint: None,
         }
     }
 
-    pub(crate) fn for_extension(self, name: &str) -> Duration {
+    pub(crate) fn for_extension(self, name: &str) -> Option<Duration> {
         if name == "lint" {
-            self.lint.unwrap_or(self.default)
+            self.lint.or(self.default)
         } else {
             self.default
         }
@@ -416,10 +420,10 @@ pub fn decide_shadowing(entries: &[(usize, String)]) -> Vec<Shadow> {
 /// - Duplicate / shadowed name → logged and skipped (AC1).
 ///
 /// The returned registry may be empty if no valid extensions are found.
-pub fn load_extensions_into_registry(
+pub fn load_extensions_into_registry<T: Into<Option<Duration>>>(
     dirs: &[PathBuf],
     deps: HostDeps,
-    request_timeout: Duration,
+    request_timeout: T,
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
 ) -> ExtensionRegistry {
@@ -440,11 +444,11 @@ pub fn load_extensions_into_registry(
 /// This is used by daemon startup so the shared registry can be injected into
 /// `EngineState` before eager extensions are spawned and initialize-time
 /// HostCalls can mutate files.
-pub fn load_extensions_into_existing_registry(
+pub fn load_extensions_into_existing_registry<T: Into<Option<Duration>>>(
     registry: &mut ExtensionRegistry,
     dirs: &[PathBuf],
     deps: HostDeps,
-    request_timeout: Duration,
+    request_timeout: T,
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
 ) {
@@ -470,11 +474,11 @@ pub fn load_extensions_into_existing_registry(
 /// Unlike [`load_extensions_into_existing_registry`], this function never holds
 /// the registry write lock while spawning eager extensions. That lets
 /// initialize-time HostCalls broadcast through the same shared registry.
-pub fn load_extensions_into_shared_registry(
+pub fn load_extensions_into_shared_registry<T: Into<Option<Duration>>>(
     registry: &std::sync::Arc<std::sync::RwLock<ExtensionRegistry>>,
     dirs: &[PathBuf],
     deps: HostDeps,
-    request_timeout: Duration,
+    request_timeout: T,
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
 ) {
@@ -498,10 +502,10 @@ pub fn load_extensions_into_shared_registry(
     );
 }
 
-pub(crate) fn load_extensions_with_register(
+pub(crate) fn load_extensions_with_register<T: Into<Option<Duration>>>(
     dirs: &[PathBuf],
     deps: HostDeps,
-    request_timeout: Duration,
+    request_timeout: T,
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
     register_instance: impl FnMut(Box<dyn ExtensionInstance>, &str, &Path),
@@ -517,10 +521,10 @@ pub(crate) fn load_extensions_with_register(
     );
 }
 
-pub(crate) fn load_extensions_with_register_cancellable(
+pub(crate) fn load_extensions_with_register_cancellable<T: Into<Option<Duration>>>(
     dirs: &[PathBuf],
     deps: HostDeps,
-    request_timeout: Duration,
+    request_timeout: T,
     disabled: &[String],
     init_configs: &ExtensionInitConfigMap,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
@@ -1069,6 +1073,22 @@ activation = "lazy"
     use super::super::timeout_test_support::{assert_timeout_after, timeout_manifest};
 
     #[test]
+    fn discovery_preserves_absent_and_explicit_extension_request_budgets() {
+        let absent = super::ExtensionRequestTimeouts::with_lint(None, None);
+        assert_eq!(absent.for_extension("ast"), None);
+        assert_eq!(absent.for_extension("lint"), None);
+
+        let host = Duration::from_secs(17);
+        let lint = Duration::from_secs(23);
+        let configured = super::ExtensionRequestTimeouts::with_lint(Some(host), Some(lint));
+        assert_eq!(configured.for_extension("ast"), Some(host));
+        assert_eq!(configured.for_extension("lint"), Some(lint));
+
+        let inherited_lint = super::ExtensionRequestTimeouts::default_only(Some(host));
+        assert_eq!(inherited_lint.for_extension("lint"), Some(host));
+    }
+
+    #[test]
     fn lint_deadline_override_reaches_eager_and_lazy_instances() {
         let deadline = Duration::from_millis(300);
         for activation in ["eager", "lazy"] {
@@ -1572,10 +1592,18 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"t
             );
             if activation == "lazy" {
                 registry
-                    .invoke("lsp_lazy_probe", serde_json::json!({}))
+                    .invoke(
+                        "lsp_lazy_probe",
+                        serde_json::json!({}),
+                        &crate::domain::NeverCancelled,
+                    )
                     .expect("lazy LSP extension starts");
                 registry
-                    .invoke("other_lazy_probe", serde_json::json!({}))
+                    .invoke(
+                        "other_lazy_probe",
+                        serde_json::json!({}),
+                        &crate::domain::NeverCancelled,
+                    )
                     .expect("lazy unrelated extension starts");
             }
 

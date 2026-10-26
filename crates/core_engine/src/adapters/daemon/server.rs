@@ -61,7 +61,7 @@ struct DaemonCtx {
 
 impl DaemonCtx {
     fn snapshot(&self) -> StatusSnapshot {
-        let prepared = self.early.wait_prepared(Duration::ZERO).ok();
+        let prepared = self.early.wait_prepared(Some(Duration::ZERO)).ok();
         let indexed_files = prepared
             .as_ref()
             .map(|engine| {
@@ -233,7 +233,11 @@ pub fn run_daemon(opts: &GlobalOpts, config: TowerConfig, detach: bool) -> Resul
         WorkspaceDaemonOwner::acquire(&workspace_root).map_err(|error| error.to_string())?;
     pre_bind_test_milestone()?;
     let idle = config.daemon.idle_timeout();
-    let failure_grace = config.daemon.connection_timeout();
+    const FAILURE_CLEANUP_GRACE: Duration = Duration::from_secs(10);
+    let failure_grace = config
+        .daemon
+        .connection_timeout()
+        .unwrap_or(FAILURE_CLEANUP_GRACE);
 
     let sock = socket_path(&workspace_root);
 
@@ -347,6 +351,20 @@ pub fn run_daemon(opts: &GlobalOpts, config: TowerConfig, detach: bool) -> Resul
             tokio::time::sleep(failure_grace).await;
         };
         tokio::pin!(failure_shutdown);
+        let preparation_expiry = async {
+            let Some(timeout) = early.preparation_timeout() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            tokio::time::sleep(timeout).await;
+            // The daemon is usable once the workspace engine is published;
+            // extension-family catch-up may legitimately continue afterward
+            // under its own supervision budget.
+            if early.prepared_if_available().is_some() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(preparation_expiry);
         let mut connections = tokio::task::JoinSet::new();
         let result = loop {
             tokio::select! {
@@ -361,6 +379,9 @@ pub fn run_daemon(opts: &GlobalOpts, config: TowerConfig, detach: bool) -> Resul
                 }
                 () = &mut failure_shutdown => {
                     break Err("workspace preparation failed".to_owned());
+                }
+                () = &mut preparation_expiry => {
+                    break Err("workspace preparation timed out".to_owned());
                 }
                 () = shutdown.wait() => {
                     eprintln!("tower: daemon shutting down");

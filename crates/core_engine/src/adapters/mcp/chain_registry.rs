@@ -34,9 +34,14 @@ impl ToolRegistry for ChainRegistry {
         self.inner.iter().flat_map(|r| r.list()).collect()
     }
 
-    fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ToolError> {
         for reg in &mut self.inner {
-            match reg.call(name, args.clone()) {
+            match reg.call(name, args.clone(), cancellation) {
                 Err(ToolError::NotFound(_)) => continue,
                 other => return other,
             }
@@ -91,7 +96,9 @@ mod tests {
             state,
             Arc::new(InMemoryCodeIntel::new()),
         ))]);
-        let err = chain.call("nope", json!({})).unwrap_err();
+        let err = chain
+            .call("nope", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
         assert!(matches!(
             err,
             crate::adapters::mcp::types::ToolError::NotFound(_)

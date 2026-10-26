@@ -65,9 +65,6 @@ use extension_protocol::ExtensionManifest;
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
 type FormatterEchoSet = Arc<Mutex<HashMap<String, ()>>>;
 const BUNDLED_DEBUG_MANIFEST: &str = include_str!("../../../../../extensions/debug/extension.toml");
-/// Smallest valid sidecar diagnostics timeout when LSP has no active language mapping.
-/// The value satisfies the initialization schema without consuming a derived request budget.
-const INACTIVE_LSP_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub enum PreparationError {
     Cancelled,
@@ -207,7 +204,7 @@ pub struct EarlyDaemonContext {
     opts: Mutex<Option<GlobalOpts>>,
     config: Mutex<Option<TowerConfig>>,
     shared: Arc<PreparationShared>,
-    preparation_timeout: Duration,
+    preparation_timeout: Option<Duration>,
     dependency_policy: Arc<ExtensionDependencyPolicy>,
 }
 
@@ -220,7 +217,7 @@ impl EarlyDaemonContext {
         self.instrumentation.snapshot()
     }
 
-    pub fn preparation_timeout(&self) -> Duration {
+    pub fn preparation_timeout(&self) -> Option<Duration> {
         self.preparation_timeout
     }
 
@@ -256,7 +253,7 @@ impl EarlyDaemonContext {
 
     pub fn wait_prepared(
         &self,
-        deadline: Duration,
+        deadline: Option<Duration>,
     ) -> Result<Arc<PreparedEngine>, ReadinessWaitError> {
         self.readiness
             .wait_until_ready(CapabilityDependency::Workspace, deadline)?;
@@ -274,50 +271,49 @@ impl EarlyDaemonContext {
 
     pub fn wait_preparation_complete(
         &self,
-        deadline: Duration,
+        deadline: Option<Duration>,
     ) -> Result<Arc<PreparedEngine>, ReadinessWaitError> {
-        let complete = self
-            .shared
-            .complete
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let (complete, timeout) = self
-            .shared
-            .changed
-            .wait_timeout_while(complete, deadline, |complete| !*complete)
-            .unwrap_or_else(|poison| poison.into_inner());
-        if !*complete && timeout.timed_out() {
-            return Err(ReadinessWaitError::Timeout {
-                dependency: CapabilityDependency::Workspace,
-                phase: StartupPhase::ExtensionsDiscovering,
-            });
-        }
-        drop(complete);
-        self.wait_prepared(Duration::ZERO)
+        self.wait_for_completion(&self.shared.complete, &self.shared.changed, deadline)?;
+        self.wait_prepared(Some(Duration::ZERO))
     }
 
     pub fn wait_extension_inventory(
         &self,
-        deadline: Duration,
+        deadline: Option<Duration>,
     ) -> Result<Arc<PreparedEngine>, ReadinessWaitError> {
-        let complete = self
-            .shared
-            .inventory_complete
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let (complete, timeout) = self
-            .shared
-            .inventory_changed
-            .wait_timeout_while(complete, deadline, |complete| !*complete)
-            .unwrap_or_else(|poison| poison.into_inner());
-        if !*complete && timeout.timed_out() {
+        self.wait_for_completion(
+            &self.shared.inventory_complete,
+            &self.shared.inventory_changed,
+            deadline,
+        )?;
+        self.wait_prepared(Some(Duration::ZERO))
+    }
+
+    fn wait_for_completion(
+        &self,
+        complete: &Mutex<bool>,
+        changed: &Condvar,
+        deadline: Option<Duration>,
+    ) -> Result<(), ReadinessWaitError> {
+        let complete = complete.lock().unwrap_or_else(|poison| poison.into_inner());
+        let timed_out = if let Some(deadline) = deadline {
+            let (complete, timeout) = changed
+                .wait_timeout_while(complete, deadline, |complete| !*complete)
+                .unwrap_or_else(|poison| poison.into_inner());
+            !*complete && timeout.timed_out()
+        } else {
+            let complete = changed
+                .wait_while(complete, |complete| !*complete)
+                .unwrap_or_else(|poison| poison.into_inner());
+            !*complete
+        };
+        if timed_out {
             return Err(ReadinessWaitError::Timeout {
                 dependency: CapabilityDependency::Workspace,
                 phase: StartupPhase::ExtensionsDiscovering,
             });
         }
-        drop(complete);
-        self.wait_prepared(Duration::ZERO)
+        Ok(())
     }
 
     pub fn release_prepared(&self) {
@@ -936,15 +932,18 @@ fn drive_extension_catch_up(
                         Ok(count) => (count, None),
                         Err((count, fault)) => (count, Some(fault)),
                     };
-                let deadline = Instant::now() + config.extensions.request_timeout();
+                let deadline = config
+                    .extensions
+                    .request_timeout()
+                    .map(|timeout| Instant::now() + timeout);
                 while failure.is_none() {
                     if cancellation.cancelled.load(Ordering::Acquire) {
                         failure = Some(CatchUpFailure::protocol(id.clone(), CatchUpError::Cancelled { extension_id: id.clone() }));
                         break;
                     }
                     let response = registry.read().unwrap_or_else(|p| p.into_inner())
-                        .invoke_extension(&id, "_tower_catch_up_fence", serde_json::json!({"epoch": 1, "delivered_events": delivered_events}));
-                    match classify_runtime_fence(&id, response, delivered_events, Instant::now() >= deadline) {
+                        .invoke_extension(&id, "_tower_catch_up_fence", serde_json::json!({"epoch": 1, "delivered_events": delivered_events}), &crate::domain::NeverCancelled);
+                    match classify_runtime_fence(&id, response, delivered_events, deadline.is_some_and(|deadline| Instant::now() >= deadline)) {
                         Ok(true) => break,
                         Ok(false) => std::thread::park_timeout(Duration::from_millis(10)),
                         Err(class) => failure = Some(class),
@@ -1000,10 +999,27 @@ fn classify_runtime_fence(
                 },
             ));
         }
+        Err(InvokeError::Cancelled) => {
+            return Err(CatchUpFailure::protocol(
+                id.clone(),
+                CatchUpError::FenceMismatch {
+                    extension_id: id.clone(),
+                },
+            ));
+        }
     };
     classify_fence_response(Ok(value), target, expired).map_err(|class| {
         if class == StartupFailureClass::ExtensionTimeout {
-            CatchUpFailure::delivery(id.clone(), &ExtensionFault::Timeout)
+            CatchUpFailure::delivery(
+                id.clone(),
+                &ExtensionFault::Timeout {
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "catch_up".into(),
+                        layer: "daemon".into(),
+                        budget_ms: 0,
+                    },
+                },
+            )
         } else {
             CatchUpFailure::protocol(
                 id.clone(),
@@ -1046,7 +1062,9 @@ fn classify_fence_response(
 
 fn catch_up_failure_class(error: Option<&InvokeError>) -> StartupFailureClass {
     match error {
-        Some(InvokeError::Fault(ExtensionFault::Timeout)) => StartupFailureClass::ExtensionTimeout,
+        Some(InvokeError::Fault(ExtensionFault::Timeout { .. })) => {
+            StartupFailureClass::ExtensionTimeout
+        }
         Some(InvokeError::Fault(ExtensionFault::Crashed { .. })) => {
             StartupFailureClass::ExtensionCrash
         }
@@ -1054,6 +1072,7 @@ fn catch_up_failure_class(error: Option<&InvokeError>) -> StartupFailureClass {
             ExtensionFault::ProtocolError { .. } | ExtensionFault::Quarantined,
         ))
         | Some(InvokeError::Application(_) | InvokeError::ToolNotFound(_))
+        | Some(InvokeError::Cancelled)
         | None => StartupFailureClass::ExtensionProtocol,
     }
 }
@@ -1263,9 +1282,10 @@ impl ExtensionHostPort for SharedExtensionHost {
         &self,
         tool_name: &str,
         params: serde_json::Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
     ) -> Result<serde_json::Value, crate::domain::InvokeError> {
         let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
-        guard.invoke(tool_name, params)
+        guard.invoke(tool_name, params, cancellation)
     }
 
     fn invoke_extension(
@@ -1273,9 +1293,10 @@ impl ExtensionHostPort for SharedExtensionHost {
         extension_id: &crate::domain::ExtensionId,
         tool_name: &str,
         params: serde_json::Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
     ) -> Result<serde_json::Value, crate::domain::InvokeError> {
         let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
-        guard.invoke_extension(extension_id, tool_name, params)
+        guard.invoke_extension(extension_id, tool_name, params, cancellation)
     }
 }
 
@@ -1646,10 +1667,7 @@ fn extension_init_configs(
     } else if !lsp_disabled {
         init_configs.insert(
             "lsp".to_owned(),
-            lsp_initialize_payload_with_diagnostics_timeout(
-                &tower_config.lsp,
-                INACTIVE_LSP_DIAGNOSTICS_TIMEOUT,
-            ),
+            lsp_initialize_payload_with_diagnostics_timeout(&tower_config.lsp, None),
         );
     }
     if let Some(debug_config) = tower_config.debug.for_extension_initialize() {
@@ -1661,7 +1679,7 @@ fn extension_init_configs(
 fn register_bundled_debug_extension(
     ext_registry: &Arc<RwLock<ExtensionRegistry>>,
     ext_deps: ExtensionHostDeps,
-    request_timeout: std::time::Duration,
+    request_timeout: Option<std::time::Duration>,
     tower_config: &TowerConfig,
 ) -> Result<(), String> {
     if tower_config.debug.is_empty()
@@ -2031,7 +2049,7 @@ mod tests {
                 idle_timeout: Some(std::time::Duration::from_secs(45)),
             },
             extensions: crate::adapters::config::ExtensionConfig {
-                request_timeout_secs: 5,
+                request_timeout_secs: Some(5),
                 initialize: BTreeMap::from([(
                     "other".to_owned(),
                     serde_json::Map::from_iter([("preserved".to_owned(), serde_json::json!(true))]),
@@ -2063,24 +2081,29 @@ mod tests {
         );
         assert_eq!(
             tower_config.extensions.request_timeout(),
-            Duration::from_secs(5)
+            Some(Duration::from_secs(5))
         );
         let supervision_timeouts =
             crate::adapters::extension::discovery::ExtensionRequestTimeouts::with_lint(
-                tower_config.extensions.request_timeout(),
+                tower_config
+                    .extensions
+                    .request_timeout()
+                    .expect("configured extension timeout"),
                 tower_config
                     .lint_request_timeout()
-                    .expect("valid unrelated lint timeout"),
+                    .expect("valid unrelated lint timeout")
+                    .expect("configured lint supervision timeout"),
             );
         assert_eq!(
             supervision_timeouts.for_extension("other"),
-            Duration::from_secs(5)
+            Some(Duration::from_secs(5))
         );
     }
 
     #[test]
     fn non_lsp_configurations_preserve_small_global_deadlines() {
-        for request_timeout_secs in [0, 1] {
+        {
+            let request_timeout_secs = 1;
             let workspace = TempDir::new().expect("create empty-LSP workspace");
             let config_dir = workspace.path().join(".tower");
             std::fs::create_dir_all(&config_dir).expect("create config directory");
@@ -2097,14 +2120,14 @@ mod tests {
             let init_configs = extension_init_configs(&config).expect("empty LSP is exempt");
             assert_eq!(
                 config.extensions.request_timeout(),
-                Duration::from_secs(request_timeout_secs)
+                Some(Duration::from_secs(request_timeout_secs))
             );
             assert_eq!(
                 init_configs.get("lsp"),
                 Some(&serde_json::json!({
                     "servers": {},
                     "idle_timeout_secs": null,
-                    "diagnostics_timeout_secs": 1,
+                    "diagnostics_timeout_secs": null,
                 }))
             );
             assert_eq!(
@@ -2131,7 +2154,7 @@ mod tests {
                 extension_init_configs(&disabled_config).expect("disabled LSP is exempt");
             assert_eq!(
                 disabled_config.extensions.request_timeout(),
-                Duration::from_secs(request_timeout_secs)
+                Some(Duration::from_secs(request_timeout_secs))
             );
             assert!(
                 !disabled_init_configs.contains_key("lsp"),
@@ -2190,7 +2213,7 @@ mod tests {
                     idle_timeout: None,
                 },
                 extensions: crate::adapters::config::ExtensionConfig {
-                    request_timeout_secs,
+                    request_timeout_secs: Some(request_timeout_secs),
                     ..crate::adapters::config::ExtensionConfig::default()
                 },
                 ..TowerConfig::default()
@@ -2261,7 +2284,7 @@ mod tests {
                 idle_timeout: None,
             },
             extensions: crate::adapters::config::ExtensionConfig {
-                request_timeout_secs: 3,
+                request_timeout_secs: Some(3),
                 ..crate::adapters::config::ExtensionConfig::default()
             },
             ..TowerConfig::default()
@@ -2278,7 +2301,11 @@ mod tests {
                 .ext_registry
                 .read()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .invoke("diagnostics", serde_json::json!({"path": "src/lib.rs"}))
+                .invoke(
+                    "diagnostics",
+                    serde_json::json!({"path": "src/lib.rs"}),
+                    &crate::domain::NeverCancelled,
+                )
                 .expect_err("fixture must report a diagnostics timeout");
             let InvokeError::Application(application) = error else {
                 panic!("diagnostics timeout must be an application error, not a transport fault");
@@ -2321,8 +2348,8 @@ target = "append"
         let lint = tower_config
             .lint_request_timeout()
             .expect("valid lint deadline must be derived by daemon assembly");
-        assert_eq!(global, Duration::from_secs(1));
-        assert_eq!(lint, Duration::from_secs(5));
+        assert_eq!(global, Some(Duration::from_secs(1)));
+        assert_eq!(lint, Some(Duration::from_secs(5)));
 
         let extensions = TempDir::new().expect("create extension fixture root");
         write_extension_manifest(extensions.path(), "lint", &timeout_manifest("lint", "lazy"));
@@ -2336,7 +2363,10 @@ target = "append"
         crate::adapters::extension::discovery::load_extensions_with_register_cancellable_with_timeouts(
             &[extensions.path().to_path_buf()],
             extension_host_deps(),
-            crate::adapters::extension::discovery::ExtensionRequestTimeouts::with_lint(global, lint),
+            crate::adapters::extension::discovery::ExtensionRequestTimeouts::with_lint(
+                global.expect("configured global timeout"),
+                lint.expect("configured lint timeout"),
+            ),
             &[],
             &crate::adapters::extension::ExtensionInitConfigMap::new(),
             None,
@@ -2388,7 +2418,13 @@ mod fence_contract_tests {
         assert!(matches!(mismatch.error, CatchUpError::FenceMismatch { .. }));
         let timeout = classify_runtime_fence(
             &id,
-            Err(InvokeError::Fault(ExtensionFault::Timeout)),
+            Err(InvokeError::Fault(ExtensionFault::Timeout {
+                detail: extension_protocol::TimeoutDetail {
+                    operation: "catch_up".into(),
+                    layer: "daemon".into(),
+                    budget_ms: 0,
+                },
+            })),
             1,
             false,
         )
@@ -2412,6 +2448,7 @@ mod fence_contract_tests {
                 &mut self,
                 _: &str,
                 _: serde_json::Value,
+                _: &dyn crate::domain::CancellationSignal,
             ) -> Result<serde_json::Value, crate::domain::extension_host::ExtensionCallError>
             {
                 panic!("registration must not invoke tools")
@@ -2514,6 +2551,7 @@ schema_json = '{}'
             .call(
                 "tower_create_file",
                 json!({"path":"host.rs","content":"before"}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         let (mut extension, delivery) = {
@@ -2560,7 +2598,7 @@ schema_json = '{}'
         assert_eq!(publisher.capture_cut().unwrap().sequence, 2);
         assert_eq!(
             extension
-                .call_tool("query", json!({}))
+                .call_tool("query", json!({}), &crate::domain::NeverCancelled)
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -2615,6 +2653,7 @@ schema_json = '{}'
             .call(
                 "tower_create_file",
                 json!({"path":"mcp.rs","content":"first"}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         std::fs::write(root.path().join("watcher.rs"), "watcher").unwrap();
@@ -2635,16 +2674,24 @@ schema_json = '{}'
             })
             .unwrap();
         assert_eq!(result.files_changed, 1);
-        native.call("tower_reindex", json!({})).unwrap();
         native
-            .call("tower_delete_file", json!({"path":"watcher.rs"}))
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
+        native
+            .call(
+                "tower_delete_file",
+                json!({"path":"watcher.rs"}),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let target = {
             let _commit = publisher.commit_lock();
             delivery.cut()
         };
         assert_eq!(target.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(5));
-        let events = extension.call_tool("query", json!({})).unwrap();
+        let events = extension
+            .call_tool("query", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         let paths: Vec<_> = events
             .as_array()
             .unwrap()
@@ -2694,7 +2741,13 @@ schema_json = '{}'
 
     #[test]
     fn catch_up_failures_preserve_timeout_crash_and_protocol_classes() {
-        let timeout = InvokeError::Fault(ExtensionFault::Timeout);
+        let timeout = InvokeError::Fault(ExtensionFault::Timeout {
+            detail: extension_protocol::TimeoutDetail {
+                operation: "catch_up".into(),
+                layer: "daemon".into(),
+                budget_ms: 0,
+            },
+        });
         let crashed = InvokeError::Fault(ExtensionFault::Crashed { code: Some(17) });
         assert_eq!(
             catch_up_failure_class(Some(&timeout)),

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
-use extension_protocol::{ExtensionFault, ExtensionManifest};
+use extension_protocol::{ExtensionFault, ExtensionManifest, ToolDecl};
 use serde_json::json;
 
 use super::host_deps::{HostDeps, UnsupportedApplyEditsHost};
@@ -93,9 +93,171 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"type":"Ack"}}'
     }
 }
 
+fn request_gate_manifest(marker: &std::path::Path, release: &std::path::Path) -> ExtensionManifest {
+    let script = r#"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[],"events":[],"capabilities":[]}}}'
+read -r invoke
+: > "$1"
+while [ ! -e "$2" ]; do sleep 0.01; done
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"ToolResult","data":{"released":true}}}'
+read -r shutdown
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"type":"Ack"}}'
+"#;
+    ExtensionManifest {
+        name: "request_gate".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "request-gate".to_owned(),
+            marker.display().to_string(),
+            release.display().to_string(),
+        ],
+        activation: Activation::Eager,
+        tools: vec![ToolDecl {
+            name: "run".to_owned(),
+            description: "release-gated request".to_owned(),
+            schema_json: "{}".to_owned(),
+        }],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection::default(),
+    }
+}
+
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture did not reach the request gate"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // AC1 — Timeout: hang-forever fixture killed within REQUEST_TIMEOUT
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn unlimited_sidecar_request_completes_after_fixture_release() {
+    let workspace = tempfile::tempdir().expect("create fixture directory");
+    let marker = workspace.path().join("request-started");
+    let release = workspace.path().join("release");
+    let manifest = request_gate_manifest(&marker, &release);
+    let mut adapter = SidecarHostAdapter::spawn(manifest, make_deps(), None, None)
+        .expect("an unlimited sidecar must initialize");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let request = std::thread::spawn(move || {
+        let result = adapter.call_tool("run", json!({}), &crate::domain::NeverCancelled);
+        tx.send(result).expect("return request result");
+        adapter.shutdown();
+    });
+
+    wait_for_file(&marker);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "an absent budget must keep the request pending until the fixture releases it"
+    );
+    std::fs::write(&release, "release").expect("release fixture request");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("released request completes")
+            .expect("released request succeeds"),
+        json!({"released": true})
+    );
+    request.join().expect("request thread joins");
+}
+
+#[test]
+fn configured_sidecar_timeout_reports_operation_layer_and_budget() {
+    let workspace = tempfile::tempdir().expect("create fixture directory");
+    let marker = workspace.path().join("request-started");
+    let release = workspace.path().join("never-release");
+    let manifest = request_gate_manifest(&marker, &release);
+    let mut adapter = SidecarHostAdapter::spawn(
+        manifest,
+        make_deps(),
+        Some(Duration::from_millis(125)),
+        None,
+    )
+    .expect("fixture initializes within the configured budget");
+
+    let error = adapter
+        .call_tool("run", json!({}), &crate::domain::NeverCancelled)
+        .expect_err("the release-gated request must expire");
+    assert_eq!(
+        error,
+        ExtensionCallError::Fault(ExtensionFault::Timeout {
+            detail: extension_protocol::TimeoutDetail {
+                operation: "invokeTool".to_owned(),
+                layer: "host".to_owned(),
+                budget_ms: 125,
+            },
+        })
+    );
+}
+
+#[test]
+fn configured_sidecar_timeout_does_not_quarantine_a_healthy_restart() {
+    let workspace = tempfile::tempdir().expect("create fixture directory");
+    let attempts = workspace.path().join("attempts");
+    let script = r#"
+attempt=0
+if [ -e "$1" ]; then attempt=$(cat "$1"); fi
+attempt=$((attempt + 1))
+printf '%s' "$attempt" > "$1"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[],"events":[],"capabilities":[]}}}'
+read -r invoke
+if [ "$attempt" -eq 1 ]; then
+  while :; do sleep 1; done
+fi
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"ToolResult","data":{"restarted":true}}}'
+read -r shutdown
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"type":"Ack"}}'
+"#;
+    let mut manifest = make_manifest("sh");
+    manifest.command = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script.to_owned(),
+        "timeout-then-recover".to_owned(),
+        attempts.display().to_string(),
+    ];
+    manifest.tools.push(ToolDecl {
+        name: "run".to_owned(),
+        description: "timeout then recover".to_owned(),
+        schema_json: "{}".to_owned(),
+    });
+    let supervisor = ExtensionSupervisor::new(
+        manifest,
+        make_deps(),
+        Some(Duration::from_millis(125)),
+        None,
+    );
+    let mut registry = crate::domain::extension_host::ExtensionRegistry::new();
+    registry
+        .register(Box::new(supervisor))
+        .expect("register supervised sidecar");
+
+    assert!(matches!(
+        registry.invoke("run", json!({}), &crate::domain::NeverCancelled),
+        Err(crate::domain::extension_host::InvokeError::Fault(
+            ExtensionFault::Timeout { .. }
+        ))
+    ));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        registry
+            .invoke("run", json!({}), &crate::domain::NeverCancelled)
+            .expect("the same registry routes to the healthy restart"),
+        json!({"restarted": true})
+    );
+}
 
 /// AC1: Given a `hang-forever` fixture, When spawned (initialize hangs),
 /// Then `spawn` returns `Timeout` within the deadline; the calling thread survives.
@@ -113,7 +275,7 @@ fn ac1_initialize_timeout_returns_fault_host_survives() {
     assert!(result.is_err(), "hang-forever must return a fault");
     let fault = result.err().expect("just checked is_err()");
     assert!(
-        matches!(fault, ExtensionFault::Timeout),
+        matches!(fault, ExtensionFault::Timeout { .. }),
         "must be Timeout, got: {fault:?}"
     );
     // The test thread is still alive — host survived (U2 / AC5).
@@ -130,10 +292,13 @@ fn ac1_supervisor_timeout_returns_fault() {
     let mut sup = ExtensionSupervisor::new(manifest, make_deps(), short, None);
 
     // call_tool returns Result<Value, ExtensionCallError>; Value: Debug.
-    let result = sup.call_tool("run", json!({}));
+    let result = sup.call_tool("run", json!({}), &crate::domain::NeverCancelled);
     let fault = result.expect_err("hang-forever call_tool must fault");
     assert!(
-        matches!(fault, ExtensionCallError::Fault(ExtensionFault::Timeout)),
+        matches!(
+            fault,
+            ExtensionCallError::Fault(ExtensionFault::Timeout { .. })
+        ),
         "supervisor must surface Timeout, got: {fault:?}"
     );
 }
@@ -145,7 +310,7 @@ fn ac1_supervisor_timeout_returns_fault() {
 /// AC2a: Given `crash-on-init`, When `spawn` is called, Then it returns
 /// `ExtensionFault::Crashed` (exit during initialize handshake).
 #[test]
-fn ac2_crash_on_init_spawn_returns_crashed() {
+fn sidecar_initialization_exit_returns_crash() {
     let bin = fixture_bin("fixture_crash_on_init");
     let manifest = make_manifest(&bin);
 
@@ -162,7 +327,7 @@ fn ac2_crash_on_init_spawn_returns_crashed() {
 /// AC2b: Given `exit-nonzero` (crashes after init during invokeTool), When
 /// `call_tool` is called, Then it returns `ExtensionFault::Crashed`.
 #[test]
-fn ac2_exit_nonzero_call_tool_returns_crashed() {
+fn sidecar_nonzero_tool_exit_returns_crash() {
     let bin = fixture_bin("fixture_exit_nonzero");
     let manifest = make_manifest(&bin);
 
@@ -172,7 +337,7 @@ fn ac2_exit_nonzero_call_tool_returns_crashed() {
 
     // The fixture exits(42) when it receives invokeTool.
     // call_tool returns Result<Value, ExtensionCallError>; Value: Debug.
-    let result = instance.call_tool("run", json!({}));
+    let result = instance.call_tool("run", json!({}), &crate::domain::NeverCancelled);
     let fault = result.expect_err("exit-nonzero call_tool must fault");
     assert!(
         matches!(
@@ -188,7 +353,7 @@ fn ac2_exit_nonzero_call_tool_returns_crashed() {
 /// fault (the fixture always crashes). The supervisor enters Backoff and does NOT
 /// block the caller.
 #[test]
-fn ac2_supervisor_respawns_lazily_after_crash() {
+fn supervisor_returns_crash_during_restart_backoff() {
     let bin = fixture_bin("fixture_exit_nonzero");
     let manifest = make_manifest(&bin);
     let timeout = Duration::from_secs(5);
@@ -197,7 +362,7 @@ fn ac2_supervisor_respawns_lazily_after_crash() {
 
     // First call: spawn succeeds, call_tool crashes → Crashed.
     let fault1 = sup
-        .call_tool("run", json!({}))
+        .call_tool("run", json!({}), &crate::domain::NeverCancelled)
         .expect_err("first call must fault");
     assert!(
         matches!(
@@ -209,7 +374,7 @@ fn ac2_supervisor_respawns_lazily_after_crash() {
 
     // Second call immediately: backoff not elapsed → still Crashed but host alive.
     let fault2 = sup
-        .call_tool("run", json!({}))
+        .call_tool("run", json!({}), &crate::domain::NeverCancelled)
         .expect_err("second call must fault (in backoff)");
     assert!(
         matches!(
@@ -228,7 +393,7 @@ fn ac2_supervisor_respawns_lazily_after_crash() {
 /// AC3: Given `garbage-frames`, When `call_tool` is called, Then the host
 /// returns `ProtocolError`; no panic.
 #[test]
-fn ac3_garbage_frames_returns_protocol_error() {
+fn malformed_sidecar_frames_return_protocol_error_or_crash() {
     let bin = fixture_bin("fixture_garbage_frames");
     let manifest = make_manifest(&bin);
 
@@ -237,7 +402,7 @@ fn ac3_garbage_frames_returns_protocol_error() {
             .unwrap_or_else(|e| panic!("garbage_frames must initialize successfully, got: {e:?}"));
 
     // call_tool returns Result<Value, ExtensionFault>; Value: Debug.
-    let result = instance.call_tool("run", json!({}));
+    let result = instance.call_tool("run", json!({}), &crate::domain::NeverCancelled);
     let fault = result.expect_err("garbage-frames call_tool must fault");
     assert!(
         matches!(
@@ -260,7 +425,7 @@ fn ac3_supervisor_garbage_frames_reports_fault() {
 
     let mut sup = ExtensionSupervisor::new(manifest, make_deps(), Duration::from_secs(5), None);
 
-    let result = sup.call_tool("run", json!({}));
+    let result = sup.call_tool("run", json!({}), &crate::domain::NeverCancelled);
 
     assert!(
         result.is_err(),
@@ -283,7 +448,7 @@ fn f008_application_supervisor_passes_through_without_restart_and_allows_absent_
         ExtensionSupervisor::new(manifest, make_deps(), Duration::from_secs(5), None);
 
     let error = supervisor
-        .call_tool("rename", json!({}))
+        .call_tool("rename", json!({}), &crate::domain::NeverCancelled)
         .expect_err("the fixture's first call must be rejected");
     assert_eq!(
         error,
@@ -295,7 +460,7 @@ fn f008_application_supervisor_passes_through_without_restart_and_allows_absent_
     );
 
     let result = supervisor
-        .call_tool("rename", json!({}))
+        .call_tool("rename", json!({}), &crate::domain::NeverCancelled)
         .expect("an application error must leave the live sidecar available");
     assert_eq!(result, json!({"same_process": true}));
     supervisor.shutdown();
@@ -308,7 +473,7 @@ fn f008_application_true_fault_control_enters_supervision_backoff() {
         ExtensionSupervisor::new(manifest, make_deps(), Duration::from_secs(5), None);
 
     let first = supervisor
-        .call_tool("run", json!({}))
+        .call_tool("run", json!({}), &crate::domain::NeverCancelled)
         .expect_err("process exit must be a genuine fault");
     assert!(matches!(
         first,
@@ -316,7 +481,7 @@ fn f008_application_true_fault_control_enters_supervision_backoff() {
     ));
 
     let second = supervisor
-        .call_tool("run", json!({}))
+        .call_tool("run", json!({}), &crate::domain::NeverCancelled)
         .expect_err("the immediate retry must observe supervision backoff");
     assert!(matches!(
         second,
@@ -332,9 +497,15 @@ fn f008_application_true_fault_control_enters_supervision_backoff() {
     );
     assert_eq!(
         timeout_supervisor
-            .call_tool("run", json!({}))
+            .call_tool("run", json!({}), &crate::domain::NeverCancelled)
             .expect_err("a supervision deadline must remain a genuine fault"),
-        ExtensionCallError::Fault(ExtensionFault::Timeout)
+        ExtensionCallError::Fault(ExtensionFault::Timeout {
+            detail: extension_protocol::TimeoutDetail {
+                operation: "initialize".into(),
+                layer: "host".into(),
+                budget_ms: 300,
+            },
+        })
     );
 }
 
@@ -359,7 +530,7 @@ fn ac4_supervisor_never_generates_quarantined_fault() {
         let wait_ms = 200u64.saturating_mul(1u64.checked_shl(i.min(4)).unwrap_or(u64::MAX));
         std::thread::sleep(Duration::from_millis(wait_ms));
 
-        let result = sup.call_tool("run", json!({}));
+        let result = sup.call_tool("run", json!({}), &crate::domain::NeverCancelled);
         match result {
             Err(ExtensionCallError::Fault(ExtensionFault::Quarantined)) => {
                 panic!("supervisor must never emit Quarantined — that is the registry (call {i})");
@@ -418,7 +589,11 @@ fn ac5_misbehaving_ext_does_not_affect_cooperative_ext() {
                 panic!("test_helper must still spawn after crash-on-init fault; got: {e:?}")
             });
 
-    let result = helper.call_tool("echo", json!({"ping": "pong"}));
+    let result = helper.call_tool(
+        "echo",
+        json!({"ping": "pong"}),
+        &crate::domain::NeverCancelled,
+    );
     assert!(
         result.is_ok(),
         "test_helper must respond after crash-on-init fault; got: {result:?}"

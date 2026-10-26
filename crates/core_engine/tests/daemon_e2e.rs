@@ -32,8 +32,8 @@ fn config_with_idle(secs: u64) -> TowerConfig {
     TowerConfig {
         daemon: DaemonConfig {
             idle_timeout_secs: secs,
-            connection_timeout_secs: 10,
-            preparation_timeout_secs: 10,
+            connection_timeout_secs: Some(10),
+            preparation_timeout_secs: Some(10),
         },
         ..Default::default()
     }
@@ -413,7 +413,7 @@ fn spawn_daemon_at_preparation_barrier_with_config(
     std::fs::create_dir_all(workspace.join(".tower")).unwrap();
     std::fs::write(
         workspace.join(".tower/config.toml"),
-        format!("[daemon]\nidle_timeout_secs = 300\nconnection_timeout_secs = 2\npreparation_timeout_secs = 2\n{extra_config}"),
+        format!("[daemon]\nidle_timeout_secs = 300\n{extra_config}"),
     )
     .unwrap();
     let mut child = Command::new(binary)
@@ -827,6 +827,169 @@ fn canonical_configuration_drives_formatter_and_rejects_legacy_before_spawn() {
     let binary = selected_production_binary();
     assert_legacy_formatter_scenarios_rejected(&binary);
     assert_canonical_formatter_execution(&binary);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tower_fmt_format_without_configured_timeout_completes_real_formatter_and_publishes_result()
+{
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let workspace = tempdir().expect("create formatter workspace");
+    let tower_dir = workspace.path().join(".tower");
+    fs::create_dir_all(&tower_dir).expect("create tower directory");
+    install_formatter_extension(workspace.path());
+    let source = workspace.path().join("source.txt");
+    let marker = workspace.path().join("formatter-started");
+    let release = workspace.path().join("formatter-release");
+    let formatter = workspace.path().join("release-gated-formatter.sh");
+    fs::write(&source, "unformatted\n").expect("seed formatter input");
+    fs::write(
+        &formatter,
+        "#!/bin/sh\nprintf started > \"$1\"\nwhile [ ! -e \"$2\" ]; do :; done\ncat >/dev/null\nprintf 'formatted\\n'\n",
+    )
+    .expect("write release-gated formatter");
+    fs::set_permissions(&formatter, fs::Permissions::from_mode(0o755))
+        .expect("make formatter executable");
+    fs::write(
+        tower_dir.join("config.toml"),
+        format!(
+            "[daemon]\nidle_timeout_secs = 300\n\
+             [formatter.tools.fixture]\nargv = [{:?}, {:?}, {:?}]\nextensions = [\"txt\"]\n",
+            formatter.to_string_lossy(),
+            marker.to_string_lossy(),
+            release.to_string_lossy(),
+        ),
+    )
+    .expect("write formatter configuration without timeout");
+
+    let binary = selected_production_binary();
+    let daemon = Command::new(&binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace.path())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn production daemon");
+    let mut daemon = ProductionDaemonGuard::new(daemon, &binary, workspace.path());
+    let mut connection = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
+        .await
+        .expect("production daemon binds its public socket");
+    connection
+        .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+        .await
+        .expect("send MCP handshake");
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"formatter-timeout","version":"1"}}}"#,
+    )
+    .await
+    .expect("send MCP initialize");
+    read_line_capped(&mut connection, 1 << 20)
+        .await
+        .expect("read MCP initialize")
+        .expect("MCP initialize response");
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await
+    .expect("send initialized notification");
+
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let raw_status = read_raw_control_status(workspace.path()).await;
+        let status: Value = serde_json::from_str(&raw_status).expect("parse daemon status");
+        let formatter_ready = status["extensions"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "format"));
+        if status["workspace"]["state"] == "ready" && formatter_ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "daemon and formatter extension did not become ready: {raw_status}"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tower_fmt_format","arguments":{"path":"source.txt"}}}"#,
+    )
+    .await
+    .expect("enqueue formatting through public MCP");
+    let acknowledgement: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .expect("read formatter acknowledgement")
+            .expect("formatter acknowledgement frame"),
+    )
+    .expect("parse formatter acknowledgement");
+    assert!(acknowledgement["result"].is_object());
+
+    let marker_deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < marker_deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        marker.exists(),
+        "real formatter did not reach its release gate; acknowledgement: {acknowledgement}"
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"unformatted\n");
+    fs::write(&release, b"release").expect("release real formatter");
+
+    let completion_deadline = Instant::now() + Duration::from_secs(5);
+    let mut request_id = 3_u64;
+    loop {
+        write_line(
+            &mut connection,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{request_id},"method":"tools/call","params":{{"name":"tower_read_file","arguments":{{"path":"source.txt"}}}}}}"#
+            ),
+        )
+        .await
+        .expect("poll formatted bytes through public MCP");
+        let response: Value = serde_json::from_str(
+            &read_line_capped(&mut connection, 1 << 20)
+                .await
+                .expect("read tower_read_file response")
+                .expect("tower_read_file response frame"),
+        )
+        .expect("parse tower_read_file response");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
+        if payload.as_ref().and_then(|value| value["content"].as_str()) == Some("formatted\n") {
+            break;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "formatter output was not published through tower_read_file: {response}"
+        );
+        request_id += 1;
+        tokio::task::yield_now().await;
+    }
+
+    drop(connection);
+    let shutdown = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+    assert!(
+        shutdown.is_ok(),
+        "shutdown production formatter daemon: {shutdown:?}"
+    );
+    assert!(daemon.wait_and_disarm().success());
 }
 
 fn formatter_workspace_with_launch_sentinels() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -1381,7 +1544,7 @@ async fn daemon_self_terminates_after_idle() {
 }
 
 #[tokio::test]
-async fn mcp_client_connect_or_spawn_then_initialize() {
+async fn connect_or_spawn_without_configured_budget_initializes() {
     use core_engine::adapters::daemon::client::connect_or_spawn;
     use core_engine::adapters::daemon::wire::{ClientRole, Handshake};
 
@@ -1427,13 +1590,11 @@ async fn mcp_client_connect_or_spawn_then_initialize() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn daemon_lint_default_timeout_precedes_small_global_deadline() {
-    for explicit_timeout in [None, Some(2_u64)] {
-        let payload = daemon_lint_timeout_payload(explicit_timeout).await;
-        assert_eq!(payload["error"]["code"], "lint_timeout");
-        assert_eq!(payload["supported"], false);
-        assert_eq!(payload["diagnostics"], json!([]));
-    }
+async fn daemon_lint_explicit_timeout_precedes_small_global_deadline() {
+    let payload = daemon_lint_timeout_payload(Some(2)).await;
+    assert_eq!(payload["error"]["code"], "lint_timeout");
+    assert_eq!(payload["supported"], false);
+    assert_eq!(payload["diagnostics"], json!([]));
 }
 
 #[cfg(unix)]
@@ -1673,7 +1834,7 @@ async fn first_client_disconnect_preserves_single_daemon_owner() {
 }
 
 #[tokio::test]
-async fn dead_owner_allows_clean_restart() {
+async fn connect_or_spawn_recovers_after_owner_exit_with_unlimited_budget() {
     use core_engine::adapters::daemon::client::connect_or_spawn;
     use core_engine::adapters::daemon::socket::{OwnerLiveness, probe_owner};
 
@@ -1740,6 +1901,44 @@ async fn dead_owner_allows_clean_restart() {
         ControlRequest::Shutdown,
     )
     .await;
+}
+
+#[tokio::test]
+async fn connect_or_spawn_reports_spawned_owner_exit_with_unlimited_budget() {
+    use core_engine::adapters::daemon::client::connect_or_spawn;
+
+    let workspace = tempdir().expect("create failed-startup workspace");
+    let tower_dir = workspace.path().join(".tower");
+    std::fs::create_dir_all(&tower_dir).expect("create tower directory");
+    std::fs::write(
+        tower_dir.join("config.toml"),
+        "[daemon]\nidle_timeout_secs = 300\n",
+    )
+    .expect("write valid unlimited daemon config");
+    let owner = WorkspaceDaemonOwner::acquire(workspace.path())
+        .expect("hold ownership so the spawned daemon exits before binding");
+    core_engine::adapters::daemon::client::register_test_daemon_exe(std::path::Path::new(env!(
+        "CARGO_BIN_EXE_tower"
+    )));
+
+    let connection = connect_or_spawn(workspace.path());
+    tokio::pin!(connection);
+    tokio::select! {
+        result = &mut connection => panic!("connection completed while the live owner was still blocked: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
+    drop(owner);
+    let result = tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("spawned owner exit must be observed without a configured connection deadline");
+    let error = result.expect_err("failed daemon startup must be reported");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(
+        error
+            .to_string()
+            .contains("exited before publishing its socket"),
+        "unexpected startup failure: {error}"
+    );
 }
 
 #[tokio::test]
@@ -3962,7 +4161,7 @@ async fn startup_failure_is_observable_and_restartable() {
     fs::write(workspace.path().join(".tower/db"), "not a directory").unwrap();
     let root = workspace.path().to_path_buf();
     let mut config = config_with_idle(300);
-    config.daemon.connection_timeout_secs = 1;
+    config.daemon.connection_timeout_secs = Some(1);
     let daemon = tokio::task::spawn_blocking(move || {
         run_daemon(
             &GlobalOpts {
@@ -4027,6 +4226,102 @@ async fn startup_failure_is_observable_and_restartable() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn configured_preparation_expiry_cleans_up_and_allows_same_workspace_recovery() {
+    struct DaemonGuard(Option<Child>);
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let workspace = tempdir().expect("create preparation-expiry workspace");
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut failed = DaemonGuard(Some(spawn_daemon_at_preparation_barrier_with_config(
+        &hooks,
+        workspace.path(),
+        "before-reconciliation-commit",
+        "preparation_timeout_secs = 1\n",
+    )));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let failure = loop {
+        let child = failed.0.as_mut().expect("failed daemon remains guarded");
+        if let Some(status) = child.try_wait().expect("poll preparation-expiry daemon") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "configured preparation deadline must terminate the blocked generation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        !failure.success(),
+        "preparation expiry is a startup failure, not a healthy shutdown: {failure}"
+    );
+    failed.0 = None;
+    assert!(
+        !socket_path(workspace.path()).exists(),
+        "expired preparation releases the public socket before recovery"
+    );
+    WorkspaceDaemonOwner::acquire(workspace.path())
+        .expect("expired preparation releases workspace ownership");
+
+    spawn_daemon_thread(workspace.path().to_path_buf(), config_with_idle(1));
+    let recovered = read_raw_control_status(workspace.path()).await;
+    assert!(
+        recovered.contains("generation"),
+        "a fresh generation serves control after preparation-expiry cleanup: {recovered}"
+    );
+    let _ = core_engine::adapters::daemon::client::send_control_async(
+        &GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        },
+        ControlRequest::Shutdown,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn healthy_unlimited_preparation_outlives_failure_cleanup_grace() {
+    struct DaemonGuard(Child);
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let workspace = tempdir().expect("create unlimited-preparation workspace");
+    let hooks = selected_binary("TOWER_TEST_BIN");
+    let mut daemon = DaemonGuard(spawn_daemon_at_preparation_barrier_with_config(
+        &hooks,
+        workspace.path(),
+        "before-reconciliation-commit",
+        "",
+    ));
+
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert!(
+        daemon
+            .0
+            .try_wait()
+            .expect("poll healthy pending preparation")
+            .is_none(),
+        "the post-failure cleanup grace must not terminate a healthy unlimited preparation"
+    );
+    assert!(
+        socket_path(workspace.path()).exists(),
+        "healthy unlimited preparation retains its public transport"
+    );
+    release_preparation_barrier(&mut daemon.0);
 }
 
 #[tokio::test]
@@ -4140,6 +4435,11 @@ async fn tower_lsp_diagnostics_returns_fixture_results_through_the_daemon() {
             "command": workspace_root().join("target/debug/fixture_lsp_server"),
             "operation": "diagnostics",
             "path": "src/timeout.rs",
+            "timeout": {
+                "operation": "diagnostics",
+                "layer": "lsp",
+                "budget_ms": 2000,
+            },
             "phase": "runtime",
             "message": "language server request failed",
         }),

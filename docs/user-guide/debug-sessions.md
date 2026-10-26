@@ -25,8 +25,15 @@ idle_ttl_secs = 300
 ```
 
 `command` and `adapter_type` must be non-empty. `extensions` must contain extension names without a
-leading dot. `default_timeout_secs` and `idle_ttl_secs` must be positive integers. A malformed debug
-section fails startup so a client does not see a half-configured debugger.
+leading dot. `default_timeout_secs` is optional and, when present, must be a positive integer;
+omitting it leaves debug operations without a Tower-controlled duration limit. `idle_ttl_secs` remains
+a separate positive lifecycle setting. A malformed debug section fails startup so a client does not
+see a half-configured debugger.
+
+Each operation uses one budget resolved from its request override or the adapter default. Launch and
+replay share that budget across initialization, launch, breakpoint configuration and initial stack
+collection; each stage receives only the remaining time. Timeout details report the original applied
+budget. If startup expires, Tower cleans up the adapter without registering a partial session.
 
 Build the workspace so `debug_extension` is available next to `tower`, or install a compatible
 `debug` extension in an extension scope, then restart `tower`. The debug tools appear as

@@ -87,8 +87,8 @@ enum RespawnState {
 ///
 /// # Fault propagation
 ///
-/// - `Timeout` and `Crashed` are re-emitted to the caller (so the registry
-///   can count them toward the quarantine threshold).
+/// - `Timeout` and `Crashed` are re-emitted to the caller. The registry counts
+///   crashes, but configured timeout expiry is not a quarantine strike.
 /// - `ProtocolError` is re-emitted as-is (counts as a fault in the registry).
 /// - `Quarantined` is never generated here; that is the registry's decision.
 ///
@@ -128,7 +128,7 @@ pub struct ExtensionSupervisor {
     /// Port dependencies — cloned for each respawn attempt.
     deps: HostDeps,
     /// Per-request wall-clock deadline forwarded to the adapter.
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
     /// Optional host-provided configuration sent during extension initialize.
     extension_config: Option<Value>,
     /// Live adapter instance, `None` when the child has crashed/timed-out.
@@ -153,12 +153,15 @@ impl ExtensionSupervisor {
     /// Create a new supervisor. The child is **not** spawned yet — spawning is
     /// lazy: the first `call_tool` or `deliver_event` triggers it.
     #[must_use]
-    pub fn new(
+    pub fn new<T>(
         mut manifest: ExtensionManifest,
         deps: HostDeps,
-        request_timeout: Duration,
+        request_timeout: T,
         extension_config: Option<Value>,
-    ) -> Self {
+    ) -> Self
+    where
+        T: Into<Option<Duration>>,
+    {
         let rr_enabled = extension_config
             .as_ref()
             .and_then(|config| config.pointer("/record/backend"))
@@ -168,7 +171,7 @@ impl ExtensionSupervisor {
         Self {
             manifest,
             deps,
-            request_timeout,
+            request_timeout: request_timeout.into(),
             extension_config,
             instance: None,
             respawn_state: RespawnState::Ready,
@@ -251,18 +254,32 @@ impl ExtensionInstance for ExtensionSupervisor {
         &self.manifest
     }
 
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError> {
+    fn call_tool(
+        &mut self,
+        name: &str,
+        params: Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ExtensionCallError> {
+        if cancellation.is_cancelled() {
+            return Err(ExtensionCallError::Cancelled);
+        }
         self.ensure_instance().map_err(ExtensionCallError::Fault)?;
 
         let result = self
             .instance
             .as_mut()
             .expect("ensure_instance succeeded")
-            .call_tool(name, params);
+            .call_tool(name, params, cancellation);
 
         match &result {
             Ok(_) => self.record_success(),
             Err(ExtensionCallError::Application(_)) => {}
+            Err(ExtensionCallError::Cancelled) => {
+                // Cancellation reaps the in-flight child, so discard that dead
+                // adapter without counting a supervision fault or backoff.
+                self.instance = None;
+                self.respawn_state = RespawnState::Ready;
+            }
             Err(ExtensionCallError::Fault(_)) => self.record_fault(),
         }
         result

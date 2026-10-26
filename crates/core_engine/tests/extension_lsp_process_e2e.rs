@@ -1089,13 +1089,14 @@ fn fake_lsp_workspace(mode: &str) -> tempfile::TempDir {
         r#"
 [lsp.rust]
 command = {command}
-args = [{mode}, {log}, {pids}]
+args = [{mode}, {log}, {pids}, {release}]
 extensions = ["rs"]
 "#,
         command = serde_json::to_string(&fixture_lsp_server::binary_path()).unwrap(),
         mode = serde_json::to_string(mode).unwrap(),
         log = serde_json::to_string(&workspace.path().join(".tower/fake_lsp.log")).unwrap(),
         pids = serde_json::to_string(&workspace.path().join(".tower/fake_lsp.pids")).unwrap(),
+        release = serde_json::to_string(&workspace.path().join(".tower/fake_lsp.release")).unwrap(),
     );
     fs::write(workspace.path().join(".tower/config.toml"), config).expect("write lsp config");
 
@@ -1263,13 +1264,17 @@ fn diagnostics_follow_the_servers_advertised_push_or_pull_capability() {
                     "error": {
                         "code": -32000,
                         "message": "language server request failed",
-                        "data": {"outcome": {
+                        "data": {"diagnostics": [], "outcome": {
                             "status": "error",
                             "code": expected_error.expect("failure case must name its outcome"),
                             "language": "rust",
                             "command": fixture_lsp_server::binary_path().to_str(),
                             "operation": "diagnostics",
                             "path": "src/lib.rs",
+                            "timeout": expected_timeout_detail(
+                                expected_error.expect("failure case must name its outcome"),
+                                "diagnostics",
+                            ),
                             "phase": "runtime",
                             "message": "language server request failed",
                         }}
@@ -1571,6 +1576,19 @@ fn diagnostics_send_did_open_then_did_change_with_current_content() {
     );
 }
 
+fn expected_timeout_detail(outcome_code: &str, operation: &str) -> serde_json::Value {
+    if outcome_code == "server_timeout" {
+        let budget_ms = 2_000;
+        serde_json::json!({
+            "operation": operation,
+            "layer": "lsp",
+            "budget_ms": budget_ms,
+        })
+    } else {
+        serde_json::Value::Null
+    }
+}
+
 fn expected_diagnostics_error(id: u64, outcome_code: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -1578,13 +1596,14 @@ fn expected_diagnostics_error(id: u64, outcome_code: &str) -> serde_json::Value 
         "error": {
             "code": -32000,
             "message": "language server request failed",
-            "data": {"outcome": {
+            "data": {"diagnostics": [], "outcome": {
                 "status": "error",
                 "code": outcome_code,
                 "language": "rust",
                 "command": fixture_lsp_server::binary_path().to_str(),
                 "operation": "diagnostics",
                 "path": "src/lib.rs",
+                "timeout": expected_timeout_detail(outcome_code, "diagnostics"),
                 "phase": "runtime",
                 "message": "language server request failed",
             }}
@@ -1609,6 +1628,121 @@ fn absent_diagnostics_publication_returns_a_structured_timeout() {
     let trace = read_trace(&workspace);
     assert!(trace.iter().any(|entry| entry["event"] == "didOpen"));
     assert!(trace.iter().all(|entry| entry["event"] != "published"));
+}
+
+#[test]
+fn diagnostics_public_tool_supports_unlimited_and_configured_waits() {
+    let unlimited_workspace = fake_lsp_workspace("diagnostics_released");
+    let release = unlimited_workspace.path().join(".tower/fake_lsp.release");
+    let mut unlimited = RawLspChild::spawn_with_workspace(Some(unlimited_workspace.path()));
+    unlimited.initialize_config["diagnostics_timeout_secs"] = serde_json::Value::Null;
+    initialize_raw_lsp_child_bounded(&mut unlimited);
+
+    let response = std::thread::scope(|scope| {
+        let request = scope.spawn(|| {
+            invoke_configured_read_tool(
+                &mut unlimited,
+                483,
+                "diagnostics",
+                serde_json::json!({"path": "src/lib.rs"}),
+            )
+        });
+        for _ in 0..200 {
+            if read_trace(&unlimited_workspace)
+                .iter()
+                .any(|entry| entry["event"] == "didOpen")
+            {
+                fs::write(&release, "release").expect("release unlimited diagnostics request");
+                return request.join().expect("unlimited diagnostics request joins");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(&release, "release").expect("release fixture during teardown");
+        let _ = request.join();
+        panic!("unlimited diagnostics request did not reach its release gate")
+    });
+    assert_eq!(response["result"]["data"]["supported"], true);
+    assert_eq!(
+        response["result"]["data"]["diagnostics"][0]["message"],
+        "released diagnostic"
+    );
+
+    let configured_workspace = fake_lsp_workspace("diagnostics_push_absent");
+    let mut configured = RawLspChild::spawn_with_workspace(Some(configured_workspace.path()));
+    configured.initialize_config["diagnostics_timeout_secs"] = serde_json::json!(1);
+    initialize_raw_lsp_child_bounded(&mut configured);
+    let timeout = invoke_configured_read_tool(
+        &mut configured,
+        484,
+        "diagnostics",
+        serde_json::json!({"path": "src/lib.rs"}),
+    );
+    assert_eq!(
+        timeout["error"]["data"]["outcome"]["code"],
+        "server_timeout"
+    );
+    assert_eq!(
+        timeout["error"]["data"]["outcome"]["timeout"],
+        serde_json::json!({"operation": "diagnostics", "layer": "lsp", "budget_ms": 1_000})
+    );
+}
+
+#[test]
+fn diagnostics_with_configured_timeout_preserves_best_published_result() {
+    for (id, mode, expected_diagnostics) in [
+        (
+            485,
+            "diagnostics_push_once",
+            serde_json::json!([{"message": "fixture syntax error"}]),
+        ),
+        (486, "diagnostics_push_absent", serde_json::json!([])),
+    ] {
+        let workspace = fake_lsp_workspace(mode);
+        let mut child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        child.initialize_config["diagnostics_timeout_secs"] = serde_json::json!(1);
+        initialize_raw_lsp_child_bounded(&mut child);
+
+        if mode == "diagnostics_push_once" {
+            let published = invoke_configured_read_tool(
+                &mut child,
+                id - 100,
+                "diagnostics",
+                serde_json::json!({"path": "src/lib.rs"}),
+            );
+            assert_eq!(
+                published["result"]["data"]["diagnostics"][0]["message"],
+                "fixture syntax error"
+            );
+            fs::write(workspace.path().join("src/lib.rs"), "fn changed() {}\n")
+                .expect("change document before the timeout probe");
+        }
+
+        let response = invoke_configured_read_tool(
+            &mut child,
+            id,
+            "diagnostics",
+            serde_json::json!({"path": "src/lib.rs"}),
+        );
+
+        assert_eq!(
+            response["error"]["data"]["outcome"]["code"],
+            "server_timeout"
+        );
+        assert_eq!(
+            response["error"]["data"]["outcome"]["timeout"],
+            serde_json::json!({"operation": "diagnostics", "layer": "lsp", "budget_ms": 1_000})
+        );
+        let diagnostics = response["error"]["data"]["diagnostics"]
+            .as_array()
+            .expect("timeout evidence includes the best published diagnostic set");
+        assert_eq!(
+            diagnostics.len(),
+            expected_diagnostics.as_array().unwrap().len()
+        );
+        if let Some(expected) = expected_diagnostics.as_array().unwrap().first() {
+            assert_eq!(diagnostics[0]["message"], expected["message"]);
+        }
+    }
 }
 
 #[test]
@@ -1700,13 +1834,18 @@ fn diagnostics_business_timeout_keeps_the_sidecar_usable() {
             "error": {
                 "code": -32000,
                 "message": "language server request failed",
-                "data": {"outcome": {
+                        "data": {"diagnostics": [], "outcome": {
                     "status": "error",
                     "code": "server_timeout",
                     "language": "rust",
                     "command": fixture_lsp_server::binary_path().to_str(),
                     "operation": "diagnostics",
                     "path": "src/lib.rs",
+                    "timeout": {
+                        "operation": "diagnostics",
+                        "layer": "lsp",
+                        "budget_ms": 2_000,
+                    },
                     "phase": "runtime",
                     "message": "language server request failed",
                 }}
@@ -1813,7 +1952,7 @@ fn invoke_type_hierarchy(
 
 fn read_trace(workspace: &tempfile::TempDir) -> Vec<serde_json::Value> {
     fs::read_to_string(workspace.path().join(".tower/fake_lsp.log.trace"))
-        .expect("read exact fake LSP trace")
+        .unwrap_or_default()
         .lines()
         .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
         .collect()
@@ -1960,6 +2099,7 @@ fn unsupported_read_envelope(
             "command": null,
             "operation": name,
             "path": path,
+            "timeout": null,
             "phase": "runtime",
             "message": message,
         }),
@@ -2163,6 +2303,7 @@ fn f008_bare_read_diagnostics_without_pull_provider_follows_published_readiness_
                 "code": -32000,
                 "message": "language server request failed",
                 "data": {
+                    "diagnostics": [],
                     "outcome": {
                         "status": "error",
                         "code": "server_timeout",
@@ -2170,6 +2311,11 @@ fn f008_bare_read_diagnostics_without_pull_provider_follows_published_readiness_
                         "command": fixture_lsp_server::binary_path(),
                         "operation": "diagnostics",
                         "path": "src/lib.rs",
+                        "timeout": {
+                            "operation": "diagnostics",
+                            "layer": "lsp",
+                            "budget_ms": 2_000,
+                        },
                         "phase": "runtime",
                         "message": "language server request failed",
                     },
@@ -2223,6 +2369,7 @@ fn expected_lsp_outcome(code: &str, command: Option<&str>, operation: &str) -> s
         "command": command,
         "operation": operation,
         "path": "src/lib.rs",
+        "timeout": expected_timeout_detail(code, operation),
         "phase": "runtime",
         "message": "language server request failed",
     })
@@ -2358,7 +2505,7 @@ fn f008_bare_rename_failure_table_preserves_read_only_and_rename_server_failure_
         let workspace = fake_lsp_workspace(mode);
         let mut read_child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
         initialize_raw_lsp_child(&mut read_child);
-        let operation = if mode == "backend_error" {
+        let operation = if matches!(mode, "backend_error" | "server_timeout") {
             "definition"
         } else {
             "diagnostics"
@@ -2534,6 +2681,7 @@ fn f008_error_envelope_preserves_typed_and_legacy_dispatch_outcomes() {
                         "command": fixture_lsp_server::binary_path(),
                         "operation": "implementations",
                         "path": "src/lib.rs",
+                        "timeout": null,
                         "phase": "runtime",
                         "message": "language server request failed",
                     },
@@ -2664,9 +2812,7 @@ impl Drop for RawLspChild {
 // ── AC1/U1: spawn and initialize ─────────────────────────────────────────────
 
 #[test]
-fn lsp_process_initialization_requires_an_explicit_diagnostics_deadline() {
-    let mut child = RawLspChild::spawn();
-
+fn lsp_process_initialization_accepts_absent_null_and_positive_operation_timeouts() {
     for (id, extension_config) in [
         (
             31,
@@ -2674,13 +2820,11 @@ fn lsp_process_initialization_requires_an_explicit_diagnostics_deadline() {
         ),
         (
             32,
-            serde_json::json!({
-                "servers": {},
-                "idle_timeout_secs": null,
-                "diagnostics_timeout_secs": 0,
-            }),
+            serde_json::json!({"servers": {}, "idle_timeout_secs": null, "diagnostics_timeout_secs": null}),
         ),
+        (33, empty_lsp_initialize_payload()),
     ] {
+        let mut child = RawLspChild::spawn();
         child.write_frame(serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -2691,34 +2835,30 @@ fn lsp_process_initialization_requires_an_explicit_diagnostics_deadline() {
                 "extension_config": extension_config,
             },
         }));
-        assert_eq!(
-            child.read_frame(),
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32602,
-                    "message": "invalid LSP initialization configuration",
-                    "data": {
-                        "kind": "invalid_lsp_initialize_config",
-                        "reason": "invalid_configuration",
-                    },
-                },
-            })
-        );
+        let response = child.read_frame();
+        assert_eq!(response["id"], id);
+        assert_eq!(response["result"]["type"], "Initialized");
     }
 
+    let mut child = RawLspChild::spawn();
     child.write_frame(serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 33,
+        "id": 34,
         "method": "initialize",
         "params": {
             "protocol_version": extension_protocol::PROTOCOL_VERSION,
             "client_info": "lsp-e2e/0.1.0",
-            "extension_config": empty_lsp_initialize_payload(),
+            "extension_config": {
+                "servers": {},
+                "idle_timeout_secs": null,
+                "diagnostics_timeout_secs": 0,
+            },
         },
     }));
-    assert_eq!(child.read_frame()["result"]["type"], "Initialized");
+    assert_eq!(
+        child.read_frame()["error"]["data"]["reason"],
+        "invalid_configuration"
+    );
 }
 
 #[test]
@@ -3423,6 +3563,7 @@ fn type_hierarchy_invalid_and_backend_failures_use_public_error_envelopes() {
                     "command": fixture_lsp_server::binary_path(),
                     "operation": "type_hierarchy",
                     "path": "src/lib.rs",
+                    "timeout": null,
                     "phase": "runtime",
                     "message": "language server request failed"
                 }}
@@ -3574,7 +3715,11 @@ fn lsp_process_diagnostics_unsupported_when_no_lsp_configured() {
     .expect("lsp_extension must spawn");
 
     let result = adapter
-        .call_tool("diagnostics", serde_json::json!({ "path": "src/lib.rs" }))
+        .call_tool(
+            "diagnostics",
+            serde_json::json!({ "path": "src/lib.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("diagnostics must not error");
 
     // Without any LSP config, the pool does not serve .rs — returns unsupported.
@@ -3612,6 +3757,7 @@ fn f007_t015_tower_lsp_implementations_parses_lsp_implementation_request_fields(
                 "line": 3,
                 "character": 14
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("implementations request with path, line, and character must parse");
 
@@ -3649,6 +3795,7 @@ fn f007_t015_tower_lsp_implementations_returns_unsupported_result_for_unsupporte
                 "line": 0,
                 "character": 0
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("unsupported implementations lookup must return a result, not a sidecar error");
 
@@ -4545,7 +4692,11 @@ fn lsp_process_concurrent_spawn_stress_20_parallel() {
 
                 // Call a tool that completes without a real LSP.
                 let result = adapter
-                    .call_tool("diagnostics", serde_json::json!({ "path": "src/main.rs" }))
+                    .call_tool(
+                        "diagnostics",
+                        serde_json::json!({ "path": "src/main.rs" }),
+                        &core_engine::domain::NeverCancelled,
+                    )
                     .unwrap_or_else(|e| panic!("call_tool #{i} failed: {e:?}"));
 
                 // Verify the result is sane (supported=false — no LSP configured).

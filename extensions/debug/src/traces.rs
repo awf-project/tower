@@ -72,7 +72,7 @@ pub struct TracePolicy {
     pub trace_root: PathBuf,
     pub ttl_secs: Option<u64>,
     pub max_traces: usize,
-    pub record_timeout_secs: u64,
+    pub record_timeout_secs: Option<u64>,
 }
 
 impl TracePolicy {
@@ -87,7 +87,7 @@ impl TracePolicy {
             trace_root,
             ttl_secs: config.ttl_secs,
             max_traces: config.max_traces.unwrap_or(20),
-            record_timeout_secs: config.record_timeout_secs.unwrap_or(60),
+            record_timeout_secs: config.record_timeout_secs,
         })
     }
 }
@@ -606,7 +606,7 @@ mod tests {
             trace_root,
             ttl_secs: None,
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         }
     }
 
@@ -709,22 +709,22 @@ mod tests {
             trace_root: PathBuf::from(".tower/traces"),
             ttl_secs: Some(86_400),
             max_traces: 25,
-            record_timeout_secs: 30,
+            record_timeout_secs: Some(30),
         };
 
         assert_eq!(policy.trace_root, PathBuf::from(".tower/traces"));
         assert_eq!(policy.ttl_secs, Some(86_400));
         assert_eq!(policy.max_traces, 25);
-        assert_eq!(policy.record_timeout_secs, 30);
+        assert_eq!(policy.record_timeout_secs, Some(30));
     }
 
     #[test]
-    fn traces_trace_policy_from_record_config_normalizes_defaults_and_configured_values() {
+    fn trace_policy_preserves_absent_and_explicit_record_timeout() {
         let defaults = TracePolicy::from_record_config(&record_config()).expect("default policy");
         assert_eq!(defaults.trace_root, PathBuf::from(".tower/traces"));
         assert_eq!(defaults.ttl_secs, None);
         assert_eq!(defaults.max_traces, 20);
-        assert_eq!(defaults.record_timeout_secs, 60);
+        assert_eq!(defaults.record_timeout_secs, None);
 
         let configured = TracePolicy::from_record_config(&DebugRecordConfig {
             backend: "rr".to_owned(),
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(configured.trace_root, PathBuf::from("debug/traces"));
         assert_eq!(configured.ttl_secs, Some(86_400));
         assert_eq!(configured.max_traces, 25);
-        assert_eq!(configured.record_timeout_secs, 30);
+        assert_eq!(configured.record_timeout_secs, Some(30));
     }
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
             trace_root: root.clone(),
             ttl_secs: Some(60),
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let allocation = store
             .allocate_trace("target/debug/probe", 100)
@@ -1016,7 +1016,7 @@ mod tests {
             trace_root: root,
             ttl_secs: None,
             max_traces: 2,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let oldest = register_trace(&mut store, "target/debug/probe-oldest", 100);
         let newer = register_trace(&mut store, "target/debug/probe-newer", 110);
@@ -1043,7 +1043,7 @@ mod tests {
             trace_root: root,
             ttl_secs: Some(10),
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let expired = register_trace(&mut store, "target/debug/probe-expired", 100);
         let retained = register_trace(&mut store, "target/debug/probe-retained", 115);
@@ -1101,7 +1101,7 @@ mod tests {
             trace_root: root,
             ttl_secs: Some(10),
             max_traces: 2,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let expired = register_trace(&mut store, "target/debug/probe-expired", 100);
         let overflow = register_trace(&mut store, "target/debug/probe-overflow", 120);
@@ -1130,7 +1130,7 @@ mod tests {
             trace_root: root,
             ttl_secs: Some(1),
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let invalid = TraceId::new("../escaped").expect_err("invalid ids are structured errors");
         assert_eq!(
@@ -1265,7 +1265,7 @@ mod tests {
             trace_root: root.clone(),
             ttl_secs: Some(1),
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let trace_id = TraceId::new("root").expect("valid trace id");
         let mut metadata = metadata(trace_id.as_str(), &root, 100);
@@ -1330,7 +1330,7 @@ mod tests {
             trace_root: root,
             ttl_secs: Some(1),
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         });
         let mut metadata = metadata(trace_id.as_str(), &symlink_path, 100);
         metadata.expires_unix_secs = Some(101);

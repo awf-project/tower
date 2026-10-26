@@ -28,6 +28,7 @@ pub(crate) struct CatchUpFailure {
     pub extension_id: ExtensionId,
     pub error: CatchUpError,
     pub failure_class: super::lifecycle::StartupFailureClass,
+    timeout_detail: Option<Box<extension_protocol::TimeoutDetail>>,
 }
 impl CatchUpFailure {
     pub fn protocol(extension_id: ExtensionId, error: CatchUpError) -> Self {
@@ -40,16 +41,25 @@ impl CatchUpFailure {
             extension_id,
             error,
             failure_class,
+            timeout_detail: None,
         }
     }
     pub fn delivery(extension_id: ExtensionId, fault: &extension_protocol::ExtensionFault) -> Self {
         use super::lifecycle::StartupFailureClass;
         let failure_class = match fault {
-            extension_protocol::ExtensionFault::Timeout => StartupFailureClass::ExtensionTimeout,
+            extension_protocol::ExtensionFault::Timeout { .. } => {
+                StartupFailureClass::ExtensionTimeout
+            }
             extension_protocol::ExtensionFault::Crashed { .. } => {
                 StartupFailureClass::ExtensionCrash
             }
             _ => StartupFailureClass::ExtensionProtocol,
+        };
+        let timeout_detail = match fault {
+            extension_protocol::ExtensionFault::Timeout { detail } => {
+                Some(Box::new(detail.clone()))
+            }
+            _ => None,
         };
         Self {
             error: CatchUpError::DeliveryFailed {
@@ -57,13 +67,23 @@ impl CatchUpFailure {
             },
             extension_id,
             failure_class,
+            timeout_detail,
         }
     }
     pub fn wire_fault(&self) -> extension_protocol::ExtensionFault {
         use super::lifecycle::StartupFailureClass;
-        match self.failure_class {
-            StartupFailureClass::ExtensionTimeout => extension_protocol::ExtensionFault::Timeout,
-            StartupFailureClass::ExtensionCrash => {
+        match (&self.failure_class, &self.timeout_detail) {
+            (StartupFailureClass::ExtensionTimeout, Some(detail)) => {
+                extension_protocol::ExtensionFault::Timeout {
+                    detail: detail.as_ref().clone(),
+                }
+            }
+            (StartupFailureClass::ExtensionTimeout, None) => {
+                extension_protocol::ExtensionFault::ProtocolError {
+                    message: "extension catch-up failed".into(),
+                }
+            }
+            (StartupFailureClass::ExtensionCrash, _) => {
                 extension_protocol::ExtensionFault::Crashed { code: None }
             }
             _ => extension_protocol::ExtensionFault::ProtocolError {
@@ -324,5 +344,26 @@ impl ExtensionCatchUpCoordinator {
 
     pub fn close(&self) {
         self.state.lock().expect("catch-up state poisoned").closed = true;
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use extension_protocol::{ExtensionFault, TimeoutDetail};
+
+    #[test]
+    fn delivery_timeout_preserves_the_original_owner_operation_and_budget() {
+        let fault = ExtensionFault::Timeout {
+            detail: TimeoutDetail {
+                operation: "deliverEvent".to_owned(),
+                layer: "host".to_owned(),
+                budget_ms: 275,
+            },
+        };
+
+        let failure = CatchUpFailure::delivery(ExtensionId::new("lsp"), &fault);
+
+        assert_eq!(failure.wire_fault(), fault);
     }
 }

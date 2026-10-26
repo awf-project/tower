@@ -13,10 +13,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::TowerConfig;
 use core_engine::adapters::daemon::engine::build_engine;
+use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use core_engine::adapters::mcp::native_tools::{EXPECTED_NATIVE_TOOL_NAMES, NativeToolRegistry};
 use core_engine::adapters::mcp::registry::ToolRegistry;
+use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
 use extension_protocol::PROTOCOL_VERSION;
+use rmcp::model::{
+    CallToolRequestParams, CancelledNotification, CancelledNotificationParam, ClientRequest,
+    Request,
+};
+use rmcp::service::PeerRequestOptions;
+use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
 
 #[path = "../../../extensions/debug/src/protocol.rs"]
@@ -26,6 +35,34 @@ use debug_protocol::{
     DebugInitError, DebugInitializeConfig, DebugRecordConfig, DebugToolError, DebugToolErrorCode,
     debug_not_initialized_result, debug_tool_declarations, debug_tool_unavailable_result,
 };
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(future)
+}
+
+async fn start_mcp_server(
+    registry: ExtensionMergedRegistry,
+) -> rmcp::service::RunningService<RoleClient, ()> {
+    let handler = TowerMcpHandler::new(
+        registry,
+        Arc::new(NoOpDiagnosticsReader),
+        Arc::new(std::sync::Mutex::new(SubscriptionRegistry::new())),
+        Vec::new(),
+    );
+    let (server_transport, client_transport) = tokio::io::duplex(65_536);
+    tokio::spawn(async move {
+        if let Ok(server) = handler.serve(server_transport).await {
+            let _ = server.waiting().await;
+        }
+    });
+    ().serve(client_transport)
+        .await
+        .expect("connect rmcp client")
+}
 
 struct RawDebugChild {
     child: Child,
@@ -152,6 +189,31 @@ idle_ttl_secs = 300
 "#
     ))
     .expect("native fixture debug config must parse")
+}
+
+fn native_fixture_tower_config_without_operation_timeouts(args: &[&str]) -> TowerConfig {
+    let args = args
+        .iter()
+        .map(|arg| serde_json::to_string(arg).expect("fixture arg must serialize"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let command = serde_json::to_string(
+        fixture_debug_adapter_bin()
+            .to_str()
+            .expect("fixture path must be utf8"),
+    )
+    .expect("fixture path must serialize");
+    toml::from_str(&format!(
+        r#"
+[debug.rust]
+extensions = ["rs"]
+command = {command}
+args = [{args}]
+adapter_type = "fixture"
+idle_ttl_secs = 300
+"#
+    ))
+    .expect("native fixture debug config without operation timeouts must parse")
 }
 
 fn rr_fixture_tower_config() -> TowerConfig {
@@ -595,6 +657,7 @@ fn reverse_debug_record_trace(
         .call(
             "tower_debug_record",
             reverse_debug_record_request(token, scenario),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_record returns a structured fixture result");
     assert_eq!(record["recordable"], true, "record payload: {record}");
@@ -774,6 +837,17 @@ fn fixture_process_count(token: &str) -> usize {
         .count()
 }
 
+fn process_count_for_token(token: &str) -> usize {
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+        .expect("ps command");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(token) && !line.contains("ps -eo"))
+        .count()
+}
+
 fn assert_fixture_processes_gone(token: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -781,6 +855,21 @@ fn assert_fixture_processes_gone(token: &str) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        fixture_process_count(token),
+        0,
+        "fixture adapter process with token {token} should be cleaned up"
+    );
+}
+
+async fn assert_fixture_processes_gone_async(token: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if fixture_process_count(token) == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
         fixture_process_count(token),
@@ -847,6 +936,7 @@ fn assert_quarantine_cleans_fixture_process(token: &str) {
                 "env": {},
                 "launch_overrides": {}
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("fixture launch succeeds before quarantine");
     let session_id = launch["session_id"]
@@ -858,6 +948,7 @@ fn assert_quarantine_cleans_fixture_process(token: &str) {
         .call(
             "tower_debug_continue",
             json!({ "session_id": session_id, "thread_id": 1, "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect_err("slow continue must fault through the sidecar request timeout");
     assert!(
@@ -868,7 +959,11 @@ fn assert_quarantine_cleans_fixture_process(token: &str) {
     let mut saw_quarantined = false;
     for _ in 0..4 {
         let fault = merged
-            .call("tower_debug_sessions", json!({}))
+            .call(
+                "tower_debug_sessions",
+                json!({}),
+                &core_engine::domain::NeverCancelled,
+            )
             .expect_err("faulted debug extension must stop serving calls");
         if format!("{fault:?}").contains("Quarantined") {
             saw_quarantined = true;
@@ -1020,7 +1115,7 @@ fn extensions_debug_src_protocol_rs_defines_public_debug_protocol_dtos_and_error
     assert_eq!(parsed.languages["rust"].adapter_type, "lldb");
     assert_eq!(parsed.languages["rust"].extensions, vec!["rs"]);
     assert_eq!(parsed.languages["rust"].args, vec!["--quiet"]);
-    assert_eq!(parsed.languages["rust"].default_timeout_secs, 15);
+    assert_eq!(parsed.languages["rust"].default_timeout_secs, Some(15));
     assert_eq!(parsed.languages["rust"].idle_ttl_secs, 300);
     assert_eq!(
         parsed.languages["rust"].launch["program"],
@@ -1714,6 +1809,228 @@ fn e2e_timeout_flow_returns_within_configured_timeout_plus_500_ms_and_leaves_the
 }
 
 #[test]
+fn tower_debug_continue_without_configured_timeout_waits_for_fixture_stop() {
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
+    };
+    let handle = build_engine(
+        &opts,
+        native_fixture_tower_config_without_operation_timeouts(&["--continue-event-delay-ms=100"]),
+    )
+    .expect("engine builds without operation timeouts");
+    let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+    let launch = merged
+        .call(
+            "tower_debug_launch",
+            json!({
+                "language": "rust",
+                "program": "fixture-program",
+                "cwd": null,
+                "args": [],
+                "env": {},
+                "launch_overrides": {}
+            }),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("launch succeeds without a timeout");
+
+    let stop = merged
+        .call(
+            "tower_debug_continue",
+            json!({ "session_id": launch["session_id"], "thread_id": 1 }),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("unlimited continue waits for the fixture stop");
+
+    assert_eq!(stop["state"], "stopped", "continue payload: {stop}");
+    assert_eq!(stop["timed_out"], false, "continue payload: {stop}");
+}
+
+#[test]
+fn tower_debug_continue_configured_timeout_reports_operation_layer_budget_and_session_remains_controllable()
+ {
+    let workspace = tempfile::tempdir().expect("create temp workspace");
+    fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: Some(workspace.path().join(".tower/extensions")),
+    };
+    let handle = build_engine(
+        &opts,
+        native_fixture_tower_config(&["--continue-delay-ms=2000"], 5),
+    )
+    .expect("engine builds with configured operation timeout");
+    let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+    let launch = merged
+        .call(
+            "tower_debug_launch",
+            json!({
+                "language": "rust",
+                "program": "fixture-program",
+                "cwd": null,
+                "args": [],
+                "env": {},
+                "launch_overrides": {}
+            }),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("fixture launch succeeds");
+    let session_id = launch["session_id"].clone();
+
+    let timed_out = merged
+        .call(
+            "tower_debug_continue",
+            json!({ "session_id": session_id, "thread_id": 1, "timeout_secs": 1 }),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("configured expiry is a structured stop");
+
+    assert_eq!(
+        timed_out,
+        json!({
+            "state": "running",
+            "reason": "timeout",
+            "thread_id": null,
+            "top_frame": null,
+            "hit_breakpoint_ids": [],
+            "timed_out": true,
+            "error": {
+                "code": "debug-timeout",
+                "message": "debug operation timed out",
+                "data": {
+                    "operation": "continue",
+                    "layer": "dap",
+                    "budget_ms": 1000
+                }
+            },
+            "output_since": []
+        })
+    );
+    let paused = merged
+        .call(
+            "tower_debug_pause",
+            json!({ "session_id": session_id, "thread_id": 1 }),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("session remains controllable after expiry");
+    assert_eq!(paused["state"], "stopped", "pause payload: {paused}");
+}
+
+#[test]
+fn tower_debug_cancel_reaps_fixture_process_tree_and_next_launch_recovers() {
+    block_on(async {
+        let token = format!("debug-cancel-{}", std::process::id());
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: Some(workspace.path().join(".tower/extensions")),
+        };
+        let handle = build_engine(
+            &opts,
+            native_fixture_tower_config(&["--token", &token, "--continue-delay-ms=5000"], 30),
+        )
+        .expect("engine builds with cancellable fixture");
+        let client = start_mcp_server(ExtensionMergedRegistry::new(
+            Arc::clone(&handle.state),
+            handle.ext_registry,
+        ))
+        .await;
+        let launch_args = json!({
+            "language": "rust",
+            "program": "fixture-program",
+            "cwd": null,
+            "args": [],
+            "env": {},
+            "launch_overrides": {}
+        });
+        let launch = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("tower_debug_launch")
+                    .with_arguments(launch_args.as_object().expect("launch args object").clone()),
+            )
+            .await
+            .expect("initial launch protocol call succeeds");
+        assert_eq!(launch.is_error, Some(false), "launch result: {launch:?}");
+        let launch: Value = serde_json::from_str(
+            launch.content[0]
+                .raw
+                .as_text()
+                .expect("launch must return text JSON")
+                .text
+                .as_str(),
+        )
+        .expect("launch result JSON");
+        let continue_args = json!({ "session_id": launch["session_id"], "thread_id": 1 });
+        let request = ClientRequest::CallToolRequest(Request::new(
+            CallToolRequestParams::new("tower_debug_continue").with_arguments(
+                continue_args
+                    .as_object()
+                    .expect("continue args object")
+                    .clone(),
+            ),
+        ));
+        let pending = client
+            .peer()
+            .send_request_with_option(request, PeerRequestOptions::no_options())
+            .await
+            .expect("start cancellable public MCP request");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture_process_count(&token) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture must be alive before cancellation");
+        let cancellation = CancelledNotification::new(CancelledNotificationParam {
+            request_id: pending.id.clone(),
+            reason: Some("test cancellation".to_owned()),
+        });
+        client
+            .peer()
+            .send_notification(cancellation.into())
+            .await
+            .expect("send rmcp cancellation notification");
+        let cancelled = tokio::time::timeout(Duration::from_secs(3), pending.await_response())
+            .await
+            .expect("cancelled public request must resolve");
+        assert!(
+            matches!(
+                cancelled,
+                Err(rmcp::ServiceError::Cancelled { ref reason })
+                    if reason.as_deref() == Some("test cancellation")
+            ),
+            "rmcp must surface cancellation with its request-token reason: {cancelled:?}"
+        );
+        assert_fixture_processes_gone_async(&token).await;
+
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.peer().call_tool(
+                CallToolRequestParams::new("tower_debug_launch")
+                    .with_arguments(launch_args.as_object().expect("launch args object").clone()),
+            ),
+        )
+        .await
+        .expect("cancelled adapter must be reaped before the next launch")
+        .expect("recovery launch protocol call succeeds");
+        assert_eq!(
+            recovered.is_error,
+            Some(false),
+            "recovery result: {recovered:?}"
+        );
+        client.cancel().await.expect("disconnect rmcp client");
+    });
+}
+
+#[test]
 fn e2e_stale_id_flow_returns_stable_session_not_found_and_running_inspection_returns_stable_not_stopped()
  {
     let mut child = RawDebugChild::spawn();
@@ -1964,6 +2281,7 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
         .call(
             "tower_debug_record",
             reverse_debug_record_request(&token, "record_ok"),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_record returns fixture-backed record result");
     assert_eq!(record["recordable"], true, "record payload: {record}");
@@ -1973,7 +2291,11 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
         .to_owned();
 
     let traces = merged
-        .call("tower_debug_traces", json!({}))
+        .call(
+            "tower_debug_traces",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("tower_debug_traces returns recorded fixture trace");
     assert!(
         traces["traces"]
@@ -1988,6 +2310,7 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
         .call(
             "tower_debug_replay",
             json!({ "trace_id": trace_id, "language": "rust", "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_replay opens fixture replay");
     assert_eq!(replay["state"], "stopped", "replay payload: {replay}");
@@ -2001,6 +2324,7 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
         .call(
             "tower_debug_reverse_continue",
             json!({ "session_id": session_id, "thread_id": 1, "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_reverse_continue returns a deterministic stop");
     assert_eq!(reverse["state"], "stopped", "reverse payload: {reverse}");
@@ -2013,6 +2337,7 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
         .call(
             "tower_debug_step_back",
             json!({ "session_id": session_id, "thread_id": 1, "granularity": "line", "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_step_back returns a deterministic line stop");
     assert_eq!(stepped["state"], "stopped", "step_back payload: {stepped}");
@@ -2025,6 +2350,7 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
         .call(
             "tower_debug_watchpoint",
             json!({ "session_id": session_id, "expression": "answer", "address": null, "kind": "write", "enabled": true }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_watchpoint sets a replay watchpoint");
     assert_eq!(watchpoint["ok"], true, "watchpoint payload: {watchpoint}");
@@ -2034,14 +2360,124 @@ fn reverse_debug_fixture_backed_e2e_covers_record_replay_reverse_continue_step_b
     );
 
     let deleted = merged
-        .call("tower_debug_delete_trace", json!({ "trace_id": trace_id }))
+        .call(
+            "tower_debug_delete_trace",
+            json!({ "trace_id": trace_id }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("tower_debug_delete_trace removes the fixture trace");
     assert_eq!(deleted["deleted"], true, "delete payload: {deleted}");
     let terminated = merged
-        .call("tower_debug_terminate", json!({ "session_id": session_id }))
+        .call(
+            "tower_debug_terminate",
+            json!({ "session_id": session_id }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("tower_debug_terminate cleans up the replay session");
     assert_eq!(terminated["ok"], true, "terminate payload: {terminated}");
     assert_fixture_processes_gone(&token);
+}
+
+#[test]
+fn tower_debug_record_without_configured_timeout_waits_for_fixture_completion() {
+    let control = tempfile::tempdir().expect("record gate directory");
+    let entered = control.path().join("entered");
+    let release = control.path().join("release");
+    let script = format!(
+        "touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; printf released",
+        entered.display(),
+        release.display()
+    );
+    let mut payload = valid_rr_debug_init_payload();
+    payload["record"]
+        .as_object_mut()
+        .expect("record config object")
+        .remove("record_timeout_secs");
+    payload["languages"]["rust"]["command"] = json!(fixture_debug_adapter_bin());
+    payload["languages"]["rust"]["adapter_type"] = json!("fixture");
+
+    let mut child = RawDebugChild::spawn();
+    initialize_debug_child(&mut child, 1, payload);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let request = json!({
+        "language": "rust",
+        "program": "/bin/sh",
+        "args": ["-c", script],
+        "cwd": null,
+        "env": {}
+    });
+    let worker = std::thread::spawn(move || {
+        let result = invoke_debug_tool(&mut child, 2, "record", request);
+        sender.send(()).expect("publish completed record");
+        (child, result)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !entered.exists() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        entered.exists(),
+        "record fixture must enter its release gate"
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "recording without a timeout must remain pending before release"
+    );
+    fs::write(&release, "release").expect("release record fixture");
+
+    let (mut child, result) = worker.join().expect("record worker joins after release");
+    assert_eq!(result["recordable"], true, "record payload: {result}");
+    let trace_id = result["trace_id"].clone();
+    let deleted = invoke_debug_tool(
+        &mut child,
+        3,
+        "delete_trace",
+        json!({ "trace_id": trace_id }),
+    );
+    assert_eq!(deleted["deleted"], true, "delete payload: {deleted}");
+    shutdown_debug_child(&mut child, 4);
+}
+
+#[test]
+fn tower_debug_record_configured_timeout_reports_operation_layer_budget_and_reaps_process_tree() {
+    let token = format!("record-policy-timeout-{}", std::process::id());
+    let mut payload = valid_rr_debug_init_payload();
+    payload["record"]["record_timeout_secs"] = json!(1);
+    payload["languages"]["rust"]["command"] = json!(fixture_debug_adapter_bin());
+    payload["languages"]["rust"]["adapter_type"] = json!("fixture");
+    let mut child = RawDebugChild::spawn();
+    initialize_debug_child(&mut child, 1, payload);
+
+    let result = invoke_debug_tool(
+        &mut child,
+        2,
+        "record",
+        json!({
+            "language": "rust",
+            "program": "/bin/sh",
+            "args": ["-c", format!("sleep 30 # {token}")],
+            "cwd": null,
+            "env": {}
+        }),
+    );
+    assert_eq!(result["error"]["code"], "record_timeout");
+    assert_eq!(result["error"]["message"], "record timed out");
+    assert_eq!(
+        result["error"]["data"],
+        json!({ "operation": "record", "layer": "subprocess", "budget_ms": 1000 })
+    );
+    assert_eq!(
+        process_count_for_token(&token),
+        0,
+        "record timeout must reap the subprocess tree before sidecar shutdown"
+    );
+    let traces = invoke_debug_tool(&mut child, 3, "traces", json!({}));
+    assert!(
+        traces["traces"].is_array(),
+        "registry remains usable: {traces}"
+    );
+    shutdown_debug_child(&mut child, 4);
 }
 
 #[test]
@@ -2063,6 +2499,7 @@ fn reverse_debug_fixture_backed_e2e_find_origin_returns_found_true_with_frame_an
                 "max_depth": 8,
                 "max_children": 8
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_find_origin returns fixture origin result");
 
@@ -2106,6 +2543,7 @@ fn reverse_debug_fixture_backed_e2e_find_origin_returns_found_false_with_reason_
                 "max_depth": 8,
                 "max_children": 8
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("tower_debug_find_origin returns fixture no-prior-write result");
 
@@ -2153,6 +2591,7 @@ fn reverse_debug_fixture_backed_e2e_record_and_find_origin_success_and_recording
                         "max_children": 8
                     }
                 }),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("tower_debug_record_and_find_origin returns fixture result");
 
@@ -2204,6 +2643,7 @@ fn reverse_debug_cleanup_token_assertions_prove_record_and_replay_process_trees_
                     "max_children": 4
                 }
             }),
+            &core_engine::domain::NeverCancelled,
         );
         assert!(
             result.is_ok(),
@@ -2258,6 +2698,7 @@ fn reverse_debug_gated_real_rr_native_fixture_records_and_replays_tiny_program_w
                 "env": {},
                 "timeout_ms": 30_000
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("real rr native fixture record returns structured result");
     assert_eq!(record["recordable"], true, "record payload: {record}");
@@ -2273,6 +2714,7 @@ fn reverse_debug_gated_real_rr_native_fixture_records_and_replays_tiny_program_w
         .call(
             "tower_debug_replay",
             json!({ "trace_id": trace_id, "language": "rust", "timeout_secs": 5 }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("real-rr gated fixture replay opens");
     assert_eq!(replay["state"], "stopped", "replay payload: {replay}");
@@ -2396,7 +2838,11 @@ fn mcp_registry_exposes_debug_tools_as_extension_contributed_runtime_capabilitie
     }
 
     let initial_sessions = merged
-        .call("tower_debug_sessions", json!({}))
+        .call(
+            "tower_debug_sessions",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("debug sessions tool returns structured runtime state");
     assert_eq!(
         initial_sessions["sessions"].as_array().map(Vec::len),
@@ -2415,6 +2861,7 @@ fn mcp_registry_exposes_debug_tools_as_extension_contributed_runtime_capabilitie
                 "env": {},
                 "launch_overrides": {}
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("debug launch works through the merged MCP registry");
     let session_id = launch["session_id"]
@@ -2424,7 +2871,11 @@ fn mcp_registry_exposes_debug_tools_as_extension_contributed_runtime_capabilitie
     assert_eq!(launch["state"], "stopped");
 
     let sessions = merged
-        .call("tower_debug_sessions", json!({}))
+        .call(
+            "tower_debug_sessions",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("launched session is visible through MCP sessions tool");
     assert!(
         sessions["sessions"]
@@ -2436,7 +2887,11 @@ fn mcp_registry_exposes_debug_tools_as_extension_contributed_runtime_capabilitie
     );
 
     let terminated = merged
-        .call("tower_debug_terminate", json!({ "session_id": session_id }))
+        .call(
+            "tower_debug_terminate",
+            json!({ "session_id": session_id }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("debug terminate works through the merged MCP registry");
     assert_eq!(terminated["ok"], true);
 }
@@ -2528,7 +2983,11 @@ fn eval_at_fixture_hit_returns_stack_output_expression_and_no_session_id() {
     let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     let result = merged
-        .call("tower_debug_eval_at", eval_at_request(5_000))
+        .call(
+            "tower_debug_eval_at",
+            eval_at_request(5_000),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("fixture-backed eval-at hit returns a successful payload");
 
     assert_eq!(result["hit"], true, "eval-at hit payload: {result}");
@@ -2586,6 +3045,7 @@ fn eval_at_fixture_no_hit_exit_returns_successful_exited_payload_and_no_leaked_p
                 "expressions": ["answer"],
                 "timeout_ms": 5_000
             }),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("fixture-backed eval-at no-hit exit returns a successful payload");
 
@@ -2604,7 +3064,7 @@ fn eval_at_fixture_no_hit_exit_returns_successful_exited_payload_and_no_leaked_p
 }
 
 #[test]
-fn eval_at_fixture_timeout_returns_successful_timeout_payload_and_no_leaked_process() {
+fn tower_debug_eval_at_configured_timeout_reaps_internal_session_and_follow_up_probe_recovers() {
     let token = format!("eval-at-timeout-{}", std::process::id());
     let workspace = tempfile::tempdir().expect("create temp workspace");
     std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("write source");
@@ -2615,14 +3075,18 @@ fn eval_at_fixture_timeout_returns_successful_timeout_payload_and_no_leaked_proc
     };
     let handle = build_engine(
         &opts,
-        native_fixture_tower_config(&["--token", &token, "--continue-delay-ms=1500"], 5),
+        native_fixture_tower_config(&["--token", &token, "--continue-event-delay-ms=1500"], 10),
     )
     .expect("engine builds with timeout fixture debug config");
     let mut merged = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     let started = Instant::now();
     let result = merged
-        .call("tower_debug_eval_at", eval_at_request(100))
+        .call(
+            "tower_debug_eval_at",
+            eval_at_request(100),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("fixture-backed eval-at timeout returns a successful payload");
 
     assert!(
@@ -2634,11 +3098,36 @@ fn eval_at_fixture_timeout_returns_successful_timeout_payload_and_no_leaked_proc
         result["finished"], "timeout",
         "eval-at timeout payload: {result}"
     );
+    assert_eq!(result["error"]["code"], "debug-timeout");
+    assert_eq!(result["error"]["message"], "debug operation timed out");
+    assert_eq!(
+        result["error"]["data"],
+        json!({
+            "operation": "eval_at",
+            "layer": "debug_recipe",
+            "budget_ms": 100
+        })
+    );
     assert!(
         result["output"].as_array().is_some(),
         "eval-at timeout must include an output payload; got {result}"
     );
     assert_object_has_no_key_recursively(&result, "session_id");
+    assert_fixture_processes_gone(&token);
+
+    let follow_up = merged
+        .call(
+            "tower_debug_eval_at",
+            eval_at_request(5_000),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("follow-up eval-at probe should recover after timed-out probe cleanup");
+    assert_eq!(follow_up["hit"], true, "follow-up payload: {follow_up}");
+    assert_eq!(
+        follow_up["finished"], "stopped",
+        "follow-up payload: {follow_up}"
+    );
+    assert_object_has_no_key_recursively(&follow_up, "session_id");
     assert_fixture_processes_gone(&token);
 }
 
@@ -2680,7 +3169,7 @@ fn discovered_lazy_debug_manifest_gates_rr_tools_before_first_spawn() {
             );
             if !expect_rr {
                 assert!(matches!(
-                    merged.call(&name, json!({})),
+                    merged.call(&name, json!({}), &core_engine::domain::NeverCancelled),
                     Err(core_engine::adapters::mcp::types::ToolError::NotFound(_))
                 ));
             }

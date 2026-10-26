@@ -1,7 +1,7 @@
 use extension_protocol::{
     LspImplementationResult, LspOperation, LspOutcome, LspOutcomeCode, LspOutcomePhase,
-    LspOutcomeStatus, ProtocolError, RenameError, TypeHierarchyDirection, TypeHierarchyItem,
-    TypeHierarchyQuery, TypeHierarchyRange, TypeHierarchyResult,
+    LspOutcomeStatus, ProtocolError, RenameError, TimeoutDetail, TypeHierarchyDirection,
+    TypeHierarchyItem, TypeHierarchyQuery, TypeHierarchyRange, TypeHierarchyResult,
 };
 use serde_json::{Value, json};
 
@@ -13,6 +13,11 @@ fn runtime_outcome() -> LspOutcome {
         command: Some("rust-analyzer".into()),
         operation: Some(LspOperation::Definition),
         path: Some("src/lib.rs".into()),
+        timeout: Some(TimeoutDetail {
+            operation: "definition".into(),
+            layer: "lsp".into(),
+            budget_ms: 750,
+        }),
         phase: LspOutcomePhase::Runtime,
         message: "language server request timed out".into(),
     }
@@ -195,6 +200,7 @@ fn type_hierarchy_result_represents_supported_unsupported_and_combined_outcomes(
             command: Some("rust-analyzer".into()),
             operation: Some(LspOperation::TypeHierarchy),
             path: Some("src/lib.rs".into()),
+            timeout: None,
             phase: LspOutcomePhase::Runtime,
             message: "type hierarchy is unsupported".into(),
         }),
@@ -296,6 +302,11 @@ fn exports_lsp_outcome_family_with_required_fields_variants_and_wire_spellings()
             "command": "rust-analyzer",
             "operation": "definition",
             "path": "src/lib.rs",
+            "timeout": {
+                "operation": "definition",
+                "layer": "lsp",
+                "budget_ms": 750
+            },
             "phase": "runtime",
             "message": "language server request timed out"
         })
@@ -374,6 +385,7 @@ fn covers_eleven_outcome_codes_six_operations_required_fields_and_explicit_nulls
         "command": null,
         "operation": null,
         "path": null,
+        "timeout": null,
         "phase": "startup",
         "message": "configured language server is missing"
     });
@@ -392,6 +404,7 @@ fn covers_eleven_outcome_codes_six_operations_required_fields_and_explicit_nulls
         "command",
         "operation",
         "path",
+        "timeout",
         "phase",
         "message",
     ] {

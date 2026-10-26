@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 use crate::adapters::cli::{GlobalOpts, resolve_workspace_root};
 use crate::adapters::config;
 use crate::adapters::daemon::socket::{
-    OwnershipError, lock_path, log_path, socket_path, try_connect,
+    OwnerLiveness, OwnershipError, lock_path, log_path, probe_owner, socket_path, try_connect,
 };
 use crate::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, Handshake, read_line_capped, write_line,
@@ -80,7 +80,7 @@ fn daemon_exe() -> std::io::Result<std::path::PathBuf> {
 }
 
 /// Spawn a detached `tower daemon --detach` for `workspace_root`.
-fn spawn_daemon(workspace_root: &Path) -> std::io::Result<()> {
+fn spawn_daemon(workspace_root: &Path) -> std::io::Result<std::process::Child> {
     let exe = daemon_exe()?;
     let log_path = log_path(workspace_root);
     if let Some(parent) = log_path.parent() {
@@ -99,8 +99,7 @@ fn spawn_daemon(workspace_root: &Path) -> std::io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2))
-        .spawn()?;
-    Ok(())
+        .spawn()
 }
 
 /// Connect to the daemon, spawning one (under a flock) if absent/stale.
@@ -109,10 +108,10 @@ pub async fn connect_or_spawn(workspace_root: &Path) -> std::io::Result<UnixStre
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?
         .daemon
         .connection_timeout();
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     let sock = socket_path(workspace_root);
-    if let Some(s) = try_connect(&sock).await? {
-        return Ok(s);
+    if let Some(stream) = try_connect(&sock).await? {
+        return Ok(stream);
     }
 
     let guard = loop {
@@ -122,22 +121,35 @@ pub async fn connect_or_spawn(workspace_root: &Path) -> std::io::Result<UnixStre
                 if error.raw_os_error() == Some(rustix::io::Errno::WOULDBLOCK.raw_os_error()) => {}
             Err(error) => return Err(std::io::Error::other(error)),
         }
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err(connection_timeout_error());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    // Re-check: another client may have spawned while we waited for the lock.
-    let stream = if let Some(s) = try_connect(&sock).await? {
-        s
+    // Re-check after acquiring ownership: another client may have spawned while
+    // this client waited for the lock.
+    let stream = if let Some(stream) = try_connect(&sock).await? {
+        stream
     } else {
-        spawn_daemon(workspace_root)?;
+        let mut child = spawn_daemon(workspace_root)?;
+        let mut child_exit = None;
         loop {
             if let Some(stream) = try_connect(&sock).await? {
                 break stream;
             }
-            if tokio::time::Instant::now() >= deadline {
+            if child_exit.is_none() {
+                child_exit = child.try_wait()?;
+            }
+            if let Some(status) = child_exit
+                && probe_owner(workspace_root).map_err(std::io::Error::other)?
+                    == OwnerLiveness::Dead
+            {
+                return Err(std::io::Error::other(format!(
+                    "workspace daemon exited before publishing its socket ({status})"
+                )));
+            }
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 return Err(connection_timeout_error());
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

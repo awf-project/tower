@@ -126,3 +126,44 @@
 {"ts":1782335376,"op":"assert","clause":"arch_convention('conv_rr_bounded_capture', 'extensions/debug', 'rr output and origin evidence must be bounded with explicit truncation markers using output byte limits and max_depth/max_children capture limits', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
 {"ts":1782335377,"op":"retractall","clause":"arch_convention('conv_rr_test_gating', _, _, _)"}
 {"ts":1782335377,"op":"assert","clause":"arch_convention('conv_rr_test_gating', 'debug reverse tests', 'ordinary tests must use fake rr/replay adapters and fixture scenarios; real rr coverage is host-gated and reverse-debug sidecar behavior must include 20-way parallel stress coverage', 'feature_f006_debug_rr_reverse__time_travel_debugging')"}
+{"ts":1792948442,"op":"assert","clause":"arch_convention(conv_rmcp_cancellation_dispatch, 'MCP extension invocation', 'Run synchronous potentially-unbounded registry dispatch off the async rmcp runtime so cancellation notifications can be processed; propagate the same adapter-neutral signal, reap the cancelled child, and restart without a quarantine strike', 'feature_b005')"}
+{"ts":1793016976,"op":"retractall","clause":"arch_component(_,_,_,'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016976,"op":"retractall","clause":"arch_port(_,_,'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016977,"op":"retractall","clause":"arch_decision(_,_,_,_,'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016977,"op":"retractall","clause":"arch_convention(_,_,_,'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016977,"op":"retractall","clause":"arch_adr(_,_,'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016978,"op":"retractall","clause":"arch_feature('bug_34_b005_remove_default_timeouts_from_all_si',_,_)"}
+{"ts":1793016978,"op":"retractall","clause":"arch_component('config', _, _, _)"}
+{"ts":1793016978,"op":"assert","clause":"arch_component('config', infrastructure, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016979,"op":"retractall","clause":"arch_component('daemon', _, _, _)"}
+{"ts":1793016979,"op":"assert","clause":"arch_component('daemon', infrastructure, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016979,"op":"retractall","clause":"arch_component('extension', _, _, _)"}
+{"ts":1793016979,"op":"assert","clause":"arch_component('extension', infrastructure, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016979,"op":"retractall","clause":"arch_component('formatter', _, _, _)"}
+{"ts":1793016979,"op":"assert","clause":"arch_component('formatter', infrastructure, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016980,"op":"retractall","clause":"arch_component('mcp', _, _, _)"}
+{"ts":1793016980,"op":"assert","clause":"arch_component('mcp', infrastructure, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016980,"op":"retractall","clause":"arch_component('watcher', _, _, _)"}
+{"ts":1793016980,"op":"assert","clause":"arch_component('watcher', infrastructure, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016980,"op":"retractall","clause":"arch_component('extension_host', _, _, _)"}
+{"ts":1793016980,"op":"assert","clause":"arch_component('extension_host', domain, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016981,"op":"retractall","clause":"arch_component('domain', _, _, _)"}
+{"ts":1793016981,"op":"assert","clause":"arch_component('domain', domain, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016981,"op":"retractall","clause":"arch_component('mutation', _, _, _)"}
+{"ts":1793016981,"op":"assert","clause":"arch_component('mutation', domain, '', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016982,"op":"retractall","clause":"arch_decision('dec_optional_operation_budgets', _, _, _, _)"}
+{"ts":1793016982,"op":"assert","clause":"arch_decision('dec_optional_operation_budgets', 'operation timeout policy', 'make Tower-controlled operation budgets optional at their existing ownership points', 'prevents omitted configuration from silently becoming undocumented finite limits while retaining strict explicit timeout validation', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016982,"op":"retractall","clause":"arch_decision('dec_shared_operation_deadline', _, _, _, _, _, _)"}
+{"ts":1793016982,"op":"assert","clause":"arch_decision('dec_shared_operation_deadline', 'multi-step timeout accounting', 'derive one absolute deadline for each configured multi-step operation', 'prevents retries, subrequests, and follow-up passes from each receiving a fresh full timeout budget', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016982,"op":"retractall","clause":"arch_decision('dec_cancellable_extension_invocation', _, _, _, _)"}
+{"ts":1793016982,"op":"assert","clause":"arch_decision('dec_cancellable_extension_invocation', 'extension invocation cancellation', 'thread an adapter-neutral request cancellation signal through public extension invocation', 'allows an unlimited in-flight sidecar request to be interrupted and recovered without coupling the domain to MCP or runtime primitives', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016983,"op":"retractall","clause":"arch_decision('dec_structured_timeout_outcomes', _, _, _, _, _, _)"}
+{"ts":1793016983,"op":"assert","clause":"arch_decision('dec_structured_timeout_outcomes', 'timeout error contract', 'enrich existing timeout outcomes with operation, layer, and applied budget details', 'keeps stable tool-specific timeout codes observable without recasting expected expiry as a transport error', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016983,"op":"retractall","clause":"arch_decision('dec_timeout_not_quarantine_strike', _, _, _, _)"}
+{"ts":1793016983,"op":"assert","clause":"arch_decision('dec_timeout_not_quarantine_strike', 'extension fault policy', 'exclude configured timeout and cancellation outcomes from quarantine strike accounting', 'a selected operation budget or caller cancellation is not evidence of an extension crash or protocol violation', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016983,"op":"retractall","clause":"arch_convention('conv_timeout_option_representation', _, _, _, _)"}
+{"ts":1793016983,"op":"assert","clause":"arch_convention('conv_timeout_option_representation', 'timeout boundaries', 'represent absent configured budgets as Option values end to end, using Option<u64> at configuration and wire boundaries and Option<Duration> at runtime', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016984,"op":"retractall","clause":"arch_convention('conv_unlimited_wait_branch', _, _, _)"}
+{"ts":1793016984,"op":"assert","clause":"arch_convention('conv_unlimited_wait_branch', 'operation waiting', 'use interruptible blocking waits when no budget is configured and timed waits only when a budget is explicit; never emulate unlimited work with a sentinel duration', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
+{"ts":1793016984,"op":"retractall","clause":"arch_convention('conv_lifecycle_safeguards_separate', _, _, _, _, _, _, _, _)"}
+{"ts":1793016984,"op":"assert","clause":"arch_convention('conv_lifecycle_safeguards_separate', 'process lifecycle', 'keep cancellation, shutdown escalation, crash detection, idle eviction, kill, and reap bounded independently of ordinary operation timeout policy', 'bug_34_b005_remove_default_timeouts_from_all_si')"}

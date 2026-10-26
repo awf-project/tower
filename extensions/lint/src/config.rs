@@ -5,7 +5,7 @@ use core_engine::adapters::config::lint::{LintCommandConfig, ParserFormat, Targe
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunnerLintConfig {
     pub command: String,
-    pub timeout_secs: u64,
+    pub timeout_secs: Option<u64>,
     pub args: Vec<String>,
     pub extensions: Vec<String>,
     pub format: ParserFormat,

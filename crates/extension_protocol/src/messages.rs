@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::fault::ProtocolError;
+use crate::fault::{ProtocolError, TimeoutDetail};
 use crate::manifest::{Capability, ToolDecl};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +39,8 @@ pub struct LspOutcome {
     pub operation: Option<LspOperation>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub path: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub timeout: Option<TimeoutDetail>,
     pub phase: LspOutcomePhase,
     pub message: String,
 }

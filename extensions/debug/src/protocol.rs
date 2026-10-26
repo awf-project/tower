@@ -119,7 +119,7 @@ pub struct DebugAdapterConfig {
     pub adapter_type: String,
     #[serde(default)]
     pub launch: Map<String, Value>,
-    pub default_timeout_secs: u64,
+    pub default_timeout_secs: Option<u64>,
     pub idle_ttl_secs: u64,
 }
 
@@ -149,7 +149,10 @@ impl DebugAdapterConfig {
                 "debug.{language}.extensions entry {extension:?} must not start with '.'"
             )));
         }
-        if self.default_timeout_secs == 0 {
+        if self
+            .default_timeout_secs
+            .is_some_and(|timeout| timeout == 0)
+        {
             return Err(DebugInitError::InvalidConfig(format!(
                 "debug.{language}.default_timeout_secs must be a positive integer"
             )));
@@ -759,7 +762,7 @@ mod tests {
                     args: Vec::new(),
                     adapter_type: "fake".to_owned(),
                     launch: serde_json::Map::new(),
-                    default_timeout_secs: 1,
+                    default_timeout_secs: Some(1),
                     idle_ttl_secs: 60,
                 },
             )]),

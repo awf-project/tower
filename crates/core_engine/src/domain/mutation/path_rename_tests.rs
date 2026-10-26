@@ -61,6 +61,7 @@ impl ExtensionHostPort for CountingHost {
         &self,
         name: &str,
         _: serde_json::Value,
+        _: &dyn crate::domain::CancellationSignal,
     ) -> Result<serde_json::Value, crate::domain::extension_host::InvokeError> {
         Err(crate::domain::extension_host::InvokeError::ToolNotFound(
             name.to_owned(),

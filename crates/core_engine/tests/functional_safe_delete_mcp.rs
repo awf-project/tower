@@ -74,11 +74,16 @@ impl ExtensionHostPort for CapturingHost {
             .declared_tools()
     }
 
-    fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError> {
+    fn invoke(
+        &self,
+        tool_name: &str,
+        params: Value,
+        cancellation: &dyn core_engine::domain::CancellationSignal,
+    ) -> Result<Value, InvokeError> {
         self.registry
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-            .invoke(tool_name, params)
+            .invoke(tool_name, params, cancellation)
     }
 
     fn invoke_extension(
@@ -86,11 +91,12 @@ impl ExtensionHostPort for CapturingHost {
         extension_id: &ExtensionId,
         tool_name: &str,
         params: Value,
+        cancellation: &dyn core_engine::domain::CancellationSignal,
     ) -> Result<Value, InvokeError> {
         self.registry
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-            .invoke_extension(extension_id, tool_name, params)
+            .invoke_extension(extension_id, tool_name, params, cancellation)
     }
 }
 
@@ -132,8 +138,13 @@ impl ExtensionHostPort for DeclarationFailureHost {
         self.inner.declared_tools()
     }
 
-    fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError> {
-        self.inner.invoke(tool_name, params)
+    fn invoke(
+        &self,
+        tool_name: &str,
+        params: Value,
+        cancellation: &dyn core_engine::domain::CancellationSignal,
+    ) -> Result<Value, InvokeError> {
+        self.inner.invoke(tool_name, params, cancellation)
     }
 
     fn invoke_extension(
@@ -141,18 +152,26 @@ impl ExtensionHostPort for DeclarationFailureHost {
         extension_id: &ExtensionId,
         tool_name: &str,
         params: Value,
+        cancellation: &dyn core_engine::domain::CancellationSignal,
     ) -> Result<Value, InvokeError> {
         if extension_id.as_str() == "ast" && tool_name == "plan_safe_delete_declaration" {
             return match self.failure {
                 DeclarationFailure::Unavailable => Err(InvokeError::ToolNotFound(tool_name.into())),
-                DeclarationFailure::Timeout => Err(InvokeError::Fault(ExtensionFault::Timeout)),
+                DeclarationFailure::Timeout => Err(InvokeError::Fault(ExtensionFault::Timeout {
+                    detail: extension_protocol::TimeoutDetail {
+                        operation: "plan_safe_delete_declaration".into(),
+                        layer: "host".into(),
+                        budget_ms: 0,
+                    },
+                })),
                 DeclarationFailure::Crashed => Err(InvokeError::Fault(ExtensionFault::Crashed {
                     code: Some(17),
                 })),
                 DeclarationFailure::Malformed => Ok(json!({"private": "RAW_DECLARATION_SENTINEL"})),
             };
         }
-        self.inner.invoke_extension(extension_id, tool_name, params)
+        self.inner
+            .invoke_extension(extension_id, tool_name, params, cancellation)
     }
 }
 
@@ -209,11 +228,16 @@ extensions = ["rs"]
                 .call(
                     "tower_create_file",
                     json!({"path": path, "content": content}),
+                    &core_engine::domain::NeverCancelled,
                 )
                 .expect("seed through the public mutation boundary");
         }
         registry
-            .call("tower_ast_reindex", json!({}))
+            .call(
+                "tower_ast_reindex",
+                json!({}),
+                &core_engine::domain::NeverCancelled,
+            )
             .expect("seed the already-active AST observer");
         host.take_changed();
 
@@ -240,6 +264,7 @@ extensions = ["rs"]
                     "kind": "function",
                     "dry_run": dry_run
                 }),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("safe delete must return a structured public result")
     }
@@ -249,6 +274,7 @@ extensions = ["rs"]
             .call(
                 "tower_read_file",
                 json!({"path": path, "with_version": true}),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("read public workspace state")
     }
@@ -261,14 +287,15 @@ extensions = ["rs"]
                     .call(
                         "tower_read_file",
                         json!({"path": path, "with_version": true}),
+                        &core_engine::domain::NeverCancelled,
                     )
                     .ok()
             })
             .collect::<Vec<_>>();
         json!({
             "reads": reads,
-            "listing": self.registry.call("tower_list_dir", json!({"path": ""})).unwrap(),
-            "target_search": self.registry.call("tower_search_text", json!({"pattern": "target"})).unwrap(),
+            "listing": self.registry.call("tower_list_dir", json!({"path": ""}), &core_engine::domain::NeverCancelled).unwrap(),
+            "target_search": self.registry.call("tower_search_text", json!({"pattern": "target"}), &core_engine::domain::NeverCancelled).unwrap(),
             "storage": self.storage_records(paths),
         })
     }
@@ -523,6 +550,7 @@ fn scenario_public_tool_registers_the_canonical_schema_and_preserves_span_delete
         .call(
             "tower_ast_delete_symbol",
             json!({"path": "src/lib.rs", "symbol_name": "target", "kind": "function"}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("legacy span-delete remains callable");
     assert_eq!(legacy["applied"], true, "legacy delete payload: {legacy}");
@@ -557,6 +585,7 @@ fn public_tool_preserves_legacy_delete_and_removes_an_unused_symbol_from_the_act
         .call(
             "tower_ast_search_symbols",
             json!({"name": "target", "kind": "function"}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("search active AST observer before mutation");
     assert!(before.to_string().contains("target"), "{before}");
@@ -578,6 +607,7 @@ fn public_tool_preserves_legacy_delete_and_removes_an_unused_symbol_from_the_act
             .call(
                 "tower_ast_search_symbols",
                 json!({"name": "target", "kind": "function"}),
+                &core_engine::domain::NeverCancelled,
             )
             .expect("search active AST observer after mutation");
         if !search.to_string().contains("target") {
@@ -700,7 +730,11 @@ fn mutation_failures_distinguish_preflight_rejection_from_partial_commit() {
     assert_eq!(
         harness
             .registry
-            .call("tower_search_text", json!({"pattern": "target"}))
+            .call(
+                "tower_search_text",
+                json!({"pattern": "target"}),
+                &core_engine::domain::NeverCancelled
+            )
             .expect("partial commit leaves the public search index usable"),
         json!({"matches": [
             {"path": "src/b.rs", "line_number": 1, "line_content": "fn consumer(){target();}"},
@@ -817,6 +851,7 @@ fn scenario_declaration_rejection_short_circuits_before_semantic_lookup() {
         .call(
             "tower_safe_delete_symbol",
             json!({"path": "src/lib.rs", "symbol_name": "missing", "kind": "function", "dry_run": false}),
+            &core_engine::domain::NeverCancelled,
         )
         .expect("declaration failure is a structured public result");
 
@@ -871,7 +906,11 @@ fn scenario_backend_mappings_are_exact_session_safe_and_private_at_the_public_bo
         assert!(
             harness
                 .registry
-                .call("tower_list_dir", json!({"path": ""}))
+                .call(
+                    "tower_list_dir",
+                    json!({"path": ""}),
+                    &core_engine::domain::NeverCancelled
+                )
                 .is_ok()
         );
         // These values are produced by the sidecar response or public request,
@@ -915,7 +954,11 @@ fn scenario_declaration_backend_failures_are_structured_private_and_non_mutating
         assert!(
             harness
                 .registry
-                .call("tower_list_dir", json!({"path": ""}))
+                .call(
+                    "tower_list_dir",
+                    json!({"path": ""}),
+                    &core_engine::domain::NeverCancelled
+                )
                 .is_ok(),
             "the public MCP registry must remain usable after declaration failure"
         );
@@ -1082,6 +1125,7 @@ fn recursive_symbol_without_external_callers_previews_and_applies_through_the_pr
         .call(
             "tower_ast_search_symbols",
             json!({"name": "old_name", "kind": "function"}),
+            &core_engine::domain::NeverCancelled,
         )
         .unwrap();
     assert!(!symbols.to_string().contains("old_name"), "{symbols}");

@@ -12,6 +12,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{Diagnostic, Hover, Location, Position, Severity};
@@ -36,7 +37,10 @@ use crate::session::LspSessionPool;
 pub(crate) enum ToolDispatchError {
     InvalidParams(String),
     Legacy(String),
-    ReadOnlyOutcome(LspOutcome),
+    ReadOnlyOutcome {
+        outcome: Box<LspOutcome>,
+        diagnostics: Vec<Value>,
+    },
 }
 
 impl fmt::Display for ToolDispatchError {
@@ -44,7 +48,7 @@ impl fmt::Display for ToolDispatchError {
         match self {
             Self::InvalidParams(message) => formatter.write_str(message),
             Self::Legacy(message) => formatter.write_str(message),
-            Self::ReadOnlyOutcome(outcome) => formatter.write_str(&outcome.message),
+            Self::ReadOnlyOutcome { outcome, .. } => formatter.write_str(&outcome.message),
         }
     }
 }
@@ -76,6 +80,7 @@ fn unsupported_read_only_outcome(
         command: None,
         operation: Some(operation),
         path: Some(path),
+        timeout: None,
         phase: LspOutcomePhase::Runtime,
         message: message.to_owned(),
     }
@@ -96,6 +101,7 @@ fn read_only_session_error(
     operation: LspOperation,
     path: String,
     binding: Option<(&str, &str)>,
+    operation_timeout: Option<Duration>,
 ) -> ToolDispatchError {
     let LspSessionError::Backend(code) = error else {
         return ToolDispatchError::Legacy(error.to_string());
@@ -103,16 +109,41 @@ fn read_only_session_error(
     let (language, command) = binding
         .map(|(language, command)| (Some(language.to_owned()), Some(command.to_owned())))
         .unwrap_or((None, None));
-    ToolDispatchError::ReadOnlyOutcome(LspOutcome {
-        status: LspOutcomeStatus::Error,
-        code,
-        language,
-        command,
-        operation: Some(operation),
-        path: Some(path),
-        phase: LspOutcomePhase::Runtime,
-        message: error.to_string(),
-    })
+    let timeout = (code == LspOutcomeCode::ServerTimeout)
+        .then_some(operation_timeout)
+        .flatten()
+        .map(|budget| timeout_detail(operation, budget));
+    ToolDispatchError::ReadOnlyOutcome {
+        outcome: Box::new(LspOutcome {
+            status: LspOutcomeStatus::Error,
+            code,
+            language,
+            command,
+            operation: Some(operation),
+            path: Some(path),
+            timeout,
+            phase: LspOutcomePhase::Runtime,
+            message: error.to_string(),
+        }),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn timeout_detail(operation: LspOperation, budget: Duration) -> extension_protocol::TimeoutDetail {
+    let operation = match operation {
+        LspOperation::Diagnostics => "diagnostics",
+        LspOperation::Definition => "definition",
+        LspOperation::References => "references",
+        LspOperation::Hover => "hover",
+        LspOperation::Implementations => "implementations",
+        LspOperation::TypeHierarchy => "type_hierarchy",
+        LspOperation::Rename => "rename",
+    };
+    extension_protocol::TimeoutDetail {
+        operation: operation.to_owned(),
+        layer: "lsp".to_owned(),
+        budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+    }
 }
 
 /// Dispatch an `invokeTool` call to the appropriate LSP tool.
@@ -439,12 +470,23 @@ where
         Err(LspSessionError::CapabilityUnavailable) => Ok(json!({
             "supported": false, "diagnostics": [], "outcome": unsupported_read_only_outcome(LspOperation::Diagnostics, LspOutcomeCode::CapabilityUnavailable, path.to_owned()),
         })),
-        Err(error) => Err(read_only_session_error(
-            error,
-            LspOperation::Diagnostics,
-            path.to_owned(),
-            pool.binding_for(&rel),
-        )),
+        Err(error) => {
+            let mut failure = read_only_session_error(
+                error,
+                LspOperation::Diagnostics,
+                path.to_owned(),
+                pool.binding_for(&rel),
+                pool.operation_timeout(),
+            );
+            if let ToolDispatchError::ReadOnlyOutcome { diagnostics, .. } = &mut failure {
+                *diagnostics = pool
+                    .diagnostics_for_path(&rel)
+                    .iter()
+                    .map(diagnostic_to_json)
+                    .collect();
+            }
+            Err(failure)
+        }
     }
 }
 
@@ -505,6 +547,7 @@ where
             LspOperation::Definition,
             path.to_owned(),
             pool.binding_for(&rel),
+            pool.operation_timeout(),
         )),
     }
 }
@@ -566,6 +609,7 @@ where
             LspOperation::References,
             path.to_owned(),
             pool.binding_for(&rel),
+            pool.operation_timeout(),
         )),
     }
 }
@@ -625,6 +669,7 @@ where
             LspOperation::Hover,
             path.to_owned(),
             pool.binding_for(&rel),
+            pool.operation_timeout(),
         )),
     }
 }
@@ -702,6 +747,7 @@ where
             LspOperation::Implementations,
             request.path,
             pool.binding_for(&rel),
+            pool.operation_timeout(),
         )),
     }
 }
@@ -758,6 +804,7 @@ where
             LspOperation::TypeHierarchy,
             query.path,
             pool.binding_for(&rel),
+            pool.operation_timeout(),
         )),
     }
 }
@@ -780,7 +827,11 @@ where
         serde_json::from_value(params).map_err(|e| format!("bad RenameRequest: {e}"))?;
     let rel = RelativePath::new(&request.path);
     if !pool.serves(&rel) {
-        return lsp_session_error_value(LspSessionError::Unconfigured, Some(request.path));
+        return lsp_session_error_value(
+            LspSessionError::Unconfigured,
+            Some(request.path),
+            pool.operation_timeout(),
+        );
     }
 
     let text = read_file(&request.path, out, lines, next_id, deferred)?;
@@ -791,7 +842,9 @@ where
 
     let raw_edit = match pool.rename(&rel, &text, position, &request.new_name) {
         Ok(raw_edit) => raw_edit,
-        Err(error) => return lsp_session_error_value(error, Some(request.path)),
+        Err(error) => {
+            return lsp_session_error_value(error, Some(request.path), pool.operation_timeout());
+        }
     };
 
     let mut text_cache = HashMap::from([(request.path.clone(), text)]);
@@ -858,7 +911,11 @@ fn protocol_location(location: &Location) -> extension_protocol::Location {
     }
 }
 
-fn lsp_session_error_value(error: LspSessionError, path: Option<String>) -> Result<Value, String> {
+fn lsp_session_error_value(
+    error: LspSessionError,
+    path: Option<String>,
+    operation_timeout: Option<Duration>,
+) -> Result<Value, String> {
     match error {
         LspSessionError::NotRenameable => {
             rename_error_value(RenameErrorCode::NotRenameable, "not renameable", path)
@@ -869,6 +926,7 @@ fn lsp_session_error_value(error: LspSessionError, path: Option<String>) -> Resu
                 "unsupported language for rename",
                 path,
                 error,
+                operation_timeout,
             )
         }
         error @ (LspSessionError::WorkspaceExternal | LspSessionError::Backend(_)) => {
@@ -877,6 +935,7 @@ fn lsp_session_error_value(error: LspSessionError, path: Option<String>) -> Resu
                 "language server request failed",
                 path,
                 error,
+                operation_timeout,
             )
         }
     }
@@ -913,11 +972,12 @@ fn rename_error_value_with_outcome(
     message: impl Into<String>,
     path: Option<String>,
     error: LspSessionError,
+    operation_timeout: Option<Duration>,
 ) -> Result<Value, String> {
     let message = message.into();
     serde_json::to_value(RenameError {
         code,
-        outcome: rename_lsp_outcome(error, path.clone(), message.clone()),
+        outcome: rename_lsp_outcome(error, path.clone(), message.clone(), operation_timeout),
         message,
         path,
     })
@@ -928,6 +988,7 @@ fn rename_lsp_outcome(
     error: LspSessionError,
     path: Option<String>,
     message: String,
+    operation_timeout: Option<Duration>,
 ) -> Option<LspOutcome> {
     let (status, code) = match error {
         LspSessionError::Unconfigured => (
@@ -951,6 +1012,10 @@ fn rename_lsp_outcome(
         command: None,
         operation: Some(LspOperation::Rename),
         path,
+        timeout: (code == LspOutcomeCode::ServerTimeout)
+            .then_some(operation_timeout)
+            .flatten()
+            .map(|budget| timeout_detail(LspOperation::Rename, budget)),
         phase: LspOutcomePhase::Runtime,
         message,
     })
@@ -1142,7 +1207,7 @@ mod tests {
             _: PathBuf,
             _: &Path,
             _: Option<crate::lsp_adapter::DiagnosticsSender>,
-            _: std::time::Duration,
+            _: Option<std::time::Duration>,
         ) -> Result<
             Arc<dyn crate::lsp_adapter::pool::PooledSession>,
             crate::lsp_adapter::LspSessionError,
@@ -1195,7 +1260,7 @@ mod tests {
             path_rename_fixture_config(workspace, mode),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = input.into_iter();
         let mut next_id = HostCallIdAllocator::new(10_000);
@@ -1281,7 +1346,7 @@ mod tests {
             LspConfig::default(),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut ids = HostCallIdAllocator::new(10_000);
@@ -1336,7 +1401,7 @@ mod tests {
             workspace.path().to_path_buf(),
             Arc::new(PlanningSpawner(session)),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut pool =
             LspSessionPool::with_session_pool_for_test(inner, workspace.path().to_path_buf());
@@ -1403,7 +1468,7 @@ mod tests {
             workspace.to_path_buf(),
             Arc::new(PlanningSpawner(session)),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut pool = LspSessionPool::with_session_pool_for_test(inner, workspace.to_path_buf());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -1706,7 +1771,7 @@ mod tests {
             LspConfig::default(),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut next_id = HostCallIdAllocator::new(10_000);
@@ -1743,7 +1808,7 @@ mod tests {
             LspConfig::default(),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut next_id = HostCallIdAllocator::new(10_000);
@@ -1774,6 +1839,7 @@ mod tests {
                         "command": null,
                         "operation": "type_hierarchy",
                         "path": "src/main.unknown",
+                        "timeout": null,
                         "phase": "runtime",
                         "message": "No language server is configured for this file."
                     }
@@ -1798,7 +1864,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let source = "private immutable hierarchy source";
         let mut lines = vec![Ok(
@@ -1851,7 +1917,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let source = "private immutable hierarchy source";
         let deferred_content = "queued event content must not replace the active snapshot";
@@ -1955,7 +2021,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, false),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = (10_000..10_003)
             .map(|id| {
@@ -1994,6 +2060,7 @@ mod tests {
                         "command": command.clone(),
                         "operation": "type_hierarchy",
                         "path": "src/main.rs",
+                        "timeout": null,
                         "phase": "runtime",
                         "message": "The configured language server does not provide this operation."
                     }
@@ -2011,7 +2078,7 @@ mod tests {
             LspConfig::default(),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut next_id = HostCallIdAllocator::new(10_000);
 
@@ -2048,7 +2115,7 @@ mod tests {
             lsp_fixture_config_with_backend_failure(&workspace_root, true, true),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let secret = "opaque backend data must stay private";
         let mut lines = vec![Ok(
@@ -2069,7 +2136,7 @@ mod tests {
         )
         .expect_err("backend hierarchy failure maps through public dispatch");
         let error_text = error.to_string();
-        let ToolDispatchError::ReadOnlyOutcome(outcome) = error else {
+        let ToolDispatchError::ReadOnlyOutcome { outcome, .. } = error else {
             panic!("backend failures use the typed read-only outcome variant");
         };
         assert_eq!(outcome.status, LspOutcomeStatus::Error);
@@ -2108,7 +2175,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, false),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = vec![Ok(
             json!({ "jsonrpc": "2.0", "id": 10_000, "result": "fn main() {}" }).to_string(),
@@ -2157,7 +2224,7 @@ mod tests {
         );
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
 
-        protocol::send_read_only_outcome_error(&out, &Some(json!(41)), outcome.clone());
+        protocol::send_read_only_outcome_error(&out, &Some(json!(41)), outcome.clone(), Vec::new());
 
         let bytes = out.lock().expect("output lock").clone();
         let envelope: Value = serde_json::from_slice(&bytes).expect("JSON-RPC error envelope");
@@ -2206,7 +2273,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = (10_000..10_005)
             .map(|id| {
@@ -2275,7 +2342,7 @@ mod tests {
             LspConfig::default(),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = std::iter::empty::<Result<String, std::io::Error>>();
         let mut next_id = HostCallIdAllocator::new(10_000);
@@ -2310,6 +2377,7 @@ mod tests {
                     "command": null,
                     "operation": "rename",
                     "path": "src/main.rs",
+                    "timeout": null,
                     "phase": "runtime",
                     "message": "unsupported language for rename"
                 }
@@ -2338,6 +2406,7 @@ mod tests {
             let backend_error = lsp_session_error_value(
                 LspSessionError::Backend(code),
                 Some("src/main.rs".to_owned()),
+                Some(Duration::from_millis(750)),
             )
             .expect("classified server failure remains a structured rename result");
             assert_eq!(backend_error["code"], "backend_error");
@@ -2345,17 +2414,32 @@ mod tests {
             assert_eq!(backend_error["path"], "src/main.rs");
             assert_eq!(backend_error["outcome"]["status"], "error");
             assert_eq!(backend_error["outcome"]["code"], wire_code);
+            if code == LspOutcomeCode::ServerTimeout {
+                assert_eq!(
+                    backend_error["outcome"]["timeout"],
+                    json!({"operation":"rename","layer":"lsp","budget_ms":750})
+                );
+            } else {
+                assert_eq!(backend_error["outcome"]["timeout"], Value::Null);
+            }
         }
     }
 
     #[test]
     fn f008_rename_outcome_distinguishes_capability_absence_and_preserves_domain_errors() {
         let path = Some("src/main.rs".to_owned());
-        let language_absent = lsp_session_error_value(LspSessionError::Unconfigured, path.clone())
-            .expect("language absence remains a structured rename result");
-        let capability_absent =
-            lsp_session_error_value(LspSessionError::CapabilityUnavailable, path.clone())
-                .expect("capability absence remains a structured rename result");
+        let language_absent = lsp_session_error_value(
+            LspSessionError::Unconfigured,
+            path.clone(),
+            Some(Duration::ZERO),
+        )
+        .expect("language absence remains a structured rename result");
+        let capability_absent = lsp_session_error_value(
+            LspSessionError::CapabilityUnavailable,
+            path.clone(),
+            Some(Duration::ZERO),
+        )
+        .expect("capability absence remains a structured rename result");
 
         assert_eq!(language_absent["code"], "unsupported_language");
         assert_eq!(capability_absent["code"], "unsupported_language");
@@ -2369,7 +2453,7 @@ mod tests {
         );
 
         let unchanged = [
-            lsp_session_error_value(LspSessionError::NotRenameable, path)
+            lsp_session_error_value(LspSessionError::NotRenameable, path, Some(Duration::ZERO))
                 .expect("not-renameable remains a structured rename result"),
             rename_decode_error_value(WorkspaceEditDecodeError::UnsupportedWorkspaceEdit {
                 message: "resource operations are unsupported".to_owned(),
@@ -2396,7 +2480,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, false),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = vec![Ok(
             json!({ "jsonrpc": "2.0", "id": 10_000, "result": "fn main() {}" }).to_string(),
@@ -2439,7 +2523,7 @@ mod tests {
             lsp_fixture_config(&workspace_root, true),
             workspace_root.clone(),
             None,
-            TEST_DIAGNOSTICS_DEADLINE,
+            Some(TEST_DIAGNOSTICS_DEADLINE),
         );
         let mut lines = vec![
             Ok(

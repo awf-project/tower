@@ -28,10 +28,11 @@ format = "eslint-json"
 target = "append"
 ```
 
-`timeout_secs` is optional, positive, and measured in seconds. It defaults to `2` when omitted.
-The same configured deadline is used for the initial lint run, fix preparation, and the follow-up
-check after edits. Tower also gives the lint extension a sufficient derived host budget. If a
-command reaches its deadline, Tower terminates and reaps its process tree.
+`timeout_secs` is optional, positive, and measured in seconds. When omitted, the linter has no
+Tower-controlled duration limit. When present, the same configured deadline is used for the initial
+lint run, fix preparation, and the follow-up check after edits. Tower also gives the lint extension
+a sufficient derived host budget. If a command reaches its explicit deadline, Tower terminates and
+reaps its process tree.
 
 Supported fix extraction is built in for `rustc-json` and `eslint-json`. `generic-regex` diagnostics
 can still be reported by `tower_lint_check`, but they are reported as unsupported by

@@ -39,12 +39,12 @@ pub fn lsp_initialize_payload(config: &LspConfig) -> serde_json::Value {
 
 pub fn lsp_initialize_payload_with_diagnostics_timeout(
     config: &LspConfig,
-    diagnostics_timeout: Duration,
+    operation_timeout: Option<Duration>,
 ) -> serde_json::Value {
     serde_json::json!({
         "servers": &config.servers,
         "idle_timeout_secs": config.idle_timeout.map(|timeout| timeout.as_secs()),
-        "diagnostics_timeout_secs": diagnostics_timeout.as_secs(),
+        "diagnostics_timeout_secs": operation_timeout.map(|timeout| timeout.as_secs()),
     })
 }
 
@@ -63,17 +63,22 @@ pub fn decode_lsp_initialize_config(
 
 pub fn decode_diagnostics_timeout(
     extension_config: Option<&serde_json::Value>,
-) -> Result<Duration, LspInitializeError> {
-    let seconds = extension_config
+) -> Result<Option<Duration>, LspInitializeError> {
+    let Some(value) = extension_config
         .and_then(|config| config.get("diagnostics_timeout_secs"))
-        .and_then(serde_json::Value::as_u64)
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let seconds = value
+        .as_u64()
         .filter(|seconds| *seconds > 0)
         .ok_or(LspInitializeError::InvalidConfiguration)?;
     let timeout = Duration::from_secs(seconds);
     std::time::Instant::now()
         .checked_add(timeout)
         .ok_or(LspInitializeError::InvalidConfiguration)?;
-    Ok(timeout)
+    Ok(Some(timeout))
 }
 
 #[derive(Serialize)]
@@ -190,6 +195,7 @@ pub fn validate_lsp_commands(
                 command: Some(server.command.clone()),
                 operation: None,
                 path: None,
+                timeout: None,
                 phase: extension_protocol::LspOutcomePhase::Startup,
                 message,
             })
@@ -414,11 +420,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn diagnostics_deadline_decoder_rejects_missing_zero_and_malformed_values() {
-        let invalid = [
+    fn diagnostics_timeout_decoder_accepts_absence_and_rejects_invalid_values() {
+        for payload in [
             None,
             Some(serde_json::json!({"servers": {}})),
             Some(serde_json::json!({"diagnostics_timeout_secs": null})),
+        ] {
+            assert_eq!(
+                decode_diagnostics_timeout(payload.as_ref()),
+                Ok(None),
+                "payload {payload:?}"
+            );
+        }
+
+        let invalid = [
             Some(serde_json::json!({"diagnostics_timeout_secs": 0})),
             Some(serde_json::json!({"diagnostics_timeout_secs": -1})),
             Some(serde_json::json!({"diagnostics_timeout_secs": 1.5})),
@@ -436,7 +451,7 @@ mod tests {
 
         assert_eq!(
             decode_diagnostics_timeout(Some(&serde_json::json!({"diagnostics_timeout_secs": 7}))),
-            Ok(Duration::from_secs(7))
+            Ok(Some(Duration::from_secs(7)))
         );
     }
 
@@ -455,7 +470,7 @@ mod tests {
         };
 
         let payload =
-            lsp_initialize_payload_with_diagnostics_timeout(&config, Duration::from_secs(4));
+            lsp_initialize_payload_with_diagnostics_timeout(&config, Some(Duration::from_secs(4)));
 
         assert_eq!(
             payload,
@@ -474,7 +489,7 @@ mod tests {
         assert_eq!(decode_lsp_initialize_config(Some(&payload)), Ok(config));
         assert_eq!(
             decode_diagnostics_timeout(Some(&payload)),
-            Ok(Duration::from_secs(4))
+            Ok(Some(Duration::from_secs(4)))
         );
         for malformed in [
             serde_json::json!({"servers": {}, "diagnostics_timeout_secs": 0}),
@@ -485,6 +500,21 @@ mod tests {
                 Err(LspInitializeError::InvalidConfiguration)
             );
         }
+    }
+
+    #[test]
+    fn lsp_request_timeout_codec_emits_null_for_an_absent_budget() {
+        let payload = lsp_initialize_payload_with_diagnostics_timeout(&LspConfig::default(), None);
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "servers": {},
+                "idle_timeout_secs": null,
+                "diagnostics_timeout_secs": null,
+            })
+        );
+        assert_eq!(decode_diagnostics_timeout(Some(&payload)), Ok(None));
     }
 
     #[test]

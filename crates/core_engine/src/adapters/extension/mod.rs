@@ -106,12 +106,16 @@ schema_json = "{{}}"
         minimum: Duration,
     ) -> Duration {
         let started = Instant::now();
-        let result = instance.call_tool("wait", serde_json::json!({}));
+        let result = instance.call_tool(
+            "wait",
+            serde_json::json!({}),
+            &crate::domain::NeverCancelled,
+        );
         let elapsed = started.elapsed();
         assert!(matches!(
             result,
             Err(crate::domain::extension_host::ExtensionCallError::Fault(
-                extension_protocol::ExtensionFault::Timeout
+                extension_protocol::ExtensionFault::Timeout { .. }
             ))
         ));
         assert!(

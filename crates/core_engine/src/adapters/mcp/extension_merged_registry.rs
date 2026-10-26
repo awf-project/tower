@@ -10,8 +10,8 @@
 //!
 //!  list()  → native.list() ++ extension tools (namespaced tower_<ext>_<tool>)
 //!  call(name, args):
-//!    native name?    → native.call(name, args)
-//!    extension name? → extension_registry.invoke(bare_tool_name, args)
+//!    native name?    → native.call(name, args, cancellation)
+//!    extension name? → extension_registry.invoke(bare_tool_name, args, cancellation)
 //!                          InvokeError → ToolError (fault mapping)
 //! ```
 //!
@@ -97,7 +97,7 @@ pub struct ExtensionMergedRegistry {
 struct ReadinessGate {
     controller: Arc<ReadinessController>,
     dependency_policy: Arc<ExtensionDependencyPolicy>,
-    preparation_timeout: Duration,
+    preparation_timeout: Option<Duration>,
 }
 
 pub struct ReadinessAwareRegistry {
@@ -108,6 +108,10 @@ impl ReadinessAwareRegistry {
     pub fn new(context: Arc<EarlyDaemonContext>) -> Self {
         Self { context }
     }
+}
+
+fn remaining_preparation_budget(budget: Option<Duration>, elapsed: Duration) -> Option<Duration> {
+    budget.map(|timeout| timeout.saturating_sub(elapsed))
 }
 
 impl ToolRegistry for ReadinessAwareRegistry {
@@ -126,7 +130,12 @@ impl ToolRegistry for ReadinessAwareRegistry {
         .list()
     }
 
-    fn call(&mut self, name: &str, args: JsonValue) -> Result<JsonValue, ToolError> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: JsonValue,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<JsonValue, ToolError> {
         let started = std::time::Instant::now();
         let budget = self.context.preparation_timeout();
         if NativeToolRegistry::descriptions()
@@ -179,9 +188,9 @@ impl ToolRegistry for ReadinessAwareRegistry {
             prepared.rename_coordinator(),
             self.context.readiness(),
             self.context.dependency_policy(),
-            budget.saturating_sub(started.elapsed()),
+            remaining_preparation_budget(budget, started.elapsed()),
         )
-        .call(name, args)
+        .call(name, args, cancellation)
     }
 }
 
@@ -245,7 +254,7 @@ impl ExtensionMergedRegistry {
         rename_coordinator: Arc<RenameCoordinator>,
         readiness: Arc<ReadinessController>,
         dependency_policy: Arc<ExtensionDependencyPolicy>,
-        preparation_timeout: Duration,
+        preparation_timeout: Option<Duration>,
     ) -> Self {
         Self {
             native: NativeToolRegistry::with_rename_coordinator(engine_state, rename_coordinator),
@@ -351,9 +360,13 @@ impl ToolRegistry for ExtensionMergedRegistry {
     /// - [`ToolError::ExecutionFailed`] — the extension tool returned a fault (timeout,
     ///   crash, quarantine, protocol error). The engine and MCP link remain alive.
     /// - Any `ToolError` variant from the native registry on native calls.
-    fn call(&mut self, name: &str, args: JsonValue) -> Result<JsonValue, ToolError> {
-        // Fast path: native tool (defence-in-depth — native always wins).
-        if self.native.list().iter().any(|t| t.name == name) {
+    fn call(
+        &mut self,
+        name: &str,
+        args: JsonValue,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<JsonValue, ToolError> {
+        if self.native.list().iter().any(|tool| tool.name == name) {
             super::native_tools::validate_native_call(name, &args)?;
             let _permit = self
                 .readiness
@@ -366,26 +379,19 @@ impl ToolRegistry for ExtensionMergedRegistry {
                 })
                 .transpose()
                 .map_err(map_workspace_wait_error)?;
-            return self.native.call(name, args);
+            return self.native.call(name, args, cancellation);
         }
 
-        // Clone initialized declarations, then release the registry before
-        // readiness waiting. Discovery must be free to register later instances
-        // while this request waits for its capability to become ready.
         let declarations = self
             .extension_host
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .declared_tools();
-
-        // Iterate and match by reconstructing the composed name — avoids underscore
-        // ambiguity in splitting.
         for (ext_id, tool_decl) in declarations {
             if tool_decl.name == CATCH_UP_FENCE_TOOL {
                 continue;
             }
-            let composed = format!("tower_{}_{}", ext_id.as_str(), tool_decl.name);
-            if composed == name {
+            if format!("tower_{}_{}", ext_id.as_str(), tool_decl.name) == name {
                 let _permit = if let Some(gate) = &self.readiness {
                     let dependencies = if gate
                         .dependency_policy
@@ -410,11 +416,10 @@ impl ToolRegistry for ExtensionMergedRegistry {
                     .extension_host
                     .read()
                     .unwrap_or_else(|poison| poison.into_inner())
-                    .invoke_extension(&ext_id, &tool_decl.name, args)
+                    .invoke_extension(&ext_id, &tool_decl.name, args, cancellation)
                     .map_err(invoke_error_to_tool_error);
             }
         }
-
         Err(ToolError::NotFound(name.to_owned()))
     }
 }
@@ -435,9 +440,10 @@ fn invoke_error_to_tool_error(err: InvokeError) -> ToolError {
             message: error.message,
             data: error.data,
         },
+        InvokeError::Cancelled => ToolError::Cancelled,
         InvokeError::Fault(fault) => {
             let class = match fault {
-                extension_protocol::ExtensionFault::Timeout => "Timeout",
+                extension_protocol::ExtensionFault::Timeout { .. } => "Timeout",
                 extension_protocol::ExtensionFault::Crashed { .. } => "Crashed",
                 extension_protocol::ExtensionFault::ProtocolError { .. } => "ProtocolError",
                 extension_protocol::ExtensionFault::Quarantined => "Quarantined",
@@ -566,6 +572,7 @@ mod tests {
             &mut self,
             name: &str,
             params: JsonValue,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<JsonValue, ExtensionCallError> {
             (self.dispatch)(name, params)
         }
@@ -591,7 +598,12 @@ mod tests {
             Vec::new()
         }
 
-        fn invoke(&self, tool_name: &str, _params: JsonValue) -> Result<JsonValue, InvokeError> {
+        fn invoke(
+            &self,
+            tool_name: &str,
+            _params: JsonValue,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<JsonValue, InvokeError> {
             Err(InvokeError::ToolNotFound(tool_name.to_owned()))
         }
 
@@ -600,6 +612,7 @@ mod tests {
             extension_id: &crate::domain::extension_host::ExtensionId,
             tool_name: &str,
             _params: JsonValue,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<JsonValue, InvokeError> {
             self.calls
                 .lock()
@@ -653,12 +666,12 @@ mod tests {
         ExtensionMergedRegistry::new(empty_engine_state(), ext_registry)
     }
 
-    fn readiness_registry(
+    fn readiness_registry<T: Into<Option<Duration>>>(
         extension_name: &str,
         tools: Vec<ToolDecl>,
         dependency: CapabilityDependency,
         readiness_controls: &[&str],
-        timeout: Duration,
+        timeout: T,
     ) -> (
         ExtensionMergedRegistry,
         Arc<ReadinessController>,
@@ -696,7 +709,7 @@ mod tests {
             Arc::new(crate::adapters::watcher::RenameCoordinator::default()),
             Arc::clone(&readiness),
             policy,
-            timeout,
+            timeout.into(),
         );
         (registry, readiness, calls)
     }
@@ -728,11 +741,15 @@ mod tests {
             vec![make_tool("outline")],
             CapabilityDependency::Ast,
             &[],
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
 
         let error = registry
-            .call("tower_ast_outline", json!({}))
+            .call(
+                "tower_ast_outline",
+                json!({}),
+                &crate::domain::NeverCancelled,
+            )
             .expect_err("supplied preparing controller must gate the call");
 
         assert_application_error(
@@ -751,7 +768,13 @@ mod tests {
         let args = json!({"path":"src/lib.rs"});
 
         assert_eq!(
-            registry.call("tower_ast_outline", args.clone()).unwrap(),
+            registry
+                .call(
+                    "tower_ast_outline",
+                    args.clone(),
+                    &crate::domain::NeverCancelled
+                )
+                .unwrap(),
             args
         );
     }
@@ -763,7 +786,7 @@ mod tests {
             vec![make_tool("outline")],
             CapabilityDependency::Ast,
             &[],
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
 
         let tools = registry.list();
@@ -852,7 +875,11 @@ mod tests {
             .unwrap();
 
         let result = registry
-            .call("tower_ast_outline", json!({"path":"a.rs"}))
+            .call(
+                "tower_ast_outline",
+                json!({"path":"a.rs"}),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
 
         assert_eq!(result["tool"], "outline");
@@ -898,7 +925,7 @@ mod tests {
             Arc::new(crate::adapters::watcher::RenameCoordinator::default()),
             Arc::clone(&readiness),
             Arc::clone(&policy),
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
         );
         let mut second = ExtensionMergedRegistry::with_readiness(
             empty_engine_state(),
@@ -906,12 +933,16 @@ mod tests {
             Arc::new(crate::adapters::watcher::RenameCoordinator::default()),
             Arc::clone(&readiness),
             policy,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
         );
 
         let admitted = thread::spawn(move || {
             let mut registry = first;
-            registry.call("tower_ast_outline", json!({"path": "src/lib.rs"}))
+            registry.call(
+                "tower_ast_outline",
+                json!({"path": "src/lib.rs"}),
+                &crate::domain::NeverCancelled,
+            )
         });
         entered_rx
             .recv_timeout(Duration::from_secs(2))
@@ -921,7 +952,11 @@ mod tests {
             .expect("shutdown transition succeeds after admission");
         assert_application_error(
             second
-                .call("tower_ast_outline", json!({"path": "src/lib.rs"}))
+                .call(
+                    "tower_ast_outline",
+                    json!({"path": "src/lib.rs"}),
+                    &crate::domain::NeverCancelled,
+                )
                 .expect_err("post-shutdown call is never dispatched"),
             -32_006,
             "daemon is stopping",
@@ -952,7 +987,11 @@ mod tests {
             .unwrap();
         assert_application_error(
             stopped_first
-                .call("tower_ast_outline", json!({"path": "src/lib.rs"}))
+                .call(
+                    "tower_ast_outline",
+                    json!({"path": "src/lib.rs"}),
+                    &crate::domain::NeverCancelled,
+                )
                 .expect_err("shutdown before admission is rejected without deadlock"),
             -32_006,
             "daemon is stopping",
@@ -1017,6 +1056,7 @@ mod tests {
             .call(
                 "tower_create_file",
                 json!({"path":"old.rs","content":"pub fn target() {}\n"}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         let readiness = Arc::new(ReadinessController::new(1));
@@ -1033,12 +1073,13 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
             )),
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
         let deletion = registry
             .call(
                 "tower_safe_delete_symbol",
                 json!({"path":"old.rs","symbol_name":"target","kind":"function","dry_run":true}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert_eq!(deletion["status"], "blocked");
@@ -1046,6 +1087,7 @@ mod tests {
         let rename = registry.call(
             "tower_rename_path",
             json!({"source":"old.rs","destination":"new.rs","semantic_policy":"best_effort"}),
+            &crate::domain::NeverCancelled,
         );
         assert!(rename.is_ok(), "{rename:?}");
     }
@@ -1057,7 +1099,7 @@ mod tests {
             vec![make_tool("hover")],
             CapabilityDependency::Lsp,
             &[],
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
         readiness
             .transition_capability(CapabilityDependency::Workspace, CapabilityReadiness::Ready)
@@ -1067,11 +1109,13 @@ mod tests {
             .call(
                 "tower_create_file",
                 json!({"path":"old.rs","content":"pub fn f() {}"}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         let result = registry.call(
             "tower_rename_path",
             json!({"source":"old.rs","destination":"new.rs","semantic_policy":"none"}),
+            &crate::domain::NeverCancelled,
         );
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1091,6 +1135,7 @@ mod tests {
             .call(
                 "tower_create_file",
                 json!({"path":"src/lib.rs","content":"pub fn target() {}\n"}),
+                &crate::domain::NeverCancelled,
             )
             .expect("seed safe-delete source through the public native operation");
 
@@ -1122,7 +1167,7 @@ mod tests {
                 ]),
                 HashMap::new(),
             )),
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
         let request = json!({
             "path":"src/lib.rs",
@@ -1133,7 +1178,11 @@ mod tests {
 
         assert_application_error(
             registry
-                .call("tower_safe_delete_symbol", request.clone())
+                .call(
+                    "tower_safe_delete_symbol",
+                    request.clone(),
+                    &crate::domain::NeverCancelled,
+                )
                 .expect_err("configured LSP preparation gates the nested native operation"),
             -32_004,
             "capability initialization is still in progress",
@@ -1148,7 +1197,11 @@ mod tests {
             .transition_extension(&lsp, CapabilityReadiness::Ready)
             .unwrap();
         let result = registry
-            .call("tower_safe_delete_symbol", request)
+            .call(
+                "tower_safe_delete_symbol",
+                request,
+                &crate::domain::NeverCancelled,
+            )
             .expect("one admitted native dispatch reaches its AST and LSP dependencies");
         assert_eq!(result["status"], "blocked");
         assert_eq!(
@@ -1163,15 +1216,38 @@ mod tests {
     }
 
     #[test]
+    fn configured_preparation_budget_remains_finite_after_exhaustion() {
+        assert_eq!(
+            super::remaining_preparation_budget(
+                Some(Duration::from_millis(1)),
+                Duration::from_millis(2),
+            ),
+            Some(Duration::ZERO),
+            "an exhausted configured budget must not become an unlimited wait",
+        );
+        assert_eq!(
+            super::remaining_preparation_budget(None, Duration::from_secs(1)),
+            None,
+            "only an originally absent budget is unlimited",
+        );
+    }
+
+    #[test]
     fn readiness_call_maps_timeout_without_dispatch() {
         let (mut registry, _, calls) = readiness_registry(
             "ast",
             vec![make_tool("outline")],
             CapabilityDependency::Ast,
             &[],
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
-        let error = registry.call("tower_ast_outline", json!({})).unwrap_err();
+        let error = registry
+            .call(
+                "tower_ast_outline",
+                json!({}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap_err();
         assert_application_error(
             error,
             -32_004,
@@ -1198,7 +1274,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let error = registry.call("tower_lsp_hover", json!({})).unwrap_err();
+        let error = registry
+            .call("tower_lsp_hover", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
         assert_application_error(
             error,
             -32_005,
@@ -1224,7 +1302,11 @@ mod tests {
                 .any(|tool| tool.name.contains(CATCH_UP_FENCE_TOOL))
         );
         assert!(matches!(
-            registry.call("tower_slow__tower_catch_up_fence", json!({})),
+            registry.call(
+                "tower_slow__tower_catch_up_fence",
+                json!({}),
+                &crate::domain::NeverCancelled
+            ),
             Err(ToolError::NotFound(_))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1256,9 +1338,11 @@ mod tests {
             Arc::new(crate::adapters::watcher::RenameCoordinator::default()),
             readiness,
             policy,
-            Duration::ZERO,
+            Some(Duration::ZERO),
         );
-        let error = registry.call("tower_lsp_hover", json!({})).unwrap_err();
+        let error = registry
+            .call("tower_lsp_hover", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
         assert_application_error(
             error,
             -32_007,
@@ -1280,7 +1364,13 @@ mod tests {
         readiness
             .transition_daemon(DaemonLifecycle::Stopping)
             .unwrap();
-        let error = registry.call("tower_ast_outline", json!({})).unwrap_err();
+        let error = registry
+            .call(
+                "tower_ast_outline",
+                json!({}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap_err();
         assert_application_error(
             error,
             -32_006,
@@ -1336,7 +1426,13 @@ mod tests {
 
     #[test]
     fn f008_application_keeps_genuine_fault_mapping_unchanged() {
-        let mapped = invoke_error_to_tool_error(InvokeError::Fault(ExtensionFault::Timeout));
+        let mapped = invoke_error_to_tool_error(InvokeError::Fault(ExtensionFault::Timeout {
+            detail: extension_protocol::TimeoutDetail {
+                operation: "invokeTool".into(),
+                layer: "host".into(),
+                budget_ms: 250,
+            },
+        }));
 
         assert!(matches!(
             mapped,
@@ -1411,7 +1507,11 @@ mod tests {
         let mut reg = merged_with_echo_extension("ast", "outline");
         let args = json!({"file": "src/main.rs"});
         let result = reg
-            .call("tower_ast_outline", args.clone())
+            .call(
+                "tower_ast_outline",
+                args.clone(),
+                &crate::domain::NeverCancelled,
+            )
             .expect("call must succeed");
         // EchoExtension echoes params.
         assert_eq!(result, args);
@@ -1438,13 +1538,21 @@ mod tests {
 
         let ast_args = json!({"file": "main.rs"});
         let result_a = merged
-            .call("tower_ast_outline", ast_args.clone())
+            .call(
+                "tower_ast_outline",
+                ast_args.clone(),
+                &crate::domain::NeverCancelled,
+            )
             .expect("tower_ast_outline");
         assert_eq!(result_a, ast_args, "ast/outline must echo args");
 
         let lsp_args = json!({"uri": "main.rs"});
         let result_b = merged
-            .call("tower_lsp_diagnostics", lsp_args.clone())
+            .call(
+                "tower_lsp_diagnostics",
+                lsp_args.clone(),
+                &crate::domain::NeverCancelled,
+            )
             .expect("tower_lsp_diagnostics");
         assert_eq!(result_b, lsp_args, "lsp/diagnostics must echo args");
     }
@@ -1468,7 +1576,11 @@ mod tests {
         let mut merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
 
         let result = merged
-            .call("tower_lint_check", JsonValue::Null)
+            .call(
+                "tower_lint_check",
+                JsonValue::Null,
+                &crate::domain::NeverCancelled,
+            )
             .expect("tower_lint_check");
 
         assert_eq!(result, JsonValue::String("lint".to_owned()));
@@ -1485,7 +1597,11 @@ mod tests {
 
         // Calling a non-existent extension tool returns NotFound.
         let err = reg
-            .call("tower_ast_outline", JsonValue::Null)
+            .call(
+                "tower_ast_outline",
+                JsonValue::Null,
+                &crate::domain::NeverCancelled,
+            )
             .expect_err("unknown extension tool must be NotFound");
         assert!(
             matches!(err, crate::adapters::mcp::types::ToolError::NotFound(_)),
@@ -1508,7 +1624,11 @@ mod tests {
         let mut merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
 
         let err = merged
-            .call("tower_bad_run", JsonValue::Null)
+            .call(
+                "tower_bad_run",
+                JsonValue::Null,
+                &crate::domain::NeverCancelled,
+            )
             .expect_err("faulting extension must error");
         assert!(
             matches!(
@@ -1524,7 +1644,11 @@ mod tests {
     fn call_unknown_tool_returns_not_found() {
         let mut reg = ExtensionMergedRegistry::new(empty_engine_state(), empty_ext_registry());
         let err = reg
-            .call("tower_unknown_tool", JsonValue::Null)
+            .call(
+                "tower_unknown_tool",
+                JsonValue::Null,
+                &crate::domain::NeverCancelled,
+            )
             .expect_err("unknown tool must fail");
         assert!(
             matches!(err, crate::adapters::mcp::types::ToolError::NotFound(_)),

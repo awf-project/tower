@@ -3,14 +3,14 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::traces::{TraceId, TraceMetadata, TracePolicy, TraceStore};
+use crate::traces::{AllocatedTrace, TraceId, TraceMetadata, TracePolicy, TraceStore};
 use crate::types::{DebugOutput, RuntimeFailure};
 
 pub const RR_OUTPUT_MAX_BYTES: usize = 65_536;
@@ -84,7 +84,20 @@ impl RrPreflight for FakeRrPreflight {
 }
 
 pub trait RrRecorder {
-    fn record(&self, request: RrRecordRequest, store: &mut TraceStore) -> RrRecordResult;
+    fn record(&self, request: RrRecordRequest, store: &mut TraceStore) -> RrRecordResult {
+        let deadline = match RecordingDeadline::from_request(&request) {
+            Ok(deadline) => deadline,
+            Err(error) => return invalid_record_timeout(error.field, error.value),
+        };
+        self.record_with_deadline(request, deadline, store)
+    }
+
+    fn record_with_deadline(
+        &self,
+        request: RrRecordRequest,
+        deadline: Option<RecordingDeadline>,
+        store: &mut TraceStore,
+    ) -> RrRecordResult;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,7 +110,12 @@ impl RealRrRecorder {
 }
 
 impl RrRecorder for RealRrRecorder {
-    fn record(&self, request: RrRecordRequest, store: &mut TraceStore) -> RrRecordResult {
+    fn record_with_deadline(
+        &self,
+        request: RrRecordRequest,
+        deadline: Option<RecordingDeadline>,
+        store: &mut TraceStore,
+    ) -> RrRecordResult {
         if request
             .trace_policy
             .trace_root
@@ -135,7 +153,7 @@ impl RrRecorder for RealRrRecorder {
             command.process_group(0);
         }
 
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let _ = store.abort_trace(&allocation);
@@ -150,59 +168,13 @@ impl RrRecorder for RealRrRecorder {
             }
         };
 
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                terminate_child(&mut child);
-                let _ = store.abort_trace(&allocation);
-                return record_failed("output", "rr stdout was unavailable");
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                terminate_child(&mut child);
-                let _ = store.abort_trace(&allocation);
-                return record_failed("output", "rr stderr was unavailable");
-            }
-        };
-
-        let output_capture = OutputCapture::new();
-        let stdout_reader = output_capture.spawn_reader("stdout", stdout);
-        let stderr_reader = output_capture.spawn_reader("stderr", stderr);
-
-        let status = match wait_with_timeout(
-            &mut child,
-            Duration::from_millis(request.effective_timeout_ms()),
-        ) {
-            WaitOutcome::Exited(status) => status,
-            WaitOutcome::TimedOut => {
-                terminate_child(&mut child);
-                let _ = store.abort_trace(&allocation);
-                return record_timeout(request.effective_timeout_ms());
-            }
-            WaitOutcome::WaitFailed => {
-                terminate_child(&mut child);
-                let _ = store.abort_trace(&allocation);
-                return record_failed("wait", "failed while waiting for rr record");
-            }
-        };
-
-        if let Err(_error) = collect_reader(stdout_reader) {
-            let _ = store.abort_trace(&allocation);
-            return record_failed("output", "failed to capture rr stdout");
-        }
-        if let Err(_error) = collect_reader(stderr_reader) {
-            let _ = store.abort_trace(&allocation);
-            return record_failed("output", "failed to capture rr stderr");
-        }
-
-        let (chunks, readers_truncated) = match output_capture.finish() {
-            Ok(output) => output,
-            Err(_) => {
-                let _ = store.abort_trace(&allocation);
-                return record_failed("output", "failed to capture rr stdout");
-            }
+        let CapturedProcess {
+            status,
+            chunks,
+            readers_truncated,
+        } = match capture_recording_process(child, deadline.as_ref(), store, &allocation, "rr") {
+            Ok(captured) => captured,
+            Err(error) => return *error,
         };
 
         if status.code().is_none() {
@@ -220,8 +192,9 @@ impl RrRecorder for RealRrRecorder {
             .map(|output| output.text.clone())
             .collect::<Vec<_>>();
         let exit_code = status.code().map(i64::from);
-        let trace = match store.register_completed(
-            allocation.clone(),
+        let trace = match register_recording(
+            store,
+            &allocation,
             crate::traces::TraceCompletion {
                 program: request.program.clone(),
                 args_summary: request.args.clone(),
@@ -232,15 +205,8 @@ impl RrRecorder for RealRrRecorder {
             now_unix_secs,
         ) {
             Ok(trace) => trace,
-            Err(_) => {
-                let _ = store.abort_trace(&allocation);
-                return record_failed("trace_register", "trace registration failed");
-            }
+            Err(error) => return *error,
         };
-
-        if store.prune(now_unix_secs).is_err() {
-            return record_failed("trace_register", "trace pruning failed");
-        }
 
         RrRecordResult {
             recordable: true,
@@ -265,8 +231,13 @@ impl FixtureRrRecorder {
 }
 
 impl RrRecorder for FixtureRrRecorder {
-    fn record(&self, request: RrRecordRequest, store: &mut TraceStore) -> RrRecordResult {
-        record_fixture_scenario(request, store)
+    fn record_with_deadline(
+        &self,
+        request: RrRecordRequest,
+        deadline: Option<RecordingDeadline>,
+        store: &mut TraceStore,
+    ) -> RrRecordResult {
+        record_fixture_scenario(request, deadline, store)
     }
 }
 
@@ -282,7 +253,12 @@ impl FakeRrRecorder {
 }
 
 impl RrRecorder for FakeRrRecorder {
-    fn record(&self, _request: RrRecordRequest, _store: &mut TraceStore) -> RrRecordResult {
+    fn record_with_deadline(
+        &self,
+        _request: RrRecordRequest,
+        _deadline: Option<RecordingDeadline>,
+        _store: &mut TraceStore,
+    ) -> RrRecordResult {
         self.result.clone()
     }
 }
@@ -329,10 +305,78 @@ pub struct RrRecordRequest {
     pub trace_policy: TracePolicy,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RrTimeoutResolutionError {
+    Overflow { record_timeout_secs: u64 },
+}
+
 impl RrRecordRequest {
-    pub fn effective_timeout_ms(&self) -> u64 {
-        self.timeout_ms
-            .unwrap_or(self.trace_policy.record_timeout_secs * 1000)
+    pub fn resolved_timeout_ms(&self) -> Result<Option<u64>, RrTimeoutResolutionError> {
+        if let Some(timeout_ms) = self.timeout_ms {
+            return Ok(Some(timeout_ms));
+        }
+        self.trace_policy
+            .record_timeout_secs
+            .map(|record_timeout_secs| {
+                record_timeout_secs
+                    .checked_mul(1_000)
+                    .ok_or(RrTimeoutResolutionError::Overflow {
+                        record_timeout_secs,
+                    })
+            })
+            .transpose()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RecordingDeadline {
+    budget_ms: u64,
+    instant: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecordingDeadlineError {
+    field: &'static str,
+    value: u64,
+}
+
+impl RecordingDeadline {
+    fn from_request(request: &RrRecordRequest) -> Result<Option<Self>, RecordingDeadlineError> {
+        let budget_ms = request.resolved_timeout_ms().map_err(
+            |RrTimeoutResolutionError::Overflow {
+                 record_timeout_secs,
+             }| RecordingDeadlineError {
+                field: "debug.record.record_timeout_secs",
+                value: record_timeout_secs,
+            },
+        )?;
+        let Some(budget_ms) = budget_ms else {
+            return Ok(None);
+        };
+        let duration = Duration::from_millis(budget_ms);
+        let invalid_deadline = || {
+            if let Some(timeout_ms) = request.timeout_ms {
+                RecordingDeadlineError {
+                    field: "timeout_ms",
+                    value: timeout_ms,
+                }
+            } else {
+                RecordingDeadlineError {
+                    field: "debug.record.record_timeout_secs",
+                    value: request
+                        .trace_policy
+                        .record_timeout_secs
+                        .expect("resolved policy timeout has a seconds value"),
+                }
+            }
+        };
+        if duration.as_nanos() > u128::from(u64::MAX) {
+            return Err(invalid_deadline());
+        }
+        let instant = Instant::now()
+            .checked_add(duration)
+            .ok_or_else(invalid_deadline)?;
+        Ok(Some(Self { budget_ms, instant }))
     }
 }
 
@@ -483,6 +527,89 @@ impl OutputCapture {
     }
 }
 
+struct CapturedProcess {
+    status: ExitStatus,
+    chunks: Vec<CapturedChunk>,
+    readers_truncated: bool,
+}
+
+fn capture_recording_process(
+    mut child: Child,
+    deadline: Option<&RecordingDeadline>,
+    store: &TraceStore,
+    allocation: &AllocatedTrace,
+    recorder: &str,
+) -> Result<CapturedProcess, Box<RrRecordResult>> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        terminate_child(&mut child);
+        let _ = store.abort_trace(allocation);
+        Box::new(record_failed(
+            "output",
+            &format!("{recorder} stdout was unavailable"),
+        ))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        terminate_child(&mut child);
+        let _ = store.abort_trace(allocation);
+        Box::new(record_failed(
+            "output",
+            &format!("{recorder} stderr was unavailable"),
+        ))
+    })?;
+
+    let output_capture = OutputCapture::new();
+    let stdout_reader = output_capture.spawn_reader("stdout", stdout);
+    let stderr_reader = output_capture.spawn_reader("stderr", stderr);
+    let status = match wait_until(&mut child, deadline) {
+        WaitOutcome::Exited(status) => status,
+        WaitOutcome::TimedOut => {
+            terminate_child(&mut child);
+            let _ = store.abort_trace(allocation);
+            return Err(Box::new(record_timeout(
+                deadline.expect("timed wait has a deadline").budget_ms,
+            )));
+        }
+        WaitOutcome::WaitFailed => {
+            terminate_child(&mut child);
+            let _ = store.abort_trace(allocation);
+            return Err(Box::new(record_failed(
+                "wait",
+                &format!("failed while waiting for {recorder} record"),
+            )));
+        }
+    };
+
+    for reader in [stdout_reader, stderr_reader] {
+        if !reader_finished_before_deadline(&reader, deadline) {
+            terminate_child(&mut child);
+            let _ = store.abort_trace(allocation);
+            return Err(Box::new(record_timeout(
+                deadline.expect("timed reader has a deadline").budget_ms,
+            )));
+        }
+        if collect_reader(reader).is_err() {
+            let _ = store.abort_trace(allocation);
+            return Err(Box::new(record_failed(
+                "output",
+                &format!("failed to capture {recorder} output"),
+            )));
+        }
+    }
+
+    let (chunks, readers_truncated) = output_capture.finish().map_err(|_| {
+        let _ = store.abort_trace(allocation);
+        Box::new(record_failed(
+            "output",
+            &format!("failed to capture {recorder} output"),
+        ))
+    })?;
+    Ok(CapturedProcess {
+        status,
+        chunks,
+        readers_truncated,
+    })
+}
+
 fn reserve_output_bytes(remaining_bytes: &AtomicUsize, requested: usize) -> usize {
     let mut current = remaining_bytes.load(Ordering::Relaxed);
     loop {
@@ -508,13 +635,39 @@ pub fn record_with_preflight(
     request: RrRecordRequest,
     store: &mut TraceStore,
 ) -> RrRecordResult {
+    let deadline = match RecordingDeadline::from_request(&request) {
+        Ok(deadline) => deadline,
+        Err(error) => return invalid_record_timeout(error.field, error.value),
+    };
     match preflight.check() {
-        RrPreflightStatus::Supported => recorder.record(request, store),
+        RrPreflightStatus::Supported => recorder.record_with_deadline(request, deadline, store),
         RrPreflightStatus::Unsupported { reason, message } => rr_unsupported(reason, &message),
     }
 }
 
-fn record_fixture_scenario(request: RrRecordRequest, store: &mut TraceStore) -> RrRecordResult {
+fn register_recording(
+    store: &mut TraceStore,
+    allocation: &AllocatedTrace,
+    completion: crate::traces::TraceCompletion,
+    now_unix_secs: u64,
+) -> Result<TraceMetadata, Box<RrRecordResult>> {
+    let trace = store
+        .register_completed(allocation.clone(), completion, now_unix_secs)
+        .map_err(|_| {
+            let _ = store.abort_trace(allocation);
+            Box::new(record_failed("trace_register", "trace registration failed"))
+        })?;
+    store
+        .prune(now_unix_secs)
+        .map_err(|_| Box::new(record_failed("trace_register", "trace pruning failed")))?;
+    Ok(trace)
+}
+
+fn record_fixture_scenario(
+    request: RrRecordRequest,
+    deadline: Option<RecordingDeadline>,
+    store: &mut TraceStore,
+) -> RrRecordResult {
     if request
         .trace_policy
         .trace_root
@@ -549,52 +702,21 @@ fn record_fixture_scenario(request: RrRecordRequest, store: &mut TraceStore) -> 
         command.process_group(0);
     }
 
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return record_failed("spawn", "failed to spawn fixture record"),
-    };
-
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_child(&mut child);
-            return record_failed("output", "fixture stdout was unavailable");
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate_child(&mut child);
-            return record_failed("output", "fixture stderr was unavailable");
+        Err(_) => {
+            let _ = store.abort_trace(&allocation);
+            return record_failed("spawn", "failed to spawn fixture record");
         }
     };
 
-    let output_capture = OutputCapture::new();
-    let stdout_reader = output_capture.spawn_reader("stdout", stdout);
-    let stderr_reader = output_capture.spawn_reader("stderr", stderr);
-
-    let status = match wait_with_timeout(
-        &mut child,
-        Duration::from_millis(request.effective_timeout_ms()),
-    ) {
-        WaitOutcome::Exited(status) => status,
-        WaitOutcome::TimedOut => {
-            terminate_child(&mut child);
-            return record_timeout(request.effective_timeout_ms());
-        }
-        WaitOutcome::WaitFailed => {
-            terminate_child(&mut child);
-            return record_failed("wait", "failed while waiting for fixture record");
-        }
-    };
-
-    if collect_reader(stdout_reader).is_err() || collect_reader(stderr_reader).is_err() {
-        return record_failed("output", "failed to capture fixture output");
-    }
-
-    let (chunks, readers_truncated) = match output_capture.finish() {
-        Ok(output) => output,
-        Err(_) => return record_failed("output", "failed to capture fixture output"),
+    let CapturedProcess {
+        status,
+        chunks,
+        readers_truncated,
+    } = match capture_recording_process(child, deadline.as_ref(), store, &allocation, "fixture") {
+        Ok(captured) => captured,
+        Err(error) => return *error,
     };
     let (output, output_truncated) = bounded_output_events(chunks, readers_truncated);
     let output_summary = output
@@ -602,8 +724,9 @@ fn record_fixture_scenario(request: RrRecordRequest, store: &mut TraceStore) -> 
         .map(|output| output.text.clone())
         .collect::<Vec<_>>();
     let exit_code = status.code().map(i64::from);
-    let trace = match store.register_completed(
-        allocation,
+    let trace = match register_recording(
+        store,
+        &allocation,
         crate::traces::TraceCompletion {
             program: trace_program,
             args_summary: request.args.clone(),
@@ -614,12 +737,8 @@ fn record_fixture_scenario(request: RrRecordRequest, store: &mut TraceStore) -> 
         now_unix_secs,
     ) {
         Ok(trace) => trace,
-        Err(_) => return record_failed("trace_register", "trace registration failed"),
+        Err(error) => return *error,
     };
-
-    if store.prune(now_unix_secs).is_err() {
-        return record_failed("trace_register", "trace pruning failed");
-    }
 
     RrRecordResult {
         recordable: status.success(),
@@ -651,6 +770,9 @@ fn fixture_program_for_request(request: &RrRecordRequest) -> PathBuf {
 }
 
 fn fixture_args_for_request(request: &RrRecordRequest) -> Vec<String> {
+    if !uses_debug_adapter_fixture(request) {
+        return request.args.clone();
+    }
     if request
         .args
         .iter()
@@ -669,6 +791,9 @@ fn fixture_args_for_request(request: &RrRecordRequest) -> Vec<String> {
 }
 
 fn fixture_trace_program(request: &RrRecordRequest) -> String {
+    if !uses_debug_adapter_fixture(request) {
+        return request.program.clone();
+    }
     let scenario = request
         .env
         .get("TOWER_DEBUG_FIXTURE_SCENARIO")
@@ -687,6 +812,13 @@ fn fixture_trace_program(request: &RrRecordRequest) -> String {
         .or_else(|| request.args.first().map(String::as_str))
         .unwrap_or(request.program.as_str());
     scenario.to_owned()
+}
+
+fn uses_debug_adapter_fixture(request: &RrRecordRequest) -> bool {
+    request.program == "fixture-program"
+        || PathBuf::from(&request.program)
+            .file_name()
+            .is_some_and(|name| name == "fixture_debug_adapter")
 }
 
 fn rr_unsupported(reason: RrUnsupportedReason, message: &str) -> RrRecordResult {
@@ -717,8 +849,36 @@ fn record_timeout(timeout_ms: u64) -> RrRecordResult {
         output_truncated: false,
         error: Some(RuntimeFailure {
             code: RECORD_TIMEOUT.to_owned(),
-            message: "rr recording timed out".to_owned(),
-            data: Some(serde_json::json!({ "timeout_ms": timeout_ms })),
+            message: "record timed out".to_owned(),
+            data: Some(
+                serde_json::to_value(extension_protocol::TimeoutDetail {
+                    operation: "record".to_owned(),
+                    layer: "subprocess".to_owned(),
+                    budget_ms: timeout_ms,
+                })
+                .expect("TimeoutDetail is serializable"),
+            ),
+        }),
+    }
+}
+
+fn invalid_record_timeout(field: &str, value: u64) -> RrRecordResult {
+    RrRecordResult {
+        recordable: false,
+        reason: Some(RECORD_TIMEOUT.to_owned()),
+        trace_id: None,
+        trace: None,
+        exit_code: None,
+        output: Vec::new(),
+        output_truncated: false,
+        error: Some(RuntimeFailure {
+            code: RECORD_TIMEOUT.to_owned(),
+            message: "invalid record timeout".to_owned(),
+            data: Some(serde_json::json!({
+                "reason": "invalid_timeout",
+                "field": field,
+                "value": value,
+            })),
         }),
     }
 }
@@ -753,16 +913,30 @@ fn apply_request_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> WaitOutcome {
-    let started = std::time::Instant::now();
+fn wait_until(child: &mut Child, deadline: Option<&RecordingDeadline>) -> WaitOutcome {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return WaitOutcome::Exited(status),
-            Ok(None) if started.elapsed() >= timeout => return WaitOutcome::TimedOut,
+            Ok(None) if deadline.is_some_and(|deadline| Instant::now() >= deadline.instant) => {
+                return WaitOutcome::TimedOut;
+            }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => return WaitOutcome::WaitFailed,
         }
     }
+}
+
+fn reader_finished_before_deadline(
+    handle: &std::thread::JoinHandle<std::io::Result<()>>,
+    deadline: Option<&RecordingDeadline>,
+) -> bool {
+    while !handle.is_finished() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline.instant) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
 }
 
 fn collect_reader(handle: std::thread::JoinHandle<std::io::Result<()>>) -> std::io::Result<()> {
@@ -940,7 +1114,7 @@ mod tests {
             trace_root: temp_trace_root(name),
             ttl_secs: Some(120),
             max_traces: 20,
-            record_timeout_secs: 60,
+            record_timeout_secs: Some(60),
         }
     }
 
@@ -1174,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn rr_record_request_contains_the_public_record_fields_and_effective_timeout_default() {
+    fn rr_record_request_contains_the_public_record_fields_and_policy_timeout() {
         let trace_policy = trace_policy("request-default-timeout");
         let request = RrRecordRequest {
             language: "rust".to_owned(),
@@ -1191,15 +1365,23 @@ mod tests {
         assert_eq!(request.args, ["--case", "smoke"]);
         assert_eq!(request.cwd.as_deref(), Some("fixtures"));
         assert_eq!(request.env["RUST_LOG"], "debug");
-        assert_eq!(request.effective_timeout_ms(), 60_000);
+        assert_eq!(request.resolved_timeout_ms(), Ok(Some(60_000)));
     }
 
     #[test]
-    fn rr_record_request_effective_timeout_ms_returns_explicit_timeout_when_present() {
+    fn rr_record_request_resolved_timeout_ms_returns_explicit_timeout_when_present() {
         let mut request = request("request-explicit-timeout");
         request.timeout_ms = Some(1_500);
 
-        assert_eq!(request.effective_timeout_ms(), 1_500);
+        assert_eq!(request.resolved_timeout_ms(), Ok(Some(1_500)));
+    }
+
+    #[test]
+    fn rr_record_without_timeout_has_no_effective_deadline() {
+        let mut request = request("request-without-timeout");
+        request.trace_policy.record_timeout_secs = None;
+
+        assert_eq!(request.resolved_timeout_ms(), Ok(None));
     }
 
     #[test]
@@ -1344,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn rr_timeout_while_target_is_running_returns_record_timeout_with_effective_timeout_data() {
+    fn rr_record_timeout_reports_the_applied_budget_and_reaps_the_process_tree() {
         let timeout_probe = temp_trace_root("timeout-reaping").join("child.pid");
         let script = format!(
             "#!/bin/sh\n\
@@ -1355,21 +1537,29 @@ mod tests {
             timeout_probe.display()
         );
         let (fake_rr_dir, _rr_path) = fake_rr_bin("timeout-reaping", &script);
-        let request = RrRecordRequest {
+        let timeout_request = RrRecordRequest {
             timeout_ms: Some(250),
             env: BTreeMap::from([("PATH".to_owned(), fake_rr_dir.display().to_string())]),
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "/bin/sleep 30".to_owned()],
             ..request("timeout-result")
         };
-        let mut store = TraceStore::new(request.trace_policy.clone());
-        let result = RealRrRecorder::new().record(request, &mut store);
+        let mut store = TraceStore::new(timeout_request.trace_policy.clone());
+        let result = RealRrRecorder::new().record(timeout_request, &mut store);
 
         assert!(!result.recordable);
         assert_eq!(result.reason.as_deref(), Some(RECORD_TIMEOUT));
         let error = result.error.expect("timeout result includes error");
         assert_eq!(error.code, RECORD_TIMEOUT);
-        assert_eq!(error.data, Some(json!({ "timeout_ms": 250 })));
+        assert_eq!(error.message, "record timed out");
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "operation": "record",
+                "layer": "subprocess",
+                "budget_ms": 250
+            }))
+        );
         let child_pid = fs::read_to_string(&timeout_probe)
             .expect("timeout path records child pid")
             .trim()
@@ -1383,6 +1573,114 @@ mod tests {
             !status.success(),
             "timeout cleanup must reap the target process tree; child pid {child_pid} is still alive"
         );
+
+        let marker = temp_trace_root("overflow-no-spawn").join("spawned");
+        let script = format!("#!/bin/sh\ntouch {}\n", marker.display());
+        let (fake_rr_dir, _rr_path) = fake_rr_bin("overflow-no-spawn", &script);
+        let overflow_secs = u64::MAX;
+        let mut overflow_request = request("overflow-result");
+        overflow_request.trace_policy.record_timeout_secs = Some(overflow_secs);
+        overflow_request.env =
+            BTreeMap::from([("PATH".to_owned(), fake_rr_dir.display().to_string())]);
+        assert_eq!(
+            overflow_request.resolved_timeout_ms(),
+            Err(RrTimeoutResolutionError::Overflow {
+                record_timeout_secs: overflow_secs
+            })
+        );
+        let mut overflow_store = TraceStore::new(overflow_request.trace_policy.clone());
+        let overflow_result = RealRrRecorder::new().record(overflow_request, &mut overflow_store);
+        let overflow_error = overflow_result
+            .error
+            .expect("invalid timeout returns a structured failure");
+        assert_eq!(overflow_error.code, RECORD_TIMEOUT);
+        assert_eq!(overflow_error.message, "invalid record timeout");
+        assert_eq!(
+            overflow_error.data,
+            Some(json!({
+                "reason": "invalid_timeout",
+                "field": "debug.record.record_timeout_secs",
+                "value": overflow_secs
+            }))
+        );
+        assert!(
+            !marker.exists(),
+            "invalid timeout must be rejected before rr spawn"
+        );
+
+        // These are deliberately separate from the seconds-to-milliseconds overflow above:
+        // both values produce a representable millisecond Duration, but must be rejected when
+        // the recording deadline cannot be represented by Instant::checked_add.
+        for (origin, timeout_ms, record_timeout_secs, field, value) in [
+            (
+                "request override",
+                Some(u64::MAX),
+                Some(60),
+                "timeout_ms",
+                u64::MAX,
+            ),
+            (
+                "policy default",
+                None,
+                Some(u64::MAX / 1_000),
+                "debug.record.record_timeout_secs",
+                u64::MAX / 1_000,
+            ),
+        ] {
+            let marker = temp_trace_root(&format!("deadline-overflow-{origin}")).join("spawned");
+            let script = format!("#!/bin/sh\ntouch {}\n", marker.display());
+            let (fake_rr_dir, _rr_path) =
+                fake_rr_bin(&format!("deadline-overflow-{origin}"), &script);
+            let mut deadline_overflow_request = request(&format!("deadline-overflow-{origin}"));
+            deadline_overflow_request.timeout_ms = timeout_ms;
+            deadline_overflow_request.trace_policy.record_timeout_secs = record_timeout_secs;
+            deadline_overflow_request.env =
+                BTreeMap::from([("PATH".to_owned(), fake_rr_dir.display().to_string())]);
+
+            let mut deadline_overflow_store =
+                TraceStore::new(deadline_overflow_request.trace_policy.clone());
+            let deadline_overflow_result = RealRrRecorder::new()
+                .record(deadline_overflow_request, &mut deadline_overflow_store);
+
+            assert!(
+                !deadline_overflow_result.recordable,
+                "{origin} deadline overflow must not record a trace"
+            );
+            assert_eq!(
+                deadline_overflow_result.reason.as_deref(),
+                Some(RECORD_TIMEOUT),
+                "{origin} deadline overflow must retain the stable timeout reason"
+            );
+            assert_eq!(
+                deadline_overflow_result.trace_id, None,
+                "{origin} deadline overflow must not allocate a trace"
+            );
+            assert_eq!(
+                deadline_overflow_result.trace, None,
+                "{origin} deadline overflow must not return a trace"
+            );
+            let deadline_overflow_error = deadline_overflow_result
+                .error
+                .expect("invalid deadline returns a structured failure");
+            assert_eq!(deadline_overflow_error.code, RECORD_TIMEOUT, "{origin}");
+            assert_eq!(
+                deadline_overflow_error.message, "invalid record timeout",
+                "{origin}"
+            );
+            assert_eq!(
+                deadline_overflow_error.data,
+                Some(json!({
+                    "reason": "invalid_timeout",
+                    "field": field,
+                    "value": value,
+                })),
+                "{origin} deadline overflow must not expose TimeoutDetail"
+            );
+            assert!(
+                !marker.exists(),
+                "{origin} deadline overflow must be rejected before rr spawn"
+            );
+        }
     }
 
     #[test]
@@ -1448,7 +1746,7 @@ mod tests {
                             trace_root: trace_root_file,
                             ttl_secs: Some(120),
                             max_traces: 20,
-                            record_timeout_secs: 60,
+                            record_timeout_secs: Some(60),
                         },
                         ..request("trace-register-failure")
                     }
@@ -1477,6 +1775,29 @@ mod tests {
                 "stage {stage} returned unexpected error"
             );
         }
+    }
+
+    #[test]
+    fn fixture_spawn_failure_aborts_the_allocated_trace() {
+        let mut request = request("fixture-spawn-failure");
+        request.program = request
+            .trace_policy
+            .trace_root
+            .join("missing-recorder")
+            .to_string_lossy()
+            .into_owned();
+        let trace_root = request.trace_policy.trace_root.clone();
+        let mut store = TraceStore::new(request.trace_policy.clone());
+        let result = FixtureRrRecorder::new().record(request, &mut store);
+        assert_eq!(
+            result.error.unwrap().data,
+            Some(serde_json::json!({"stage":"spawn"}))
+        );
+        assert_eq!(
+            fs::read_dir(trace_root).unwrap().count(),
+            0,
+            "failed spawn must not leave an allocated trace directory"
+        );
     }
 
     #[test]

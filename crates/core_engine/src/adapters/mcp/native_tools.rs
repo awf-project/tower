@@ -288,7 +288,12 @@ impl ToolRegistry for NativeToolRegistry {
         Self::descriptions()
     }
 
-    fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ToolError> {
         match name {
             "tower_find_file" => call_find_file(&self.state, args),
             "tower_list_dir" => call_list_dir(&self.state, args),
@@ -300,8 +305,10 @@ impl ToolRegistry for NativeToolRegistry {
             "tower_global_replace" => call_global_replace(&self.state, args),
             "tower_edit_range" => call_edit_range(&self.state, args),
             "tower_reindex" => call_reindex(&self.state),
-            "tower_rename_path" => call_rename_path(&self.state, &self.rename_coordinator, args),
-            "tower_safe_delete_symbol" => call_safe_delete_symbol(&self.state, args),
+            "tower_rename_path" => {
+                call_rename_path(&self.state, &self.rename_coordinator, args, cancellation)
+            }
+            "tower_safe_delete_symbol" => call_safe_delete_symbol(&self.state, args, cancellation),
             other => Err(ToolError::NotFound(other.to_owned())),
         }
     }
@@ -1090,6 +1097,7 @@ fn call_rename_path(
     state: &Arc<RwLock<EngineState>>,
     rename_coordinator: &RenameCoordinator,
     args: Value,
+    cancellation: &dyn crate::domain::CancellationSignal,
 ) -> Result<Value, ToolError> {
     let request: wire::PathRenameRequest = serde_json::from_value(args)
         .map_err(|_| ToolError::InvalidArgs("invalid tower_rename_path arguments".to_owned()))?;
@@ -1131,10 +1139,11 @@ fn call_rename_path(
     let semantic = if policy == PathRenameSemanticPolicy::None {
         None
     } else {
-        Some(request_semantic_rename(
-            extension_host.as_ref(),
-            &native_plan,
-        ))
+        match request_semantic_rename(extension_host.as_ref(), &native_plan, cancellation) {
+            Ok(edits) => Some(Ok(edits)),
+            Err(SemanticRenameRequestError::Domain(error)) => Some(Err(error)),
+            Err(SemanticRenameRequestError::Cancelled) => return Err(ToolError::Cancelled),
+        }
     };
 
     let deferred_host = Arc::new(DeferredRenameHost::default());
@@ -1225,6 +1234,7 @@ fn call_rename_path(
 fn call_safe_delete_symbol(
     state: &Arc<RwLock<EngineState>>,
     args: Value,
+    cancellation: &dyn crate::domain::CancellationSignal,
 ) -> Result<Value, ToolError> {
     let request: wire::SafeDeleteRequest = serde_json::from_value(args).map_err(|_| {
         ToolError::InvalidArgs("invalid tower_safe_delete_symbol arguments".to_owned())
@@ -1242,6 +1252,7 @@ fn call_safe_delete_symbol(
     let declaration = match invoke_safe_delete_declaration_planner(
         extension_host.as_ref(),
         &declaration_request,
+        cancellation,
     )? {
         Ok(declaration) => declaration,
         Err(blocking_reason) => return serialize_safe_delete_block(blocking_reason),
@@ -1276,7 +1287,11 @@ fn call_safe_delete_symbol(
     let semantic_request = wire::SafeDeleteSemanticRequest {
         declaration: declaration_plan,
     };
-    let semantic = invoke_safe_delete_semantic_planner(extension_host.as_ref(), &semantic_request)?;
+    let semantic = invoke_safe_delete_semantic_planner(
+        extension_host.as_ref(),
+        &semantic_request,
+        cancellation,
+    )?;
     let snapshot_paths = safe_delete_snapshot_paths(&declaration, &semantic);
     run_safe_delete(
         state,
@@ -1291,6 +1306,7 @@ fn call_safe_delete_symbol(
 fn invoke_safe_delete_declaration_planner(
     host: &dyn ExtensionHostPort,
     request: &wire::SafeDeleteDeclarationRequest,
+    cancellation: &dyn crate::domain::CancellationSignal,
 ) -> Result<Result<wire::SafeDeleteDeclarationOutcome, wire::SafeDeleteBlockingReason>, ToolError> {
     let params = serde_json::to_value(request)
         .map_err(|_| ToolError::ExecutionFailed("safe-delete planning failed".to_owned()))?;
@@ -1298,10 +1314,14 @@ fn invoke_safe_delete_declaration_planner(
         &crate::domain::extension_host::ExtensionId::new("ast"),
         "plan_safe_delete_declaration",
         params,
+        cancellation,
     ) {
         Ok(value) => value,
         Err(crate::domain::extension_host::InvokeError::ToolNotFound(_)) => {
             return Ok(Err(wire::SafeDeleteBlockingReason::CapabilityUnavailable));
+        }
+        Err(crate::domain::extension_host::InvokeError::Cancelled) => {
+            return Err(ToolError::Cancelled);
         }
         Err(
             crate::domain::extension_host::InvokeError::Fault(_)
@@ -1330,6 +1350,7 @@ fn serialize_safe_delete_block(
 fn invoke_safe_delete_semantic_planner(
     host: &dyn ExtensionHostPort,
     request: &wire::SafeDeleteSemanticRequest,
+    cancellation: &dyn crate::domain::CancellationSignal,
 ) -> Result<wire::SafeDeleteSemanticOutcome, ToolError> {
     let params = serde_json::to_value(request)
         .map_err(|_| ToolError::ExecutionFailed("safe-delete planning failed".to_owned()))?;
@@ -1337,11 +1358,12 @@ fn invoke_safe_delete_semantic_planner(
         &crate::domain::extension_host::ExtensionId::new("lsp"),
         "plan_safe_delete",
         params,
+        cancellation,
     ) {
         Ok(value) => value,
         Err(crate::domain::extension_host::InvokeError::Fault(fault)) => {
             return Ok(match fault {
-                extension_protocol::ExtensionFault::Timeout => {
+                extension_protocol::ExtensionFault::Timeout { .. } => {
                     wire::SafeDeleteSemanticOutcome::BackendTimeout
                 }
                 extension_protocol::ExtensionFault::Crashed { .. } => {
@@ -1355,6 +1377,9 @@ fn invoke_safe_delete_semantic_planner(
         }
         Err(crate::domain::extension_host::InvokeError::Application(_)) => {
             return Ok(wire::SafeDeleteSemanticOutcome::MalformedResponse);
+        }
+        Err(crate::domain::extension_host::InvokeError::Cancelled) => {
+            return Err(ToolError::Cancelled);
         }
         Err(crate::domain::extension_host::InvokeError::ToolNotFound(_)) => {
             return Ok(wire::SafeDeleteSemanticOutcome::CapabilityUnavailable);
@@ -1542,7 +1567,12 @@ impl ExtensionHostPort for DeferredRenameHost {
         Vec::new()
     }
 
-    fn invoke(&self, tool_name: &str, _params: Value) -> Result<Value, crate::domain::InvokeError> {
+    fn invoke(
+        &self,
+        tool_name: &str,
+        _params: Value,
+        _cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, crate::domain::InvokeError> {
         Err(crate::domain::InvokeError::ToolNotFound(
             tool_name.to_owned(),
         ))
@@ -1614,32 +1644,48 @@ fn wire_rename_plan(plan: &PathRenamePlan) -> wire::PathRenamePlan {
     }
 }
 
+enum SemanticRenameRequestError {
+    Domain(PathRenameError),
+    Cancelled,
+}
+
 fn request_semantic_rename(
     host: &dyn ExtensionHostPort,
     native_plan: &PathRenamePlan,
-) -> Result<Vec<WorkspaceEditSpan>, PathRenameError> {
+    cancellation: &dyn crate::domain::CancellationSignal,
+) -> Result<Vec<WorkspaceEditSpan>, SemanticRenameRequestError> {
     let request = wire::PathRenamePlanningRequest {
         moves: wire_rename_plan(native_plan).moves,
         semantic_policy: wire_rename_policy(native_plan.semantic_policy()),
     };
-    let params = serde_json::to_value(&request).map_err(|_| PathRenameError::SemanticBackend)?;
+    let params = serde_json::to_value(&request)
+        .map_err(|_| SemanticRenameRequestError::Domain(PathRenameError::SemanticBackend))?;
     let value = host
-        .invoke("plan_path_rename", params)
+        .invoke("plan_path_rename", params, cancellation)
         .map_err(|error| match error {
             crate::domain::extension_host::InvokeError::ToolNotFound(_) => {
-                PathRenameError::SemanticUnsupported
+                SemanticRenameRequestError::Domain(PathRenameError::SemanticUnsupported)
             }
-            _ => PathRenameError::SemanticBackend,
+            crate::domain::extension_host::InvokeError::Cancelled => {
+                SemanticRenameRequestError::Cancelled
+            }
+            _ => SemanticRenameRequestError::Domain(PathRenameError::SemanticBackend),
         })?;
-    let response: wire::PathRenamePlanningResult =
-        serde_json::from_value(value).map_err(|_| PathRenameError::SemanticBackend)?;
+    let response: wire::PathRenamePlanningResult = serde_json::from_value(value)
+        .map_err(|_| SemanticRenameRequestError::Domain(PathRenameError::SemanticBackend))?;
     if let Some(error) = response.error {
-        return Err(domain_rename_error_code(error.code));
+        return Err(SemanticRenameRequestError::Domain(
+            domain_rename_error_code(error.code),
+        ));
     }
-    let plan = response.plan.ok_or(PathRenameError::SemanticBackend)?;
+    let plan = response.plan.ok_or(SemanticRenameRequestError::Domain(
+        PathRenameError::SemanticBackend,
+    ))?;
     let expected = wire_rename_plan(native_plan);
     if plan.moves != expected.moves || plan.semantic_policy != expected.semantic_policy {
-        return Err(PathRenameError::SemanticBackend);
+        return Err(SemanticRenameRequestError::Domain(
+            PathRenameError::SemanticBackend,
+        ));
     }
     plan.edits
         .into_iter()
@@ -1895,6 +1941,37 @@ mod tests {
     use crate::domain::workspace::ProjectWorkspace;
     use crate::ports::FileSystemPort;
 
+    struct CancelledExtensionHost;
+
+    impl crate::ports::ExtensionHostPort for CancelledExtensionHost {
+        fn on_file_indexed(&self, _id: crate::domain::FileId, _path: &RelativePath) {}
+        fn on_file_changed(&self, _id: crate::domain::FileId, _path: &RelativePath) {}
+        fn on_file_deleted(&self, _path: &RelativePath) {}
+        fn declared_tools(
+            &self,
+        ) -> Vec<(crate::domain::ExtensionId, extension_protocol::ToolDecl)> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            _tool_name: &str,
+            _params: Value,
+            _cancellation: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, crate::domain::InvokeError> {
+            Err(crate::domain::InvokeError::Cancelled)
+        }
+
+        fn invoke_extension(
+            &self,
+            _extension_id: &crate::domain::ExtensionId,
+            _tool_name: &str,
+            _params: Value,
+            _cancellation: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, crate::domain::InvokeError> {
+            Err(crate::domain::InvokeError::Cancelled)
+        }
+    }
+
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
     fn empty_state() -> Arc<RwLock<EngineState>> {
@@ -1957,6 +2034,69 @@ mod tests {
         NativeToolRegistry::new(state)
     }
 
+    #[test]
+    fn cancelled_semantic_rename_does_not_mutate_the_workspace() {
+        let state = state_with_file("src/old.rs", "fn old() {}\n");
+        state
+            .write()
+            .unwrap()
+            .set_plugin_host(Arc::new(CancelledExtensionHost));
+        let mut registry = make_registry(Arc::clone(&state));
+
+        let error = registry
+            .call(
+                "tower_rename_path",
+                json!({
+                    "source": "src/old.rs",
+                    "destination": "src/new.rs",
+                    "semantic_policy": "best_effort",
+                    "expected_versions": {}
+                }),
+                &crate::domain::NeverCancelled,
+            )
+            .expect_err("cancellation must abort the composite rename");
+
+        assert!(matches!(error, ToolError::Cancelled));
+        let guard = state.read().unwrap();
+        assert!(guard.fs.read(&RelativePath::new("src/old.rs")).is_ok());
+        assert!(guard.fs.read(&RelativePath::new("src/new.rs")).is_err());
+    }
+
+    #[test]
+    fn cancelled_safe_delete_does_not_mutate_the_workspace() {
+        let original = "fn target() {}\n";
+        let state = state_with_file("src/lib.rs", original);
+        state
+            .write()
+            .unwrap()
+            .set_plugin_host(Arc::new(CancelledExtensionHost));
+        let mut registry = make_registry(Arc::clone(&state));
+
+        let error = registry
+            .call(
+                "tower_safe_delete_symbol",
+                json!({
+                    "path": "src/lib.rs",
+                    "symbol_name": "target",
+                    "kind": "function",
+                    "dry_run": false
+                }),
+                &crate::domain::NeverCancelled,
+            )
+            .expect_err("cancellation must abort the composite safe-delete");
+
+        assert!(matches!(error, ToolError::Cancelled));
+        assert_eq!(
+            state
+                .read()
+                .unwrap()
+                .fs
+                .read(&RelativePath::new("src/lib.rs"))
+                .unwrap(),
+            original.as_bytes()
+        );
+    }
+
     fn state_with_list_dir_files() -> Arc<RwLock<EngineState>> {
         let state = empty_state();
         let mut reg = make_registry(Arc::clone(&state));
@@ -1968,6 +2108,7 @@ mod tests {
             reg.call(
                 "tower_create_file",
                 json!({ "path": path, "content": content }),
+                &crate::domain::NeverCancelled,
             )
             .expect("setup create_file must succeed");
         }
@@ -2138,7 +2279,11 @@ mod tests {
         let mut reg = make_registry(state_with_list_dir_files());
 
         let value = reg
-            .call("tower_list_dir", json!({ "path": "src" }))
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src" }),
+                &crate::domain::NeverCancelled,
+            )
             .expect("tower_list_dir call must dispatch to the handler and succeed");
 
         assert_eq!(
@@ -2177,7 +2322,11 @@ mod tests {
         let mut reg = make_registry(state_with_list_dir_files());
 
         let value = reg
-            .call("tower_list_dir", json!({ "path": "src" }))
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src" }),
+                &crate::domain::NeverCancelled,
+            )
             .expect("omitted recursive must default to false");
 
         assert_eq!(
@@ -2200,7 +2349,11 @@ mod tests {
         let mut reg = make_registry(state_with_list_dir_files());
 
         let omitted = reg
-            .call("tower_list_dir", json!({ "path": "src", "max_depth": 1 }))
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src", "max_depth": 1 }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
         assert_invalid_args(omitted);
 
@@ -2208,6 +2361,7 @@ mod tests {
             .call(
                 "tower_list_dir",
                 json!({ "path": "src", "recursive": false, "max_depth": 1 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert_invalid_args(false_recursive);
@@ -2221,6 +2375,7 @@ mod tests {
             .call(
                 "tower_list_dir",
                 json!({ "path": "src", "recursive": true, "max_depth": 0 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -2237,7 +2392,9 @@ mod tests {
             json!({ "path": "src", "recursive": "yes" }),
             json!({ "path": "src", "recursive": true, "max_depth": "1" }),
         ] {
-            let err = reg.call("tower_list_dir", args).unwrap_err();
+            let err = reg
+                .call("tower_list_dir", args, &crate::domain::NeverCancelled)
+                .unwrap_err();
             assert_invalid_args(err);
         }
     }
@@ -2247,7 +2404,11 @@ mod tests {
      {
         let mut reg = make_registry(state_with_list_dir_files());
         let err = reg
-            .call("tower_list_dir", json!({ "path": "src/a.rs" }))
+            .call(
+                "tower_list_dir",
+                json!({ "path": "src/a.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
 
         match err {
@@ -2268,6 +2429,7 @@ mod tests {
             .call(
                 "tower_list_dir",
                 json!({ "path": "src", "recursive": true }),
+                &crate::domain::NeverCancelled,
             )
             .expect("recursive tower_list_dir must succeed");
 
@@ -2298,7 +2460,11 @@ mod tests {
         fn accepts_registry_trait(registry: &mut dyn ToolRegistry) -> Result<Value, ToolError> {
             let tools = registry.list();
             assert!(tools.iter().any(|tool| tool.name == "tower_list_dir"));
-            registry.call("tower_list_dir", json!({ "path": "src" }))
+            registry.call(
+                "tower_list_dir",
+                json!({ "path": "src" }),
+                &crate::domain::NeverCancelled,
+            )
         }
 
         let mut reg = make_registry(state_with_list_dir_files());
@@ -2340,6 +2506,7 @@ mod tests {
             &self,
             tool_name: &str,
             _params: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<serde_json::Value, crate::domain::InvokeError> {
             Err(crate::domain::InvokeError::ToolNotFound(
                 tool_name.to_owned(),
@@ -2364,11 +2531,16 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/lib.rs", "content": "fn lib() {}" }),
+            &crate::domain::NeverCancelled,
         )
         .expect("create_file should succeed");
 
-        reg.call("tower_delete_file", json!({ "path": "src/lib.rs" }))
-            .expect("delete_file should succeed");
+        reg.call(
+            "tower_delete_file",
+            json!({ "path": "src/lib.rs" }),
+            &crate::domain::NeverCancelled,
+        )
+        .expect("delete_file should succeed");
 
         let changed = host.changed.lock().unwrap();
         assert!(
@@ -2432,7 +2604,11 @@ mod tests {
     #[test]
     fn ac2_find_file_returns_matching_paths() {
         let mut reg = make_registry(state_with_client_file());
-        let result = reg.call("tower_find_file", json!({ "query": "client" }));
+        let result = reg.call(
+            "tower_find_file",
+            json!({ "query": "client" }),
+            &crate::domain::NeverCancelled,
+        );
         let val = result.expect("find_file must succeed");
         let paths = val["paths"]
             .as_array()
@@ -2448,7 +2624,11 @@ mod tests {
     fn ac2_find_file_returns_empty_for_no_match() {
         let mut reg = make_registry(state_with_client_file());
         let val = reg
-            .call("tower_find_file", json!({ "query": "zzznomatch" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "zzznomatch" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         assert!(paths.is_empty(), "no-match query must return empty paths");
@@ -2465,12 +2645,17 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/widget.rs", "content": "pub struct Widget;" }),
+            &crate::domain::NeverCancelled,
         )
         .expect("create_file must succeed");
 
         // Find.
         let val = reg
-            .call("tower_find_file", json!({ "query": "widget" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "widget" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         let path_strings: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
@@ -2488,11 +2673,16 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/readme.md", "content": "# Hello" }),
+            &crate::domain::NeverCancelled,
         )
         .unwrap();
 
         let val = reg
-            .call("tower_read_file", json!({ "path": "src/readme.md" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/readme.md" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(
             val["content"].as_str().unwrap(),
@@ -2506,7 +2696,9 @@ mod tests {
     #[test]
     fn ac4_missing_query_returns_invalid_args() {
         let mut reg = make_registry(empty_state());
-        let err = reg.call("tower_find_file", json!({})).unwrap_err();
+        let err = reg
+            .call("tower_find_file", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
         assert!(
             matches!(err, crate::adapters::mcp::types::ToolError::InvalidArgs(_)),
             "missing 'query' must return InvalidArgs"
@@ -2517,7 +2709,11 @@ mod tests {
     fn ac4_missing_path_for_create_file_returns_invalid_args() {
         let mut reg = make_registry(empty_state());
         let err = reg
-            .call("tower_create_file", json!({ "content": "hi" }))
+            .call(
+                "tower_create_file",
+                json!({ "content": "hi" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -2529,7 +2725,11 @@ mod tests {
     fn ac4_missing_content_for_create_file_returns_invalid_args() {
         let mut reg = make_registry(empty_state());
         let err = reg
-            .call("tower_create_file", json!({ "path": "a.rs" }))
+            .call(
+                "tower_create_file",
+                json!({ "path": "a.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -2543,11 +2743,19 @@ mod tests {
         let mut reg = make_registry(Arc::clone(&state));
 
         // Attempt create with missing content — must fail.
-        let _ = reg.call("tower_create_file", json!({ "path": "ghost.rs" }));
+        let _ = reg.call(
+            "tower_create_file",
+            json!({ "path": "ghost.rs" }),
+            &crate::domain::NeverCancelled,
+        );
 
         // State must be unchanged: the file must NOT exist.
         let val = reg
-            .call("tower_find_file", json!({ "query": "ghost" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "ghost" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         assert!(
@@ -2562,7 +2770,11 @@ mod tests {
     fn ac5_delete_missing_file_returns_not_found_error() {
         let mut reg = make_registry(empty_state());
         let err = reg
-            .call("tower_delete_file", json!({ "path": "nonexistent.rs" }))
+            .call(
+                "tower_delete_file",
+                json!({ "path": "nonexistent.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
 
         // Must be ResourceNotFound (maps to -32002 on the wire).
@@ -2581,7 +2793,11 @@ mod tests {
     fn search_text_finds_content_in_indexed_file() {
         let mut reg = make_registry(state_with_client_file());
         let val = reg
-            .call("tower_search_text", json!({ "pattern": "client" }))
+            .call(
+                "tower_search_text",
+                json!({ "pattern": "client" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let matches = val["matches"]
             .as_array()
@@ -2602,12 +2818,20 @@ mod tests {
         let state = state_with_client_file();
         let mut reg = make_registry(Arc::clone(&state));
 
-        reg.call("tower_delete_file", json!({ "path": "src/client.rs" }))
-            .expect("delete of existing file must succeed");
+        reg.call(
+            "tower_delete_file",
+            json!({ "path": "src/client.rs" }),
+            &crate::domain::NeverCancelled,
+        )
+        .expect("delete of existing file must succeed");
 
         // File must no longer appear in find.
         let val = reg
-            .call("tower_find_file", json!({ "query": "client" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "client" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths = val["paths"].as_array().unwrap();
         assert!(paths.is_empty(), "deleted file must not be findable");
@@ -2619,7 +2843,11 @@ mod tests {
     fn create_directory_succeeds_on_empty_state() {
         let mut reg = make_registry(empty_state());
         let val = reg
-            .call("tower_create_directory", json!({ "path": "a/b/c" }))
+            .call(
+                "tower_create_directory",
+                json!({ "path": "a/b/c" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(val["created"], true);
     }
@@ -2635,6 +2863,7 @@ mod tests {
             .call(
                 "tower_global_replace",
                 json!({ "target": "client", "replacement": "server" }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
 
@@ -2645,7 +2874,11 @@ mod tests {
 
         // Content must have been updated.
         let read_val = reg
-            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let content = read_val["content"].as_str().unwrap();
         assert!(
@@ -2659,7 +2892,9 @@ mod tests {
     #[test]
     fn reindex_on_empty_state_returns_zero_files_indexed() {
         let mut reg = make_registry(empty_state());
-        let val = reg.call("tower_reindex", json!({})).unwrap();
+        let val = reg
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         assert_eq!(
             val["files_indexed"].as_u64().unwrap_or(99),
             0,
@@ -2683,7 +2918,9 @@ mod tests {
         }
 
         let mut reg = make_registry(Arc::clone(&state));
-        let val = reg.call("tower_reindex", json!({})).unwrap();
+        let val = reg
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         assert_eq!(
             val["files_indexed"].as_u64().unwrap_or(0),
             1,
@@ -2692,7 +2929,11 @@ mod tests {
 
         // The file must now be findable via the index.
         let find = reg
-            .call("tower_find_file", json!({ "query": "new" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "new" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths = find["paths"].as_array().unwrap();
         let path_strings: Vec<&str> = paths.iter().filter_map(Value::as_str).collect();
@@ -2719,7 +2960,9 @@ mod tests {
         }
 
         let mut reg = make_registry(Arc::clone(&state));
-        let val = reg.call("tower_reindex", json!({})).unwrap();
+        let val = reg
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         assert_eq!(
             val["files_indexed"].as_u64().unwrap_or(99),
             0,
@@ -2728,7 +2971,11 @@ mod tests {
 
         // The deleted file must no longer be findable.
         let find = reg
-            .call("tower_find_file", json!({ "query": "client" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "client" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths = find["paths"].as_array().unwrap();
         assert!(
@@ -2756,7 +3003,9 @@ mod tests {
         }
 
         let mut reg = make_registry(Arc::clone(&state));
-        let err = reg.call("tower_reindex", json!({})).unwrap_err();
+        let err = reg
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
         assert!(
             matches!(err, ToolError::ExecutionFailed(_)),
             "reindex must surface storage failure; got {err:?}"
@@ -2786,7 +3035,8 @@ mod tests {
         }
 
         let mut reg = make_registry(Arc::clone(&state));
-        reg.call("tower_reindex", json!({})).unwrap();
+        reg.call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
 
         let guard = state.read().unwrap();
         let ws = guard.workspace.read().unwrap();
@@ -2820,7 +3070,9 @@ mod tests {
         )));
 
         let mut reg = make_registry(Arc::clone(&state));
-        let val = reg.call("tower_reindex", json!({})).unwrap();
+        let val = reg
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         assert_eq!(
             val["files_indexed"].as_u64().unwrap_or(0),
             1,
@@ -2828,7 +3080,11 @@ mod tests {
         );
 
         let find = reg
-            .call("tower_find_file", json!({ "query": "external" }))
+            .call(
+                "tower_find_file",
+                json!({ "query": "external" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let paths: Vec<&str> = find["paths"]
             .as_array()
@@ -2861,6 +3117,7 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": path, "content": content }),
+            &crate::domain::NeverCancelled,
         )
         .expect("setup create_file must succeed");
         state
@@ -2883,6 +3140,7 @@ mod tests {
                     "end_byte": 7,
                     "replacement": "run"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .expect("edit_range must succeed");
 
@@ -2892,7 +3150,11 @@ mod tests {
 
         // Verify the actual content via tower_read_file.
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/main.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/main.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(
             read["content"].as_str().unwrap(),
@@ -2917,6 +3179,7 @@ mod tests {
                     "end_byte": 10,
                     "replacement": "x"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -2927,7 +3190,11 @@ mod tests {
 
         // File must be unchanged.
         let read = make_registry(Arc::clone(&state))
-            .call("tower_read_file", json!({ "path": "src/bounds.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/bounds.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "abc");
     }
@@ -2946,6 +3213,7 @@ mod tests {
                     "end_byte": 0,
                     "replacement": "x"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -2968,6 +3236,7 @@ mod tests {
             .call(
                 "tower_edit_range",
                 json!({ "path": "src/a.rs", "end_byte": 2, "replacement": "x" }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -2992,6 +3261,7 @@ mod tests {
                     "end_byte": 2,
                     "replacement": "x"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -3016,6 +3286,7 @@ mod tests {
                     "end_byte": 2,
                     "replacement": "x"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -3052,6 +3323,7 @@ mod tests {
                 &self,
                 tool_name: &str,
                 _params: serde_json::Value,
+                _: &dyn crate::domain::CancellationSignal,
             ) -> Result<serde_json::Value, crate::domain::InvokeError> {
                 Err(crate::domain::InvokeError::ToolNotFound(
                     tool_name.to_owned(),
@@ -3075,6 +3347,7 @@ mod tests {
                 "end_byte": 6,
                 "replacement": "new"
             }),
+            &crate::domain::NeverCancelled,
         )
         .expect("edit_range must succeed");
 
@@ -3104,6 +3377,7 @@ mod tests {
                     "end_byte": 2,
                     "replacement": "x"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -3114,7 +3388,11 @@ mod tests {
 
         // File must be unchanged.
         let read = make_registry(Arc::clone(&state))
-            .call("tower_read_file", json!({ "path": "src/order_mcp.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/order_mcp.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(
             read["content"].as_str().unwrap(),
@@ -3154,6 +3432,7 @@ mod tests {
                     "end_byte": 4,
                     "replacement": "e"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -3164,7 +3443,11 @@ mod tests {
 
         // File must be unchanged.
         let read = make_registry(Arc::clone(&state))
-            .call("tower_read_file", json!({ "path": "src/utf8_mcp.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/utf8_mcp.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(
             read["content"].as_str().unwrap(),
@@ -3178,7 +3461,13 @@ mod tests {
     #[test]
     fn unknown_tool_name_returns_not_found() {
         let mut reg = make_registry(empty_state());
-        let err = reg.call("tower_unknown_tool", json!({})).unwrap_err();
+        let err = reg
+            .call(
+                "tower_unknown_tool",
+                json!({}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap_err();
         assert!(matches!(
             err,
             crate::adapters::mcp::types::ToolError::NotFound(_)
@@ -3195,7 +3484,11 @@ mod tests {
         let mut reg = make_registry(state);
 
         let val = reg
-            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
 
         assert!(val.get("content").is_some(), "must have content");
@@ -3216,6 +3509,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/client.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
 
@@ -3239,6 +3533,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/client.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3249,6 +3544,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/client.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3270,6 +3566,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/client.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3284,6 +3581,7 @@ mod tests {
                 "content": "fn client_v2() {}",
                 "expected_version": v0
             }),
+            &crate::domain::NeverCancelled,
         );
         assert!(
             result.is_ok(),
@@ -3291,7 +3589,11 @@ mod tests {
         );
 
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "fn client_v2() {}");
     }
@@ -3308,6 +3610,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/client.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3318,6 +3621,7 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/client.rs", "content": "fn modified_by_b() {}" }),
+            &crate::domain::NeverCancelled,
         )
         .unwrap();
 
@@ -3330,6 +3634,7 @@ mod tests {
                     "content": "fn a_write() {}",
                     "expected_version": v0
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -3343,7 +3648,11 @@ mod tests {
 
         // File must still hold B's content.
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(
             read["content"].as_str().unwrap(),
@@ -3362,11 +3671,16 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/client.rs", "content": "fn unconditional() {}" }),
+            &crate::domain::NeverCancelled,
         )
         .expect("no expected_version → must always succeed");
 
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/client.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/client.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "fn unconditional() {}");
     }
@@ -3381,6 +3695,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/edit_cas.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3396,6 +3711,7 @@ mod tests {
                 "replacement": "run",
                 "expected_version": v0
             }),
+            &crate::domain::NeverCancelled,
         );
         assert!(
             result.is_ok(),
@@ -3403,7 +3719,11 @@ mod tests {
         );
 
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/edit_cas.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/edit_cas.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "fn run() {}");
     }
@@ -3419,6 +3739,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/edit_stale.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3429,6 +3750,7 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/edit_stale.rs", "content": "fn modified() {}" }),
+            &crate::domain::NeverCancelled,
         )
         .unwrap();
 
@@ -3443,6 +3765,7 @@ mod tests {
                     "replacement": "// stale ",
                     "expected_version": v0
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
 
@@ -3456,7 +3779,11 @@ mod tests {
 
         // File must hold the content B wrote.
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/edit_stale.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/edit_stale.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "fn modified() {}");
     }
@@ -3475,6 +3802,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/race.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3489,6 +3817,7 @@ mod tests {
                 "content": "writer_a",
                 "expected_version": v0.clone()
             }),
+            &crate::domain::NeverCancelled,
         );
         assert!(a_result.is_ok(), "writer A must win; got {a_result:?}");
 
@@ -3501,6 +3830,7 @@ mod tests {
                     "content": "writer_b",
                     "expected_version": v0
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert!(
@@ -3513,7 +3843,11 @@ mod tests {
 
         // Final content must be A's.
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/race.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/race.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(
             read["content"].as_str().unwrap(),
@@ -3533,11 +3867,13 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/a.rs", "content": "let x = foo;" }),
+            &crate::domain::NeverCancelled,
         )
         .unwrap();
         reg.call(
             "tower_create_file",
             json!({ "path": "src/b.rs", "content": "let y = foo;" }),
+            &crate::domain::NeverCancelled,
         )
         .unwrap();
 
@@ -3546,6 +3882,7 @@ mod tests {
             .call(
                 "tower_read_file",
                 json!({ "path": "src/b.rs", "with_version": true }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap()["version"]
             .as_str()
@@ -3556,6 +3893,7 @@ mod tests {
         reg.call(
             "tower_create_file",
             json!({ "path": "src/b.rs", "content": "let y = BAR;" }),
+            &crate::domain::NeverCancelled,
         )
         .unwrap();
 
@@ -3568,6 +3906,7 @@ mod tests {
                     "replacement": "bar",
                     "expected_versions": { "src/b.rs": v0_b }
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
 
@@ -3579,7 +3918,11 @@ mod tests {
         );
 
         let a_read = reg
-            .call("tower_read_file", json!({ "path": "src/a.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/a.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(a_read["content"].as_str().unwrap(), "let x = bar;");
 
@@ -3590,7 +3933,11 @@ mod tests {
 
         // File b's content must be unchanged (external write preserved).
         let b_read = reg
-            .call("tower_read_file", json!({ "path": "src/b.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/b.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(b_read["content"].as_str().unwrap(), "let y = BAR;");
     }
@@ -3607,6 +3954,7 @@ mod tests {
             .call(
                 "tower_create_file",
                 json!({ "path": "src/x.rs", "content": "v1", "expected_version": 123 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert!(
@@ -3615,7 +3963,11 @@ mod tests {
         );
         // The file must be untouched — the malformed call wrote nothing.
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/x.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/x.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "v0");
     }
@@ -3636,6 +3988,7 @@ mod tests {
                     "replacement": "Z",
                     "expected_version": true
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert!(
@@ -3659,6 +4012,7 @@ mod tests {
                     "replacement": "bar",
                     "expected_versions": { "src/z.rs": 42 }
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert!(
@@ -3667,7 +4021,11 @@ mod tests {
         );
         // Nothing was replaced.
         let read = reg
-            .call("tower_read_file", json!({ "path": "src/z.rs" }))
+            .call(
+                "tower_read_file",
+                json!({ "path": "src/z.rs" }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         assert_eq!(read["content"].as_str().unwrap(), "foo");
     }
@@ -3686,6 +4044,7 @@ mod tests {
                     "replacement": "bar",
                     "expected_versions": "not-an-object"
                 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert!(

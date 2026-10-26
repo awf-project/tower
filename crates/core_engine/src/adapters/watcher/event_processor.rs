@@ -1023,6 +1023,7 @@ impl ExtensionHostPort for ArcBufferedEvents {
         &self,
         name: &str,
         _: serde_json::Value,
+        _: &dyn crate::domain::CancellationSignal,
     ) -> Result<serde_json::Value, crate::domain::InvokeError> {
         Err(crate::domain::InvokeError::ToolNotFound(name.to_owned()))
     }
@@ -1074,6 +1075,7 @@ mod tests {
             &self,
             tool_name: &str,
             _params: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<serde_json::Value, crate::domain::InvokeError> {
             Err(crate::domain::InvokeError::ToolNotFound(
                 tool_name.to_owned(),
@@ -2576,8 +2578,10 @@ mod tests {
             &self,
             tool_name: &str,
             params: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
         ) -> Result<serde_json::Value, crate::domain::InvokeError> {
-            self.0.invoke(tool_name, params)
+            self.0
+                .invoke(tool_name, params, &crate::domain::NeverCancelled)
         }
     }
 

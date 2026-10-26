@@ -29,11 +29,11 @@
 //!
 //! # Quarantine policy (S1 / AC5)
 //!
-//! The registry tracks consecutive faults per extension. After
-//! [`MAX_CONSECUTIVE_FAILURES`] (= 3) consecutive faults the extension is marked
-//! `Quarantined`. Subsequent `invoke` calls and event deliveries return
-//! [`ExtensionFault::Quarantined`] immediately without contacting the instance.
-//! A successful `call_tool` or `deliver_event` resets the counter to zero.
+//! The registry tracks consecutive crash/protocol faults per extension. After
+//! [`MAX_CONSECUTIVE_FAILURES`] (= 3) consecutive strikes the extension is marked
+//! `Quarantined`. Configured timeouts are expected expiry outcomes and do not add
+//! strikes. Subsequent calls and deliveries to a quarantined extension fail
+//! immediately without contacting the instance. A success resets the counter.
 //!
 //! # Interior mutability
 //!
@@ -60,11 +60,11 @@ use crate::ports::ExtensionHostPort;
 
 /// Maximum consecutive faults before an extension is quarantined (S1).
 ///
-/// After this many consecutive faults from `call_tool` or `deliver_event`, the
-/// registry marks the extension quarantined and returns
+/// After this many consecutive quarantine-counting faults from `call_tool` or
+/// `deliver_event`, the registry marks the extension quarantined and returns
 /// [`ExtensionFault::Quarantined`] for all subsequent calls without invoking the
-/// instance. A single successful call before reaching this threshold resets the
-/// counter.
+/// instance. Configured timeouts do not increment this counter. A single
+/// successful call before reaching the threshold resets it.
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 // ── ExtensionId ───────────────────────────────────────────────────────────────
@@ -154,6 +154,7 @@ impl std::error::Error for ExtensionApplicationError {}
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExtensionCallError {
     Application(ExtensionApplicationError),
+    Cancelled,
     Fault(ExtensionFault),
 }
 
@@ -161,6 +162,7 @@ impl std::fmt::Display for ExtensionCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Application(error) => error.fmt(f),
+            Self::Cancelled => f.write_str("extension invocation cancelled"),
             Self::Fault(fault) => fault.fmt(f),
         }
     }
@@ -182,6 +184,7 @@ pub enum InvokeError {
     /// No registered extension owns the named tool.
     ToolNotFound(String),
     Application(ExtensionApplicationError),
+    Cancelled,
     /// The owning extension returned a fault.
     Fault(ExtensionFault),
 }
@@ -191,12 +194,26 @@ impl std::fmt::Display for InvokeError {
         match self {
             Self::ToolNotFound(name) => write!(f, "no extension owns tool: {name}"),
             Self::Application(error) => error.fmt(f),
+            Self::Cancelled => f.write_str("extension invocation cancelled"),
             Self::Fault(fault) => write!(f, "extension fault: {fault}"),
         }
     }
 }
 
 impl std::error::Error for InvokeError {}
+
+pub trait CancellationSignal: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Debug, Default)]
+pub struct NeverCancelled;
+
+impl CancellationSignal for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
 
 // ── ExtensionInstance ─────────────────────────────────────────────────────────
 
@@ -229,7 +246,12 @@ pub trait ExtensionInstance: Send {
     ///
     /// Returns an [`ExtensionCallError`] when the extension reports an
     /// application error or encounters a runtime/protocol fault.
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError>;
+    fn call_tool(
+        &mut self,
+        name: &str,
+        params: Value,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Value, ExtensionCallError>;
 
     /// Deliver a workspace event to this extension instance.
     ///
@@ -306,6 +328,10 @@ impl ExtensionHandle {
         *guard += 1;
         *guard
     }
+}
+
+fn counts_toward_quarantine(fault: &ExtensionFault) -> bool {
+    !matches!(fault, ExtensionFault::Timeout { .. })
 }
 
 // ── ExtensionRegistry ─────────────────────────────────────────────────────────
@@ -461,7 +487,12 @@ impl ExtensionRegistry {
     /// - [`InvokeError::Application`] — the extension rejected the tool call.
     /// - [`InvokeError::Fault`] — the owning extension returned a fault (or is
     ///   quarantined).
-    pub fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError> {
+    pub fn invoke(
+        &self,
+        tool_name: &str,
+        params: Value,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Value, InvokeError> {
         // Find the handle that owns this tool.
         let handle = self
             .handles
@@ -469,7 +500,7 @@ impl ExtensionRegistry {
             .find(|h| h.manifest.tools.iter().any(|t| t.name == tool_name))
             .ok_or_else(|| InvokeError::ToolNotFound(tool_name.to_owned()))?;
 
-        let result = Self::invoke_handle(handle, tool_name, params);
+        let result = Self::invoke_handle(handle, tool_name, params, cancellation);
         self.drain_deferred_events();
         result
     }
@@ -484,6 +515,7 @@ impl ExtensionRegistry {
         extension_id: &ExtensionId,
         tool_name: &str,
         params: Value,
+        cancellation: &dyn CancellationSignal,
     ) -> Result<Value, InvokeError> {
         let handle = self
             .handles
@@ -494,7 +526,7 @@ impl ExtensionRegistry {
             })
             .ok_or_else(|| InvokeError::ToolNotFound(tool_name.to_owned()))?;
 
-        let result = Self::invoke_handle(handle, tool_name, params);
+        let result = Self::invoke_handle(handle, tool_name, params, cancellation);
         self.drain_deferred_events();
         result
     }
@@ -503,13 +535,14 @@ impl ExtensionRegistry {
         handle: &ExtensionHandle,
         tool_name: &str,
         params: Value,
+        cancellation: &dyn CancellationSignal,
     ) -> Result<Value, InvokeError> {
         let mut instance = handle.instance.lock().unwrap_or_else(|p| p.into_inner());
         if handle.is_quarantined() {
             return Err(InvokeError::Fault(ExtensionFault::Quarantined));
         }
 
-        let result = instance.call_tool(tool_name, params);
+        let result = instance.call_tool(tool_name, params, cancellation);
 
         match result {
             Ok(value) => {
@@ -517,8 +550,11 @@ impl ExtensionRegistry {
                 Ok(value)
             }
             Err(ExtensionCallError::Application(error)) => Err(InvokeError::Application(error)),
+            Err(ExtensionCallError::Cancelled) => Err(InvokeError::Cancelled),
             Err(ExtensionCallError::Fault(fault)) => {
-                handle.record_fault();
+                if counts_toward_quarantine(&fault) {
+                    handle.record_fault();
+                }
                 Err(InvokeError::Fault(fault))
             }
         }
@@ -576,12 +612,14 @@ impl ExtensionRegistry {
                     handle.record_success();
                 }
                 Err(fault) => {
-                    let count = handle.record_fault();
-                    eprintln!(
-                        "[tower] extension '{}' deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {}",
-                        handle.manifest.name,
-                        event_fault_label(&fault)
-                    );
+                    if counts_toward_quarantine(&fault) {
+                        let count = handle.record_fault();
+                        eprintln!(
+                            "[tower] extension '{}' deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {}",
+                            handle.manifest.name,
+                            event_fault_label(&fault)
+                        );
+                    }
                 }
             }
         }
@@ -627,12 +665,14 @@ impl ExtensionRegistry {
                 match result {
                     Ok(()) => handle.record_success(),
                     Err(fault) => {
-                        let count = handle.record_fault();
-                        eprintln!(
-                            "[tower] extension '{}' deferred deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {}",
-                            handle.manifest.name,
-                            event_fault_label(&fault)
-                        );
+                        if counts_toward_quarantine(&fault) {
+                            let count = handle.record_fault();
+                            eprintln!(
+                                "[tower] extension '{}' deferred deliver_event fault ({count}/{MAX_CONSECUTIVE_FAILURES}): {}",
+                                handle.manifest.name,
+                                event_fault_label(&fault)
+                            );
+                        }
                     }
                 }
             }
@@ -651,7 +691,7 @@ impl ExtensionRegistry {
 // Never print sidecar-controlled error payloads to the daemon's public stderr.
 fn event_fault_label(fault: &ExtensionFault) -> &'static str {
     match fault {
-        ExtensionFault::Timeout => "extension timed out",
+        ExtensionFault::Timeout { .. } => "extension timed out",
         ExtensionFault::Crashed { .. } => "extension crashed",
         ExtensionFault::ProtocolError { .. } => "extension protocol error",
         ExtensionFault::Quarantined => "extension is quarantined",
@@ -720,8 +760,13 @@ impl ExtensionHostPort for ExtensionRegistry {
         Self::declared_tools(self)
     }
 
-    fn invoke(&self, tool_name: &str, params: Value) -> Result<Value, InvokeError> {
-        Self::invoke(self, tool_name, params)
+    fn invoke(
+        &self,
+        tool_name: &str,
+        params: Value,
+        cancellation: &dyn CancellationSignal,
+    ) -> Result<Value, InvokeError> {
+        Self::invoke(self, tool_name, params, cancellation)
     }
 
     fn invoke_extension(
@@ -729,8 +774,9 @@ impl ExtensionHostPort for ExtensionRegistry {
         extension_id: &ExtensionId,
         tool_name: &str,
         params: Value,
+        cancellation: &dyn CancellationSignal,
     ) -> Result<Value, InvokeError> {
-        Self::invoke_extension(self, extension_id, tool_name, params)
+        Self::invoke_extension(self, extension_id, tool_name, params, cancellation)
     }
 }
 
@@ -740,12 +786,13 @@ impl ExtensionHostPort for ExtensionRegistry {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use extension_protocol::{Event, ExtensionFault, ExtensionManifest, ToolDecl};
+    use extension_protocol::{Event, ExtensionFault, ExtensionManifest, TimeoutDetail, ToolDecl};
     use serde_json::Value;
 
     use super::{
-        ExtensionApplicationError, ExtensionCallError, ExtensionId, ExtensionInstance,
-        ExtensionRegistry, InvokeError, MAX_CONSECUTIVE_FAILURES, RegistrationError,
+        CancellationSignal, ExtensionApplicationError, ExtensionCallError, ExtensionId,
+        ExtensionInstance, ExtensionRegistry, InvokeError, MAX_CONSECUTIVE_FAILURES,
+        NeverCancelled, RegistrationError,
     };
     use crate::domain::{FileId, RelativePath};
     use crate::ports::ExtensionHostPort;
@@ -783,6 +830,20 @@ mod tests {
         RelativePath::new(s)
     }
 
+    fn timeout_fault() -> ExtensionFault {
+        ExtensionFault::Timeout {
+            detail: TimeoutDetail {
+                operation: "invokeTool".to_owned(),
+                layer: "host".to_owned(),
+                budget_ms: 250,
+            },
+        }
+    }
+
+    fn crash_fault() -> ExtensionFault {
+        ExtensionFault::Crashed { code: Some(1) }
+    }
+
     #[test]
     fn f008_error_types_are_neutral_and_convert_faults() {
         fn assert_error_traits<T: std::error::Error + Clone + PartialEq + std::fmt::Debug>() {}
@@ -790,11 +851,11 @@ mod tests {
         assert_error_traits::<ExtensionApplicationError>();
         assert_error_traits::<ExtensionCallError>();
 
-        let fault = ExtensionFault::Timeout;
+        let fault = timeout_fault();
         let converted = ExtensionCallError::from(fault.clone());
 
         assert_eq!(converted, ExtensionCallError::Fault(fault));
-        assert_eq!(converted.to_string(), ExtensionFault::Timeout.to_string());
+        assert_eq!(converted.to_string(), timeout_fault().to_string());
     }
 
     #[test]
@@ -825,7 +886,7 @@ mod tests {
         );
         assert_ne!(
             ExtensionCallError::Application(without_data),
-            ExtensionCallError::Fault(ExtensionFault::Timeout)
+            ExtensionCallError::Fault(timeout_fault())
         );
     }
 
@@ -834,14 +895,14 @@ mod tests {
         fn call_migrated_trait(
             extension: &mut dyn ExtensionInstance,
         ) -> Result<Value, ExtensionCallError> {
-            extension.call_tool("echo", Value::Bool(true))
+            extension.call_tool("echo", Value::Bool(true), &crate::domain::NeverCancelled)
         }
 
         let mut extension = RecordingExtension::new("existing", vec![], vec![]);
         assert_eq!(call_migrated_trait(&mut extension), Ok(Value::Bool(true)));
         assert_eq!(
-            InvokeError::Fault(ExtensionFault::Timeout),
-            InvokeError::Fault(ExtensionFault::Timeout)
+            InvokeError::Fault(timeout_fault()),
+            InvokeError::Fault(timeout_fault())
         );
         assert_eq!(
             InvokeError::ToolNotFound("missing".to_owned()),
@@ -872,7 +933,12 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, params: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            params: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             // Echo params back as the result.
             Ok(params)
         }
@@ -904,7 +970,12 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _params: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             Err(ExtensionFault::Crashed { code: Some(1) }.into())
         }
 
@@ -934,7 +1005,12 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            name: &str,
+            _params: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             if self.manifest.tools.iter().any(|t| t.name == name) {
                 Ok(Value::String(self.manifest.name.clone()))
             } else {
@@ -959,6 +1035,7 @@ mod tests {
     struct CountingFaultExtension {
         manifest: ExtensionManifest,
         remaining_faults: u32,
+        fault: ExtensionFault,
     }
 
     impl CountingFaultExtension {
@@ -966,6 +1043,15 @@ mod tests {
             Self {
                 manifest: make_manifest(name, tools, vec![]),
                 remaining_faults: fault_count,
+                fault: ExtensionFault::Crashed { code: Some(1) },
+            }
+        }
+
+        fn timing_out(name: &str, tools: Vec<ToolDecl>, fault_count: u32) -> Self {
+            Self {
+                manifest: make_manifest(name, tools, vec![]),
+                remaining_faults: fault_count,
+                fault: timeout_fault(),
             }
         }
     }
@@ -975,10 +1061,15 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _params: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             if self.remaining_faults > 0 {
                 self.remaining_faults -= 1;
-                Err(ExtensionFault::Timeout.into())
+                Err(self.fault.clone().into())
             } else {
                 Ok(Value::Bool(true))
             }
@@ -1000,6 +1091,43 @@ mod tests {
         outcomes: Vec<Result<Value, ExtensionCallError>>,
     }
 
+    struct CancellationAwareExtension {
+        manifest: ExtensionManifest,
+    }
+
+    impl ExtensionInstance for CancellationAwareExtension {
+        fn manifest(&self) -> &ExtensionManifest {
+            &self.manifest
+        }
+
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _params: Value,
+            cancellation: &dyn CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
+            if cancellation.is_cancelled() {
+                Err(ExtensionCallError::Cancelled)
+            } else {
+                Err(ExtensionFault::Crashed { code: Some(1) }.into())
+            }
+        }
+
+        fn deliver_event(&mut self, _event: Event) -> Result<(), ExtensionFault> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    struct CancelledSignal;
+
+    impl CancellationSignal for CancelledSignal {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
     impl SequencedExtension {
         fn new(
             name: &str,
@@ -1018,7 +1146,12 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _params: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             assert!(
                 !self.outcomes.is_empty(),
                 "test invoked the extension more times than configured"
@@ -1173,7 +1306,7 @@ mod tests {
         registry.register(Box::new(ext)).expect("register");
 
         let result = registry
-            .invoke("outline", Value::Null)
+            .invoke("outline", Value::Null, &crate::domain::NeverCancelled)
             .expect("invoke must succeed");
         assert_eq!(result, Value::String("ast".to_owned()));
     }
@@ -1189,12 +1322,12 @@ mod tests {
         registry.register(Box::new(ext_b)).expect("register lsp");
 
         let r_a = registry
-            .invoke("outline", Value::Null)
+            .invoke("outline", Value::Null, &crate::domain::NeverCancelled)
             .expect("ast/outline");
         assert_eq!(r_a, Value::String("ast".to_owned()), "must route to ast");
 
         let r_b = registry
-            .invoke("diagnostics", Value::Null)
+            .invoke("diagnostics", Value::Null, &crate::domain::NeverCancelled)
             .expect("lsp/diagnostics");
         assert_eq!(r_b, Value::String("lsp".to_owned()), "must route to lsp");
     }
@@ -1209,7 +1342,12 @@ mod tests {
         registry.register(Box::new(ext_b)).expect("register lint");
 
         let result = registry
-            .invoke_extension(&ExtensionId::new("lint"), "check", Value::Null)
+            .invoke_extension(
+                &ExtensionId::new("lint"),
+                "check",
+                Value::Null,
+                &crate::domain::NeverCancelled,
+            )
             .expect("lint/check");
 
         assert_eq!(result, Value::String("lint".to_owned()));
@@ -1228,12 +1366,22 @@ mod tests {
             .expect("register ast");
         for id in ["ast", "missing"] {
             assert_eq!(
-                registry.invoke_extension(&ExtensionId::new(id), "undeclared", Value::Null),
+                registry.invoke_extension(
+                    &ExtensionId::new(id),
+                    "undeclared",
+                    Value::Null,
+                    &crate::domain::NeverCancelled
+                ),
                 Err(InvokeError::ToolNotFound("undeclared".to_owned()))
             );
         }
         assert_eq!(
-            registry.invoke_extension(&ExtensionId::new("ast"), "outline", Value::Null),
+            registry.invoke_extension(
+                &ExtensionId::new("ast"),
+                "outline",
+                Value::Null,
+                &crate::domain::NeverCancelled
+            ),
             Ok(Value::String("first call".to_owned()))
         );
     }
@@ -1263,7 +1411,12 @@ mod tests {
                 .expect("register planner");
             let host: &dyn ExtensionHostPort = &registry;
             assert_eq!(
-                host.invoke_extension(&ExtensionId::new(id), tool, Value::Null),
+                host.invoke_extension(
+                    &ExtensionId::new(id),
+                    tool,
+                    Value::Null,
+                    &crate::domain::NeverCancelled
+                ),
                 Ok(Value::String(id.to_owned()))
             );
         }
@@ -1287,7 +1440,12 @@ mod tests {
             .expect("register lsp");
 
         let error = registry
-            .invoke_extension(&ExtensionId::new("lsp"), "rename", Value::Null)
+            .invoke_extension(
+                &ExtensionId::new("lsp"),
+                "rename",
+                Value::Null,
+                &crate::domain::NeverCancelled,
+            )
             .expect_err("application errors must be returned to the caller");
 
         assert_eq!(error, InvokeError::Application(application));
@@ -1298,7 +1456,7 @@ mod tests {
     fn invoke_unknown_tool_returns_tool_not_found() {
         let registry = ExtensionRegistry::new();
         let err = registry
-            .invoke("no_such_tool", Value::Null)
+            .invoke("no_such_tool", Value::Null, &crate::domain::NeverCancelled)
             .expect_err("must fail");
         assert!(
             matches!(err, InvokeError::ToolNotFound(ref name) if name == "no_such_tool"),
@@ -1367,21 +1525,83 @@ mod tests {
         let mut registry = ExtensionRegistry::new();
         registry.register(Box::new(ext)).expect("register");
 
-        // First MAX_CONSECUTIVE_FAILURES calls should fault (Crashed/Timeout, not Quarantined).
+        // First MAX_CONSECUTIVE_FAILURES calls should fault, not return Quarantined yet.
         for i in 0..MAX_CONSECUTIVE_FAILURES {
             let err = registry
-                .invoke("run", Value::Null)
+                .invoke("run", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err(&format!("call {i} must fault"));
-            assert_eq!(err, InvokeError::Fault(ExtensionFault::Timeout));
+            assert_eq!(
+                err,
+                InvokeError::Fault(ExtensionFault::Crashed { code: Some(1) })
+            );
         }
 
         // The (MAX_CONSECUTIVE_FAILURES + 1)-th call must return Quarantined.
         let err = registry
-            .invoke("run", Value::Null)
+            .invoke("run", Value::Null, &crate::domain::NeverCancelled)
             .expect_err("quarantined call must fail");
         assert!(
             matches!(err, InvokeError::Fault(ExtensionFault::Quarantined)),
             "must be Quarantined after {MAX_CONSECUTIVE_FAILURES} faults: {err:?}"
+        );
+    }
+
+    #[test]
+    fn configured_timeouts_do_not_add_quarantine_strikes() {
+        let ext = CountingFaultExtension::timing_out(
+            "slow",
+            vec![make_tool("run")],
+            MAX_CONSECUTIVE_FAILURES + 1,
+        );
+        let mut registry = ExtensionRegistry::new();
+        registry.register(Box::new(ext)).expect("register");
+
+        for _ in 0..=MAX_CONSECUTIVE_FAILURES {
+            assert_eq!(
+                registry.invoke("run", Value::Null, &NeverCancelled),
+                Err(InvokeError::Fault(timeout_fault()))
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_sidecar_request_does_not_add_a_quarantine_strike() {
+        let extension = CancellationAwareExtension {
+            manifest: make_manifest("cancellable", vec![make_tool("run")], vec![]),
+        };
+        let mut registry = ExtensionRegistry::new();
+        registry
+            .register(Box::new(extension))
+            .expect("register cancellable extension");
+
+        for _ in 0..MAX_CONSECUTIVE_FAILURES {
+            assert_eq!(
+                registry.invoke("run", Value::Null, &CancelledSignal),
+                Err(InvokeError::Cancelled)
+            );
+        }
+
+        assert_eq!(
+            registry.invoke("run", Value::Null, &NeverCancelled),
+            Err(InvokeError::Fault(ExtensionFault::Crashed {
+                code: Some(1)
+            }))
+        );
+        assert_eq!(
+            registry.invoke("run", Value::Null, &NeverCancelled),
+            Err(InvokeError::Fault(ExtensionFault::Crashed {
+                code: Some(1)
+            }))
+        );
+        assert_eq!(
+            registry.invoke("run", Value::Null, &NeverCancelled),
+            Err(InvokeError::Fault(ExtensionFault::Crashed {
+                code: Some(1)
+            }))
+        );
+        assert_eq!(
+            registry.invoke("run", Value::Null, &NeverCancelled),
+            Err(InvokeError::Fault(ExtensionFault::Quarantined))
         );
     }
 
@@ -1409,6 +1629,7 @@ mod tests {
                 &mut self,
                 _name: &str,
                 _params: Value,
+                _: &dyn crate::domain::CancellationSignal,
             ) -> Result<Value, ExtensionCallError> {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if call == MAX_CONSECUTIVE_FAILURES {
@@ -1419,7 +1640,7 @@ mod tests {
                         .recv()
                         .expect("test must release threshold call");
                 }
-                Err(ExtensionFault::Timeout.into())
+                Err(crash_fault().into())
             }
 
             fn deliver_event(&mut self, _event: Event) -> Result<(), ExtensionFault> {
@@ -1445,27 +1666,31 @@ mod tests {
 
         for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
             assert_eq!(
-                registry.invoke("run", Value::Null),
-                Err(InvokeError::Fault(ExtensionFault::Timeout))
+                registry.invoke("run", Value::Null, &crate::domain::NeverCancelled),
+                Err(InvokeError::Fault(crash_fault()))
             );
         }
 
         let registry = Arc::new(registry);
         let threshold_registry = Arc::clone(&registry);
-        let threshold_call = thread::spawn(move || threshold_registry.invoke("run", Value::Null));
+        let threshold_call = thread::spawn(move || {
+            threshold_registry.invoke("run", Value::Null, &crate::domain::NeverCancelled)
+        });
         threshold_entered_rx
             .recv()
             .expect("threshold call must enter extension");
 
         let queued_registry = Arc::clone(&registry);
-        let queued_call = thread::spawn(move || queued_registry.invoke("run", Value::Null));
+        let queued_call = thread::spawn(move || {
+            queued_registry.invoke("run", Value::Null, &crate::domain::NeverCancelled)
+        });
         release_threshold_tx
             .send(())
             .expect("release threshold call");
 
         assert_eq!(
             threshold_call.join().expect("threshold thread must join"),
-            Err(InvokeError::Fault(ExtensionFault::Timeout))
+            Err(InvokeError::Fault(crash_fault()))
         );
         assert_eq!(
             queued_call.join().expect("queued thread must join"),
@@ -1490,12 +1715,12 @@ mod tests {
             "flaky",
             vec![make_tool("run")],
             vec![
-                Err(ExtensionFault::Timeout.into()),
-                Err(ExtensionFault::Timeout.into()),
+                Err(crash_fault().into()),
+                Err(crash_fault().into()),
                 Ok(Value::Bool(true)),
-                Err(ExtensionFault::Timeout.into()),
-                Err(ExtensionFault::Timeout.into()),
-                Err(ExtensionFault::Timeout.into()),
+                Err(crash_fault().into()),
+                Err(crash_fault().into()),
+                Err(crash_fault().into()),
             ],
         );
 
@@ -1505,14 +1730,14 @@ mod tests {
         // Calls 0 and 1: genuine faults (counter → 1, → 2).
         for i in 0..2u32 {
             let err = registry
-                .invoke("run", Value::Null)
+                .invoke("run", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err(&format!("call {i} must fault"));
-            assert_eq!(err, InvokeError::Fault(ExtensionFault::Timeout));
+            assert_eq!(err, InvokeError::Fault(crash_fault()));
         }
 
         // Call 2: success — resets counter to 0.
         let success = registry
-            .invoke("run", Value::Null)
+            .invoke("run", Value::Null, &crate::domain::NeverCancelled)
             .expect("call 2 must succeed and reset the counter");
         assert_eq!(success, Value::Bool(true));
 
@@ -1520,13 +1745,13 @@ mod tests {
         // The next call confirms the third post-success fault reached the limit.
         for i in 3..6u32 {
             let error = registry
-                .invoke("run", Value::Null)
+                .invoke("run", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err(&format!("call {i} must be a genuine fault"));
-            assert_eq!(error, InvokeError::Fault(ExtensionFault::Timeout));
+            assert_eq!(error, InvokeError::Fault(crash_fault()));
         }
         assert_eq!(
             registry
-                .invoke("run", Value::Null)
+                .invoke("run", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err("call after three post-success faults must quarantine"),
             InvokeError::Fault(ExtensionFault::Quarantined)
         );
@@ -1543,10 +1768,10 @@ mod tests {
             "lsp",
             vec![make_tool("references")],
             vec![
-                Err(ExtensionFault::Timeout.into()),
+                Err(crash_fault().into()),
                 Err(ExtensionCallError::Application(application.clone())),
-                Err(ExtensionFault::Timeout.into()),
-                Err(ExtensionFault::Timeout.into()),
+                Err(crash_fault().into()),
+                Err(crash_fault().into()),
             ],
         );
         let mut registry = ExtensionRegistry::new();
@@ -1554,27 +1779,27 @@ mod tests {
 
         assert_eq!(
             registry
-                .invoke("references", Value::Null)
+                .invoke("references", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err("first call must be a genuine fault"),
-            InvokeError::Fault(ExtensionFault::Timeout)
+            InvokeError::Fault(crash_fault())
         );
         assert_eq!(
             registry
-                .invoke("references", Value::Null)
+                .invoke("references", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err("application error must be propagated"),
             InvokeError::Application(application)
         );
         for call in 3..=4 {
             assert_eq!(
                 registry
-                    .invoke("references", Value::Null)
+                    .invoke("references", Value::Null, &crate::domain::NeverCancelled)
                     .expect_err(&format!("call {call} must be a genuine fault")),
-                InvokeError::Fault(ExtensionFault::Timeout)
+                InvokeError::Fault(crash_fault())
             );
         }
         assert_eq!(
             registry
-                .invoke("references", Value::Null)
+                .invoke("references", Value::Null, &crate::domain::NeverCancelled)
                 .expect_err("three genuine faults around an application error must quarantine"),
             InvokeError::Fault(ExtensionFault::Quarantined)
         );
@@ -1717,7 +1942,12 @@ mod tests {
             &self.manifest
         }
 
-        fn call_tool(&mut self, _name: &str, _params: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _params: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             Ok(Value::Null)
         }
 

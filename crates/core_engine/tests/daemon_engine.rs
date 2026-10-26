@@ -24,6 +24,9 @@ use core_engine::adapters::daemon::{
     ExtensionDependencyPolicy, PublicationError, ReadinessController, SnapshotEntry,
 };
 use core_engine::adapters::fs::workspace_scan;
+use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::registry::ToolRegistry;
+use core_engine::adapters::mcp::types::ToolError;
 use core_engine::adapters::watcher::WatcherError;
 use core_engine::adapters::{InMemoryStorage, NotifyWatcherAdapter, SledStorageAdapter};
 use core_engine::domain::extension_host::ExtensionId;
@@ -69,6 +72,53 @@ fn early_context_exposes_readiness_without_engine_state() {
     assert!(matches!(
         snapshot.workspace,
         CapabilityReadiness::Preparing { .. }
+    ));
+}
+
+#[test]
+fn unlimited_preparation_wait_remains_pending_until_stopping() {
+    let workspace = tempdir().expect("create workspace");
+    let (_owner, context) = early_context_fixture(workspace.path(), TowerConfig::default());
+    let (result_tx, result_rx) = mpsc::channel();
+    let waiting = Arc::clone(&context);
+
+    let waiter = std::thread::spawn(move || {
+        result_tx
+            .send(waiting.wait_prepared(None))
+            .expect("report unlimited wait result");
+    });
+
+    assert!(
+        result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "an absent preparation budget must not synthesize an expiry"
+    );
+    context
+        .readiness()
+        .transition_daemon(DaemonLifecycle::Stopping)
+        .expect("stopping wakes a pending unlimited preparation wait");
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(
+            core_engine::adapters::daemon::ReadinessWaitError::Stopping { .. }
+        ))
+    ));
+    waiter
+        .join()
+        .expect("unlimited waiter joins after stopping");
+}
+
+#[test]
+fn finite_preparation_and_inventory_waits_report_timeout() {
+    let workspace = tempdir().expect("create workspace");
+    let (_owner, context) = early_context_fixture(workspace.path(), TowerConfig::default());
+
+    assert!(matches!(
+        context.wait_preparation_complete(Some(Duration::ZERO)),
+        Err(core_engine::adapters::daemon::ReadinessWaitError::Timeout { .. })
+    ));
+    assert!(matches!(
+        context.wait_extension_inventory(Some(Duration::ZERO)),
+        Err(core_engine::adapters::daemon::ReadinessWaitError::Timeout { .. })
     ));
 }
 
@@ -424,7 +474,7 @@ idle_ttl_secs = 300
                 }
             },
             "idle_timeout_secs": null,
-            "diagnostics_timeout_secs": 29,
+            "diagnostics_timeout_secs": null,
         })
     );
 
@@ -490,6 +540,7 @@ impl ExtensionHostPort for BlockingExtensionHost {
         &self,
         tool_name: &str,
         _params: serde_json::Value,
+        _cancellation: &dyn core_engine::domain::CancellationSignal,
     ) -> Result<serde_json::Value, core_engine::domain::InvokeError> {
         Err(core_engine::domain::InvokeError::ToolNotFound(
             tool_name.to_owned(),
@@ -562,6 +613,7 @@ fn repaired_additions_replay_after_commit_and_watcher_catch_up() {
     use std::time::{Duration, Instant};
 
     let workspace = tempdir().expect("create workspace");
+    let observations = tempdir().expect("create replay observation directory");
     std::fs::write(
         workspace.path().join("persisted.rs"),
         "pub fn persisted() {}\n",
@@ -587,7 +639,9 @@ fn repaired_additions_replay_after_commit_and_watcher_catch_up() {
     .expect("create offline addition");
     let extension_dir = workspace.path().join("extensions/recorder");
     std::fs::create_dir_all(&extension_dir).expect("create recorder extension directory");
-    let replay_marker = workspace.path().join("replay.json");
+    // Keep observer writes outside the indexed tree: otherwise they wake the
+    // watcher and can contend with the lock-availability assertions below.
+    let replay_marker = observations.path().join("replay.json");
     let script = extension_dir.join("record-replay.sh");
     std::fs::write(
         &script,
@@ -1079,10 +1133,67 @@ fn f008_startup_validation_hands_an_explicit_empty_servers_map_to_the_lsp_extens
         serde_json::json!({
             "servers": {},
             "idle_timeout_secs": null,
-            "diagnostics_timeout_secs": 1,
+            "diagnostics_timeout_secs": null,
         }),
         "daemon must hand the explicit empty LSP configuration to its lsp extension"
     );
+}
+
+#[test]
+fn daemon_produced_lsp_timeout_reaches_the_real_sidecar_session_pool() {
+    let workspace = tempdir().expect("create workspace");
+    std::fs::create_dir_all(workspace.path().join("src")).expect("create source directory");
+    std::fs::write(workspace.path().join("src/lib.rs"), "fn probe() {}\n")
+        .expect("write source file");
+    let extension_dir = workspace.path().join("extensions/lsp");
+    std::fs::create_dir_all(&extension_dir).expect("create LSP extension directory");
+    let lsp_binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .parent()
+        .expect("workspace root")
+        .join("target/debug/lsp_extension");
+    std::fs::write(
+        extension_dir.join("extension.toml"),
+        format!(
+            "name = \"lsp\"\nversion = \"0.1.0\"\ncommand = [\"{}\"]\nactivation = \"eager\"\n\n[[tools]]\nname = \"diagnostics\"\ndescription = \"fixture diagnostics\"\nschema_json = '{{\"type\":\"object\"}}'\n\n[capabilities]\nrequired = [\"read_file\"]\n",
+            lsp_binary.display()
+        ),
+    )
+    .expect("write LSP extension manifest");
+    let config_source = format!(
+        "[extensions]\nrequest_timeout_secs = 3\n\n[lsp.rust]\ncommand = {}\nargs = [\"diagnostics_push_absent\", {}]\nextensions = [\"rs\"]\n",
+        serde_json::to_string(&fixture_lsp_server::binary_path()).expect("serialize fixture path"),
+        serde_json::to_string(&workspace.path().join(".tower/lsp.log"))
+            .expect("serialize log path"),
+    );
+    let config: TowerConfig = toml::from_str(&config_source).expect("parse daemon configuration");
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        extensions_dir: Some(workspace.path().join("extensions")),
+    };
+    let handle = build_engine(&opts, config).expect("daemon builds the real LSP sidecar");
+    let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
+
+    let error = registry
+        .call(
+            "tower_lsp_diagnostics",
+            serde_json::json!({"path": "src/lib.rs"}),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect_err("the fixture withholds diagnostics until the daemon-produced pool deadline");
+    assert!(matches!(
+        error,
+        ToolError::Application {
+            code: -32_000,
+            ref message,
+            data: Some(ref data),
+        } if message == "language server request failed"
+            && data["outcome"]["code"] == "server_timeout"
+            && data["outcome"]["timeout"] == serde_json::json!({
+                "operation": "diagnostics", "layer": "lsp", "budget_ms": 2_000
+            })
+    ));
 }
 
 #[cfg(unix)]
@@ -1153,6 +1264,7 @@ args = ["F008_SENTINEL_ARGUMENT"]
             "command": "./missing-f008-server",
             "operation": null,
             "path": null,
+            "timeout": null,
             "phase": "startup",
             "message": payload["outcome"]["message"].clone(),
         })
@@ -1634,13 +1746,69 @@ fn unknown_tools_do_not_wait_for_workspace_preparation() {
     let started = std::time::Instant::now();
     for name in ["does_not_exist", "tower_ast__tower_catch_up_fence"] {
         assert!(matches!(
-            registry.call(name, serde_json::json!({})),
+            registry.call(
+                name,
+                serde_json::json!({}),
+                &core_engine::domain::NeverCancelled
+            ),
             Err(ToolError::NotFound(_))
         ));
     }
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(matches!(
-        registry.call("tower_read_file", serde_json::json!({})),
+        registry.call(
+            "tower_read_file",
+            serde_json::json!({}),
+            &core_engine::domain::NeverCancelled
+        ),
         Err(ToolError::InvalidArgs(_))
     ));
+}
+
+#[test]
+fn readiness_aware_registry_unlimited_call_wakes_only_when_stopping() {
+    use core_engine::adapters::mcp::extension_merged_registry::ReadinessAwareRegistry;
+    use core_engine::adapters::mcp::registry::ToolRegistry;
+    use core_engine::adapters::mcp::types::ToolError;
+
+    let workspace = tempdir().expect("create workspace");
+    let (_owner, context) = early_context_fixture(workspace.path(), TowerConfig::default());
+    let (result_tx, result_rx) = mpsc::channel();
+    let waiting_context = Arc::clone(&context);
+    let caller = std::thread::spawn(move || {
+        let mut registry = ReadinessAwareRegistry::new(waiting_context);
+        result_tx
+            .send(registry.call(
+                "tower_read_file",
+                serde_json::json!({"path":"pending.rs"}),
+                &core_engine::domain::NeverCancelled,
+            ))
+            .expect("report registry result");
+    });
+
+    assert!(
+        result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "a public native call must not invent a preparation deadline"
+    );
+    context
+        .readiness()
+        .transition_daemon(DaemonLifecycle::Stopping)
+        .expect("stopping wakes registry dispatch");
+    match result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("registry wake result")
+        .expect_err("stopping rejects the pending public call")
+    {
+        ToolError::Application {
+            code,
+            message,
+            data,
+        } => {
+            assert_eq!(code, -32_006);
+            assert_eq!(message, "daemon is stopping");
+            assert_eq!(data, Some(serde_json::json!({"dependency":"workspace"})));
+        }
+        other => panic!("expected stopping application error, got {other:?}"),
+    }
+    caller.join().expect("registry caller joins after stopping");
 }

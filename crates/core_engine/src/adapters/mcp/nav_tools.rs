@@ -108,7 +108,12 @@ impl ToolRegistry for NavToolRegistry {
         tool_descs()
     }
 
-    fn call(&mut self, name: &str, args: Value) -> Result<Value, ToolError> {
+    fn call(
+        &mut self,
+        name: &str,
+        args: Value,
+        _cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ToolError> {
         // The result key under which each tool nests its data.
         let result_key = match name {
             "tower_lsp_definition" => "locations",
@@ -221,6 +226,7 @@ mod tests {
             .call(
                 "tower_lsp_definition",
                 json!({ "path": "src/a.rs", "line": 0, "character": 3 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert_eq!(val["supported"], true);
@@ -238,6 +244,7 @@ mod tests {
             .call(
                 "tower_lsp_references",
                 json!({ "path": "src/a.rs", "line": 1, "character": 0 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert_eq!(val["supported"], true);
@@ -251,6 +258,7 @@ mod tests {
             .call(
                 "tower_lsp_hover",
                 json!({ "path": "src/a.rs", "line": 0, "character": 0 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert_eq!(val["supported"], true);
@@ -264,6 +272,7 @@ mod tests {
             .call(
                 "tower_lsp_definition",
                 json!({ "path": "notes.txt", "line": 0, "character": 0 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert_eq!(val["supported"], false);
@@ -280,6 +289,7 @@ mod tests {
             .call(
                 "tower_lsp_definition",
                 json!({ "path": "src/a.rs", "line": 0, "character": 0 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert_eq!(val["supported"], false);
@@ -289,7 +299,11 @@ mod tests {
     fn missing_path_is_invalid_args() {
         let mut reg = with_fake_nav(state_with_file("src/a.rs", b"fn main() {}"));
         let err = reg
-            .call("tower_lsp_definition", json!({ "line": 0, "character": 0 }))
+            .call(
+                "tower_lsp_definition",
+                json!({ "line": 0, "character": 0 }),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
     }
@@ -301,6 +315,7 @@ mod tests {
             .call(
                 "tower_lsp_definition",
                 json!({ "path": "src/a.rs", "character": 0 }),
+                &crate::domain::NeverCancelled,
             )
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
@@ -309,7 +324,9 @@ mod tests {
     #[test]
     fn unknown_tool_is_not_found() {
         let mut reg = with_fake_nav(state_with_file("src/a.rs", b"fn main() {}"));
-        let err = reg.call("lsp_nope", json!({})).unwrap_err();
+        let err = reg
+            .call("lsp_nope", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
     }
 }

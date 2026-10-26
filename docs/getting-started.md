@@ -365,8 +365,9 @@ format = "eslint-json"
 target = "append"
 ```
 
-`timeout_secs` is optional and defaults to two seconds. Set a positive integer when a configured
-linter needs longer; the same deadline applies to lint checks and both phases of a lint fix.
+`timeout_secs` is optional. Omit it for no Tower-controlled duration limit, or set a positive integer
+when a configured linter needs an explicit budget; the same deadline applies to lint checks and both
+phases of a lint fix.
 
 Call `tower_lint_check` with a path to lint one file, or with `{}` to lint every indexed file
 that has a matching lint configuration.

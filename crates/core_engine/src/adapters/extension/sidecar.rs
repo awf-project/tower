@@ -15,17 +15,19 @@
 //!   response to be written into the pending slot so the caller gets
 //!   `ExtensionFault::ProtocolError` (existing behaviour, now explicit).
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use extension_protocol::envelope::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use extension_protocol::{
     Capability, ExtensionFault, ExtensionManifest, InitParams, InitResult, PROTOCOL_VERSION,
-    Response,
+    Response, TimeoutDetail,
 };
 use serde_json::Value;
 
@@ -38,6 +40,47 @@ use crate::ports::inbound::{
     PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
     WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
 };
+
+#[derive(Debug)]
+enum SidecarWaitError {
+    Fault(ExtensionFault),
+    Cancelled,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REQUEST_TIMEOUT_TEST_CAP: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_request_timeout_test_cap<T>(cap: Duration, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Duration>);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REQUEST_TIMEOUT_TEST_CAP.set(self.0);
+        }
+    }
+
+    let previous = REQUEST_TIMEOUT_TEST_CAP.replace(Some(cap));
+    let _reset = Reset(previous);
+    run()
+}
+
+fn effective_request_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    #[cfg(test)]
+    {
+        REQUEST_TIMEOUT_TEST_CAP.with(|cap| match (timeout, cap.get()) {
+            (Some(timeout), Some(cap)) => Some(timeout.min(cap)),
+            (timeout, _) => timeout,
+        })
+    }
+
+    #[cfg(not(test))]
+    {
+        timeout
+    }
+}
 
 // ── Wire helpers ──────────────────────────────────────────────────────────────
 
@@ -193,7 +236,7 @@ pub struct SidecarHostAdapter {
     /// Reader thread handle. Joined in `shutdown`.
     reader_thread: Option<JoinHandle<()>>,
     /// Per-request wall-clock deadline (spec 24 U1).
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for SidecarHostAdapter {
@@ -220,25 +263,33 @@ impl SidecarHostAdapter {
     ///
     /// - `manifest` — the extension's manifest; `manifest.command` is the argv.
     /// - `deps` — existing outbound ports for capability dispatch.
-    /// - `request_timeout` — wall-clock deadline for each request (spec 24 U1).
-    ///   Pass `Duration::from_secs(30)` for the default.
-    pub fn spawn(
+    /// - `request_timeout` — optional wall-clock deadline for each request
+    ///   (spec 24 U1); `None` waits without a host deadline.
+    pub fn spawn<T>(
         manifest: ExtensionManifest,
         deps: HostDeps,
-        request_timeout: Duration,
+        request_timeout: T,
         extension_config: Option<Value>,
-    ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault> {
-        Self::spawn_with_config(manifest, deps, request_timeout, extension_config)
+    ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault>
+    where
+        T: Into<Option<Duration>>,
+    {
+        Self::spawn_with_config(manifest, deps, request_timeout.into(), extension_config)
     }
 
     /// Spawn the extension and include host-provided extension configuration in
     /// the `initialize` request.
-    pub fn spawn_with_config(
+    pub fn spawn_with_config<T>(
         manifest: ExtensionManifest,
         deps: HostDeps,
-        request_timeout: Duration,
+        request_timeout: T,
         extension_config: Option<Value>,
-    ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault> {
+    ) -> Result<Box<dyn ExtensionInstance>, ExtensionFault>
+    where
+        T: Into<Option<Duration>>,
+    {
+        let request_timeout = request_timeout.into();
+        validate_request_timeout(request_timeout)?;
         let rr_enabled = extension_config
             .as_ref()
             .and_then(|config| config.pointer("/record/backend"))
@@ -256,6 +307,12 @@ impl SidecarHostAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
 
         // Tell the extension where the workspace is. The host knows the workspace
         // root (--workspace-dir) but the extension is a separate process: without
@@ -351,7 +408,7 @@ impl SidecarHostAdapter {
         pending: Arc<(Mutex<PendingSlot>, Condvar)>,
         deps: HostDeps,
         manifest: &ExtensionManifest,
-        request_timeout: Duration,
+        request_timeout: Option<Duration>,
         extension_config: Option<Value>,
     ) -> Result<(InitResult, JoinHandle<()>), InitializeError> {
         // Send the initialize request (id = 0).
@@ -406,7 +463,7 @@ impl SidecarHostAdapter {
         // Wait for the Initialized response (id=0) — with timeout (spec 24 U1).
         // We do NOT have a `Child` handle here so we cannot kill on timeout during
         // initialize; instead we return `Timeout` and the caller must drop/kill.
-        let raw = match Self::wait_response_timed(&pending, request_timeout, None) {
+        let raw = match Self::wait_response_timed(&pending, request_timeout, None, "initialize") {
             Ok(PendingResponse::Result(raw)) => raw,
             Ok(PendingResponse::ApplicationError(error)) => {
                 return Err(InitializeError::after_reader(
@@ -482,31 +539,130 @@ impl SidecarHostAdapter {
         method: &str,
         params: Value,
     ) -> Result<PendingResponse, ExtensionFault> {
+        validate_request_timeout(self.request_timeout)?;
+        let frame = self.begin_request(method, params);
+        self.write_request_frame(&frame, None)
+            .map_err(|error| match error {
+                SidecarWaitError::Fault(fault) => fault,
+                SidecarWaitError::Cancelled => ExtensionFault::ProtocolError {
+                    message: "unexpected cancellation without a signal".to_owned(),
+                },
+            })?;
+
+        Self::wait_response_timed(
+            &self.pending,
+            self.request_timeout,
+            Some(&mut self.child),
+            method,
+        )
+    }
+
+    /// Send an invocation request while observing the caller's cancellation
+    /// signal. Unlimited calls still wake periodically so cancellation cannot
+    /// be hidden behind an unbounded condvar wait.
+    fn send_cancellable_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<PendingResponse, SidecarWaitError> {
+        if cancellation.is_cancelled() {
+            return Err(SidecarWaitError::Cancelled);
+        }
+
+        validate_request_timeout(self.request_timeout).map_err(SidecarWaitError::Fault)?;
+        let frame = self.begin_request(method, params);
+        self.write_request_frame(&frame, Some(cancellation))?;
+
+        const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+        let request_timeout = effective_request_timeout(self.request_timeout);
+        let started = Instant::now();
+        let (lock, cvar) = &*self.pending;
+        let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        while slot.state.is_waiting() {
+            if cancellation.is_cancelled() {
+                slot.expected_id = None;
+                drop(slot);
+                return Err(SidecarWaitError::Cancelled);
+            }
+
+            let wait_for = match request_timeout {
+                Some(timeout) => {
+                    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                        slot.expected_id = None;
+                        drop(slot);
+                        self.terminate_process_tree();
+                        return Err(SidecarWaitError::Fault(ExtensionFault::Timeout {
+                            detail: TimeoutDetail {
+                                operation: method.to_owned(),
+                                layer: "host".to_owned(),
+                                budget_ms: timeout_budget_ms(timeout),
+                            },
+                        }));
+                    };
+                    remaining.min(CANCELLATION_POLL_INTERVAL)
+                }
+                None => CANCELLATION_POLL_INTERVAL,
+            };
+            let (next_slot, _) = cvar
+                .wait_timeout_while(slot, wait_for, |pending| pending.state.is_waiting())
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot = next_slot;
+        }
+
+        Self::take_pending_response(&mut slot).map_err(SidecarWaitError::Fault)
+    }
+
+    fn write_request_frame(
+        &self,
+        frame: &str,
+        cancellation: Option<&dyn crate::domain::CancellationSignal>,
+    ) -> Result<(), SidecarWaitError> {
+        let result = (|| {
+            let mut stdin = self.stdin.lock().map_err(|_| {
+                SidecarWaitError::Fault(ExtensionFault::ProtocolError {
+                    message: "stdin mutex poisoned".to_owned(),
+                })
+            })?;
+            if cancellation.is_some_and(crate::domain::CancellationSignal::is_cancelled) {
+                return Err(SidecarWaitError::Cancelled);
+            }
+            stdin
+                .write_all(frame.as_bytes())
+                .map_err(|_| SidecarWaitError::Fault(ExtensionFault::Crashed { code: None }))
+        })();
+        if result.is_err() {
+            let (lock, _) = &*self.pending;
+            let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
+            slot.expected_id = None;
+            slot.state = SlotState::Waiting;
+        }
+        result
+    }
+
+    fn begin_request(&mut self, method: &str, params: Value) -> String {
         let id = self.next_id;
         self.next_id += 1;
 
-        // Clear the pending slot before sending.
-        {
-            let (lock, _) = &*self.pending;
-            let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
-            slot.expected_id = Some(Value::Number(id.into()));
-            slot.state = SlotState::Waiting;
-        }
+        let (lock, _) = &*self.pending;
+        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.expected_id = Some(Value::Number(id.into()));
+        slot.state = SlotState::Waiting;
+        drop(slot);
 
-        let frame = encode_request(id, method, params);
-        {
-            let mut guard = self
-                .stdin
-                .lock()
-                .map_err(|_| ExtensionFault::ProtocolError {
-                    message: "stdin mutex poisoned".to_owned(),
-                })?;
-            guard
-                .write_all(frame.as_bytes())
-                .map_err(|_| ExtensionFault::Crashed { code: None })?;
-        }
+        encode_request(id, method, params)
+    }
 
-        Self::wait_response_timed(&self.pending, self.request_timeout, Some(&mut self.child))
+    fn take_pending_response(slot: &mut PendingSlot) -> Result<PendingResponse, ExtensionFault> {
+        slot.expected_id = None;
+        match std::mem::replace(&mut slot.state, SlotState::Waiting) {
+            SlotState::Response(response) => Ok(response),
+            SlotState::ChildExited(code) => Err(ExtensionFault::Crashed { code }),
+            SlotState::Waiting => Err(ExtensionFault::ProtocolError {
+                message: "condvar woke spuriously with Waiting state".to_owned(),
+            }),
+        }
     }
 
     /// Block until the pending slot contains a response (or deadline exceeded).
@@ -529,39 +685,87 @@ impl SidecarHostAdapter {
     /// `do_initialize` where the `Child` handle is not yet stored in `self`.
     fn wait_response_timed(
         pending: &Arc<(Mutex<PendingSlot>, Condvar)>,
-        timeout: Duration,
+        timeout: Option<Duration>,
         child: Option<&mut Child>,
+        operation: &str,
     ) -> Result<PendingResponse, ExtensionFault> {
+        let timeout = effective_request_timeout(timeout);
         let (lock, cvar) = &**pending;
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-        let (mut guard, timed_out) = cvar
-            .wait_timeout_while(guard, timeout, |slot| slot.state.is_waiting())
-            .unwrap_or_else(|p| p.into_inner());
+        let (mut guard, timed_out) = if let Some(timeout) = timeout {
+            let (guard, result) = cvar
+                .wait_timeout_while(guard, timeout, |slot| slot.state.is_waiting())
+                .unwrap_or_else(|p| p.into_inner());
+            (guard, result.timed_out())
+        } else {
+            (
+                cvar.wait_while(guard, |slot| slot.state.is_waiting())
+                    .unwrap_or_else(|p| p.into_inner()),
+                false,
+            )
+        };
 
-        if timed_out.timed_out() {
+        if timed_out {
             guard.expected_id = None;
             // Kill the child to reclaim its resources (spec 24 UN1).
             if let Some(c) = child {
                 let _ = c.kill();
                 let _ = c.wait(); // reap zombie
             }
-            return Err(ExtensionFault::Timeout);
+            return Err(ExtensionFault::Timeout {
+                detail: TimeoutDetail {
+                    operation: operation.to_owned(),
+                    layer: "host".to_owned(),
+                    budget_ms: timeout.map(timeout_budget_ms).unwrap_or_default(),
+                },
+            });
         }
 
-        // Extract the state.
-        guard.expected_id = None;
-        match std::mem::replace(&mut guard.state, SlotState::Waiting) {
-            SlotState::Response(response) => Ok(response),
-            SlotState::ChildExited(code) => Err(ExtensionFault::Crashed { code }),
-            SlotState::Waiting => {
-                // Should not happen: condvar woke but state is still Waiting.
-                Err(ExtensionFault::ProtocolError {
-                    message: "condvar woke spuriously with Waiting state".to_owned(),
-                })
-            }
+        Self::take_pending_response(&mut guard)
+    }
+
+    /// Terminate the sidecar's process tree on Unix, then reap the direct child.
+    fn terminate_process_tree(&mut self) {
+        #[cfg(target_os = "linux")]
+        let descendants = linux_descendant_identities(self.child.id());
+        #[cfg(target_os = "linux")]
+        terminate_linux_descendants(&descendants);
+        #[cfg(unix)]
+        let tree_result = terminate_unix_process_group(&self.child);
+        #[cfg(not(unix))]
+        let tree_result: std::io::Result<()> = Ok(());
+
+        // Reap regardless of tree-termination outcome. `kill` is retained as a
+        // direct-child fallback and is harmless when the tree operation won.
+        let _ = self.child.kill();
+        let reap_result = self.child.wait();
+        #[cfg(target_os = "linux")]
+        terminate_linux_descendants(&descendants);
+        if tree_result.is_err() || reap_result.is_err() {
+            eprintln!(
+                "[tower] extension '{}' process-tree cleanup failed",
+                self.manifest.name
+            );
         }
     }
+}
+
+fn validate_request_timeout(timeout: Option<Duration>) -> Result<(), ExtensionFault> {
+    if timeout.is_some_and(|timeout| {
+        timeout.is_zero()
+            || u64::try_from(timeout.as_millis()).is_err()
+            || Instant::now().checked_add(timeout).is_none()
+    }) {
+        return Err(ExtensionFault::ProtocolError {
+            message: "invalid extension request timeout".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn timeout_budget_ms(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).expect("request timeout validated before dispatch")
 }
 
 impl ExtensionInstance for SidecarHostAdapter {
@@ -569,13 +773,27 @@ impl ExtensionInstance for SidecarHostAdapter {
         &self.manifest
     }
 
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError> {
+    fn call_tool(
+        &mut self,
+        name: &str,
+        params: Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ExtensionCallError> {
         // Build the flat wire params with the tool name and original params.
         let flat_params = serde_json::json!({"name": name, "params": params});
 
-        let response = self
-            .send_request("invokeTool", flat_params)
-            .map_err(ExtensionCallError::Fault)?;
+        let response = match self.send_cancellable_request("invokeTool", flat_params, cancellation)
+        {
+            Ok(response) => response,
+            Err(SidecarWaitError::Fault(fault)) => return Err(ExtensionCallError::Fault(fault)),
+            Err(SidecarWaitError::Cancelled) => {
+                self.terminate_process_tree();
+                if let Some(handle) = self.reader_thread.take() {
+                    let _ = handle.join();
+                }
+                return Err(ExtensionCallError::Cancelled);
+            }
+        };
 
         let raw = match response {
             PendingResponse::Result(raw) => raw,
@@ -615,7 +833,8 @@ impl ExtensionInstance for SidecarHostAdapter {
             message: format!("serialize Event: {e}"),
         })?;
 
-        let raw = match self.send_request("deliverEvent", params)? {
+        let pending_response = self.send_request("deliverEvent", params)?;
+        let raw = match pending_response {
             PendingResponse::Result(raw) => raw,
             PendingResponse::ApplicationError(error) => {
                 return Err(ExtensionFault::ProtocolError {
@@ -697,8 +916,7 @@ impl ExtensionInstance for SidecarHostAdapter {
         // ── Step 4: SIGKILL — unconditional reap. ────────────────────────────
         // `Child::kill()` sends SIGKILL (Unix) / TerminateProcess (Windows).
         // If the child has already exited this is a harmless no-op.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate_process_tree();
 
         // ── Step 5: join the reader thread — only now that the child is dead. ─
         // The child has been reaped, so its stdout write-end is closed; the
@@ -713,28 +931,130 @@ impl ExtensionInstance for SidecarHostAdapter {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinuxProcessIdentity {
+    pid: u32,
+    parent_pid: u32,
+    process_group: u32,
+    start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessIdentity {
+    fn is_process_group_leader(self) -> bool {
+        self.pid == self.process_group
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(pid: u32, stat: &str) -> Option<LinuxProcessIdentity> {
+    let fields = stat.rsplit_once(") ")?.1;
+    let mut fields = fields.split_whitespace();
+    let _state = fields.next()?;
+    let parent_pid = fields.next()?.parse().ok()?;
+    let process_group = fields.next()?.parse().ok()?;
+    let start_time = fields.nth(16)?.parse().ok()?;
+    Some(LinuxProcessIdentity {
+        pid,
+        parent_pid,
+        process_group,
+        start_time,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_identity(pid: u32) -> Option<LinuxProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_linux_process_stat(pid, &stat)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendant_identities(root_pid: u32) -> Vec<LinuxProcessIdentity> {
+    let mut children_by_parent = std::collections::HashMap::<u32, Vec<LinuxProcessIdentity>>::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(identity) = parse_linux_process_stat(pid, &stat) else {
+            continue;
+        };
+        children_by_parent
+            .entry(identity.parent_pid)
+            .or_default()
+            .push(identity);
+    }
+
+    let mut descendants = Vec::new();
+    let mut parents = vec![root_pid];
+    while let Some(parent) = parents.pop() {
+        if let Some(children) = children_by_parent.remove(&parent) {
+            for identity in children {
+                descendants.push(identity);
+                parents.push(identity.pid);
+            }
+        }
+    }
+
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_descendants(descendants: &[LinuxProcessIdentity]) {
+    for &identity in descendants.iter().rev() {
+        if read_linux_process_identity(identity.pid) != Some(identity) {
+            continue;
+        }
+        let Some(pid) = rustix::process::Pid::from_raw(identity.pid as i32) else {
+            continue;
+        };
+        if identity.is_process_group_leader() {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        if read_linux_process_identity(identity.pid) == Some(identity) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
 // ── Signal helpers ────────────────────────────────────────────────────────────
 
 /// Send SIGTERM to the process with the given PID (spec 25 EV2 escalation).
 ///
-/// On Unix we invoke the platform `kill -TERM <pid>` command — this avoids any
-/// `unsafe` code while still delivering the correct signal. The exit status of
-/// `kill` is ignored because the process may have already exited between the
-/// `try_wait` check and this call (harmless race).
+/// On Unix this uses the native signal syscall through rustix. Errors are
+/// ignored because the process may have exited after the caller's `try_wait`.
 ///
 /// On non-Unix platforms (Windows) this is a no-op: the caller will proceed to
 /// `Child::kill()` (SIGKILL / `TerminateProcess`) immediately.
 fn send_sigterm(pid: u32) {
     #[cfg(unix)]
     {
-        let _ = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
+        if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
     }
     // non-Unix: no-op — caller escalates to SIGKILL directly.
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group(child: &Child) -> std::io::Result<()> {
+    let pid = rustix::process::Pid::from_child(child);
+    match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(std::io::Error::from_raw_os_error(error.raw_os_error())),
+    }
 }
 
 // ── Reader loop ───────────────────────────────────────────────────────────────
@@ -1391,6 +1711,8 @@ mod tests {
     use serde_json::json;
 
     use super::{HostDeps, dispatch_host_call};
+    #[cfg(target_os = "linux")]
+    use super::{LinuxProcessIdentity, parse_linux_process_stat};
     use crate::adapters::extension::host_deps::ApplyEditsHostPort;
     use crate::adapters::formatter::NoOpFormatQueue;
     use crate::adapters::mcp::PushEvent;
@@ -1904,5 +2226,39 @@ mod tests {
             response.get("result").is_some(),
             "must return success even when push_tx is None; got: {response}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_identity_uses_start_time_and_only_leaders_target_groups() {
+        let leader = parse_linux_process_stat(
+            42,
+            "42 (worker) S 7 42 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0",
+        )
+        .expect("valid proc stat");
+        assert_eq!(
+            leader,
+            LinuxProcessIdentity {
+                pid: 42,
+                parent_pid: 7,
+                process_group: 42,
+                start_time: 12_345,
+            }
+        );
+        assert!(leader.is_process_group_leader());
+
+        let reused = parse_linux_process_stat(
+            42,
+            "42 (worker) S 7 42 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 99999 0",
+        )
+        .expect("valid proc stat");
+        assert_ne!(leader, reused, "PID reuse must change stable identity");
+
+        let member = parse_linux_process_stat(
+            43,
+            "43 (worker child) S 42 42 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12346 0",
+        )
+        .expect("valid proc stat with spaces in comm");
+        assert!(!member.is_process_group_leader());
     }
 }

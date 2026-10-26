@@ -301,7 +301,11 @@ impl OrderedExtension {
                                 Some(failure) => {
                                     Err(ExtensionCallError::Fault(failure.wire_fault()))
                                 }
-                                None => instance.call_tool(&name, params),
+                                None => instance.call_tool(
+                                    &name,
+                                    params,
+                                    &crate::domain::NeverCancelled,
+                                ),
                             };
                             let _ = response.send(result);
                         }
@@ -413,7 +417,12 @@ impl ExtensionInstance for OrderedExtension {
     fn manifest(&self) -> &ExtensionManifest {
         &self.manifest
     }
-    fn call_tool(&mut self, name: &str, params: Value) -> Result<Value, ExtensionCallError> {
+    fn call_tool(
+        &mut self,
+        name: &str,
+        params: Value,
+        _cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ExtensionCallError> {
         let (sender, receiver) = mpsc::channel();
         self.delivery
             .sender
@@ -490,7 +499,12 @@ pub(crate) mod tests {
         fn manifest(&self) -> &ExtensionManifest {
             &self.manifest
         }
-        fn call_tool(&mut self, name: &str, _: Value) -> Result<Value, ExtensionCallError> {
+        fn call_tool(
+            &mut self,
+            name: &str,
+            _: Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<Value, ExtensionCallError> {
             match name {
                 "release" => {
                     self.released = true;
@@ -629,15 +643,21 @@ pub(crate) mod tests {
             Ok(2)
         );
         assert_eq!(
-            extension.call_tool("fence", json!({})).unwrap(),
+            extension
+                .call_tool("fence", json!({}), &crate::domain::NeverCancelled)
+                .unwrap(),
             json!({"ready":false,"count":2})
         );
         assert_eq!(
-            extension.call_tool("release", json!({})).unwrap(),
+            extension
+                .call_tool("release", json!({}), &crate::domain::NeverCancelled)
+                .unwrap(),
             json!({"released":true})
         );
         assert_eq!(
-            extension.call_tool("fence", json!({})).unwrap(),
+            extension
+                .call_tool("fence", json!({}), &crate::domain::NeverCancelled)
+                .unwrap(),
             json!({"ready":true,"count":2})
         );
         {
@@ -645,7 +665,9 @@ pub(crate) mod tests {
             delivery.activate();
             publisher.commit_events(vec![changed("live.rs")]).unwrap();
         }
-        let events = extension.call_tool("query", json!({})).unwrap();
+        let events = extension
+            .call_tool("query", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         let paths: Vec<_> = events
             .as_array()
             .unwrap()
@@ -686,6 +708,7 @@ pub(crate) mod tests {
             .call(
                 "tower_create_file",
                 json!({"path":"mcp.rs","content":"first"}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         assert!(
@@ -693,17 +716,22 @@ pub(crate) mod tests {
                 .call(
                     "tower_create_file",
                     json!({"path":"mcp.rs","content":"rejected","expected_version":"00".repeat(32)})
-                )
+                , &crate::domain::NeverCancelled)
                 .is_err()
         );
         registry
             .call(
                 "tower_edit_range",
                 json!({"path":"mcp.rs","start_byte":0,"end_byte":5,"replacement":"second"}),
+                &crate::domain::NeverCancelled,
             )
             .unwrap();
         registry
-            .call("tower_delete_file", json!({"path":"mcp.rs"}))
+            .call(
+                "tower_delete_file",
+                json!({"path":"mcp.rs"}),
+                &crate::domain::NeverCancelled,
+            )
             .unwrap();
         let target = {
             let _commit = publisher.commit_lock();
@@ -715,7 +743,9 @@ pub(crate) mod tests {
                 .unwrap(),
             Ok(3)
         );
-        let events = extension.call_tool("query", json!({})).unwrap();
+        let events = extension
+            .call_tool("query", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
         assert_eq!(events.as_array().unwrap().len(), 3);
         assert_eq!(events[2], json!({"type":"FileDeleted","path":"mcp.rs"}));
         extension.shutdown();
@@ -745,7 +775,9 @@ pub(crate) mod tests {
                 .unwrap();
         }
         assert_eq!(
-            extension.call_tool("fence", json!({})).unwrap()["count"],
+            extension
+                .call_tool("fence", json!({}), &crate::domain::NeverCancelled)
+                .unwrap()["count"],
             MAX_PENDING_EVENTS
         );
         {
@@ -753,7 +785,9 @@ pub(crate) mod tests {
             publisher.commit_events(vec![changed("last.rs")]).unwrap();
         }
         assert_eq!(
-            extension.call_tool("fence", json!({})).unwrap()["count"],
+            extension
+                .call_tool("fence", json!({}), &crate::domain::NeverCancelled)
+                .unwrap()["count"],
             MAX_PENDING_EVENTS + 1
         );
         extension.shutdown();
@@ -776,8 +810,10 @@ pub(crate) mod tests {
                 &mut self,
                 name: &str,
                 params: Value,
+                _: &dyn crate::domain::CancellationSignal,
             ) -> Result<Value, ExtensionCallError> {
-                self.recorder.call_tool(name, params)
+                self.recorder
+                    .call_tool(name, params, &crate::domain::NeverCancelled)
             }
             fn deliver_event(&mut self, _: Event) -> Result<(), ExtensionFault> {
                 self.calls.fetch_add(1, Ordering::AcqRel);

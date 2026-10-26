@@ -32,8 +32,9 @@ pub enum DapError {
     Io(std::io::Error),
     MalformedFrame(String),
     MalformedMessage(String),
-    Timeout { command: String },
+    Timeout { command: String, budget_ms: u64 },
     AdapterExited,
+    InvalidTimeout,
 }
 
 impl From<std::io::Error> for DapError {
@@ -44,7 +45,7 @@ impl From<std::io::Error> for DapError {
 
 pub trait DapTransport {
     fn send(&mut self, message: &Value) -> Result<(), DapError>;
-    fn recv(&mut self, timeout: Duration) -> Result<Option<Value>, DapError>;
+    fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<Value>, DapError>;
 }
 
 pub struct DapClient {
@@ -64,12 +65,14 @@ impl DapClient {
         }
     }
 
-    pub fn request(
+    pub fn request<T: Into<Option<Duration>>>(
         &mut self,
         command: &str,
         arguments: Value,
-        timeout: Duration,
+        timeout: T,
     ) -> Result<DapResponse, DapError> {
+        let timeout = timeout.into();
+        let deadline = checked_deadline(timeout)?;
         let request_seq = self.next_seq;
         self.next_seq += 1;
 
@@ -92,14 +95,27 @@ impl DapClient {
                 .ok_or_else(|| DapError::MalformedMessage("buffered response disappeared".into()));
         }
 
-        let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| DapError::Timeout {
-                    command: command.to_string(),
-                })?;
-            let frame = self.transport.recv(remaining)?;
+            let remaining = match deadline {
+                Some(deadline) => Some(
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .ok_or_else(|| DapError::Timeout {
+                            command: command.to_string(),
+                            budget_ms: duration_ms(timeout.expect("finite deadline")),
+                        })?,
+                ),
+                None => None,
+            };
+            let frame = match self.transport.recv(remaining) {
+                Err(DapError::Timeout { .. }) => {
+                    return Err(DapError::Timeout {
+                        command: command.to_owned(),
+                        budget_ms: duration_ms(timeout.expect("finite receive timeout")),
+                    });
+                }
+                result => result?,
+            };
             let Some(frame) = frame else {
                 return Err(DapError::AdapterExited);
             };
@@ -116,11 +132,13 @@ impl DapClient {
         }
     }
 
-    pub fn wait_for_event(
+    pub fn wait_for_event<T: Into<Option<Duration>>>(
         &mut self,
         event_names: &[&str],
-        timeout: Duration,
+        timeout: T,
     ) -> Result<Option<DapEvent>, DapError> {
+        let timeout = timeout.into();
+        let deadline = checked_deadline(timeout)?;
         if let Some(index) = self
             .pending_events
             .iter()
@@ -129,10 +147,15 @@ impl DapClient {
             return Ok(Some(self.pending_events.remove(index)));
         }
 
-        let deadline = Instant::now() + timeout;
         loop {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Ok(None);
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        return Ok(None);
+                    };
+                    Some(remaining)
+                }
+                None => None,
             };
             let frame = match self.transport.recv(remaining) {
                 Ok(frame) => frame,
@@ -156,6 +179,21 @@ impl DapClient {
     pub fn drain_events(&mut self) -> Vec<DapEvent> {
         std::mem::take(&mut self.pending_events)
     }
+}
+
+fn checked_deadline(timeout: Option<Duration>) -> Result<Option<Instant>, DapError> {
+    timeout
+        .map(|timeout| {
+            u64::try_from(timeout.as_millis()).map_err(|_| DapError::InvalidTimeout)?;
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or(DapError::InvalidTimeout)
+        })
+        .transpose()
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).expect("DAP timeout validated at admission")
 }
 
 pub fn write_frame(writer: &mut impl Write, message: &Value) -> Result<(), DapError> {
@@ -306,11 +344,27 @@ mod tests {
             Ok(())
         }
 
-        fn recv(&mut self, _timeout: Duration) -> Result<Option<Value>, DapError> {
+        fn recv(&mut self, _timeout: Option<Duration>) -> Result<Option<Value>, DapError> {
             self.received
                 .pop_front()
                 .unwrap_or(Err(DapError::AdapterExited))
         }
+    }
+
+    #[test]
+    fn unrepresentable_dap_budget_is_rejected_before_sending_or_receiving() {
+        let transport = ScriptedTransport::new(vec![]);
+        let sent = transport.sent_messages();
+        let mut client = DapClient::new(Box::new(transport));
+        assert!(matches!(
+            client.request("launch", json!({}), Some(Duration::from_secs(u64::MAX))),
+            Err(DapError::InvalidTimeout)
+        ));
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(matches!(
+            client.wait_for_event(&["stopped"], Some(Duration::from_secs(u64::MAX))),
+            Err(DapError::InvalidTimeout)
+        ));
     }
 
     #[test]
@@ -560,6 +614,7 @@ mod tests {
         let mut client = DapClient::new(Box::new(ScriptedTransport::new(vec![Err(
             DapError::Timeout {
                 command: "launch".to_string(),
+                budget_ms: 50,
             },
         )])));
         let timeout = Duration::from_millis(10);
@@ -572,7 +627,7 @@ mod tests {
         assert!(started.elapsed() <= timeout + Duration::from_millis(100));
         assert!(matches!(
             error,
-            DapError::Timeout { command } if command == "launch"
+            DapError::Timeout { command, .. } if command == "launch"
         ));
     }
 

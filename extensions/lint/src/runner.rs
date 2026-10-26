@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 compile_error!("lint command process-tree supervision requires a Unix host");
 
 use core_engine::adapters::config::lint::{ParserFormat, TargetMode};
+use extension_protocol::TimeoutDetail;
 use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::config::RunnerLintConfig;
@@ -29,7 +30,7 @@ pub struct RunRequest<'a> {
     pub workspace_root: &'a Path,
     pub target_path: Option<&'a str>,
     pub stdin_content: Option<&'a str>,
-    pub timeout: Duration,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +50,7 @@ pub enum LintToolError {
     MissingBinary { command: String },
     UnparseableOutput,
     NonzeroExit { code: Option<i32> },
-    Timeout,
+    Timeout { detail: TimeoutDetail },
     InvalidConfig(String),
 }
 
@@ -60,14 +61,14 @@ impl LintToolError {
             Self::MissingBinary { .. } => "lint_missing_binary",
             Self::UnparseableOutput => "lint_unparseable_output",
             Self::NonzeroExit { .. } => "lint_nonzero_exit",
-            Self::Timeout => "lint_timeout",
+            Self::Timeout { .. } => "lint_timeout",
             Self::InvalidConfig(_) => "lint_invalid_config",
         }
     }
 }
 
 pub fn run_linter(request: RunRequest<'_>) -> Result<RunOutcome, LintToolError> {
-    let (output, status_code, status_success) = run_linter_output(request)?;
+    let (output, status_code, status_success) = run_linter_output(request, "check")?;
     if status_success && output.trim().is_empty() {
         return Ok(RunOutcome {
             supported: true,
@@ -95,7 +96,7 @@ pub fn run_linter(request: RunRequest<'_>) -> Result<RunOutcome, LintToolError> 
 }
 
 pub fn run_linter_fixes(request: RunRequest<'_>) -> Result<RunFixOutcome, LintToolError> {
-    let (output, status_code, status_success) = run_linter_output(request)?;
+    let (output, status_code, status_success) = run_linter_output(request, "fix")?;
     if status_success && output.trim().is_empty() {
         return Ok(RunFixOutcome {
             supported: true,
@@ -124,12 +125,13 @@ pub fn run_linter_fixes(request: RunRequest<'_>) -> Result<RunFixOutcome, LintTo
 
 fn run_linter_output(
     request: RunRequest<'_>,
+    operation: &'static str,
 ) -> Result<(String, Option<i32>, bool), LintToolError> {
     validate_config(request.config)?;
 
-    let deadline = Instant::now() + request.timeout;
+    let (deadline, budget_ms) = operation_deadline(request.timeout)?;
     let args = command_args(request)?;
-    let child = spawn_command(request, &args, deadline)?;
+    let child = spawn_command(request, &args, deadline, operation, budget_ms)?;
     let mut process = RunningProcess::new(child);
 
     process.stdout = process.child.stdout.take().map(read_output);
@@ -165,6 +167,12 @@ fn run_linter_output(
         poll_output_worker(&mut process.stdout, &mut stdout_output)?;
         poll_output_worker(&mut process.stderr, &mut stderr_output)?;
 
+        let now = Instant::now();
+        if deadline_expired(deadline, now) {
+            process.cleanup()?;
+            return Err(timeout_error(operation, budget_ms));
+        }
+
         if let Some(status) = status
             && stdin_done
             && stdout_output.is_some()
@@ -172,18 +180,21 @@ fn run_linter_output(
         {
             process.disarm();
             let mut output = stdout_output.unwrap_or_default();
-            output.extend(stderr_output.unwrap_or_default());
+            if matches!(request.config.format, ParserFormat::GenericRegex) {
+                output.extend(stderr_output.unwrap_or_default());
+            }
             let output = String::from_utf8_lossy(&output);
             return Ok((output.into_owned(), status.code(), status.success()));
         }
 
-        if Instant::now() >= deadline {
-            process.cleanup()?;
-            return Err(LintToolError::Timeout);
-        }
-
-        thread::sleep(WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        thread::sleep(deadline.map_or(WAIT_POLL_INTERVAL, |deadline| {
+            WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now))
+        }));
     }
+}
+
+fn deadline_expired(deadline: Option<Instant>, observed_at: Instant) -> bool {
+    deadline.is_some_and(|deadline| observed_at > deadline)
 }
 
 fn validate_config(config: &RunnerLintConfig) -> Result<(), LintToolError> {
@@ -231,7 +242,9 @@ fn command_args(request: RunRequest<'_>) -> Result<Vec<String>, LintToolError> {
 fn spawn_command(
     request: RunRequest<'_>,
     args: &[String],
-    deadline: Instant,
+    deadline: Option<Instant>,
+    operation: &'static str,
+    budget_ms: Option<u64>,
 ) -> Result<Child, LintToolError> {
     loop {
         let mut command = Command::new(&request.config.command);
@@ -256,16 +269,50 @@ fn spawn_command(
                     command: request.config.command.clone(),
                 });
             }
-            Err(error) if is_executable_busy(&error) && Instant::now() < deadline => {
+            Err(error)
+                if is_executable_busy(&error)
+                    && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+            {
                 thread::sleep(WAIT_POLL_INTERVAL);
             }
-            Err(error) if is_executable_busy(&error) => return Err(LintToolError::Timeout),
+            Err(error) if is_executable_busy(&error) => {
+                return Err(timeout_error(operation, budget_ms));
+            }
             Err(_) => {
                 return Err(LintToolError::InvalidConfig(
                     "failed to spawn lint command".to_owned(),
                 ));
             }
         }
+    }
+}
+
+fn operation_deadline(
+    timeout: Option<Duration>,
+) -> Result<(Option<Instant>, Option<u64>), LintToolError> {
+    let Some(timeout) = timeout else {
+        return Ok((None, None));
+    };
+    if timeout.is_zero() {
+        return Err(LintToolError::InvalidConfig(
+            "lint timeout must be positive".to_owned(),
+        ));
+    }
+    let budget_ms = u64::try_from(timeout.as_millis())
+        .map_err(|_| LintToolError::InvalidConfig("lint timeout is too large".to_owned()))?;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        LintToolError::InvalidConfig("lint timeout deadline is not representable".to_owned())
+    })?;
+    Ok((Some(deadline), Some(budget_ms)))
+}
+
+fn timeout_error(operation: &'static str, budget_ms: Option<u64>) -> LintToolError {
+    LintToolError::Timeout {
+        detail: TimeoutDetail {
+            operation: operation.to_owned(),
+            layer: "subprocess".to_owned(),
+            budget_ms: budget_ms.expect("a subprocess timeout requires an operation budget"),
+        },
     }
 }
 
@@ -500,6 +547,7 @@ mod tests {
 
     use core_engine::adapters::config::lint::{LintCommandConfig, ParserFormat, TargetMode};
     use core_engine::domain::code_intel::Severity;
+    use extension_protocol::TimeoutDetail;
 
     static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -582,7 +630,7 @@ mod tests {
     fn regex_config(command: String, target: TargetMode) -> RunnerLintConfig {
         RunnerLintConfig {
             command,
-            timeout_secs: 2,
+            timeout_secs: Some(2),
             args: Vec::new(),
             extensions: vec!["rs".to_owned()],
             format: ParserFormat::GenericRegex,
@@ -603,7 +651,7 @@ mod tests {
             workspace_root: &workspace.root,
             target_path,
             stdin_content,
-            timeout: Duration::from_secs(2),
+            timeout: Some(Duration::from_secs(2)),
         }
     }
 
@@ -632,7 +680,7 @@ mod tests {
     fn host_lint_configuration_preserves_all_runner_settings() {
         let host_config = LintCommandConfig {
             command: "cargo".to_owned(),
-            timeout_secs: 2,
+            timeout_secs: Some(2),
             args: vec!["check".to_owned(), "--message-format=json".to_owned()],
             extensions: vec!["rs".to_owned()],
             format: ParserFormat::RustcJson,
@@ -654,6 +702,22 @@ mod tests {
     }
 
     #[test]
+    fn host_lint_configuration_preserves_absent_timeout() {
+        let host_config = LintCommandConfig {
+            command: "cargo".to_owned(),
+            timeout_secs: None,
+            args: vec!["check".to_owned()],
+            extensions: vec!["rs".to_owned()],
+            format: ParserFormat::RustcJson,
+            target: TargetMode::Append,
+            regex: None,
+            source: None,
+        };
+
+        assert_eq!(RunnerLintConfig::from(&host_config).timeout_secs, None);
+    }
+
+    #[test]
     fn lint_tool_error_code_returns_exact_stable_error_codes() {
         assert_eq!(
             LintToolError::MissingBinary {
@@ -670,7 +734,17 @@ mod tests {
             LintToolError::NonzeroExit { code: Some(1) }.code(),
             "lint_nonzero_exit"
         );
-        assert_eq!(LintToolError::Timeout.code(), "lint_timeout");
+        assert_eq!(
+            LintToolError::Timeout {
+                detail: TimeoutDetail {
+                    operation: "check".to_owned(),
+                    layer: "subprocess".to_owned(),
+                    budget_ms: 0,
+                },
+            }
+            .code(),
+            "lint_timeout"
+        );
         assert_eq!(
             LintToolError::InvalidConfig("bad".to_owned()).code(),
             "lint_invalid_config"
@@ -833,14 +907,92 @@ mod tests {
     }
 
     #[test]
-    fn timeout_or_hanging_command_returns_timeout_without_blocking_indefinitely() {
+    fn configured_linter_timeout_reports_operation_layer_and_budget() {
         let workspace = TestWorkspace::new();
         let command = workspace.command("hang.sh", "#!/bin/sh\nsleep 5\n");
         let config = regex_config(command, TargetMode::None);
         let mut run_request = request(&config, &workspace, None, None);
-        run_request.timeout = Duration::from_millis(50);
+        run_request.timeout = Some(Duration::from_millis(50));
 
-        assert_timeout(|| run_linter(run_request));
+        let error = run_linter(run_request).assert_err();
+
+        assert_eq!(
+            error,
+            LintToolError::Timeout {
+                detail: TimeoutDetail {
+                    operation: "check".to_owned(),
+                    layer: "subprocess".to_owned(),
+                    budget_ms: 50,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn completed_process_is_rejected_when_observed_after_deadline() {
+        let deadline = Instant::now();
+
+        assert!(!deadline_expired(Some(deadline), deadline));
+        assert!(deadline_expired(
+            Some(deadline),
+            deadline + Duration::from_nanos(1)
+        ));
+        assert!(!deadline_expired(None, deadline + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn overflowing_runner_deadline_is_rejected_before_spawning_without_timeout_detail() {
+        let workspace = TestWorkspace::new();
+        let command = workspace.command(
+            "overflow-must-not-spawn.sh",
+            "#!/bin/sh\ndir=$(dirname \"$0\")\nprintf spawned > \"$dir/spawned.txt\"\n",
+        );
+        let config = regex_config(command, TargetMode::None);
+        let mut run_request = request(&config, &workspace, None, None);
+        run_request.timeout = Some(Duration::new(u64::MAX, 0));
+
+        let error = run_linter(run_request).assert_err();
+
+        match error {
+            LintToolError::InvalidConfig(message) => {
+                assert!(
+                    message.contains("timeout"),
+                    "invalid timeout message: {message}"
+                );
+            }
+            LintToolError::Timeout { detail } => {
+                panic!("overflow validation must not create timeout detail: {detail:?}");
+            }
+            other => panic!("expected InvalidConfig before spawning, got {other:?}"),
+        }
+        assert!(
+            !workspace.root.join("spawned.txt").exists(),
+            "invalid timeout must be rejected before command spawn"
+        );
+    }
+
+    #[test]
+    fn linter_without_configured_timeout_completes_after_release() {
+        let workspace = TestWorkspace::new();
+        let release = workspace.root.join("release");
+        let command = workspace.command(
+            "wait_for_release.sh",
+            "#!/bin/sh\ndir=$(dirname \"$0\")\nwhile [ ! -f \"$dir/release\" ]; do sleep 0.01; done\nprintf 'src/main.rs:1:1: released\\n'\n",
+        );
+        let mut config = regex_config(command, TargetMode::None);
+        config.timeout_secs = None;
+        let release_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            fs::write(release, "released").unwrap();
+        });
+        let mut run_request = request(&config, &workspace, None, None);
+        run_request.timeout = None;
+
+        let outcome = run_linter(run_request).assert_ok();
+        release_thread.join().unwrap();
+
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(outcome.diagnostics[0].diagnostic.message, "released");
     }
 
     #[test]
@@ -855,7 +1007,7 @@ mod tests {
             Some("src/lib.rs"),
             Some(stdin_content.as_str()),
         );
-        run_request.timeout = Duration::from_millis(50);
+        run_request.timeout = Some(Duration::from_millis(50));
 
         assert_timeout(|| run_linter(run_request));
     }
@@ -866,7 +1018,7 @@ mod tests {
         let command = workspace.command("fix_hang.sh", "#!/bin/sh\nsleep 5\n");
         let config = regex_config(command, TargetMode::None);
         let mut run_request = request(&config, &workspace, None, None);
-        run_request.timeout = Duration::from_millis(50);
+        run_request.timeout = Some(Duration::from_millis(50));
 
         assert_timeout(|| run_linter_fixes(run_request));
     }
@@ -874,7 +1026,7 @@ mod tests {
     fn assert_timeout<T>(run: impl FnOnce() -> Result<T, LintToolError>) {
         let started = Instant::now();
         let error = run().assert_err();
-        assert_eq!(error, LintToolError::Timeout);
+        assert!(matches!(error, LintToolError::Timeout { .. }));
         assert_eq!(error.code(), "lint_timeout");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
@@ -895,7 +1047,7 @@ mod tests {
         );
         let config = regex_config(command, TargetMode::None);
         let mut run_request = request(&config, &workspace, None, None);
-        run_request.timeout = EXECUTION_DEADLINE;
+        run_request.timeout = Some(EXECUTION_DEADLINE);
 
         let started = Instant::now();
         let error = run_linter(run_request).assert_err();
@@ -905,7 +1057,16 @@ mod tests {
         let mut cleanup = ProcessCleanup::new();
         cleanup.retain_until_test_end(descendant_pid.clone());
 
-        assert_eq!(error, LintToolError::Timeout);
+        assert_eq!(
+            error,
+            LintToolError::Timeout {
+                detail: TimeoutDetail {
+                    operation: "check".to_owned(),
+                    layer: "subprocess".to_owned(),
+                    budget_ms: EXECUTION_DEADLINE.as_millis() as u64,
+                },
+            }
+        );
         assert_eq!(error.code(), "lint_timeout");
         assert!(
             elapsed <= maximum_return_time,
@@ -927,7 +1088,7 @@ mod tests {
         );
         let config = regex_config(command, TargetMode::None);
         let mut run_request = request(&config, &workspace, None, None);
-        run_request.timeout = EXECUTION_DEADLINE;
+        run_request.timeout = Some(EXECUTION_DEADLINE);
 
         let started = Instant::now();
         let error = run_linter(run_request).assert_err();
@@ -935,7 +1096,16 @@ mod tests {
         let pipe_holder_pid = workspace.read("pipe_holder.pid").trim().to_owned();
         cleanup.retain_until_test_end(pipe_holder_pid.clone());
 
-        assert_eq!(error, LintToolError::Timeout);
+        assert_eq!(
+            error,
+            LintToolError::Timeout {
+                detail: TimeoutDetail {
+                    operation: "check".to_owned(),
+                    layer: "subprocess".to_owned(),
+                    budget_ms: EXECUTION_DEADLINE.as_millis() as u64,
+                },
+            }
+        );
         assert_eq!(error.code(), "lint_timeout");
         assert!(
             elapsed <= maximum_return_time,

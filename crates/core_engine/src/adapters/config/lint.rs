@@ -4,39 +4,18 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-const fn default_timeout_secs() -> u64 {
-    2
-}
-
-fn deserialize_positive_timeout_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = u64::deserialize(deserializer)?;
-    if value == 0 {
-        return Err(serde::de::Error::custom("must be a positive integer"));
+pub(super) fn validate_timeout_values(
+    raw: &toml::Value,
+    validate: impl Fn(&str, &toml::Value) -> Result<(), toml::de::Error>,
+) -> Result<(), toml::de::Error> {
+    let Some(commands) = raw.get("lint").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (language, command) in commands {
+        if let Some(value) = command.get("timeout_secs") {
+            validate(&format!("lint.{language}.timeout_secs"), value)?;
+        }
     }
-    Ok(value)
-}
-
-pub(super) fn validate_timeout_values(raw: &toml::Value) -> Result<(), toml::de::Error> {
-    let invalid_field = raw
-        .get("lint")
-        .and_then(toml::Value::as_table)
-        .and_then(|commands| {
-            commands.iter().find_map(|(language, command)| {
-                let timeout = command.get("timeout_secs")?;
-                (!matches!(timeout.as_integer(), Some(value) if value > 0))
-                    .then(|| format!("lint.{language}.timeout_secs"))
-            })
-        });
-
-    if let Some(field) = invalid_field {
-        return Err(<toml::de::Error as serde::de::Error>::custom(format!(
-            "{field}: must be a positive integer"
-        )));
-    }
-
     Ok(())
 }
 
@@ -80,11 +59,8 @@ impl LintConfig {
 #[serde(deny_unknown_fields)]
 pub struct LintCommandConfig {
     pub command: String,
-    #[serde(
-        default = "default_timeout_secs",
-        deserialize_with = "deserialize_positive_timeout_secs"
-    )]
-    pub timeout_secs: u64,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub args: Vec<String>,
     pub extensions: Vec<String>,
@@ -151,38 +127,29 @@ mod tests {
     }
 
     #[test]
-    fn lint_timeout_defaults_to_two_seconds_when_omitted() {
+    fn lint_timeout_absence_and_positive_value_are_preserved() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), &lint_config(None));
 
-        let config = load(tmp.path()).expect("omitted lint timeout must use its default");
+        let config = load(tmp.path()).expect("omitted lint timeout must remain absent");
 
-        assert_eq!(config.lint.commands["rust"].timeout_secs, 2);
+        assert_eq!(config.lint.commands["rust"].timeout_secs, None);
+
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), &lint_config(Some("17")));
+        let config = load(tmp.path()).expect("positive integer lint timeout must parse");
+        assert_eq!(config.lint.commands["rust"].timeout_secs, Some(17));
     }
 
     #[test]
-    fn lint_timeout_accepts_positive_integer_seconds() {
-        for timeout_secs in [1, 2, 17, 86_400] {
-            let tmp = tempdir().unwrap();
-            write_config(tmp.path(), &lint_config(Some(&timeout_secs.to_string())));
-
-            let config = load(tmp.path()).expect("positive integer lint timeout must parse");
-
-            assert_eq!(
-                config.lint.commands["rust"].timeout_secs, timeout_secs,
-                "timeout {timeout_secs}"
-            );
-        }
-    }
-
-    #[test]
-    fn lint_timeout_rejects_non_positive_malformed_and_overflowing_values() {
+    fn lint_timeout_rejects_zero_negative_non_integer_and_u64_overflow() {
         for (name, value, typed_error) in [
             ("zero", "0", true),
             ("negative", "-1", true),
             ("string", "\"2\"", true),
             ("float", "2.5", true),
-            ("parser-range overflow", "9223372036854775808", false),
+            ("parser-range overflow", "9223372036854775808", true),
+            ("millisecond overflow", "9223372036854775807", true),
         ] {
             let tmp = tempdir().unwrap();
             write_config(tmp.path(), &lint_config(Some(value)));
@@ -209,23 +176,6 @@ mod tests {
                 "{name}: {rendered}"
             );
         }
-
-        let tmp = tempdir().unwrap();
-        let timeout_secs = 9_223_372_036_854_775_807_u64;
-        write_config(tmp.path(), &lint_config(Some(&timeout_secs.to_string())));
-
-        let err = load(tmp.path()).expect_err("unrepresentable lint deadline must fail at load");
-        match &err {
-            ConfigError::InvalidLintDeadline { field, value } => {
-                assert_eq!(field, "lint.rust.timeout_secs");
-                assert_eq!(*value, timeout_secs);
-            }
-            other => panic!("expected ConfigError::InvalidLintDeadline, got {other:?}"),
-        }
-        assert_eq!(
-            err.to_string(),
-            "invalid lint deadline lint.rust.timeout_secs: 9223372036854775807 cannot produce 2 * timeout_secs + 1"
-        );
     }
 
     #[test]

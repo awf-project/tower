@@ -583,7 +583,7 @@ fn runtime_test_proves_apply_edits_writes_are_visible_through_an_indexed_read_se
     write_apply_edits_extension(&workspace, &expected_version);
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = 1;
+    config.extensions.request_timeout_secs = Some(1);
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.root().to_path_buf()),
@@ -595,16 +595,28 @@ fn runtime_test_proves_apply_edits_writes_are_visible_through_an_indexed_read_se
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_lint_replace", json!({}))
+        .call(
+            "tower_lint_replace",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("apply extension must request workspace/applyEdits successfully");
 
     let read = registry
-        .call("tower_read_file", json!({ "path": "src/lint_target.txt" }))
+        .call(
+            "tower_read_file",
+            json!({ "path": "src/lint_target.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("read mutated file through shared engine state");
     assert_eq!(read["content"], "alpha fixed\n");
 
     let matches = registry
-        .call("tower_search_text", json!({ "pattern": "fixed" }))
+        .call(
+            "tower_search_text",
+            json!({ "pattern": "fixed" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("search mutated content through shared index");
     assert!(
         matches["matches"]
@@ -624,7 +636,7 @@ fn apply_edits_from_file_changed_subscriber_does_not_deadlock_its_own_tool_call(
     write_subscribed_apply_edits_extension(&workspace, &expected_version);
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = 2;
+    config.extensions.request_timeout_secs = Some(2);
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.root().to_path_buf()),
@@ -636,11 +648,19 @@ fn apply_edits_from_file_changed_subscriber_does_not_deadlock_its_own_tool_call(
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_lint_replace", json!({}))
+        .call(
+            "tower_lint_replace",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("subscribed apply extension must not deadlock its own apply-edits HostCall");
 
     let read = registry
-        .call("tower_read_file", json!({ "path": "src/lint_target.txt" }))
+        .call(
+            "tower_read_file",
+            json!({ "path": "src/lint_target.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("read mutated file through shared engine state");
     assert_eq!(read["content"], "alpha fixed\n");
 }
@@ -658,7 +678,7 @@ fn apply_edits_from_file_changed_handler_does_not_deadlock_original_apply() {
     );
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = 2;
+    config.extensions.request_timeout_secs = Some(2);
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.root().to_path_buf()),
@@ -670,11 +690,19 @@ fn apply_edits_from_file_changed_handler_does_not_deadlock_original_apply() {
     let mut registry = ExtensionMergedRegistry::new(Arc::clone(&handle.state), handle.ext_registry);
 
     registry
-        .call("tower_lint_replace", json!({}))
+        .call(
+            "tower_lint_replace",
+            json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("fileChanged apply-edits HostCall must not deadlock the original apply");
 
     let read = registry
-        .call("tower_read_file", json!({ "path": "src/lint_target.txt" }))
+        .call(
+            "tower_read_file",
+            json!({ "path": "src/lint_target.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("read twice-mutated file through shared engine state");
     assert_eq!(read["content"], "omega fixed\n");
 }
@@ -687,7 +715,7 @@ fn eager_initialize_time_apply_edits_uses_real_extension_host_for_file_changed_b
     write_eager_observer_and_initialize_apply_extensions(&workspace, &expected_version);
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = 2;
+    config.extensions.request_timeout_secs = Some(2);
     let _handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.root().to_path_buf()),
@@ -832,7 +860,11 @@ fn lint_fix_path_reads_file_hashes_content_applies_one_safe_fix_and_reports_one_
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("fix must return a tool result");
     adapter.shutdown();
 
@@ -857,7 +889,11 @@ fn lint_fix_dry_run_returns_would_apply_preview_and_leaves_file_hash_unchanged()
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs", "dry_run": true }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs", "dry_run": true }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("dry-run fix must return a tool result");
     adapter.shutdown();
 
@@ -903,7 +939,7 @@ fn lint_fix_counts_distinct_changed_files_and_accepted_lint_fix_records_not_byte
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({}))
+        .call_tool("fix", json!({}), &core_engine::domain::NeverCancelled)
         .expect("workspace fix must return a tool result");
     adapter.shutdown();
 
@@ -948,7 +984,11 @@ fn lint_fix_conflicting_multi_edit_skips_entire_fix_without_applying_any_edit() 
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("partial conflict fix must return a tool result");
     adapter.shutdown();
 
@@ -990,7 +1030,11 @@ fn lint_fix_overlapping_fixture_edits_skip_the_entire_conflicting_fix() {
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("overlapping fix must return a tool result");
     adapter.shutdown();
 
@@ -1028,7 +1072,11 @@ fn lint_fix_skips_structured_fixes_for_a_different_file_than_the_current_plan() 
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/a.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/a.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("cross-file fix must return a tool result");
     adapter.shutdown();
 
@@ -1057,7 +1105,11 @@ fn lint_fix_unsafe_false_skips_maybe_incorrect_but_unsafe_true_applies_it() {
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let safe_default = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("unsafe default fix must return a tool result");
     adapter.shutdown();
 
@@ -1071,7 +1123,11 @@ fn lint_fix_unsafe_false_skips_maybe_incorrect_but_unsafe_true_applies_it() {
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let unsafe_allowed = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs", "unsafe": true }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs", "unsafe": true }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("unsafe opt-in fix must return a tool result");
     adapter.shutdown();
 
@@ -1095,7 +1151,11 @@ fn lint_fix_generic_regex_fixless_diagnostics_return_unsupported_skips_without_p
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("unsupported fixes must remain on the success-result path");
     adapter.shutdown();
 
@@ -1260,7 +1320,11 @@ fi
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("fix with follow-up check must return a tool result");
     adapter.shutdown();
 
@@ -1316,7 +1380,8 @@ printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy"
         ),
     );
     workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
-    set_lint_timeout(&workspace, 4);
+    // Preparation and verification each take three seconds and share one budget.
+    set_lint_timeout(&workspace, 10);
     workspace.write_file("src/main.rs", "nope\n");
 
     let mut adapter = SidecarHostAdapter::spawn(
@@ -1327,13 +1392,21 @@ printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy"
     )
     .expect("lint extension with two configured-timeout fix passes must spawn");
     let check = adapter
-        .call_tool("check", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("configured check must return a tool result");
     assert_success_check_result(&check);
     assert_eq!(check["error"], Value::Null);
 
     let fix = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("configured fix must return a tool result");
     adapter.shutdown();
 
@@ -1363,7 +1436,7 @@ printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy"
     assert_eq!(
         fs::read_to_string(counter).expect("read invocation counter"),
         "3",
-        "check, fix preparation, and post-fix verification must each use the configured timeout"
+        "check must use its own budget; fix preparation and verification must share one budget"
     );
 }
 
@@ -1398,21 +1471,20 @@ wait
 
     let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("post-edit tool failure must return a structured tool result");
 
-    assert_eq!(result["error"]["code"], "lint_fix_apply_failed");
-    assert!(
-        result["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("lint command timed out")),
-        "the public error must retain the runner failure cause: {result}"
-    );
-    assert!(
-        result["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("edits were applied")),
-        "the public error must warn that edits committed: {result}"
+    assert_eq!(
+        result["error"],
+        json!({
+            "code": "lint_timeout",
+            "message": "lint command timed out",
+            "detail": { "operation": "fix", "layer": "subprocess", "budget_ms": 1000 }
+        })
     );
     assert_eq!(
         fs::read_to_string(workspace.root().join("src/main.rs")).expect("read applied file"),
@@ -1505,7 +1577,11 @@ fn lint_fix_invalid_request_returns_stable_lint_fix_invalid_request_error_code()
 
     let mut adapter = spawn_lint_fix_adapter(&workspace);
     let result = adapter
-        .call_tool("fix", json!({ "unsafe": "yes" }))
+        .call_tool(
+            "fix",
+            json!({ "unsafe": "yes" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("invalid fix params must return a structured tool result");
     adapter.shutdown();
 
@@ -1528,7 +1604,11 @@ fn the_check_tool_accepts_optional_path_and_with_a_path_lints_one_workspace_rela
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("check must return a tool result");
 
     adapter.shutdown();
@@ -1563,7 +1643,7 @@ esac
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({}))
+        .call_tool("check", json!({}), &core_engine::domain::NeverCancelled)
         .expect("check-all must return a tool result");
 
     adapter.shutdown();
@@ -1606,7 +1686,11 @@ fn unsupported_file_extensions_return_supported_false_diagnostics_empty_and_no_p
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({ "path": "README.md" }))
+        .call_tool(
+            "check",
+            json!({ "path": "README.md" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("unsupported path must still be a successful tool result");
 
     adapter.shutdown();
@@ -1630,7 +1714,11 @@ fn main_rs_returns_runner_failures_as_tool_result_error_with_stable_missing_bina
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("missing binary must remain on the success-result path");
 
     adapter.shutdown();
@@ -1656,7 +1744,11 @@ fn main_rs_returns_runner_failures_as_tool_result_error_with_stable_invalid_conf
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("invalid config must remain on the success-result path");
 
     adapter.shutdown();
@@ -1685,7 +1777,11 @@ fn unparseable_nonzero_output_preserves_success_result_path_with_stable_lint_err
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("nonzero parser failure must remain on the success-result path");
 
     adapter.shutdown();
@@ -1730,7 +1826,11 @@ source = "fixture-lint"
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("successful parser failure must remain on the success-result path");
 
     adapter.shutdown();
@@ -1770,7 +1870,11 @@ wait
         .expect("lint extension must spawn"),
     );
     let result = adapter
-        .call_tool("check", json!({ "path": "src/main.txt" }))
+        .call_tool(
+            "check",
+            json!({ "path": "src/main.txt" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("timeout must remain on the success-result path");
 
     assert_eq!(result["supported"], false);
@@ -1802,15 +1906,24 @@ wait
 
     let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
     let result = adapter
-        .call_tool("fix", json!({ "path": "src/main.rs" }))
+        .call_tool(
+            "fix",
+            json!({ "path": "src/main.rs" }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("preparation timeout must return a structured tool result");
 
-    assert_eq!(result["error"]["code"], "lint_fix_unavailable");
-    assert!(
-        result["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("lint command timed out")),
-        "the preparation failure must preserve the timeout cause: {result}"
+    assert_eq!(
+        result["error"],
+        json!({
+            "code": "lint_timeout",
+            "message": "lint command timed out",
+            "detail": {
+                "operation": "fix",
+                "layer": "subprocess",
+                "budget_ms": 1000
+            }
+        })
     );
     assert_eq!(
         fs::read(workspace.root().join("src/main.rs")).expect("read preserved file"),
@@ -1908,9 +2021,16 @@ printf '%s\n' '{"reason":"compiler-message","message":{"message":"replace nope",
     workspace.write_file("src/b.rs", "nope\n");
     let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
     let result = adapter
-        .call_tool("fix", json!({}))
+        .call_tool("fix", json!({}), &core_engine::domain::NeverCancelled)
         .expect("workspace fix result");
-    assert_eq!(result["error"]["code"], "lint_fix_unavailable");
+    assert_eq!(
+        result["error"],
+        json!({
+            "code": "lint_timeout",
+            "message": "lint command timed out",
+            "detail": { "operation": "fix", "layer": "subprocess", "budget_ms": 1000 }
+        })
+    );
     for path in ["src/a.rs", "src/b.rs"] {
         assert_eq!(
             fs::read_to_string(workspace.root().join(path)).unwrap(),
@@ -1939,7 +2059,8 @@ printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope
         ),
     );
     workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
-    set_lint_timeout(&workspace, 2);
+    // Both one-second subprocesses must fit within the shared operation budget.
+    set_lint_timeout(&workspace, 5);
     workspace.write_file("src/a.rs", "nope\n");
     workspace.write_file("src/b.rs", "nope\n");
 
@@ -1951,10 +2072,14 @@ printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope
     )
     .expect("lint extension must spawn");
     let check = adapter
-        .call_tool("check", json!({}))
+        .call_tool("check", json!({}), &core_engine::domain::NeverCancelled)
         .expect("workspace check must fit the sufficient request budget");
     let dry_run = adapter
-        .call_tool("fix", json!({ "dry_run": true }))
+        .call_tool(
+            "fix",
+            json!({ "dry_run": true }),
+            &core_engine::domain::NeverCancelled,
+        )
         .expect("workspace dry-run fix must fit the sufficient request budget");
     adapter.shutdown();
 
@@ -2026,7 +2151,7 @@ fn workspace_check_propagates_per_file_runner_error_with_stable_lint_error_code(
     )
     .expect("lint extension must spawn");
     let result = adapter
-        .call_tool("check", json!({}))
+        .call_tool("check", json!({}), &core_engine::domain::NeverCancelled)
         .expect("workspace runner failure must remain on the success-result path");
 
     adapter.shutdown();

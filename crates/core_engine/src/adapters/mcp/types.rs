@@ -108,6 +108,8 @@ pub enum ToolError {
     InvalidArgs(String),
     /// The tool executed but encountered a runtime error.
     ExecutionFailed(String),
+    /// The caller cancelled the request before the composite operation committed.
+    Cancelled,
     Application {
         code: i32,
         message: String,
@@ -129,6 +131,7 @@ impl core::fmt::Display for ToolError {
             Self::NotFound(name) => write!(f, "tool not found: {name}"),
             Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
             Self::ExecutionFailed(msg) => write!(f, "tool execution failed: {msg}"),
+            Self::Cancelled => f.write_str("tool invocation cancelled"),
             Self::Application { code, message, .. } => {
                 write!(f, "application error {code}: {message}")
             }
