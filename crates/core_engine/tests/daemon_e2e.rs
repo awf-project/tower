@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::{DaemonConfig, TowerConfig};
+use core_engine::adapters::daemon::client::SpawnAttemptGuard;
 use core_engine::adapters::daemon::server::run_daemon;
-use core_engine::adapters::daemon::socket::{WorkspaceDaemonOwner, socket_path, wait_for_socket};
+use core_engine::adapters::daemon::socket::{
+    OwnerLiveness, WorkspaceDaemonOwner, probe_owner, socket_path, wait_for_socket,
+};
 use core_engine::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, Handshake, read_line_capped, write_line,
 };
@@ -712,6 +715,610 @@ fn indexed_paths_through_mcp(workspace: &Path) -> Result<Vec<String>, String> {
                 })
                 .collect()
         })
+}
+
+struct RoutedMcpSession {
+    connection: UnixStream,
+    next_id: u64,
+}
+
+impl RoutedMcpSession {
+    async fn connect(workspace: &Path) -> Self {
+        let mut connection = wait_for_socket(&socket_path(workspace), Duration::from_secs(5))
+            .await
+            .expect("connect routed MCP session");
+        connection
+            .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
+            .await
+            .expect("write routed MCP handshake");
+        write_line(
+            &mut connection,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"project-routing-e2e","version":"1"}}}"#,
+        )
+        .await
+        .expect("initialize routed MCP session");
+        let initialized = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_line_capped(&mut connection, 1 << 20),
+        )
+        .await
+        .expect("routed MCP initialization response exceeded 5s")
+        .expect("read routed MCP initialization")
+        .expect("routed daemon returned initialization response");
+        let response: Value =
+            serde_json::from_str(&initialized).expect("parse routed MCP initialization");
+        assert!(response["result"].is_object(), "{response}");
+        write_line(
+            &mut connection,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        )
+        .await
+        .expect("complete routed MCP initialization");
+        Self {
+            connection,
+            next_id: 2,
+        }
+    }
+
+    async fn call_with_timeout(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        response_timeout: Duration,
+    ) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_line(
+            &mut self.connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            })
+            .to_string(),
+        )
+        .await
+        .map_err(|error| format!("write {name} request: {error}"))?;
+        let line = tokio::time::timeout(
+            response_timeout,
+            read_line_capped(&mut self.connection, 1 << 20),
+        )
+        .await
+        .map_err(|_| format!("{name} response exceeded {response_timeout:?}"))?
+        .map_err(|error| format!("read {name} response: {error}"))?
+        .ok_or_else(|| format!("daemon closed MCP connection during {name}"))?;
+        let response: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("parse {name} response: {error}; raw={line}"))?;
+        if response["id"] != id {
+            return Err(format!(
+                "{name} response id mismatch: expected {id}, got {response}"
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn call(&mut self, name: &str, arguments: Value) -> Value {
+        self.call_with_timeout(name, arguments, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|error| panic!("routed MCP call failed: {error}"))
+    }
+}
+
+fn routed_tool_payload(response: &Value) -> Value {
+    serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool response lacks text content: {response}")),
+    )
+    .unwrap_or_else(|error| panic!("tool response text is not JSON ({error}): {response}"))
+}
+
+fn write_routing_config(
+    source: &Path,
+    projects: &[(&str, &str, &Path)],
+    availability_timeout_secs: Option<u64>,
+) {
+    fs::create_dir_all(source.join(".tower")).unwrap();
+    let mut config = "[daemon]\nidle_timeout_secs = 300\n".to_owned();
+    if let Some(timeout) = availability_timeout_secs {
+        config.push_str(&format!(
+            "[projects]\nexternal_availability_timeout_secs = {timeout}\n"
+        ));
+    }
+    for (id, name, path) in projects {
+        config.push_str(&format!(
+            "[[projects.queryable]]\nid = {id:?}\nname = {name:?}\npath = {:?}\n",
+            path.to_string_lossy()
+        ));
+    }
+    fs::write(source.join(".tower/config.toml"), config).unwrap();
+}
+
+fn spawn_routing_daemon(binary: &Path, workspace: &Path) -> ProductionDaemonGuard {
+    let capture_dir = workspace.join(".tower");
+    fs::create_dir_all(&capture_dir).expect("create routing daemon capture directory");
+    let stdout = fs::File::create(capture_dir.join("routing-daemon.stdout.log"))
+        .expect("create routing daemon stdout capture");
+    let stderr = fs::File::create(capture_dir.join("routing-daemon.stderr.log"))
+        .expect("create routing daemon stderr capture");
+    let child = Command::new(binary)
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("start routing daemon");
+    ProductionDaemonGuard::new(child, binary, workspace)
+}
+
+fn routing_daemon_output(workspace: &Path) -> String {
+    let stdout = fs::read_to_string(workspace.join(".tower/routing-daemon.stdout.log"))
+        .expect("read captured routing daemon stdout");
+    let stderr = fs::read_to_string(workspace.join(".tower/routing-daemon.stderr.log"))
+        .expect("read captured routing daemon stderr");
+    format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+}
+
+async fn await_local_search_ready(
+    session: &mut RoutedMcpSession,
+    workspace: &Path,
+    pattern: &str,
+    expected_path: &str,
+    sentinel: Option<&Path>,
+) -> Value {
+    let configured_timeout = Duration::from_secs(5);
+    let started = Instant::now();
+    let deadline = started + configured_timeout;
+    loop {
+        let last_observation = match session
+            .call_with_timeout(
+                "tower_search_text",
+                json!({"pattern": pattern}),
+                Duration::from_secs(1),
+            )
+            .await
+        {
+            Ok(response) if response["result"]["isError"] == false => {
+                let payload = routed_tool_payload(&response);
+                let found_expected_path = payload["matches"].as_array().is_some_and(|matches| {
+                    matches
+                        .iter()
+                        .any(|entry| entry["path"].as_str() == Some(expected_path))
+                });
+                if found_expected_path {
+                    return response;
+                }
+                response.to_string()
+            }
+            Ok(response) => response.to_string(),
+            Err(error) => error,
+        };
+        assert!(
+            Instant::now() < deadline,
+            "workspace search readiness exceeded configured_timeout={configured_timeout:?} \
+             elapsed={:?} socket={} owner={:?} sentinel={} expected_path={expected_path} \
+             result_payload={last_observation}",
+            started.elapsed(),
+            socket_path(workspace).exists(),
+            probe_owner(workspace),
+            sentinel.is_some_and(Path::exists),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn shutdown_and_reap(guard: &mut ProductionDaemonGuard) {
+    let output = run_production(&guard.binary, &guard.workspace, "shutdown");
+    assert!(output.status.success(), "shutdown failed: {output:?}");
+    let status = guard.wait_and_disarm();
+    assert!(status.success(), "daemon exited unsuccessfully: {status}");
+}
+
+#[tokio::test]
+async fn external_read_only_search_identifies_its_source_project() {
+    let binary = selected_production_binary();
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::create_dir_all(target.path().join("src")).unwrap();
+    fs::write(
+        target.path().join("src/target.rs"),
+        "pub const ROUTED_NEEDLE: &str = \"target\";\n",
+    )
+    .unwrap();
+    write_routing_config(target.path(), &[], None);
+    write_routing_config(
+        source.path(),
+        &[("target-id", "Target project", target.path())],
+        Some(2),
+    );
+
+    let _target_daemon = spawn_routing_daemon(&binary, target.path());
+    let mut target_session = RoutedMcpSession::connect(target.path()).await;
+    let target_ready = await_local_search_ready(
+        &mut target_session,
+        target.path(),
+        "ROUTED_NEEDLE",
+        "src/target.rs",
+        None,
+    )
+    .await;
+    assert_eq!(
+        routed_tool_payload(&target_ready)["matches"][0]["path"],
+        "src/target.rs"
+    );
+
+    let _source_daemon = spawn_routing_daemon(&binary, source.path());
+    let mut source_session = RoutedMcpSession::connect(source.path()).await;
+    for selector in [
+        json!({"id": "target-id"}),
+        json!({"name": "Target project"}),
+        json!({"path": target.path()}),
+    ] {
+        let response = source_session
+            .call(
+                "tower_query_project",
+                json!({
+                    "project": selector,
+                    "tool": "tower_search_text",
+                    "arguments": {"pattern": "ROUTED_NEEDLE"},
+                }),
+            )
+            .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let payload = routed_tool_payload(&response);
+        assert_eq!(
+            payload["project"],
+            json!({"id": "target-id", "name": "Target project"})
+        );
+        assert_eq!(payload["result"]["matches"][0]["path"], "src/target.rs");
+    }
+
+    let empty = source_session
+        .call(
+            "tower_query_project",
+            json!({
+                "project": {"id": "target-id"},
+                "tool": "tower_search_text",
+                "arguments": {"pattern": "NO_ROUTED_MATCH"},
+            }),
+        )
+        .await;
+    assert_eq!(
+        routed_tool_payload(&empty),
+        json!({
+            "project": {"id": "target-id", "name": "Target project"},
+            "result": {"matches": []},
+        })
+    );
+}
+
+#[tokio::test]
+async fn external_mutations_are_rejected_before_dispatch() {
+    let binary = selected_production_binary();
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::create_dir_all(target.path().join("src")).unwrap();
+    let original = target.path().join("src/original.rs");
+    fs::write(&original, "pub const ORIGINAL: &str = \"unchanged\";\n").unwrap();
+    let sentinel = target.path().join(".tower/eager-launched");
+    write_launch_sentinel(
+        &target.path().join(".tower/extensions"),
+        "routing-eager-sentinel",
+        &sentinel,
+    );
+    write_routing_config(
+        source.path(),
+        &[("target-id", "Target project", target.path())],
+        Some(2),
+    );
+
+    let _source_daemon = spawn_routing_daemon(&binary, source.path());
+    let mut source_session = RoutedMcpSession::connect(source.path()).await;
+    let denied = source_session
+        .call(
+            "tower_query_project",
+            json!({
+                "project": {"id": "target-id"},
+                "tool": "tower_create_file",
+                "arguments": {"path": "src/original.rs", "content": "MUTATED"},
+            }),
+        )
+        .await;
+    assert_eq!(denied["result"]["isError"], true, "{denied}");
+    assert_eq!(
+        denied["result"]["content"][0]["text"],
+        "external project operation is not permitted"
+    );
+    assert_eq!(
+        denied["result"]["structuredContent"],
+        json!({
+            "code": "external_read_only_boundary",
+            "project": {"id": "target-id", "name": "Target project"},
+            "operation": "tower_create_file",
+        })
+    );
+
+    let observation_budget = Duration::from_millis(500);
+    let observation_started = Instant::now();
+    let observation_deadline = observation_started + observation_budget;
+    while Instant::now() < observation_deadline {
+        assert!(
+            !socket_path(target.path()).exists(),
+            "mutation rejection started target: configured_timeout={observation_budget:?} \
+             elapsed={:?} socket={} owner={:?} sentinel={} result_payload={denied}",
+            observation_started.elapsed(),
+            socket_path(target.path()).exists(),
+            probe_owner(target.path()),
+            sentinel.exists(),
+        );
+        assert!(
+            !sentinel.exists(),
+            "mutation rejection launched eager extension: configured_timeout={observation_budget:?} \
+             elapsed={:?} socket={} owner={:?} sentinel={} result_payload={denied}",
+            observation_started.elapsed(),
+            socket_path(target.path()).exists(),
+            probe_owner(target.path()),
+            sentinel.exists(),
+        );
+        assert_eq!(
+            fs::read_to_string(&original).unwrap(),
+            "pub const ORIGINAL: &str = \"unchanged\";\n",
+            "mutation rejection changed target bytes: configured_timeout={observation_budget:?} \
+             elapsed={:?} socket={} owner={:?} sentinel={} result_payload={denied}",
+            observation_started.elapsed(),
+            socket_path(target.path()).exists(),
+            probe_owner(target.path()),
+            sentinel.exists(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let _target_daemon = spawn_routing_daemon(&binary, target.path());
+    let mut target_session = RoutedMcpSession::connect(target.path()).await;
+    let read = target_session
+        .call("tower_read_file", json!({"path": "src/original.rs"}))
+        .await;
+    assert_eq!(
+        routed_tool_payload(&read)["content"],
+        "pub const ORIGINAL: &str = \"unchanged\";\n"
+    );
+    let original_ready = await_local_search_ready(
+        &mut target_session,
+        target.path(),
+        "ORIGINAL",
+        "src/original.rs",
+        Some(&sentinel),
+    )
+    .await;
+    assert_eq!(
+        routed_tool_payload(&original_ready)["matches"][0]["path"],
+        "src/original.rs"
+    );
+    let search = target_session
+        .call("tower_search_text", json!({"pattern": "MUTATED"}))
+        .await;
+    assert_eq!(search["result"]["isError"], false, "{search}");
+    assert_eq!(routed_tool_payload(&search), json!({"matches": []}));
+}
+
+#[tokio::test]
+async fn unavailable_external_project_does_not_break_local_queries() {
+    let binary = selected_production_binary();
+    let source = tempdir().unwrap();
+    let target_parent = tempdir().unwrap();
+    let target = target_parent.path().join("PRIVATE_RAW_PATH_SENTINEL");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        target.join("PRIVATE_CONTENT_SENTINEL.rs"),
+        "pub const PRIVATE_CONTENT_SENTINEL: &str = \"secret\";\n",
+    )
+    .unwrap();
+    let target_sentinel = target.join(".tower/eager-launched");
+    write_launch_sentinel(
+        &target.join(".tower/extensions"),
+        "unavailable-target-sentinel",
+        &target_sentinel,
+    );
+    let missing_root = target_parent.path().join("MISSING_EXTERNAL_PROJECT_ROOT");
+    fs::write(
+        source.path().join("local.rs"),
+        "pub const LOCAL_RECOVERY: u8 = 1;\n",
+    )
+    .unwrap();
+    write_routing_config(
+        source.path(),
+        &[
+            ("stalled-id", "Stalled target", &target),
+            ("missing-id", "Missing target", &missing_root),
+        ],
+        None,
+    );
+    let _stalled_acquisition =
+        SpawnAttemptGuard::acquire(&target).expect("hold target daemon acquisition lock");
+
+    let _source_daemon = spawn_routing_daemon(&binary, source.path());
+    let mut session = RoutedMcpSession::connect(source.path()).await;
+    let started = Instant::now();
+    let availability_budget = Duration::from_secs(10);
+    let harness_allowance = Duration::from_secs(2);
+    let unavailable = session
+        .call_with_timeout(
+            "tower_query_project",
+            json!({
+                "project": {"id": "stalled-id"},
+                "tool": "tower_search_text",
+                "arguments": {"pattern": "PRIVATE_CONTENT_SENTINEL"},
+            }),
+            availability_budget + harness_allowance,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "availability response failed: configured_timeout={availability_budget:?} \
+                 harness_allowance={harness_allowance:?} elapsed={:?} socket={} owner={:?} \
+                 sentinel={} result_payload=<none> error={error}",
+                started.elapsed(),
+                socket_path(&target).exists(),
+                probe_owner(&target),
+                target_sentinel.exists(),
+            )
+        });
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= availability_budget + harness_allowance,
+        "configured_timeout={availability_budget:?} harness_allowance={harness_allowance:?} \
+         elapsed={elapsed:?} socket={} owner={:?} sentinel={} result_payload={unavailable}",
+        socket_path(&target).exists(),
+        probe_owner(&target),
+        target_sentinel.exists(),
+    );
+    assert_eq!(unavailable["result"]["isError"], true, "{unavailable}");
+    assert_eq!(
+        unavailable["result"]["content"][0]["text"],
+        "external project is unavailable"
+    );
+    assert_eq!(
+        unavailable["result"]["structuredContent"],
+        json!({
+            "code": "external_project_unavailable",
+            "project": {"id": "stalled-id", "name": "Stalled target"},
+            "operation": "tower_search_text",
+        })
+    );
+    assert!(
+        !socket_path(&target).exists() && !target_sentinel.exists(),
+        "stalled target unexpectedly started: socket={} owner={:?} sentinel={} result_payload={unavailable}",
+        socket_path(&target).exists(),
+        probe_owner(&target),
+        target_sentinel.exists(),
+    );
+    assert_eq!(
+        probe_owner(&target).expect("probe stalled target daemon ownership"),
+        OwnerLiveness::Absent,
+        "stalled target has a daemon owner despite failed acquisition: socket={} sentinel={} result_payload={unavailable}",
+        socket_path(&target).exists(),
+        target_sentinel.exists(),
+    );
+    let public = unavailable.to_string();
+    let source_log = routing_daemon_output(source.path());
+    for sentinel in ["PRIVATE_RAW_PATH_SENTINEL", "PRIVATE_CONTENT_SENTINEL"] {
+        assert!(
+            !public.contains(sentinel),
+            "public result leaked {sentinel}: {public}"
+        );
+        assert!(
+            !source_log.contains(sentinel),
+            "source log leaked {sentinel}: {source_log}"
+        );
+    }
+
+    let local = await_local_search_ready(
+        &mut session,
+        source.path(),
+        "LOCAL_RECOVERY",
+        "local.rs",
+        None,
+    )
+    .await;
+    assert_eq!(
+        routed_tool_payload(&local)["matches"][0]["path"],
+        "local.rs"
+    );
+
+    let missing_started = Instant::now();
+    let missing = session
+        .call_with_timeout(
+            "tower_query_project",
+            json!({
+                "project": {"id": "missing-id"},
+                "tool": "tower_search_text",
+                "arguments": {"pattern": "LOCAL_RECOVERY"},
+            }),
+            availability_budget + harness_allowance,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "missing-root availability response failed: configured_timeout={availability_budget:?} \
+                 harness_allowance={harness_allowance:?} elapsed={:?} root_exists={} socket={} \
+                 owner={:?} sentinel=<absent> result_payload=<none> error={error}",
+                missing_started.elapsed(),
+                missing_root.exists(),
+                socket_path(&missing_root).exists(),
+                probe_owner(&missing_root),
+            )
+        });
+    let missing_elapsed = missing_started.elapsed();
+    assert!(
+        missing_elapsed <= availability_budget + harness_allowance,
+        "missing-root availability exceeded budget: configured_timeout={availability_budget:?} \
+         harness_allowance={harness_allowance:?} elapsed={missing_elapsed:?} root_exists={} \
+         socket={} owner={:?} sentinel=<absent> result_payload={missing}",
+        missing_root.exists(),
+        socket_path(&missing_root).exists(),
+        probe_owner(&missing_root),
+    );
+    assert_eq!(missing["result"]["isError"], true, "{missing}");
+    assert_eq!(
+        missing["result"]["content"][0]["text"],
+        "external project is unavailable"
+    );
+    assert_eq!(
+        missing["result"]["structuredContent"],
+        json!({
+            "code": "external_project_unavailable",
+            "project": {"id": "missing-id", "name": "Missing target"},
+            "operation": "tower_search_text",
+        })
+    );
+    assert!(
+        !missing_root.exists() && !socket_path(&missing_root).exists(),
+        "missing target was created or spawned: root_exists={} socket={} owner={:?} \
+         sentinel=<absent> result_payload={missing}",
+        missing_root.exists(),
+        socket_path(&missing_root).exists(),
+        probe_owner(&missing_root),
+    );
+    assert_eq!(
+        probe_owner(&missing_root).expect("probe missing target daemon ownership"),
+        OwnerLiveness::Absent,
+        "missing target acquired a daemon owner: root_exists={} socket={} result_payload={missing}",
+        missing_root.exists(),
+        socket_path(&missing_root).exists(),
+    );
+}
+
+#[tokio::test]
+async fn configured_project_identity_survives_source_daemon_restart() {
+    let binary = selected_production_binary();
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    write_routing_config(
+        source.path(),
+        &[("stable-project-id", "Stable project", target.path())],
+        Some(2),
+    );
+
+    let mut first_daemon = spawn_routing_daemon(&binary, source.path());
+    let mut first_session = RoutedMcpSession::connect(source.path()).await;
+    let first = first_session.call("tower_list_projects", json!({})).await;
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let first_id = routed_tool_payload(&first)["projects"][0]["id"].clone();
+    drop(first_session);
+    shutdown_and_reap(&mut first_daemon);
+    assert!(!socket_path(source.path()).exists());
+
+    let _second_daemon = spawn_routing_daemon(&binary, source.path());
+    let mut second_session = RoutedMcpSession::connect(source.path()).await;
+    let second = second_session.call("tower_list_projects", json!({})).await;
+    assert_eq!(second["result"]["isError"], false, "{second}");
+    assert_eq!(routed_tool_payload(&second)["projects"][0]["id"], first_id);
+    assert_eq!(first_id, "stable-project-id");
 }
 
 fn start_and_observe_inventory(binary: &Path, workspace: &Path, expected_count: usize) -> u128 {

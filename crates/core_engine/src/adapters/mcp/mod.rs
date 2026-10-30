@@ -1,4 +1,4 @@
-//! MCP inbound adapter (spec 10a — rmcp 1.7).
+//! MCP inbound adapter.
 //!
 //! JSON-RPC 2.0 over stdio, served via the [`rmcp`] SDK. This module contains
 //! the protocol plumbing and the tool-registry abstraction — it is
@@ -25,11 +25,6 @@
 //! # Registry seam
 //!
 //! The [`ToolRegistry`] trait is the single surface shared by all tool sources:
-//!
-//! | Spec | Implementor | What it adds |
-//! |------|-------------|--------------|
-//! | 10b  | `NativeToolRegistry` | 9 workspace tools |
-//! | 28   | `ExtensionMergedRegistry` | wraps 10b + extension tools |
 
 pub mod chain_registry;
 pub mod diagnostics;
@@ -39,6 +34,7 @@ pub mod lsp_support;
 pub mod lsp_tools;
 pub mod native_tools;
 pub mod nav_tools;
+pub mod project_query;
 pub mod registry;
 pub mod rmcp_server;
 pub mod types;
@@ -46,6 +42,12 @@ pub mod types;
 pub use diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader, PushEvent};
 pub use extension_merged_registry::ExtensionMergedRegistry;
 pub use native_tools::{EngineState, NativeToolRegistry};
+pub use project_query::{
+    EXTERNAL_PROJECT_UNAVAILABLE, EXTERNAL_QUERY_CANCELLED, EXTERNAL_READ_ONLY_BOUNDARY,
+    EXTERNAL_TARGET_FAILURE, EXTERNAL_TARGET_RESPONSE_INVALID, ExternalQueryRequest,
+    ExternalQueryResult, ProjectListResult, ProjectQueryRegistry, ProjectSelector,
+    QueryableProjectListing,
+};
 pub use registry::ToolRegistry;
 pub use rmcp_server::{TowerMcpHandler, spawn_push_task};
 pub use types::{ToolDesc, ToolError};

@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use crate::adapters::cli::GlobalOpts;
 use crate::adapters::config::TowerConfig;
 use crate::adapters::daemon::DaemonLifecycle;
+use crate::adapters::daemon::client::ExternalDaemonClient;
 use crate::adapters::daemon::engine::{
     EarlyDaemonContext, build_early_context, start_workspace_preparation,
 };
@@ -22,6 +23,8 @@ use crate::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, StatusSnapshot, read_handshake, read_line_capped,
     write_line,
 };
+use crate::adapters::mcp::ProjectQueryRegistry;
+use crate::adapters::mcp::chain_registry::ChainRegistry;
 use crate::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
 use crate::adapters::mcp::extension_merged_registry::ReadinessAwareRegistry;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
@@ -108,7 +111,15 @@ impl DaemonCtx {
 /// Build a fresh per-connection MCP handler over the shared engine state.
 fn build_handler(ctx: &DaemonCtx) -> (TowerMcpHandler, Arc<Mutex<SubscriptionRegistry>>) {
     let sub = Arc::new(Mutex::new(SubscriptionRegistry::new()));
-    let registry = ReadinessAwareRegistry::new(Arc::clone(&ctx.early));
+    let registry = ChainRegistry::new(vec![
+        Box::new(ProjectQueryRegistry::new(
+            ctx.early.workspace_root().to_path_buf(),
+            ctx.early.queryable_projects().clone(),
+            ctx.early.external_availability_timeout(),
+            Arc::new(ExternalDaemonClient::new()),
+        )),
+        Box::new(ReadinessAwareRegistry::new(Arc::clone(&ctx.early))),
+    ]);
     let handler = TowerMcpHandler::new(
         registry,
         Arc::new(NoOpDiagnosticsReader),

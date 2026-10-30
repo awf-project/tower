@@ -18,6 +18,28 @@ leaves the config unchanged.
 
 ## Canonical sections
 
+Cross-project read-only queries use the strict `[projects]` section. Each
+`[[projects.queryable]]` entry must declare a unique stable `id`, display `name`,
+and configured workspace `path`. Tower never discovers additional projects.
+
+```toml
+[projects]
+# Bounds locating, spawning, and initializing a configured target daemon.
+# Defaults to 10 seconds; it must be a positive integer.
+external_availability_timeout_secs = 10
+
+[[projects.queryable]]
+id = "api"
+name = "API service"
+path = "../api"
+```
+
+Configured projects remain read-only targets. Duplicate IDs, names, or resolved
+workspace paths fail configuration loading. A temporarily unavailable configured
+path remains listed but a query against it returns a bounded, project-attributed
+error; it does not impair local workspace queries. See [cross-project
+queries](project-queries.md) for the tool workflow and selector rules.
+
 Native sidecars are controlled by `[extensions]`:
 
 ```toml
@@ -93,12 +115,12 @@ limit; `idle_ttl_secs`, shutdown, and process cleanup remain separate lifecycle 
 **BREAKING:** absent operation timeout settings no longer impose finite Tower deadlines. To retain
 previous implicit limits, set the relevant positive values explicitly:
 
-| Operation | Previous implicit limit | Configuration |
-| --- | --- | --- |
-| Host sidecar initialization, requests, and events | 30 seconds | `request_timeout_secs = 30` under `[extensions]` |
-| Lint commands | 2 seconds | `timeout_secs = 2` under each affected `[lint.<language>]` |
-| External formatter | 30 seconds | `timeout_secs = 30` under each affected `[formatter.tools.<id>]` |
-| rr recording | 60 seconds | `record_timeout_secs = 60` under `[debug.record]` |
+| Operation                                         | Previous implicit limit | Configuration                                                    |
+| ------------------------------------------------- | ----------------------- | ---------------------------------------------------------------- |
+| Host sidecar initialization, requests, and events | 30 seconds              | `request_timeout_secs = 30` under `[extensions]`                 |
+| Lint commands                                     | 2 seconds               | `timeout_secs = 2` under each affected `[lint.<language>]`       |
+| External formatter                                | 30 seconds              | `timeout_secs = 30` under each affected `[formatter.tools.<id>]` |
+| rr recording                                      | 60 seconds              | `record_timeout_secs = 60` under `[debug.record]`                |
 
 LSP also had separate internal 10-second request and 60-second diagnostics limits. These implicit
 limits are removed. Set `[extensions].request_timeout_secs` to bound LSP operations; diagnostics

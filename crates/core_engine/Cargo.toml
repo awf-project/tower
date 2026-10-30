@@ -22,6 +22,8 @@ testing = []
 startup-test-hooks = ["testing"]
 
 [dev-dependencies]
+# Paused Tokio time proves acquisition and execution budget boundaries without wall-clock sleeps.
+tokio = { version = "1.54.1", features = ["test-util"] }
 fixture_lsp_server = { path = "../../extensions/fixtures/lsp_server" }
 # Property-based testing: generates arbitrary inputs to verify invariants over
 # a large random search space (DoD: determinism property test).
@@ -87,7 +89,7 @@ serde_json = "1"
 # XDG_DATA_HOME" rule) cross-platform, used only at the binary/adapter edge to
 # locate the global extensions dir. Domain stays untouched.
 directories = "6"
-rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync"] }
 # clap (derive) for the binary CLI surface: subcommands + --version/--help.
 # MIT/Apache-2.0; covered by deny.toml allow-list.

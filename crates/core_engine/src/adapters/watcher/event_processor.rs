@@ -111,6 +111,8 @@ pub struct EventProcessor {
     path_exclusion: Option<Arc<dyn PathExclusionPort>>,
     rename_coordinator: Option<Arc<RenameCoordinator>>,
     watcher_cancelled: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    before_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl std::fmt::Debug for EventProcessor {
@@ -160,6 +162,8 @@ impl EventProcessor {
             path_exclusion,
             rename_coordinator: None,
             watcher_cancelled: None,
+            #[cfg(test)]
+            before_commit: None,
         }
     }
 
@@ -518,6 +522,11 @@ impl EventProcessor {
             read_identity_metadata(&abs_path).unwrap_or_else(|| read_metadata(&abs_path));
         let tokens = tokenize(rel_path.as_str());
 
+        #[cfg(test)]
+        if let Some(hook) = self.before_commit.take() {
+            hook();
+        }
+
         // ── Write lock: minimal critical section ──────────────────────────────
         // Acquire workspace lock first, then index lock (anti-deadlock order).
         // If the path is already tracked (e.g. duplicate event), skip silently.
@@ -526,6 +535,14 @@ impl EventProcessor {
                 .workspace
                 .write()
                 .expect("workspace lock poisoned — unrecoverable");
+
+            // Native mutations hold this lock across their disk and VFS changes.
+            // The metadata read above may predate a rename that completed while
+            // we waited for the lock; never reinsert its now-missing source.
+            if !abs_path.is_file() {
+                drop(ws);
+                return self.handle_delete(abs_path);
+            }
 
             // Idempotency: if already tracked, do not re-insert.
             if ws.get_by_path(&rel_path).is_some() {
@@ -711,6 +728,11 @@ impl EventProcessor {
             return self.handle_modify(abs_path);
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self.before_commit.take() {
+            hook();
+        }
+
         // ── Write lock ────────────────────────────────────────────────────────
         // `rel_path` is cloned before the lock is taken so it is available for
         // the post-lock extension_host call (OP1) without holding the lock during
@@ -720,6 +742,12 @@ impl EventProcessor {
                 .workspace
                 .write()
                 .expect("workspace lock poisoned — unrecoverable");
+
+            // A scan may have indexed a recreated file while this event waited.
+            if !self.is_excluded(&rel_path) && abs_path.is_file() {
+                drop(ws);
+                return self.handle_modify(abs_path);
+            }
 
             let Some(file_id) = ws.get_by_path(&rel_path) else {
                 // Already removed or never tracked — idempotent no-op.
@@ -842,6 +870,11 @@ impl EventProcessor {
         let to_metadata = read_identity_metadata(&to).unwrap_or_else(|| read_metadata(&to));
         let to_tokens = tokenize(to_rel_path.as_str());
 
+        #[cfg(test)]
+        if let Some(hook) = self.before_commit.take() {
+            hook();
+        }
+
         // ── Single write-lock critical section ────────────────────────────────
         // Both the remove(from) and insert(to) happen atomically from the
         // perspective of concurrent readers. No gap where neither path exists.
@@ -850,6 +883,14 @@ impl EventProcessor {
                 .workspace
                 .write()
                 .expect("workspace lock poisoned — unrecoverable");
+
+            // Reindex or a native mutation can complete after our endpoint reads.
+            // Reconcile their current state rather than replaying a stale move.
+            if from.is_file() || !to.is_file() {
+                drop(ws);
+                self.handle_modify(from)?;
+                return self.handle_modify(to);
+            }
 
             // Remove the source entry (if tracked).
             let from_file_id = ws.get_by_path(&from_rel_path);
@@ -1139,6 +1180,118 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         (processor, workspace, index)
+    }
+
+    #[test]
+    fn create_staged_before_native_rename_does_not_resurrect_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("old.rs");
+        let destination = root.path().join("new.rs");
+        std::fs::write(&source, "fn value() {}\n").unwrap();
+        let (mut processor, workspace, index) = make_processor(root.path().to_path_buf());
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+
+        let (entered, observed) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        processor.before_commit = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let worker =
+            std::thread::spawn(move || processor.process_event(WatchEvent::Create(source)));
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // The native mutation owns the workspace lock for both the disk move
+        // and the indexed remap. Release the stale watcher read only afterward.
+        {
+            let mut ws = workspace.write().unwrap();
+            std::fs::rename(root.path().join("old.rs"), destination).unwrap();
+            ws.remap_paths(&[file_move("old.rs", "new.rs")]).unwrap();
+            let id = ws.get_by_path(&RelativePath::new("new.rs")).unwrap();
+            let mut idx = index.write().unwrap();
+            idx.remove(id);
+            idx.insert(id, &tokenize("new.rs"));
+        }
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+
+        let ws = workspace.read().unwrap();
+        assert!(ws.get_by_path(&RelativePath::new("old.rs")).is_none());
+        assert!(ws.get_by_path(&RelativePath::new("new.rs")).is_some());
+        assert_eq!(ws.snapshot().files.len(), 1);
+        let idx = index.read().unwrap();
+        assert!(
+            FileSearch::new(&idx, &ws)
+                .find_file("old")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_delete_and_rename_preserve_source_recreated_by_reindex() {
+        for rename in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("old.rs");
+            let destination = root.path().join("new.rs");
+            std::fs::write(&source, "fn original() {}\n").unwrap();
+            let (mut processor, workspace, index) = make_processor(root.path().to_path_buf());
+            processor
+                .process_event(WatchEvent::Create(source.clone()))
+                .unwrap();
+            let event = if rename {
+                std::fs::rename(&source, &destination).unwrap();
+                WatchEvent::Rename {
+                    from: source.clone(),
+                    to: destination.clone(),
+                }
+            } else {
+                std::fs::remove_file(&source).unwrap();
+                WatchEvent::Delete(source.clone())
+            };
+            let (entered, observed) = mpsc::channel();
+            let (release, resumed) = mpsc::channel();
+            processor.before_commit = Some(Box::new(move || {
+                entered.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            let worker = std::thread::spawn(move || processor.process_event(event));
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            // Recreate and reindex while the event retains obsolete disk reads.
+            {
+                let mut ws = workspace.write().unwrap();
+                if rename {
+                    std::fs::remove_file(&destination).unwrap();
+                }
+                std::fs::write(&source, "fn recreated() {}\n").unwrap();
+                let id = ws.get_by_path(&RelativePath::new("old.rs")).unwrap();
+                ws.update(id, read_identity_metadata(&source).unwrap())
+                    .unwrap();
+            }
+            release.send(()).unwrap();
+            worker.join().unwrap().unwrap();
+
+            let ws = workspace.read().unwrap();
+            assert_eq!(ws.snapshot().files.len(), 1, "rename={rename}");
+            assert!(
+                ws.get_by_path(&RelativePath::new("old.rs")).is_some(),
+                "rename={rename}"
+            );
+            assert!(
+                ws.get_by_path(&RelativePath::new("new.rs")).is_none(),
+                "rename={rename}"
+            );
+            assert_eq!(
+                FileSearch::new(&index.read().unwrap(), &ws)
+                    .find_file("old")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]

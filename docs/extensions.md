@@ -43,7 +43,12 @@ The protocol is JSON-RPC 2.0 over stdio. Each message is a newline-delimited JSO
 the JSON-RPC 2.0 envelope:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":1,"client_info":"tower-host/0.1.0"}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": { "protocol_version": 1, "client_info": "tower-host/0.1.0" }
+}
 ```
 
 When `id` is present the message is a request; when absent it is a notification (used for event
@@ -283,26 +288,26 @@ max_traces = 20
 record_timeout_secs = 60
 ```
 
-| Field                  | Meaning                                                                                                       |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `extensions`           | File extensions, without leading `.`, associated with this debug language. Must not be empty.                 |
-| `command`              | Debug adapter executable. Must not be empty.                                                                  |
-| `args`                 | Optional adapter arguments.                                                                                   |
-| `adapter_type`         | DAP adapter identifier sent during initialize, for example `lldb`, `go`, or `python`.                         |
-| `launch`               | Adapter-specific default launch arguments. Tool-level `launch_overrides` are merged into this object.         |
+| Field                  | Meaning                                                                                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `extensions`           | File extensions, without leading `.`, associated with this debug language. Must not be empty.                                                                       |
+| `command`              | Debug adapter executable. Must not be empty.                                                                                                                        |
+| `args`                 | Optional adapter arguments.                                                                                                                                         |
+| `adapter_type`         | DAP adapter identifier sent during initialize, for example `lldb`, `go`, or `python`.                                                                               |
+| `launch`               | Adapter-specific default launch arguments. Tool-level `launch_overrides` are merged into this object.                                                               |
 | `default_timeout_secs` | Optional positive per-operation timeout used by launch, resume, and inspect calls unless a tool overrides it; omitted means no Tower-controlled operation deadline. |
-| `idle_ttl_secs`        | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it.              |
+| `idle_ttl_secs`        | Positive idle lifetime for an inactive debug session before the sidecar terminates and reaps it.                                                                    |
 
 Add `[debug.record] backend = "rr"` only when rr record/replay tools should be exposed. The host
 validates this section at startup and forwards it through the sidecar initialize payload; the sidecar
 does not reread `.tower/config.toml`.
 
-| Field                 | Meaning                                                                                                              |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `backend`             | Required record backend. The only supported value is `"rr"`.                                                         |
-| `trace_dir`           | Optional workspace-relative trace root. Defaults to `.tower/traces`; absolute paths and `..` traversal are rejected. |
-| `ttl_secs`            | Optional positive trace TTL in seconds. Omit for no TTL expiry.                                                      |
-| `max_traces`          | Optional positive retained trace limit. Defaults to `20`; pruning still applies without TTL.                         |
+| Field                 | Meaning                                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `backend`             | Required record backend. The only supported value is `"rr"`.                                                                   |
+| `trace_dir`           | Optional workspace-relative trace root. Defaults to `.tower/traces`; absolute paths and `..` traversal are rejected.           |
+| `ttl_secs`            | Optional positive trace TTL in seconds. Omit for no TTL expiry.                                                                |
+| `max_traces`          | Optional positive retained trace limit. Defaults to `20`; pruning still applies without TTL.                                   |
 | `record_timeout_secs` | Optional positive default record timeout; omitted means no Tower-controlled record deadline. Tool calls may pass `timeout_ms`. |
 
 The debug sidecar declares no workspace mutation capabilities. A discovered extension named `debug`
