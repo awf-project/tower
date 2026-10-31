@@ -204,6 +204,18 @@ impl EngineState {
 
 // ── NativeToolRegistry ────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalAccess {
+    ReadOnly,
+    Mutating,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeToolDescriptor {
+    pub tool: ToolDesc,
+    pub external_access: ExternalAccess,
+}
+
 /// [`ToolRegistry`] implementation for the native `tower_*` tools (spec 10b).
 ///
 /// Holds a reference-counted, lock-protected [`EngineState`] so that both this
@@ -239,29 +251,81 @@ pub struct NativeToolRegistry {
 
 impl NativeToolRegistry {
     #[must_use]
-    pub fn descriptions() -> Vec<ToolDesc> {
-        let tools = vec![
-            tool_find_file_desc(),
-            tool_list_dir_desc(),
-            tool_search_text_desc(),
-            tool_read_file_desc(),
-            tool_create_file_desc(),
-            tool_create_directory_desc(),
-            tool_delete_file_desc(),
-            tool_global_replace_desc(),
-            tool_edit_range_desc(),
-            tool_reindex_desc(),
-            tool_rename_path_desc(),
-            tool_safe_delete_symbol_desc(),
+    pub fn descriptors() -> Vec<NativeToolDescriptor> {
+        let descriptors = vec![
+            NativeToolDescriptor {
+                tool: tool_find_file_desc(),
+                external_access: ExternalAccess::ReadOnly,
+            },
+            NativeToolDescriptor {
+                tool: tool_list_dir_desc(),
+                external_access: ExternalAccess::ReadOnly,
+            },
+            NativeToolDescriptor {
+                tool: tool_search_text_desc(),
+                external_access: ExternalAccess::ReadOnly,
+            },
+            NativeToolDescriptor {
+                tool: tool_read_file_desc(),
+                external_access: ExternalAccess::ReadOnly,
+            },
+            NativeToolDescriptor {
+                tool: tool_create_file_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_create_directory_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_delete_file_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_global_replace_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_edit_range_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_reindex_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_rename_path_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
+            NativeToolDescriptor {
+                tool: tool_safe_delete_symbol_desc(),
+                external_access: ExternalAccess::Mutating,
+            },
         ];
         debug_assert_eq!(
-            tools
+            descriptors
                 .iter()
-                .map(|tool| tool.name.as_str())
+                .map(|descriptor| descriptor.tool.name.as_str())
                 .collect::<Vec<_>>(),
             EXPECTED_NATIVE_TOOL_NAMES
         );
-        tools
+        descriptors
+    }
+
+    #[must_use]
+    pub fn descriptions() -> Vec<ToolDesc> {
+        Self::descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.tool)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn external_access(name: &str) -> Option<ExternalAccess> {
+        Self::descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.tool.name == name)
+            .map(|descriptor| descriptor.external_access)
     }
 
     /// Construct a registry wrapping the given shared engine state.

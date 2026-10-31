@@ -21,13 +21,17 @@ use rmcp::{RoleClient, ServerHandler, ServiceExt};
 use serde_json::json;
 
 use super::{
-    ToolError,
+    ToolDesc, ToolError,
     diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader},
     extension_merged_registry::ExtensionMergedRegistry,
     lsp_tools::SubscriptionRegistry,
     rmcp_server::{TowerMcpHandler, tool_error_to_rmcp},
 };
-use crate::adapters::mcp::native_tools::EngineState;
+use crate::adapters::mcp::native_tools::{
+    EXPECTED_NATIVE_TOOL_NAMES, EngineState, ExternalAccess, NativeToolRegistry,
+    validate_native_call,
+};
+use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::{InMemoryFs, InMemoryStorage};
 use crate::domain::index::InvertedIndex;
 use crate::domain::workspace::ProjectWorkspace;
@@ -187,6 +191,121 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .build()
         .expect("tokio runtime")
         .block_on(f)
+}
+
+/// Independently authored snapshot of the public native-tool inventory.  Keep
+/// this separate from `NativeToolRegistry::descriptors()` so consolidation
+/// cannot silently alter an existing name, description, order, or schema.
+fn expected_native_tool_descriptions() -> Vec<ToolDesc> {
+    vec![
+        ToolDesc { name: "tower_find_file".into(), description: "Find files in the workspace whose path matches the query string.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string","description":"Substring or fuzzy query to match against file paths."}},"required":["query"]}) },
+        ToolDesc { name: "tower_list_dir".into(), description: "List indexed files and synthesized directories under a workspace-relative path.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative directory path to list."},"recursive":{"type":"boolean","description":"When true, include descendants rather than only direct children."},"max_depth":{"type":"integer","minimum":1,"description":"Optional positive recursion depth limit; valid only when recursive is true."}},"required":["path"]}) },
+        ToolDesc { name: "tower_search_text".into(), description: "Search all indexed file contents for lines matching the pattern.".into(), input_schema: json!({"type":"object","properties":{"pattern":{"type":"string","description":"Text pattern to search for across all indexed files."}},"required":["pattern"]}) },
+        ToolDesc { name: "tower_read_file".into(), description: "Read the raw UTF-8 content of a file at the given workspace-relative path. Pass with_version: true to receive a `version` field (hex SHA-256) alongside `content` for use as an expected_version in a subsequent mutating call (spec 18 optimistic CAS).".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path to the file to read."},"with_version":{"type":"boolean","description":"When true, include a `version` field (hex SHA-256) in the response for use as an optimistic concurrency token."}},"required":["path"]}) },
+        ToolDesc { name: "tower_create_file".into(), description: "Create or overwrite a file at the given path with the provided content. Supply expected_version (hex SHA-256 from a prior tower_read_file with with_version:true) to enable optimistic compare-and-swap: the write is rejected with a precondition error if the file changed since you read it.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path for the new or existing file."},"content":{"type":"string","description":"UTF-8 content to write to the file."},"expected_version":{"type":"string","description":"Optional hex SHA-256 of the expected current file content. When supplied the write is conditional: rejected with PreconditionFailed if the file has changed."}},"required":["path","content"]}) },
+        ToolDesc { name: "tower_create_directory".into(), description: "Create a directory at the given workspace-relative path (recursive mkdir).".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the directory to create."}},"required":["path"]}) },
+        ToolDesc { name: "tower_delete_file".into(), description: "Delete a file from the workspace at the given path.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to delete."}},"required":["path"]}) },
+        ToolDesc { name: "tower_global_replace".into(), description: "Replace every occurrence of a target string with a replacement string across all indexed files. Supply expected_versions (a JSON object mapping workspace-relative paths to hex SHA-256 hashes) to apply per-file optimistic CAS guards: files whose content has changed appear in the errors array while non-conflicting files still commit.".into(), input_schema: json!({"type":"object","properties":{"target":{"type":"string","description":"The string to search for and replace."},"replacement":{"type":"string","description":"The string to substitute in place of every occurrence of target."},"expected_versions":{"type":"object","description":"Optional map of path → hex SHA-256. When present, each listed file is checked under the write-lock before being written; a mismatch records a conflict in TxReport.errors without blocking other files.","additionalProperties":{"type":"string"}}},"required":["target","replacement"]}) },
+        ToolDesc { name: "tower_edit_range".into(), description: "Replace the byte range [start_byte, end_byte) of an existing file with the replacement string, splicing it into the current content and committing atomically. Both start_byte and end_byte must fall on UTF-8 character boundaries. end_byte must be ≤ the file length. start_byte must be ≤ end_byte. An empty replacement deletes the span; start_byte == end_byte inserts without removing. Supply expected_version (hex SHA-256 from a prior tower_read_file with with_version:true) to enable optimistic compare-and-swap.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path of the file to edit."},"start_byte":{"type":"integer","minimum":0,"description":"Inclusive start of the byte range to replace."},"end_byte":{"type":"integer","minimum":0,"description":"Exclusive end of the byte range to replace."},"replacement":{"type":"string","description":"UTF-8 text that replaces bytes [start_byte, end_byte)."},"expected_version":{"type":"string","description":"Optional hex SHA-256 of the expected current file content. When supplied the edit is conditional: rejected with PreconditionFailed if the file has changed since the version was read."}},"required":["path","start_byte","end_byte","replacement"]}) },
+        ToolDesc { name: "tower_reindex".into(), description: "Force a full re-scan of the workspace: rebuild the file index and text-search index from the current filesystem state (reconciles created and deleted files). Use after external changes or if the index drifted.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
+        ToolDesc { name: "tower_rename_path".into(), description: "Rename a workspace-relative file or directory, optionally planning semantic edits.".into(), input_schema: json!({"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"},"dry_run":{"type":"boolean","default":false},"semantic_policy":{"type":"string","enum":["none","best_effort","required"]},"expected_versions":{"type":"object","additionalProperties":{"type":"string","pattern":"^[0-9A-Fa-f]{64}$"},"default":{}}},"required":["source","destination","semantic_policy"],"additionalProperties":false}) },
+        ToolDesc { name: "tower_safe_delete_symbol".into(), description: "Safely delete a symbol after planning declaration and reference cleanup.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path containing the declaration."},"symbol_name":{"type":"string","description":"Name of the declaration to delete."},"kind":{"type":"string","description":"Optional declaration kind used to disambiguate the symbol."},"dry_run":{"type":"boolean","description":"When true, validate and return the plan without applying edits."}},"required":["path","symbol_name"]}) },
+    ]
+}
+
+#[test]
+fn external_tool_access_is_deny_by_default() {
+    let descriptors = NativeToolRegistry::descriptors();
+    let read_only = descriptors
+        .iter()
+        .filter_map(|descriptor| {
+            (descriptor.external_access == ExternalAccess::ReadOnly)
+                .then_some(descriptor.tool.name.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        read_only,
+        [
+            "tower_find_file",
+            "tower_list_dir",
+            "tower_search_text",
+            "tower_read_file",
+        ]
+    );
+    assert!(descriptors.iter().all(
+        |descriptor| read_only.contains(&descriptor.tool.name.as_str())
+            || descriptor.external_access == ExternalAccess::Mutating
+    ));
+
+    for descriptor in &descriptors {
+        assert_eq!(
+            NativeToolRegistry::external_access(&descriptor.tool.name),
+            Some(descriptor.external_access),
+            "exact native lookup for {}",
+            descriptor.tool.name
+        );
+    }
+
+    for denied in [
+        "tower_missing",
+        "extension_tool",
+        "tower_debug_launch",
+        "tower_lint_check",
+        "tower_fmt_format",
+        "tower_refactor_symbol",
+    ] {
+        assert_eq!(
+            NativeToolRegistry::external_access(denied),
+            None,
+            "{denied}"
+        );
+    }
+}
+
+#[test]
+fn external_tool_metadata_preserves_native_registry_contract() {
+    let descriptors = NativeToolRegistry::descriptors();
+    let descriptions = NativeToolRegistry::descriptions();
+    let expected_descriptions = expected_native_tool_descriptions();
+    let names = descriptors
+        .iter()
+        .map(|descriptor| descriptor.tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, EXPECTED_NATIVE_TOOL_NAMES);
+    assert_eq!(descriptions, expected_descriptions);
+    assert_eq!(
+        descriptors
+            .iter()
+            .map(|descriptor| descriptor.tool.clone())
+            .collect::<Vec<_>>(),
+        descriptions
+    );
+
+    assert!(validate_native_call("tower_find_file", &json!({"query": "src"})).is_ok());
+    assert!(matches!(
+        validate_native_call("tower_find_file", &json!({})),
+        Err(ToolError::InvalidArgs(_))
+    ));
+    assert!(matches!(
+        validate_native_call("extension_tool", &json!({})),
+        Err(ToolError::NotFound(name)) if name == "extension_tool"
+    ));
+
+    let mut registry = NativeToolRegistry::new(make_empty_engine_state());
+    let result = registry
+        .call(
+            "tower_find_file",
+            json!({"query": "src"}),
+            &crate::domain::NeverCancelled,
+        )
+        .expect("valid local dispatch must remain successful");
+    assert_eq!(result, json!({"paths": []}));
+    assert!(matches!(
+        registry.call("tower_find_file", json!({}), &crate::domain::NeverCancelled,),
+        Err(ToolError::InvalidArgs(_))
+    ));
 }
 
 // ── F008 T017: structured MCP application errors ────────────────────────────────

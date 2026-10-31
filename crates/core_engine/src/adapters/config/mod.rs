@@ -20,6 +20,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::adapters::path_identity::lexical_normalize;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -38,6 +40,124 @@ pub enum ExtensionConfigurationReason {
     BuiltinExhaustiveControl,
     ReservedInitializeIdentity,
     NonJsonInitializeValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ProjectId(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidProjectId;
+
+impl std::fmt::Display for InvalidProjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("project id must not be empty")
+    }
+}
+
+impl std::error::Error for InvalidProjectId {}
+
+impl ProjectId {
+    pub fn new(value: String) -> Result<Self, InvalidProjectId> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(InvalidProjectId);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectIdentity {
+    pub id: ProjectId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryableProject {
+    pub id: ProjectId,
+    pub name: String,
+    pub configured_path: PathBuf,
+    pub resolved_path: PathBuf,
+    pub canonical_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryableProjects(Vec<QueryableProject>);
+
+impl QueryableProjects {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &QueryableProject> {
+        self.0.iter()
+    }
+
+    #[must_use]
+    pub fn get_by_id(&self, id: &ProjectId) -> Option<&QueryableProject> {
+        self.0.iter().find(|project| project.id == *id)
+    }
+
+    #[must_use]
+    pub fn get_by_name(&self, name: &str) -> Option<&QueryableProject> {
+        self.0.iter().find(|project| project.name == name)
+    }
+
+    #[must_use]
+    pub fn get_by_configured_path(&self, path: &Path) -> Option<&QueryableProject> {
+        self.0
+            .iter()
+            .find(|project| project.configured_path == path)
+    }
+
+    #[must_use]
+    pub fn get_by_canonical_path(&self, path: &Path) -> Option<&QueryableProject> {
+        self.0
+            .iter()
+            .find(|project| project.canonical_path.as_deref() == Some(path))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectsConfig {
+    queryable: QueryableProjects,
+    external_availability_timeout: std::time::Duration,
+}
+
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            queryable: QueryableProjects::default(),
+            external_availability_timeout: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+impl ProjectsConfig {
+    #[must_use]
+    pub fn queryable(&self) -> &QueryableProjects {
+        &self.queryable
+    }
+
+    #[must_use]
+    pub fn external_availability_timeout(&self) -> std::time::Duration {
+        self.external_availability_timeout
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryableProjectIdentityField {
+    Id,
+    Name,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryableProjectPathReason {
+    Empty,
+    Invalid,
+    NotDirectory,
 }
 
 /// Parsed `.tower/config.toml`. Unknown top-level keys are rejected.
@@ -59,6 +179,7 @@ pub struct TowerConfig {
     /// `[daemon]` section — shared-daemon runtime settings.
     /// Absent → `DaemonConfig::default()` (30-second idle timeout).
     pub daemon: DaemonConfig,
+    pub projects: ProjectsConfig,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +197,8 @@ struct RawTowerConfig {
     extensions: ExtensionConfig,
     #[serde(default)]
     daemon: DaemonConfig,
+    #[serde(default)]
+    projects: Option<toml::Value>,
 }
 
 impl<'de> Deserialize<'de> for TowerConfig {
@@ -86,6 +209,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
         let value = toml::Value::deserialize(deserializer)?;
         validate_timeout_values(&value).map_err(serde::de::Error::custom)?;
         let raw: RawTowerConfig = value.try_into().map_err(serde::de::Error::custom)?;
+        let _ = raw.projects;
         Ok(Self {
             formatter: raw.formatter,
             lsp: raw.lsp,
@@ -93,6 +217,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
             debug: raw.debug,
             extensions: raw.extensions,
             daemon: raw.daemon,
+            projects: ProjectsConfig::default(),
         })
     }
 }
@@ -345,6 +470,27 @@ pub enum ConfigError {
         section: &'static str,
         replacements: Vec<&'static str>,
     },
+    InvalidQueryableProjectIdentity {
+        index: usize,
+        field: QueryableProjectIdentityField,
+    },
+    InvalidQueryableProjectPath {
+        index: usize,
+        reason: QueryableProjectPathReason,
+    },
+    DuplicateQueryableProjectId {
+        id: ProjectId,
+    },
+    DuplicateQueryableProjectName {
+        name: String,
+    },
+    DuplicateQueryableProjectPath {
+        first_id: ProjectId,
+        second_id: ProjectId,
+    },
+    InvalidExternalAvailabilityTimeout {
+        value: i64,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -383,6 +529,37 @@ impl std::fmt::Display for ConfigError {
                 path.display(),
                 replacements.join(", ")
             ),
+            ConfigError::InvalidQueryableProjectIdentity { index, field } => {
+                write!(
+                    f,
+                    "invalid queryable project identity at index {index}: {field:?}"
+                )
+            }
+            ConfigError::InvalidQueryableProjectPath { index, reason } => {
+                write!(
+                    f,
+                    "invalid queryable project path at index {index}: {reason:?}"
+                )
+            }
+            ConfigError::DuplicateQueryableProjectId { id } => {
+                write!(f, "duplicate queryable project id: {}", id.as_str())
+            }
+            ConfigError::DuplicateQueryableProjectName { name } => {
+                write!(f, "duplicate queryable project name: {name}")
+            }
+            ConfigError::DuplicateQueryableProjectPath {
+                first_id,
+                second_id,
+            } => write!(
+                f,
+                "duplicate queryable project path for {} and {}",
+                first_id.as_str(),
+                second_id.as_str()
+            ),
+            ConfigError::InvalidExternalAvailabilityTimeout { value } => write!(
+                f,
+                "invalid projects.external_availability_timeout_secs: {value}"
+            ),
         }
     }
 }
@@ -392,6 +569,17 @@ impl std::fmt::Display for ConfigError {
 /// Missing file → `Ok(TowerConfig::default())`. Present but unreadable or
 /// invalid → `Err`.
 pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
+    load_with_path_canonicalizer(workspace_root, |path| fs::canonicalize(path))
+}
+
+/// Loads configuration with its external path-resolution boundary supplied by
+/// the caller. Production uses [`fs::canonicalize`]; co-located tests can
+/// deterministically exercise OS failures that cannot be made portable by
+/// changing filesystem permissions.
+fn load_with_path_canonicalizer(
+    workspace_root: &Path,
+    canonicalize_path: impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<TowerConfig, ConfigError> {
     let path = workspace_root.join(".tower").join("config.toml");
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -438,8 +626,20 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         path: path.clone(),
         source,
     })?;
-    let config: TowerConfig =
-        toml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })?;
+    let mut config: TowerConfig =
+        toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.clone(),
+            source,
+        })?;
+    config.projects = parse_projects_config(&raw, workspace_root, canonicalize_path).map_err(
+        |error| match error {
+            ProjectConfigLoadError::Parse(source) => ConfigError::Parse {
+                path: path.clone(),
+                source,
+            },
+            ProjectConfigLoadError::Config(error) => error,
+        },
+    )?;
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
     config.lint_request_timeout()?;
@@ -447,6 +647,180 @@ pub fn load(workspace_root: &Path) -> Result<TowerConfig, ConfigError> {
         config.extensions.lsp_diagnostics_timeout()?;
     }
     Ok(config)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProjectsConfig {
+    #[serde(default)]
+    queryable: Vec<RawQueryableProject>,
+    #[serde(default = "default_external_availability_timeout_secs")]
+    external_availability_timeout_secs: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQueryableProject {
+    id: String,
+    name: String,
+    path: String,
+}
+
+const fn default_external_availability_timeout_secs() -> i64 {
+    10
+}
+
+enum ProjectConfigLoadError {
+    Parse(toml::de::Error),
+    Config(ConfigError),
+}
+
+fn parse_projects_config(
+    raw: &toml::Value,
+    workspace_root: &Path,
+    canonicalize_path: impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<ProjectsConfig, ProjectConfigLoadError> {
+    let raw_projects = raw
+        .get("projects")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let raw_projects: RawProjectsConfig = raw_projects
+        .try_into()
+        .map_err(ProjectConfigLoadError::Parse)?;
+    if raw_projects.external_availability_timeout_secs <= 0 {
+        return Err(ProjectConfigLoadError::Config(
+            ConfigError::InvalidExternalAvailabilityTimeout {
+                value: raw_projects.external_availability_timeout_secs,
+            },
+        ));
+    }
+
+    let absolute_workspace_root = if workspace_root.is_absolute() {
+        lexical_normalize(workspace_root)
+    } else {
+        let current_dir = std::env::current_dir().map_err(|_| {
+            ProjectConfigLoadError::Config(ConfigError::InvalidQueryableProjectPath {
+                index: 0,
+                reason: QueryableProjectPathReason::Invalid,
+            })
+        })?;
+        lexical_normalize(&current_dir.join(workspace_root))
+    };
+    let mut projects = Vec::<QueryableProject>::with_capacity(raw_projects.queryable.len());
+
+    for (index, raw_project) in raw_projects.queryable.into_iter().enumerate() {
+        let (id, name) = validate_project_identity(raw_project.id, &raw_project.name, index)
+            .map_err(ProjectConfigLoadError::Config)?;
+        if projects.iter().any(|project| project.id == id) {
+            return Err(ProjectConfigLoadError::Config(
+                ConfigError::DuplicateQueryableProjectId { id },
+            ));
+        }
+        if projects.iter().any(|project| project.name == name) {
+            return Err(ProjectConfigLoadError::Config(
+                ConfigError::DuplicateQueryableProjectName { name },
+            ));
+        }
+
+        let (configured_path, resolved_path, canonical_path) = resolve_project_path(
+            raw_project.path,
+            &absolute_workspace_root,
+            index,
+            &canonicalize_path,
+        )?;
+        if let Some(first) = projects.iter().find(|project| {
+            project.resolved_path == resolved_path
+                || canonical_path
+                    .as_ref()
+                    .zip(project.canonical_path.as_ref())
+                    .is_some_and(|(left, right)| left == right)
+        }) {
+            return Err(ProjectConfigLoadError::Config(
+                ConfigError::DuplicateQueryableProjectPath {
+                    first_id: first.id.clone(),
+                    second_id: id,
+                },
+            ));
+        }
+        projects.push(QueryableProject {
+            id,
+            name,
+            configured_path,
+            resolved_path,
+            canonical_path,
+        });
+    }
+
+    Ok(ProjectsConfig {
+        queryable: QueryableProjects(projects),
+        external_availability_timeout: std::time::Duration::from_secs(
+            raw_projects.external_availability_timeout_secs as u64,
+        ),
+    })
+}
+
+fn validate_project_identity(
+    raw_id: String,
+    raw_name: &str,
+    index: usize,
+) -> Result<(ProjectId, String), ConfigError> {
+    let id = ProjectId::new(raw_id).map_err(|_| ConfigError::InvalidQueryableProjectIdentity {
+        index,
+        field: QueryableProjectIdentityField::Id,
+    })?;
+    let name = raw_name.trim().to_owned();
+    if name.is_empty() {
+        return Err(ConfigError::InvalidQueryableProjectIdentity {
+            index,
+            field: QueryableProjectIdentityField::Name,
+        });
+    }
+    Ok((id, name))
+}
+
+fn resolve_project_path(
+    raw_path: String,
+    absolute_workspace_root: &Path,
+    index: usize,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>), ProjectConfigLoadError> {
+    let invalid = |reason| {
+        ProjectConfigLoadError::Config(ConfigError::InvalidQueryableProjectPath { index, reason })
+    };
+    if raw_path.trim().is_empty() {
+        return Err(invalid(QueryableProjectPathReason::Empty));
+    }
+    if raw_path.contains('\0') {
+        return Err(invalid(QueryableProjectPathReason::Invalid));
+    }
+    let configured_path = PathBuf::from(raw_path);
+    let absolute_path = if configured_path.is_absolute() {
+        configured_path.clone()
+    } else {
+        absolute_workspace_root.join(&configured_path)
+    };
+    // Resolve the original spelling first: collapsing `..` earlier changes
+    // filesystem traversal when an intermediate component is a symlink.
+    let canonical_path = match canonicalize_path(&absolute_path) {
+        Ok(path) => {
+            let metadata =
+                fs::metadata(&path).map_err(|_| invalid(QueryableProjectPathReason::Invalid))?;
+            if !metadata.is_dir() {
+                return Err(invalid(QueryableProjectPathReason::NotDirectory));
+            }
+            Some(path)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+            return Err(invalid(QueryableProjectPathReason::NotDirectory));
+        }
+        Err(_) => return Err(invalid(QueryableProjectPathReason::Invalid)),
+    };
+    let resolved_path = lexical_normalize(&absolute_path);
+    if !resolved_path.is_absolute() {
+        return Err(invalid(QueryableProjectPathReason::Invalid));
+    }
+    Ok((configured_path, resolved_path, canonical_path))
 }
 
 fn timeout_parse_error(contents: &str, source: &toml::de::Error) -> Option<toml::de::Error> {
@@ -1746,5 +2120,416 @@ extensions = ["rs"]
                 }) if actual_field == field && actual_reason == reason
             ));
         }
+    }
+
+    #[test]
+    fn configured_queryable_projects_accept_distinct_canonical_workspaces() {
+        let tmp = tempfile::Builder::new()
+            .prefix("queryable-projects-")
+            .tempdir_in(".")
+            .unwrap();
+        let workspace_root = fs::canonicalize(tmp.path()).unwrap();
+        let alpha = workspace_root.join("alpha");
+        let beta = workspace_root.join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+
+        write_config(
+            &workspace_root,
+            &format!(
+                r#"
+[[projects.queryable]]
+id = "  alpha-id  "
+name = "  Alpha  "
+path = "alpha"
+
+[[projects.queryable]]
+id = "beta-id"
+name = "Beta"
+path = "{}"
+"#,
+                beta.display()
+            ),
+        );
+
+        let config = load(&workspace_root).expect("distinct queryable projects must load");
+        let projects = config.projects.queryable();
+        assert_eq!(projects.iter().len(), 2);
+        let configured: Vec<_> = projects.iter().collect();
+        assert_eq!(configured[0].id.as_str(), "alpha-id");
+        assert_eq!(configured[0].name, "Alpha");
+        assert_eq!(configured[0].configured_path, PathBuf::from("alpha"));
+        assert_eq!(configured[0].resolved_path, alpha);
+        assert_eq!(configured[0].canonical_path, Some(alpha.clone()));
+        assert_eq!(configured[1].id.as_str(), "beta-id");
+        assert_eq!(configured[1].name, "Beta");
+        assert_eq!(configured[1].configured_path, beta);
+        assert_eq!(configured[1].resolved_path, beta);
+        assert_eq!(configured[1].canonical_path, Some(beta.clone()));
+
+        let alpha_id = ProjectId::new("alpha-id".to_owned()).unwrap();
+        assert_eq!(projects.get_by_id(&alpha_id), Some(configured[0]));
+        assert_eq!(projects.get_by_name("Alpha"), Some(configured[0]));
+        assert_eq!(
+            projects.get_by_configured_path(Path::new("alpha")),
+            Some(configured[0])
+        );
+        assert_eq!(projects.get_by_canonical_path(&alpha), Some(configured[0]));
+        assert_eq!(projects.get_by_name("alpha"), None);
+        assert_eq!(projects.get_by_configured_path(&alpha), None);
+        assert_eq!(projects.get_by_canonical_path(Path::new("alpha")), None);
+
+        assert_eq!(
+            serde_json::to_value(&alpha_id).unwrap(),
+            serde_json::json!("alpha-id")
+        );
+        assert_eq!(
+            serde_json::to_value(ProjectIdentity {
+                id: alpha_id,
+                name: "Alpha".to_owned(),
+            })
+            .unwrap(),
+            serde_json::json!({"id": "alpha-id", "name": "Alpha"})
+        );
+        assert_eq!(ProjectId::new("   ".to_owned()), Err(InvalidProjectId));
+        assert_eq!(InvalidProjectId.to_string(), "project id must not be empty");
+
+        #[cfg(unix)]
+        {
+            let symlink_root = workspace_root.join("symlink-root");
+            let real_root = workspace_root.join("real-root");
+            let real_target = real_root.join("target");
+            fs::create_dir_all(&real_target).unwrap();
+            fs::create_dir_all(symlink_root.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+            write_config(
+                &real_target,
+                "[[projects.queryable]]\nid = \"symlinked\"\nname = \"Symlinked\"\npath = \"../../symlink-root/target/../target\"\n",
+            );
+            let config = load(&real_target).unwrap();
+            let project = config.projects.queryable().iter().next().unwrap();
+            assert_eq!(
+                project.configured_path,
+                Path::new("../../symlink-root/target/../target")
+            );
+            assert_eq!(project.resolved_path, symlink_root.join("target"));
+            assert_eq!(project.canonical_path, Some(real_target));
+        }
+    }
+
+    #[test]
+    fn configured_queryable_projects_reject_duplicate_id_name_or_resolved_canonical_path() {
+        #[derive(Clone, Copy)]
+        enum ExpectedError {
+            Identity(usize, QueryableProjectIdentityField),
+            DuplicateId(&'static str),
+            DuplicateName(&'static str),
+            DuplicatePath(&'static str, &'static str),
+            Path(usize, QueryableProjectPathReason),
+        }
+
+        let tmp = tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        let other = tmp.path().join("other");
+        let regular_file = tmp.path().join("not-a-directory");
+        let traversal_through_file = regular_file.join("descendant");
+        let privacy_sentinel = tmp.path().join("unrelated-private-queryable-project-root");
+        fs::create_dir_all(&existing).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(&regular_file, "file").unwrap();
+
+        let cases = [
+            (
+                "empty id",
+                format!("[[projects.queryable]]\nid = \"  \"\nname = \"Name\"\npath = \"{}\"\n", existing.display()),
+                ExpectedError::Identity(0, QueryableProjectIdentityField::Id),
+            ),
+            (
+                "empty name is contextualized with its zero-based index",
+                format!("[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"{}\"\n[[projects.queryable]]\nid = \"two\"\nname = \" \\t \"\npath = \"{}\"\n", existing.display(), other.display()),
+                ExpectedError::Identity(1, QueryableProjectIdentityField::Name),
+            ),
+            (
+                "trimmed duplicate id",
+                format!("[[projects.queryable]]\nid = \"same\"\nname = \"One\"\npath = \"{}\"\n[[projects.queryable]]\nid = \" same \"\nname = \"Two\"\npath = \"{}\"\n", existing.display(), other.display()),
+                ExpectedError::DuplicateId("same"),
+            ),
+            (
+                "trimmed duplicate name",
+                format!("[[projects.queryable]]\nid = \"one\"\nname = \"Same\"\npath = \"{}\"\n[[projects.queryable]]\nid = \"two\"\nname = \" Same \"\npath = \"{}\"\n", existing.display(), other.display()),
+                ExpectedError::DuplicateName("Same"),
+            ),
+            (
+                "unresolved lexical alias",
+                "[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"missing/../missing\"\n[[projects.queryable]]\nid = \"two\"\nname = \"Two\"\npath = \"missing\"\n".to_owned(),
+                ExpectedError::DuplicatePath("one", "two"),
+            ),
+            (
+                "empty path",
+                "[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \" \\t \"\n".to_owned(),
+                ExpectedError::Path(0, QueryableProjectPathReason::Empty),
+            ),
+            (
+                "embedded nul",
+                "[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"bad\\u0000path\"\n".to_owned(),
+                ExpectedError::Path(0, QueryableProjectPathReason::Invalid),
+            ),
+            (
+                "file root",
+                format!("[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"{}\"\n", regular_file.display()),
+                ExpectedError::Path(0, QueryableProjectPathReason::NotDirectory),
+            ),
+            (
+                "traversal through a file",
+                format!("[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"{}\"\n", traversal_through_file.display()),
+                ExpectedError::Path(0, QueryableProjectPathReason::NotDirectory),
+            ),
+        ];
+
+        for (name, body, expected) in cases {
+            // Every rejected path is accompanied by an unrelated raw path in
+            // the parser input. This proves both public renderings redact
+            // unrelated configured paths, including for failures before the
+            // resolver reaches the offending entry (such as an empty path).
+            write_config(
+                tmp.path(),
+                &format!(
+                    "{body}[[projects.queryable]]\nid = \"privacy-sentinel\"\nname = \"Privacy sentinel\"\npath = \"{}\"\n",
+                    privacy_sentinel.display()
+                ),
+            );
+            let error = load(tmp.path()).expect_err(name);
+            match (expected, &error) {
+                (
+                    ExpectedError::Identity(expected_index, expected_field),
+                    ConfigError::InvalidQueryableProjectIdentity { index, field },
+                ) => {
+                    assert_eq!((*index, *field), (expected_index, expected_field), "{name}");
+                }
+                (
+                    ExpectedError::DuplicateId(expected_id),
+                    ConfigError::DuplicateQueryableProjectId { id },
+                ) => assert_eq!(id.as_str(), expected_id, "{name}"),
+                (
+                    ExpectedError::DuplicateName(expected_name),
+                    ConfigError::DuplicateQueryableProjectName { name: actual_name },
+                ) => assert_eq!(actual_name, expected_name, "{name}"),
+                (
+                    ExpectedError::DuplicatePath(expected_first, expected_second),
+                    ConfigError::DuplicateQueryableProjectPath {
+                        first_id,
+                        second_id,
+                    },
+                ) => assert_eq!(
+                    (first_id.as_str(), second_id.as_str()),
+                    (expected_first, expected_second),
+                    "{name}"
+                ),
+                (
+                    ExpectedError::Path(expected_index, expected_reason),
+                    ConfigError::InvalidQueryableProjectPath { index, reason },
+                ) => assert_eq!(
+                    (*index, *reason),
+                    (expected_index, expected_reason),
+                    "{name}"
+                ),
+                _ => panic!("{name}: unexpected error {error:?}"),
+            }
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(
+                !display.contains(privacy_sentinel.to_str().unwrap()),
+                "{name}: display leaked the unrelated configured path: {display}"
+            );
+            assert!(
+                !debug.contains(privacy_sentinel.to_str().unwrap()),
+                "{name}: debug leaked the unrelated configured path: {debug}"
+            );
+            fs::remove_file(tmp.path().join(".tower/config.toml")).unwrap();
+        }
+
+        let permission_denied_path = tmp.path().join("permission-denied-private-root");
+        write_config(
+            tmp.path(),
+            &format!(
+                "[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"{}\"\n\
+                 [[projects.queryable]]\nid = \"privacy-sentinel\"\nname = \"Privacy sentinel\"\npath = \"{}\"\n",
+                permission_denied_path.display(),
+                privacy_sentinel.display(),
+            ),
+        );
+        let error = load_with_path_canonicalizer(tmp.path(), |path| {
+            if path == permission_denied_path {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                fs::canonicalize(path)
+            }
+        })
+        .expect_err("permission denial must be mapped through the real configuration loader");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidQueryableProjectPath {
+                index: 0,
+                reason: QueryableProjectPathReason::Invalid,
+            }
+        ));
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(
+            !display.contains(privacy_sentinel.to_str().unwrap()),
+            "permission denial display leaked the unrelated configured path: {display}"
+        );
+        assert!(
+            !debug.contains(privacy_sentinel.to_str().unwrap()),
+            "permission denial debug leaked the unrelated configured path: {debug}"
+        );
+        fs::remove_file(tmp.path().join(".tower/config.toml")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&existing, &alias).unwrap();
+            write_config(
+                tmp.path(),
+                &format!(
+                    "[[projects.queryable]]\nid = \"one\"\nname = \"One\"\npath = \"{}\"\n[[projects.queryable]]\nid = \"two\"\nname = \"Two\"\npath = \"{}\"\n",
+                    existing.display(),
+                    alias.display()
+                ),
+            );
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigError::DuplicateQueryableProjectPath { first_id, second_id })
+                    if first_id.as_str() == "one" && second_id.as_str() == "two"
+            ));
+            fs::remove_file(tmp.path().join(".tower/config.toml")).unwrap();
+
+            let loop_path = tmp.path().join("loop");
+            std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+            write_config(
+                tmp.path(),
+                &format!(
+                    "[[projects.queryable]]\nid = \"loop\"\nname = \"Loop\"\npath = \"{}\"\n\
+                     [[projects.queryable]]\nid = \"privacy-sentinel\"\nname = \"Privacy sentinel\"\npath = \"{}\"\n",
+                    loop_path.display(),
+                    privacy_sentinel.display(),
+                ),
+            );
+            let error = load(tmp.path()).expect_err("symlink loop must be invalid");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidQueryableProjectPath {
+                    index: 0,
+                    reason: QueryableProjectPathReason::Invalid,
+                }
+            ));
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            assert!(
+                !display.contains(privacy_sentinel.to_str().unwrap()),
+                "symlink loop display leaked the unrelated configured path: {display}"
+            );
+            assert!(
+                !debug.contains(privacy_sentinel.to_str().unwrap()),
+                "symlink loop debug leaked the unrelated configured path: {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_queryable_projects_preserve_temporarily_unavailable_root() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("not-yet-mounted");
+        write_config(
+            tmp.path(),
+            "[[projects.queryable]]\nid = \"offline\"\nname = \"Offline\"\npath = \"not-yet-mounted\"\n",
+        );
+
+        let config = load(tmp.path()).expect("an unavailable root remains configured");
+        let project = config.projects.queryable().iter().next().unwrap();
+        assert_eq!(project.id.as_str(), "offline");
+        assert_eq!(project.name, "Offline");
+        assert_eq!(project.configured_path, Path::new("not-yet-mounted"));
+        assert_eq!(project.resolved_path, missing);
+        assert_eq!(project.canonical_path, None);
+        assert!(!missing.exists());
+        assert_eq!(
+            config
+                .projects
+                .queryable()
+                .get_by_configured_path(Path::new("not-yet-mounted")),
+            Some(project)
+        );
+        assert_eq!(
+            config.projects.queryable().get_by_canonical_path(&missing),
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(tmp.path().join(".tower/config.toml")).unwrap();
+            let dangling = tmp.path().join("dangling");
+            std::os::unix::fs::symlink(tmp.path().join("absent-target"), &dangling).unwrap();
+            write_config(
+                tmp.path(),
+                "[[projects.queryable]]\nid = \"dangling\"\nname = \"Dangling\"\npath = \"dangling\"\n",
+            );
+            let config = load(tmp.path()).expect("a dangling symlink remains configured");
+            let project = config.projects.queryable().iter().next().unwrap();
+            assert_eq!(project.resolved_path, dangling);
+            assert_eq!(project.canonical_path, None);
+        }
+    }
+
+    #[test]
+    fn queryable_project_availability_timeout_defaults_to_ten_seconds_and_rejects_non_positive_values()
+     {
+        let absent = tempdir().unwrap();
+        let config = load(absent.path()).unwrap();
+        assert_eq!(config.projects.queryable().iter().len(), 0);
+        assert_eq!(
+            config.projects.external_availability_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+
+        let positive = tempdir().unwrap();
+        write_config(
+            positive.path(),
+            "[projects]\nexternal_availability_timeout_secs = 37\n[daemon]\nconnection_timeout_secs = 3\n",
+        );
+        let config = load(positive.path()).unwrap();
+        assert_eq!(
+            config.projects.external_availability_timeout(),
+            std::time::Duration::from_secs(37)
+        );
+        assert_eq!(
+            config.daemon.connection_timeout(),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(config.daemon.preparation_timeout(), None);
+        assert_eq!(config.extensions.request_timeout(), None);
+
+        for value in [0, -1] {
+            let tmp = tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!("[projects]\nexternal_availability_timeout_secs = {value}\n"),
+            );
+            assert!(matches!(
+                load(tmp.path()),
+                Err(ConfigError::InvalidExternalAvailabilityTimeout { value: actual })
+                    if actual == value
+            ));
+        }
+
+        let non_integer = tempdir().unwrap();
+        write_config(
+            non_integer.path(),
+            "[projects]\nexternal_availability_timeout_secs = \"ten\"\n",
+        );
+        assert!(matches!(
+            load(non_integer.path()),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 }

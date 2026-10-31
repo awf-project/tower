@@ -2,20 +2,12 @@
 //!
 //! All tests use an in-process rmcp server driven via `tokio::io::duplex`.
 //! No spawned processes, no real stdio.
-//!
-//! # TDD sequence (spec 10b §TDD sequence)
-//!
-//! 1. AC1 — `tools/list` returns the native `tower_*` tools with schemas.
-//! 2. AC2 — `tower_find_file` round-trip.
-//! 3. AC3 — `tower_create_file` then `tower_find_file` finds it.
-//! 4. AC4 — malformed args → `invalid-params` protocol error, no state change.
-//! 5. AC5 — `tower_delete_file` on missing file → is_error:true result.
-
-// Feature: F001
 
 #![forbid(unsafe_code)]
 
+use std::fs;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use extension_protocol::messages::{
     PATH_RENAME_REQUEST_SCHEMA_JSON, PathRenameError, PathRenameErrorCode,
@@ -25,6 +17,10 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
 
+use core_engine::adapters::config::{QueryableProjects, load};
+use core_engine::adapters::daemon::client::{
+    ExternalDaemonClient, ExternalDaemonError, ExternalProjectConnector,
+};
 use core_engine::adapters::fs::WorkspacePathExclusion;
 use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
@@ -32,6 +28,7 @@ use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use core_engine::adapters::mcp::native_tools::{
     EXPECTED_NATIVE_TOOL_NAMES, EngineState, NativeToolRegistry,
 };
+use core_engine::adapters::mcp::project_query::ProjectQueryRegistry;
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
 use core_engine::adapters::{InMemoryFs, InMemoryStorage, RealFs};
@@ -241,6 +238,193 @@ fn tools_list_returns_native_tools_with_schemas() {
         }
 
         client.cancel().await.expect("cancel failed");
+    });
+}
+
+#[test]
+fn configured_queryable_projects_have_stable_identities() {
+    block_on(async {
+        fn assert_public_connector_types(
+            connector: Arc<dyn ExternalProjectConnector>,
+        ) -> Arc<dyn ExternalProjectConnector> {
+            connector
+        }
+
+        fn assert_public_error_type(error: Option<ExternalDaemonError>) {
+            assert!(error.is_none());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active");
+        let alpha = temp.path().join("alpha");
+        let beta = temp.path().join("beta");
+        let unconfigured = temp.path().join("unconfigured");
+        fs::create_dir_all(active.join(".tower")).unwrap();
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        fs::create_dir_all(&unconfigured).unwrap();
+        fs::write(
+            active.join(".tower/config.toml"),
+            format!(
+                "[[projects.queryable]]\nid = \"alpha-id\"\nname = \"Alpha\"\npath = \"{}\"\n\
+                 [[projects.queryable]]\nid = \"beta-id\"\nname = \"Beta\"\npath = \"{}\"\n",
+                alpha.display(),
+                beta.display()
+            ),
+        )
+        .unwrap();
+        let projects = load(&active).unwrap().projects.queryable().clone();
+        let connector = assert_public_connector_types(Arc::new(ExternalDaemonClient::new()));
+        assert_public_error_type(None);
+        let registry =
+            ProjectQueryRegistry::new(active.clone(), projects, Duration::from_secs(1), connector);
+        assert_eq!(
+            registry
+                .list()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tower_list_projects", "tower_query_project"]
+        );
+        let handler = TowerMcpHandler::new(
+            registry,
+            Arc::new(NoOpDiagnosticsReader),
+            Arc::new(Mutex::new(SubscriptionRegistry::new())),
+            vec![],
+        );
+        let client = start_server(handler).await;
+
+        let listed_tools = client
+            .peer()
+            .list_tools(Default::default())
+            .await
+            .expect("list_tools failed");
+        assert_eq!(
+            listed_tools
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["tower_list_projects", "tower_query_project"]
+        );
+        assert_eq!(
+            Value::Object((*listed_tools.tools[0].input_schema).clone()),
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            Value::Object((*listed_tools.tools[1].input_schema).clone()),
+            json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "path": {"type": "string"}
+                        }
+                    },
+                    "tool": {"type": "string"},
+                    "arguments": {"type": "object"}
+                },
+                "required": ["project", "tool", "arguments"]
+            })
+        );
+
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("tower_list_projects"))
+            .await
+            .expect("listing configured projects must be a successful tool call");
+        assert_eq!(result.is_error, Some(false));
+        let listed_projects = serde_json::from_str::<Value>(first_text(&result)).unwrap();
+        assert_eq!(
+            listed_projects,
+            json!({
+                "projects": [
+                    {"id": "alpha-id", "name": "Alpha", "path": alpha},
+                    {"id": "beta-id", "name": "Beta", "path": beta}
+                ]
+            })
+        );
+        assert!(
+            listed_projects["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|project| project["path"] != json!(unconfigured))
+        );
+
+        // Query validation remains a JSON-RPC InvalidParams response at the
+        // public RMCP boundary, rather than a generic tool-result error.
+        let invalid_query = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("tower_query_project")
+                    .with_arguments(serde_json::Map::new()),
+            )
+            .await;
+        let _ = invalid_params_error(invalid_query);
+
+        // A mutating operation is rejected before `ExternalDaemonClient` can
+        // acquire the configured target. Its numeric application code is
+        // intentionally internal; RMCP exposes the fixed text and stable
+        // string-coded structured payload.
+        let denied = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("tower_query_project").with_arguments(
+                    serde_json::from_value(json!({
+                        "project": {"id": "alpha-id"},
+                        "tool": "tower_create_file",
+                        "arguments": {"path": "src/new.rs", "content": "ignored"}
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .expect("read-only boundary must return a tool result");
+        assert_eq!(denied.is_error, Some(true));
+        assert_eq!(
+            first_text(&denied),
+            "external project operation is not permitted"
+        );
+        assert_eq!(
+            denied.structured_content,
+            Some(json!({
+                "code": "external_read_only_boundary",
+                "project": {"id": "alpha-id", "name": "Alpha"},
+                "operation": "tower_create_file"
+            }))
+        );
+        assert!(!temp.path().join("alpha/.tower").exists());
+        assert!(!temp.path().join("beta/.tower").exists());
+        client.cancel().await.expect("cancel failed");
+
+        let empty_registry = ProjectQueryRegistry::new(
+            active,
+            QueryableProjects::default(),
+            Duration::from_secs(1),
+            Arc::new(ExternalDaemonClient::new()),
+        );
+        let empty_handler = TowerMcpHandler::new(
+            empty_registry,
+            Arc::new(NoOpDiagnosticsReader),
+            Arc::new(Mutex::new(SubscriptionRegistry::new())),
+            vec![],
+        );
+        let empty_client = start_server(empty_handler).await;
+        let empty_result = empty_client
+            .peer()
+            .call_tool(CallToolRequestParams::new("tower_list_projects"))
+            .await
+            .expect("empty listing must be a successful tool call");
+        assert_eq!(empty_result.is_error, Some(false));
+        assert_eq!(
+            serde_json::from_str::<Value>(first_text(&empty_result)).unwrap(),
+            json!({"projects": []})
+        );
+        empty_client.cancel().await.expect("cancel failed");
     });
 }
 

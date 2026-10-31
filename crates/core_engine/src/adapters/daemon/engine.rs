@@ -20,10 +20,10 @@ use crate::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
 use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_workspace_root};
-use crate::adapters::config::TowerConfig;
 use crate::adapters::config::lsp::{
     lsp_initialize_payload_with_diagnostics_timeout, validate_lsp_commands,
 };
+use crate::adapters::config::{QueryableProjects, TowerConfig};
 use crate::adapters::daemon::instrumentation::StartupInstrumentation;
 use crate::adapters::daemon::lifecycle::{
     CapabilityDependency, CapabilityReadiness, DaemonLifecycle, ReadinessController,
@@ -201,6 +201,9 @@ struct PreparationShared {
 pub struct EarlyDaemonContext {
     readiness: Arc<ReadinessController>,
     instrumentation: Arc<StartupInstrumentation>,
+    workspace_root: std::path::PathBuf,
+    queryable_projects: QueryableProjects,
+    external_availability_timeout: Duration,
     opts: Mutex<Option<GlobalOpts>>,
     config: Mutex<Option<TowerConfig>>,
     shared: Arc<PreparationShared>,
@@ -209,6 +212,18 @@ pub struct EarlyDaemonContext {
 }
 
 impl EarlyDaemonContext {
+    pub fn queryable_projects(&self) -> &QueryableProjects {
+        &self.queryable_projects
+    }
+
+    pub fn external_availability_timeout(&self) -> Duration {
+        self.external_availability_timeout
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     pub fn readiness(&self) -> Arc<ReadinessController> {
         Arc::clone(&self.readiness)
     }
@@ -409,6 +424,8 @@ pub fn build_early_context(
     let preparation_timeout = config.daemon.preparation_timeout();
     let dependency_policy = Arc::new(extension_dependency_policy(&config));
     let workspace_root = resolve_workspace_root(opts);
+    let queryable_projects = config.projects.queryable().clone();
+    let external_availability_timeout = config.projects.external_availability_timeout();
     emit_lsp_startup_diagnostics(&config, &workspace_root);
     let readiness = Arc::new(ReadinessController::new(owner.generation()));
     let instrumentation = Arc::new(StartupInstrumentation::new());
@@ -426,6 +443,9 @@ pub fn build_early_context(
     Ok(EarlyDaemonContext {
         readiness,
         instrumentation,
+        workspace_root,
+        queryable_projects,
+        external_availability_timeout,
         opts: Mutex::new(Some(GlobalOpts {
             workspace_dir: opts.workspace_dir.clone(),
             extensions_dir: opts.extensions_dir.clone(),
@@ -1994,6 +2014,7 @@ mod tests {
 
     use super::*;
     use crate::adapters::config::{LspConfig, LspServerConfig, load};
+    use crate::adapters::daemon::socket::WorkspaceDaemonOwner;
     use crate::adapters::extension::host_deps::{HostDeps, UnsupportedApplyEditsHost};
     use crate::adapters::formatter::NoOpFormatQueue;
     use crate::adapters::{InMemoryAstIndex, InMemoryFs};
@@ -2014,6 +2035,49 @@ mod tests {
             apply_edits: Arc::new(UnsupportedApplyEditsHost),
             push_tx: None,
         }
+    }
+
+    #[test]
+    fn early_context_preserves_project_snapshot_before_preparation_consumes_config() {
+        let workspace = TempDir::new().expect("create source workspace");
+        let target = TempDir::new().expect("create target workspace");
+        let config_dir = workspace.path().join(".tower");
+        std::fs::create_dir_all(&config_dir).expect("create source configuration directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[projects]\nexternal_availability_timeout_secs = 37\n\
+                 [[projects.queryable]]\nid = \"snapshot-id\"\nname = \"Snapshot target\"\npath = {:?}\n",
+                target.path().to_string_lossy(),
+            ),
+        )
+        .expect("write source configuration");
+        let config = load(workspace.path()).expect("load source configuration");
+        let owner = WorkspaceDaemonOwner::acquire(workspace.path()).expect("acquire source owner");
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        };
+
+        let context = build_early_context(&opts, config, &owner).expect("build early context");
+
+        // The context has taken ownership of the loaded configuration. A later
+        // on-disk edit must not reload or alter its generation-owned snapshot.
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[projects]\nexternal_availability_timeout_secs = 1\n",
+        )
+        .expect("replace source configuration after snapshot");
+        assert_eq!(context.workspace_root(), workspace.path());
+        assert_eq!(
+            context.external_availability_timeout(),
+            Duration::from_secs(37)
+        );
+        let projects: Vec<_> = context.queryable_projects().iter().collect();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id.as_str(), "snapshot-id");
+        assert_eq!(projects[0].name, "Snapshot target");
+        assert_eq!(projects[0].resolved_path, target.path());
     }
 
     use crate::adapters::extension::timeout_test_support::{

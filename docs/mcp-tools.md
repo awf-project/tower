@@ -75,7 +75,7 @@ version and capability advertisement.
 **Request**
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+{ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }
 ```
 
 **Response**
@@ -108,7 +108,7 @@ the `lsp` extension, `"tower_debug_launch"` from the `debug` extension, or
 **Request**
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }
 ```
 
 **Response (excerpt)**
@@ -124,7 +124,10 @@ the `lsp` extension, `"tower_debug_launch"` from the `debug` extension, or
         "inputSchema": {
           "type": "object",
           "properties": {
-            "query": { "type": "string", "description": "Substring or fuzzy query to match against file paths." }
+            "query": {
+              "type": "string",
+              "description": "Substring or fuzzy query to match against file paths."
+            }
           },
           "required": ["query"]
         }
@@ -132,7 +135,7 @@ the `lsp` extension, `"tower_debug_launch"` from the `debug` extension, or
       {
         "name": "tower_ast_get_outline",
         "description": "Return a structural outline ...",
-        "inputSchema": { "..." : "..." }
+        "inputSchema": { "...": "..." }
       }
     ]
   },
@@ -166,9 +169,7 @@ to `{}` when absent).
 {
   "jsonrpc": "2.0",
   "result": {
-    "content": [
-      { "type": "text", "text": "<json-encoded result string>" }
-    ]
+    "content": [{ "type": "text", "text": "<json-encoded result string>" }]
   },
   "id": 3
 }
@@ -182,19 +183,19 @@ result object.
 
 ## Error codes
 
-| Code    | Name             | Meaning                                                                 |
-|---------|------------------|-------------------------------------------------------------------------|
-| -32700  | ParseError       | Malformed JSON or invalid UTF-8 in the request frame                   |
-| -32600  | InvalidRequest   | `jsonrpc` field is not exactly `"2.0"`                                  |
-| -32601  | MethodNotFound   | The JSON-RPC method name (e.g. `"tools/call"`) is unknown               |
-| -32602  | InvalidParams    | A required tool argument is missing or has the wrong type               |
-| -32603  | InternalError    | Tool execution failed at runtime (I/O error, extension fault, etc.)     |
-| -32001  | ToolNotFound     | The named tool does not exist in the registry                           |
-| -32002  | ResourceNotFound | The workspace entity targeted by the tool was not found (stable code — clients may branch on this without parsing the message) |
-| -32004  | InitializationPending | The required capability is still preparing; `data` identifies the dependency and phase. |
-| -32005  | CapabilityInitializationFailed | The required capability failed; `data` includes its failure class. |
-| -32006  | DaemonStopping | The daemon is stopping and will not admit new work. |
-| -32007  | CapabilityUnavailable | The requested capability is not configured or was disabled. |
+| Code   | Name                           | Meaning                                                                                                                        |
+| ------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| -32700 | ParseError                     | Malformed JSON or invalid UTF-8 in the request frame                                                                           |
+| -32600 | InvalidRequest                 | `jsonrpc` field is not exactly `"2.0"`                                                                                         |
+| -32601 | MethodNotFound                 | The JSON-RPC method name (e.g. `"tools/call"`) is unknown                                                                      |
+| -32602 | InvalidParams                  | A required tool argument is missing or has the wrong type                                                                      |
+| -32603 | InternalError                  | Tool execution failed at runtime (I/O error, extension fault, etc.)                                                            |
+| -32001 | ToolNotFound                   | The named tool does not exist in the registry                                                                                  |
+| -32002 | ResourceNotFound               | The workspace entity targeted by the tool was not found (stable code — clients may branch on this without parsing the message) |
+| -32004 | InitializationPending          | The required capability is still preparing; `data` identifies the dependency and phase.                                        |
+| -32005 | CapabilityInitializationFailed | The required capability failed; `data` includes its failure class.                                                             |
+| -32006 | DaemonStopping                 | The daemon is stopping and will not admit new work.                                                                            |
+| -32007 | CapabilityUnavailable          | The requested capability is not configured or was disabled.                                                                    |
 
 Codes `-32001`, `-32002`, and `-32004` through `-32007` are in the JSON-RPC 2.0
 server-defined range (`-32000` to `-32099`). `-32001` is for an unknown **tool name** inside
@@ -220,18 +221,46 @@ server-defined range (`-32000` to `-32099`). `-32001` is for an unknown **tool n
 The native tools are always available, regardless of which extensions are loaded. Their
 names are undecorated (no namespace prefix).
 
+### tower_list_projects
+
+List the projects explicitly configured under `[projects].queryable`. The result
+contains each project's stable `id`, configured `name`, and configured `path`.
+Unconfigured workspaces are never discovered or returned. This tool takes no
+arguments.
+
+**Returns** `{"projects":[{"id": string, "name": string, "path": string}]}`
+
+### tower_query_project
+
+Run one supported read-only native tool against exactly one configured external
+project. Select the target with exactly one of `project.id`, `project.name`, or
+`project.path`; `tool` must name an authoritatively classified read-only native
+tool, and `arguments` must be an object.
+
+The successful response is wrapped as
+`{"project":{"id": string, "name": string}, "result": <target result>}`.
+Target file paths remain relative to the selected project's workspace. Empty
+target results still include the project identity.
+
+Mutating, unknown, extension, and ambiguously classified tools are rejected
+before Tower connects to or dispatches to the target. Availability failures are
+bounded by `projects.external_availability_timeout_secs`; after initialization,
+the routed operation keeps its own configured budget and caller cancellation.
+See [the project-query how-to](user-guide/project-queries.md) for configuration
+and examples.
+
 ### tower_safe_delete_symbol
 
 Safely delete one declaration after resolving its references and optional backend cleanup edits.
 This native tool does not replace `tower_ast_delete_symbol`, which remains the explicit span-only
 deletion operation.
 
-| Field         | Type    | Required | Description                                             |
-| ------------- | ------- | -------- | ------------------------------------------------------- |
-| `path`        | string  | yes      | Workspace-relative file containing the declaration     |
-| `symbol_name` | string  | yes      | Nonempty declaration name                               |
-| `kind`        | string  | no       | Declaration kind filter; omit to match any kind         |
-| `dry_run`     | boolean | no       | Preview without mutation; defaults to `false`           |
+| Field         | Type    | Required | Description                                        |
+| ------------- | ------- | -------- | -------------------------------------------------- |
+| `path`        | string  | yes      | Workspace-relative file containing the declaration |
+| `symbol_name` | string  | yes      | Nonempty declaration name                          |
+| `kind`        | string  | no       | Declaration kind filter; omit to match any kind    |
+| `dry_run`     | boolean | no       | Preview without mutation; defaults to `false`      |
 
 Valid `kind` values are `function`, `struct`, `enum`, `trait`, `impl`, `method`, `module`,
 `type_alias`, `const`, `static`, `macro_def`, and `class`.
@@ -277,9 +306,9 @@ files. Inspect `status` before treating the operation as complete.
 
 Find workspace files whose path matches a query string via the inverted index.
 
-| Field   | Type   | Required | Description                                      |
-|---------|--------|----------|--------------------------------------------------|
-| `query` | string | yes      | Substring or fuzzy query matched against paths   |
+| Field   | Type   | Required | Description                                    |
+| ------- | ------ | -------- | ---------------------------------------------- |
+| `query` | string | yes      | Substring or fuzzy query matched against paths |
 
 **Returns** `{"paths": [string]}`
 
@@ -320,8 +349,8 @@ The listing is derived from the tracked path set, not from a live filesystem
 walk, so it inherits the current index and ignore rules. Empty directories are
 not tracked.
 
-| Field       | Type    | Required | Description                                                        |
-|-------------|---------|----------|--------------------------------------------------------------------|
+| Field       | Type    | Required | Description                                                         |
+| ----------- | ------- | -------- | ------------------------------------------------------------------- |
 | `path`      | string  | yes      | Workspace-relative directory path to list; `""` and `"."` mean root |
 | `recursive` | boolean | no       | Include descendants instead of only direct children                 |
 | `max_depth` | integer | no       | Positive recursion depth limit; valid only when `recursive` is true |
@@ -351,7 +380,12 @@ from tracked file prefixes and de-duplicated.
 {
   "jsonrpc": "2.0",
   "result": {
-    "content": [{ "type": "text", "text": "{\"entries\":[{\"path\":\"src/lib.rs\",\"name\":\"lib.rs\",\"kind\":\"file\"},{\"path\":\"src/net\",\"name\":\"net\",\"kind\":\"dir\"}]}" }]
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"entries\":[{\"path\":\"src/lib.rs\",\"name\":\"lib.rs\",\"kind\":\"file\"},{\"path\":\"src/net\",\"name\":\"net\",\"kind\":\"dir\"}]}"
+      }
+    ]
   },
   "id": 11
 }
@@ -368,9 +402,9 @@ InvalidParams` with a not-a-directory message. Supplying `max_depth` without
 
 Parallel grep across all indexed file contents.
 
-| Field     | Type   | Required | Description                                      |
-|-----------|--------|----------|--------------------------------------------------|
-| `pattern` | string | yes      | Text pattern searched across all indexed files   |
+| Field     | Type   | Required | Description                                    |
+| --------- | ------ | -------- | ---------------------------------------------- |
+| `pattern` | string | yes      | Text pattern searched across all indexed files |
 
 **Returns** `{"matches": [{"path": string, "line_number": uint, "line_content": string}]}`
 
@@ -394,7 +428,12 @@ Parallel grep across all indexed file contents.
 {
   "jsonrpc": "2.0",
   "result": {
-    "content": [{ "type": "text", "text": "{\"matches\":[{\"path\":\"src/client.rs\",\"line_number\":1,\"line_content\":\"fn client() {}\"}]}" }]
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"matches\":[{\"path\":\"src/client.rs\",\"line_number\":1,\"line_content\":\"fn client() {}\"}]}"
+      }
+    ]
   },
   "id": 12
 }
@@ -407,9 +446,9 @@ Parallel grep across all indexed file contents.
 Read the raw UTF-8 content of a workspace-relative file. Uses `FileSystemPort`
 directly (no domain logic wrapper); returns `-32002` if the path does not exist.
 
-| Field  | Type   | Required | Description                            |
-|--------|--------|----------|----------------------------------------|
-| `path` | string | yes      | Workspace-relative path to the file    |
+| Field  | Type   | Required | Description                         |
+| ------ | ------ | -------- | ----------------------------------- |
+| `path` | string | yes      | Workspace-relative path to the file |
 
 **Returns** `{"content": string}`
 
@@ -444,7 +483,10 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
 ```json
 {
   "jsonrpc": "2.0",
-  "error": { "code": -32002, "message": "Resource not found: path or entity not found in workspace" },
+  "error": {
+    "code": -32002,
+    "message": "Resource not found: path or entity not found in workspace"
+  },
   "id": 13
 }
 ```
@@ -456,10 +498,10 @@ directly (no domain logic wrapper); returns `-32002` if the path does not exist.
 Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
 → flush → atomic `fs::rename`). The file is indexed immediately.
 
-| Field     | Type   | Required | Description                                    |
-|-----------|--------|----------|------------------------------------------------|
-| `path`    | string | yes      | Workspace-relative path for the new file       |
-| `content` | string | yes      | UTF-8 content to write                         |
+| Field     | Type   | Required | Description                              |
+| --------- | ------ | -------- | ---------------------------------------- |
+| `path`    | string | yes      | Workspace-relative path for the new file |
+| `content` | string | yes      | UTF-8 content to write                   |
 
 **Returns** `{"created": true}`
 
@@ -496,9 +538,9 @@ Create or overwrite a file using the shadow-file pattern (`.tmp_write` sibling
 Create a directory (recursive `mkdir_all`). Does not index any files; directories
 become visible to subsequent file operations.
 
-| Field  | Type   | Required | Description                                    |
-|--------|--------|----------|------------------------------------------------|
-| `path` | string | yes      | Workspace-relative path of the directory       |
+| Field  | Type   | Required | Description                              |
+| ------ | ------ | -------- | ---------------------------------------- |
+| `path` | string | yes      | Workspace-relative path of the directory |
 
 **Returns** `{"created": true}`
 
@@ -535,9 +577,9 @@ become visible to subsequent file operations.
 Remove a file from the workspace and the VFS index. Returns `-32002` if the
 path is not found.
 
-| Field  | Type   | Required | Description                              |
-|--------|--------|----------|------------------------------------------|
-| `path` | string | yes      | Workspace-relative path of the file      |
+| Field  | Type   | Required | Description                         |
+| ------ | ------ | -------- | ----------------------------------- |
+| `path` | string | yes      | Workspace-relative path of the file |
 
 **Returns** `{"deleted": true}`
 
@@ -602,10 +644,10 @@ a `CHANGELOG.txt` entry — all rewritten unconditionally.
    prose file that should not change, consider a targeted edit instead.
 3. Only then call `tower_global_replace`.
 
-| Field         | Type   | Required | Description                                    |
-|---------------|--------|----------|------------------------------------------------|
-| `target`      | string | yes      | The string to search for                       |
-| `replacement` | string | yes      | The string to substitute in every occurrence   |
+| Field         | Type   | Required | Description                                  |
+| ------------- | ------ | -------- | -------------------------------------------- |
+| `target`      | string | yes      | The string to search for                     |
+| `replacement` | string | yes      | The string to substitute in every occurrence |
 
 **Returns** `{"files_changed": uint, "replacements": uint, "errors": [{"path": string, "reason": string}]}`
 
@@ -629,7 +671,12 @@ a `CHANGELOG.txt` entry — all rewritten unconditionally.
 {
   "jsonrpc": "2.0",
   "result": {
-    "content": [{ "type": "text", "text": "{\"files_changed\":3,\"replacements\":7,\"errors\":[]}" }]
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"files_changed\":3,\"replacements\":7,\"errors\":[]}"
+      }
+    ]
   },
   "id": 17
 }
@@ -643,9 +690,9 @@ Force a full rebuild of the VFS and the inverted text-search index from the
 current filesystem. Use after large external changes or to correct drift. Takes
 no arguments.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| _(none)_ | — | — | This tool takes no arguments |
+| Field    | Type | Required | Description                  |
+| -------- | ---- | -------- | ---------------------------- |
+| _(none)_ | —    | —        | This tool takes no arguments |
 
 **Returns** `{"files_indexed": uint}`
 
@@ -686,12 +733,12 @@ read a symbol's `start_byte`/`end_byte`, then edit exactly that span.
 The replacement is applied **byte-exact** — no normalization and no implicit
 formatting.
 
-| Field         | Type    | Required | Description                                                        |
-|---------------|---------|----------|--------------------------------------------------------------------|
-| `path`        | string  | yes      | Workspace-relative path of the existing file to edit               |
-| `start_byte`  | integer | yes      | Start of the replaced range (inclusive), `≥ 0`                     |
-| `end_byte`    | integer | yes      | End of the replaced range (exclusive), `≥ start_byte`             |
-| `replacement` | string  | yes      | UTF-8 text spliced in place of `[start_byte, end_byte)`            |
+| Field         | Type    | Required | Description                                             |
+| ------------- | ------- | -------- | ------------------------------------------------------- |
+| `path`        | string  | yes      | Workspace-relative path of the existing file to edit    |
+| `start_byte`  | integer | yes      | Start of the replaced range (inclusive), `≥ 0`          |
+| `end_byte`    | integer | yes      | End of the replaced range (exclusive), `≥ start_byte`   |
+| `replacement` | string  | yes      | UTF-8 text spliced in place of `[start_byte, end_byte)` |
 
 **Returns** `{"files_changed": uint, "replacements": uint, "errors": [{"path": string, "reason": string}]}`
 — on success, `{"files_changed": 1, "replacements": 1, "errors": []}`.
@@ -732,7 +779,12 @@ formatting.
 {
   "jsonrpc": "2.0",
   "result": {
-    "content": [{ "type": "text", "text": "{\"files_changed\":1,\"replacements\":1,\"errors\":[]}" }]
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"files_changed\":1,\"replacements\":1,\"errors\":[]}"
+      }
+    ]
   },
   "id": 19
 }
@@ -745,13 +797,13 @@ move against workspace boundaries, exclusions, conflicts, and optimistic
 concurrency checks. With a configured language server, the tool can also plan
 and apply import/reference edits through the existing workspace-edit path.
 
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| `source` | string | yes | Workspace-relative file or directory to move |
-| `destination` | string | yes | Workspace-relative destination; it must not already exist or be inside the source |
-| `dry_run` | boolean | no | Return the plan without changing disk, contents, versions, or indexes; defaults to `false` |
-| `semantic_policy` | string | yes | `none`, `best_effort`, or `required` |
-| `expected_versions` | object | no | Map of workspace-relative paths to 64-character SHA-256 CAS tokens; defaults to `{}` |
+| Field               | Type    | Required | Description                                                                                |
+| ------------------- | ------- | -------: | ------------------------------------------------------------------------------------------ |
+| `source`            | string  |      yes | Workspace-relative file or directory to move                                               |
+| `destination`       | string  |      yes | Workspace-relative destination; it must not already exist or be inside the source          |
+| `dry_run`           | boolean |       no | Return the plan without changing disk, contents, versions, or indexes; defaults to `false` |
+| `semantic_policy`   | string  |      yes | `none`, `best_effort`, or `required`                                                       |
+| `expected_versions` | object  |       no | Map of workspace-relative paths to 64-character SHA-256 CAS tokens; defaults to `{}`       |
 
 `none` performs a native-only move. `best_effort` uses semantic edits when
 available and reports backend failures in the result. `required` returns an
@@ -827,9 +879,9 @@ Positions use **zero-based** `line` and `character`, where `character` is a
 Run the configured language server over a file's current content and return
 compiler/linter diagnostics. Use after editing a file to verify the change.
 
-| Field  | Type   | Required | Description                                |
-|--------|--------|----------|--------------------------------------------|
-| `path` | string | yes      | Workspace-relative path of the file        |
+| Field  | Type   | Required | Description                         |
+| ------ | ------ | -------- | ----------------------------------- |
+| `path` | string | yes      | Workspace-relative path of the file |
 
 **Returns**
 
@@ -838,7 +890,10 @@ compiler/linter diagnostics. Use after editing a file to verify the change.
   "supported": true,
   "diagnostics": [
     {
-      "line": 4, "character": 8, "endLine": 4, "endCharacter": 15,
+      "line": 4,
+      "character": 8,
+      "endLine": 4,
+      "endCharacter": 15,
       "severity": "error",
       "message": "cannot find value `foo` in this scope",
       "source": "rustc",
@@ -863,11 +918,11 @@ is described in [workspace configuration](user-guide/configuration.md).
 
 Resolve the definition site(s) of the symbol at a position.
 
-| Field       | Type    | Required | Description                                   |
-|-------------|---------|----------|-----------------------------------------------|
-| `path`      | string  | yes      | Workspace-relative path of the file           |
-| `line`      | integer | yes      | Zero-based line number                        |
-| `character` | integer | yes      | Zero-based UTF-16 code-unit column            |
+| Field       | Type    | Required | Description                         |
+| ----------- | ------- | -------- | ----------------------------------- |
+| `path`      | string  | yes      | Workspace-relative path of the file |
+| `line`      | integer | yes      | Zero-based line number              |
+| `character` | integer | yes      | Zero-based UTF-16 code-unit column  |
 
 **Returns**
 
@@ -875,7 +930,13 @@ Resolve the definition site(s) of the symbol at a position.
 {
   "supported": true,
   "locations": [
-    { "path": "src/lib.rs", "line": 10, "character": 7, "endLine": 10, "endCharacter": 13 }
+    {
+      "path": "src/lib.rs",
+      "line": 10,
+      "character": 7,
+      "endLine": 10,
+      "endCharacter": 13
+    }
   ]
 }
 ```
@@ -901,7 +962,10 @@ Get hover information (type/doc) for the symbol at a position. Same arguments as
   "supported": true,
   "hover": {
     "contents": "fn handle() -> Result<()>",
-    "line": 10, "character": 7, "endLine": 10, "endCharacter": 13
+    "line": 10,
+    "character": 7,
+    "endLine": 10,
+    "endCharacter": 13
   }
 }
 ```
@@ -921,8 +985,20 @@ Find implementation sites for the symbol at a position. Same arguments as
 {
   "supported": true,
   "locations": [
-    { "path": "src/lib.rs", "line": 10, "character": 7, "endLine": 10, "endCharacter": 13 },
-    { "path": "src/impls.rs", "line": 4, "character": 6, "endLine": 4, "endCharacter": 18 }
+    {
+      "path": "src/lib.rs",
+      "line": 10,
+      "character": 7,
+      "endLine": 10,
+      "endCharacter": 13
+    },
+    {
+      "path": "src/impls.rs",
+      "line": 4,
+      "character": 6,
+      "endLine": 4,
+      "endCharacter": 18
+    }
   ]
 }
 ```
@@ -935,12 +1011,12 @@ tool returns `{"supported": false, "locations": []}`.
 Query the supertypes, subtypes, or both for the symbol at a position. The tool uses the configured
 language server's type-hierarchy capability and is read-only.
 
-| Field       | Type    | Required | Description                                  |
-|-------------|---------|----------|----------------------------------------------|
-| `path`      | string  | yes      | Workspace-relative path of the file          |
-| `line`      | integer | yes      | Zero-based line number                       |
-| `character` | integer | yes      | Zero-based UTF-16 code-unit column           |
-| `direction` | string  | yes      | `supertypes`, `subtypes`, or `both`          |
+| Field       | Type    | Required | Description                         |
+| ----------- | ------- | -------- | ----------------------------------- |
+| `path`      | string  | yes      | Workspace-relative path of the file |
+| `line`      | integer | yes      | Zero-based line number              |
+| `character` | integer | yes      | Zero-based UTF-16 code-unit column  |
+| `direction` | string  | yes      | `supertypes`, `subtypes`, or `both` |
 
 **Request**
 
@@ -972,7 +1048,12 @@ language server's type-hierarchy capability and is read-only.
       "kind": "class",
       "detail": null,
       "range": { "line": 2, "character": 6, "endLine": 2, "endCharacter": 10 },
-      "selectionRange": { "line": 2, "character": 6, "endLine": 2, "endCharacter": 10 },
+      "selectionRange": {
+        "line": 2,
+        "character": 6,
+        "endLine": 2,
+        "endCharacter": 10
+      },
       "path": "src/base.rs",
       "externalUri": null,
       "external": false
@@ -1002,13 +1083,13 @@ payloads are accepted, including versioned `TextDocumentEdit` entries; file
 create, rename, and delete resource operations are rejected before any file is
 changed.
 
-| Field       | Type    | Required | Description                                   |
-|-------------|---------|----------|-----------------------------------------------|
-| `path`      | string  | yes      | Workspace-relative path of the file           |
-| `line`      | integer | yes      | Zero-based line number                        |
-| `character` | integer | yes      | Zero-based UTF-16 code-unit column            |
-| `new_name`  | string  | yes      | Replacement symbol name                       |
-| `dry_run`   | boolean | no       | Return preview data without mutating files    |
+| Field       | Type    | Required | Description                                |
+| ----------- | ------- | -------- | ------------------------------------------ |
+| `path`      | string  | yes      | Workspace-relative path of the file        |
+| `line`      | integer | yes      | Zero-based line number                     |
+| `character` | integer | yes      | Zero-based UTF-16 code-unit column         |
+| `new_name`  | string  | yes      | Replacement symbol name                    |
+| `dry_run`   | boolean | no       | Return preview data without mutating files |
 
 Before issuing the rename, Tower uses `prepareRename` when the server supports
 it. A non-renameable position returns a structured tool payload instead of
@@ -1071,7 +1152,10 @@ partially editing files.
 **Structured error results**
 
 ```json
-{ "code": "not_renameable", "message": "the symbol at this position cannot be renamed" }
+{
+  "code": "not_renameable",
+  "message": "the symbol at this position cannot be renamed"
+}
 ```
 
 Other stable `code` values are `unsupported_workspace_edit`,
@@ -1117,11 +1201,11 @@ are configuration errors naming
 Supported `format` values are `rustc-json`, `eslint-json`, and `generic-regex`. Supported `target`
 values are:
 
-| Value | Behavior |
-|-------|----------|
-| `append` | Append the target path to the configured command arguments |
-| `stdin` | Read the target file through Tower and pass its content to command stdin |
-| `none` | Run the command without a per-file path; the linter output must identify files |
+| Value    | Behavior                                                                       |
+| -------- | ------------------------------------------------------------------------------ |
+| `append` | Append the target path to the configured command arguments                     |
+| `stdin`  | Read the target file through Tower and pass its content to command stdin       |
+| `none`   | Run the command without a per-file path; the linter output must identify files |
 
 For `generic-regex`, set `regex` to a pattern with named capture groups. Required groups are
 `file`, `line`, `col`, and `message`; optional groups include `endLine`, `endCol`, `severity`, and
@@ -1133,7 +1217,7 @@ Run configured standalone linters for one file or for every indexed file with a 
 configuration.
 
 | Field  | Type   | Required | Description                                                |
-|--------|--------|----------|------------------------------------------------------------|
+| ------ | ------ | -------- | ---------------------------------------------------------- |
 | `path` | string | no       | Workspace-relative file path; omit to lint supported files |
 
 **Single-file request**
@@ -1225,11 +1309,11 @@ from suggestion spans; `MachineApplicable` suggestions are applied by default, w
 are extracted from `messages[].fix.range` and `messages[].fix.text`. `generic-regex` and fix-less
 diagnostics are reported as skipped unsupported fixes, not tool failures.
 
-| Field     | Type    | Required | Description                                                     |
-|-----------|---------|----------|-----------------------------------------------------------------|
-| `path`    | string  | no       | Workspace-relative file path; omit to inspect supported files   |
-| `unsafe`  | boolean | no       | Apply fixes with unsafe or unknown applicability                |
-| `dry_run` | boolean | no       | Return previews without writing files                           |
+| Field     | Type    | Required | Description                                                   |
+| --------- | ------- | -------- | ------------------------------------------------------------- |
+| `path`    | string  | no       | Workspace-relative file path; omit to inspect supported files |
+| `unsafe`  | boolean | no       | Apply fixes with unsafe or unknown applicability              |
+| `dry_run` | boolean | no       | Return previews without writing files                         |
 
 **Dry-run request**
 
@@ -1308,9 +1392,7 @@ Dry-run responses keep `files_changed` at `0` and include preview entries:
   "previews": [
     {
       "path": "src/main.rs",
-      "edits": [
-        { "start_byte": 6, "end_byte": 10, "replacement": "fixed" }
-      ],
+      "edits": [{ "start_byte": 6, "end_byte": 10, "replacement": "fixed" }],
       "preview_content": "let fixed = true;\n"
     }
   ]
@@ -1409,14 +1491,14 @@ protocol-level invalid-params errors.
 
 Launch a configured adapter session.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `language` | string | yes | Configured `[debug.<language>]` key |
-| `program` | string | yes | Program path or adapter-specific program value |
-| `cwd` | string or null | no | Working directory passed to the adapter |
-| `args` | string array | no | Program arguments |
-| `env` | object | no | Environment variables passed to launch |
-| `launch_overrides` | object | yes | Adapter-specific launch arguments merged over configured defaults; use `{}` when no override is needed |
+| Field              | Type           | Required | Description                                                                                            |
+| ------------------ | -------------- | -------- | ------------------------------------------------------------------------------------------------------ |
+| `language`         | string         | yes      | Configured `[debug.<language>]` key                                                                    |
+| `program`          | string         | yes      | Program path or adapter-specific program value                                                         |
+| `cwd`              | string or null | no       | Working directory passed to the adapter                                                                |
+| `args`             | string array   | no       | Program arguments                                                                                      |
+| `env`              | object         | no       | Environment variables passed to launch                                                                 |
+| `launch_overrides` | object         | yes      | Adapter-specific launch arguments merged over configured defaults; use `{}` when no override is needed |
 
 **Returns**
 
@@ -1428,7 +1510,13 @@ Launch a configured adapter session.
     "state": "stopped",
     "reason": "entry",
     "thread_id": 1,
-    "top_frame": { "id": 7, "name": "main", "path": "src/main.rs", "line": 1, "column": 1 },
+    "top_frame": {
+      "id": 7,
+      "name": "main",
+      "path": "src/main.rs",
+      "line": 1,
+      "column": 1
+    },
     "hit_breakpoint_ids": [],
     "timed_out": false,
     "output_since": []
@@ -1440,11 +1528,11 @@ Launch a configured adapter session.
 
 Replace the session's breakpoints for one source file.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `path` | string | yes | Workspace-relative source path |
-| `breakpoints` | array | yes | Breakpoints with `line`, optional `condition`, optional `hit_condition` |
+| Field         | Type   | Required | Description                                                             |
+| ------------- | ------ | -------- | ----------------------------------------------------------------------- |
+| `session_id`  | string | yes      | Session returned by `tower_debug_launch`                                |
+| `path`        | string | yes      | Workspace-relative source path                                          |
+| `breakpoints` | array  | yes      | Breakpoints with `line`, optional `condition`, optional `hit_condition` |
 
 **Returns** `{"breakpoints": [{"path": string, "line": uint, "condition": string|null, "hit_condition": string|null, "verified": bool, "verified_id": uint|null}]}`
 
@@ -1452,11 +1540,11 @@ Replace the session's breakpoints for one source file.
 
 Resume a session until it stops, terminates, or times out.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `thread_id` | integer or null | no | Adapter thread to resume; omit for adapter default |
-| `timeout_secs` | integer or null | no | Override the configured `default_timeout_secs` for this call |
+| Field          | Type            | Required | Description                                                  |
+| -------------- | --------------- | -------- | ------------------------------------------------------------ |
+| `session_id`   | string          | yes      | Session returned by `tower_debug_launch`                     |
+| `thread_id`    | integer or null | no       | Adapter thread to resume; omit for adapter default           |
+| `timeout_secs` | integer or null | no       | Override the configured `default_timeout_secs` for this call |
 
 **Returns** a stop object with `state`, `reason`, `thread_id`, `top_frame`, `hit_breakpoint_ids`,
 `timed_out`, and `output_since`. A timeout returns `state:"running"` with `timed_out:true`; the
@@ -1466,11 +1554,11 @@ session remains available for `tower_debug_pause` or cleanup.
 
 Step a session until it stops, terminates, or times out.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `thread_id` | integer or null | no | Adapter thread to step |
-| `timeout_secs` | integer or null | no | Override the configured `default_timeout_secs` for this call |
+| Field          | Type            | Required | Description                                                  |
+| -------------- | --------------- | -------- | ------------------------------------------------------------ |
+| `session_id`   | string          | yes      | Session returned by `tower_debug_launch`                     |
+| `thread_id`    | integer or null | no       | Adapter thread to step                                       |
+| `timeout_secs` | integer or null | no       | Override the configured `default_timeout_secs` for this call |
 
 **Returns** the same stop object as `tower_debug_continue`.
 
@@ -1478,10 +1566,10 @@ Step a session until it stops, terminates, or times out.
 
 Pause a running session.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `thread_id` | integer or null | no | Adapter thread to pause |
+| Field        | Type            | Required | Description                              |
+| ------------ | --------------- | -------- | ---------------------------------------- |
+| `session_id` | string          | yes      | Session returned by `tower_debug_launch` |
+| `thread_id`  | integer or null | no       | Adapter thread to pause                  |
 
 **Returns** the same stop object as `tower_debug_continue`.
 
@@ -1489,9 +1577,9 @@ Pause a running session.
 
 List session threads.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| Field        | Type   | Required | Description                              |
+| ------------ | ------ | -------- | ---------------------------------------- |
+| `session_id` | string | yes      | Session returned by `tower_debug_launch` |
 
 **Returns** `{"threads": [{"id": uint, "name": string}]}`
 
@@ -1499,10 +1587,10 @@ List session threads.
 
 Read stack frames for a stopped thread.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `thread_id` | integer | yes | Thread id returned by `tower_debug_threads` or a stop result |
+| Field        | Type    | Required | Description                                                  |
+| ------------ | ------- | -------- | ------------------------------------------------------------ |
+| `session_id` | string  | yes      | Session returned by `tower_debug_launch`                     |
+| `thread_id`  | integer | yes      | Thread id returned by `tower_debug_threads` or a stop result |
 
 **Returns** `{"frames": [{"id": uint, "name": string, "path": string|null, "line": uint, "column": uint}]}`
 
@@ -1510,10 +1598,10 @@ Read stack frames for a stopped thread.
 
 Read variables from a DAP `variables_reference`.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `variables_reference` | integer | yes | Adapter variable reference returned by prior debug data |
+| Field                 | Type    | Required | Description                                             |
+| --------------------- | ------- | -------- | ------------------------------------------------------- |
+| `session_id`          | string  | yes      | Session returned by `tower_debug_launch`                |
+| `variables_reference` | integer | yes      | Adapter variable reference returned by prior debug data |
 
 **Returns** `{"variables": [{"name": string, "value": string, "type": string|null, "variables_reference": uint}]}`
 
@@ -1521,11 +1609,11 @@ Read variables from a DAP `variables_reference`.
 
 Evaluate an expression in a stopped frame.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
-| `frame_id` | integer | yes | Frame id returned by `tower_debug_stack` |
-| `expression` | string | yes | Expression passed to the adapter |
+| Field        | Type    | Required | Description                              |
+| ------------ | ------- | -------- | ---------------------------------------- |
+| `session_id` | string  | yes      | Session returned by `tower_debug_launch` |
+| `frame_id`   | integer | yes      | Frame id returned by `tower_debug_stack` |
+| `expression` | string  | yes      | Expression passed to the adapter         |
 
 **Returns** `{"result": {"name": string, "value": string, "type": string|null, "variables_reference": uint}}`
 
@@ -1536,21 +1624,21 @@ breakpoint, continues until stop, exit, timeout, termination, or adapter exit, c
 evidence, and always tears down the internal session before returning. It does not expose a
 `session_id`.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `lang` | string | yes | Configured `[debug.<language>]` key |
-| `program` | string | yes | Program path or adapter-specific program value; the program must already be built |
-| `args` | string array | no | Program arguments; defaults to `[]` |
-| `cwd` | string or null | no | Working directory passed to the adapter |
-| `env` | string map | no | Environment variables passed to launch; defaults to `{}` |
-| `breakpoint` | object or null | no | Optional single breakpoint with `path`, `line`, and optional `condition` |
-| `expressions` | string array | no | Expressions to evaluate at each captured hit; defaults to `[]` |
-| `capture` | object | no | Booleans `stack`, `locals`, and `args`; each defaults to `true` |
-| `on_hit` | `"first"` or `"all"` | no | Capture only the first hit or continue until `max_hits`; defaults to `"first"` |
-| `max_hits` | integer | no | Positive hit bound; defaults to `1` |
-| `max_depth` | integer | no | Recursive variable expansion depth; defaults to `2` |
-| `max_children` | integer | no | Maximum expanded children per node or scope; defaults to `50` |
-| `timeout_ms` | integer or null | no | Probe continue timeout in milliseconds; omit to use the configured default |
+| Field          | Type                 | Required | Description                                                                       |
+| -------------- | -------------------- | -------- | --------------------------------------------------------------------------------- |
+| `lang`         | string               | yes      | Configured `[debug.<language>]` key                                               |
+| `program`      | string               | yes      | Program path or adapter-specific program value; the program must already be built |
+| `args`         | string array         | no       | Program arguments; defaults to `[]`                                               |
+| `cwd`          | string or null       | no       | Working directory passed to the adapter                                           |
+| `env`          | string map           | no       | Environment variables passed to launch; defaults to `{}`                          |
+| `breakpoint`   | object or null       | no       | Optional single breakpoint with `path`, `line`, and optional `condition`          |
+| `expressions`  | string array         | no       | Expressions to evaluate at each captured hit; defaults to `[]`                    |
+| `capture`      | object               | no       | Booleans `stack`, `locals`, and `args`; each defaults to `true`                   |
+| `on_hit`       | `"first"` or `"all"` | no       | Capture only the first hit or continue until `max_hits`; defaults to `"first"`    |
+| `max_hits`     | integer              | no       | Positive hit bound; defaults to `1`                                               |
+| `max_depth`    | integer              | no       | Recursive variable expansion depth; defaults to `2`                               |
+| `max_children` | integer              | no       | Maximum expanded children per node or scope; defaults to `50`                     |
+| `timeout_ms`   | integer or null      | no       | Probe continue timeout in milliseconds; omit to use the configured default        |
 
 `breakpoint` shape:
 
@@ -1566,9 +1654,21 @@ evidence, and always tears down the internal session before returning. It does n
   "hits": [
     {
       "thread_id": 1,
-      "frame": { "id": 7, "name": "main", "path": "src/main.rs", "line": 42, "column": 1 },
+      "frame": {
+        "id": 7,
+        "name": "main",
+        "path": "src/main.rs",
+        "line": 42,
+        "column": 1
+      },
       "stack": [
-        { "id": 7, "name": "main", "path": "src/main.rs", "line": 42, "column": 1 }
+        {
+          "id": 7,
+          "name": "main",
+          "path": "src/main.rs",
+          "line": 42,
+          "column": 1
+        }
       ],
       "locals": [
         {
@@ -1604,14 +1704,14 @@ sets `condition_unsupported:true` instead of silently ignoring the condition.
 Record one native execution through rr and register the resulting trace. This tool is present only
 when `[debug.record] backend = "rr"` is configured.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `language` | string | yes | Configured `[debug.<language>]` key |
-| `program` | string | yes | Program path to run under `rr record`; the program must already be built |
-| `args` | string array | no | Program arguments; defaults to `[]` |
-| `cwd` | string or null | no | Working directory for the recorded process |
-| `env` | string map | no | Environment variables for the recorded process; defaults to `{}` |
-| `timeout_ms` | integer or null | no | Record timeout in milliseconds; omit to use `debug.record.record_timeout_secs` |
+| Field        | Type            | Required | Description                                                                    |
+| ------------ | --------------- | -------- | ------------------------------------------------------------------------------ |
+| `language`   | string          | yes      | Configured `[debug.<language>]` key                                            |
+| `program`    | string          | yes      | Program path to run under `rr record`; the program must already be built       |
+| `args`       | string array    | no       | Program arguments; defaults to `[]`                                            |
+| `cwd`        | string or null  | no       | Working directory for the recorded process                                     |
+| `env`        | string map      | no       | Environment variables for the recorded process; defaults to `{}`               |
+| `timeout_ms` | integer or null | no       | Record timeout in milliseconds; omit to use `debug.record.record_timeout_secs` |
 
 **Returns** `{"recordable": bool, "reason": string|null, "trace_id": string|null, "trace": object|null, "exit_code": integer|null, "output": array, "output_truncated": bool, "error": object|null}`.
 
@@ -1627,11 +1727,11 @@ tools (`tower_debug_continue`, `tower_debug_step`, `tower_debug_threads`, `tower
 `tower_debug_variables`, `tower_debug_evaluate`, `tower_debug_terminate`, and
 `tower_debug_disconnect`) and advertise reverse execution support.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `trace_id` | string | yes | Trace returned by `tower_debug_record` or `tower_debug_traces` |
-| `language` | string | yes | Configured `[debug.<language>]` key |
-| `timeout_secs` | integer or null | no | Override the configured debug timeout for replay startup |
+| Field          | Type            | Required | Description                                                    |
+| -------------- | --------------- | -------- | -------------------------------------------------------------- |
+| `trace_id`     | string          | yes      | Trace returned by `tower_debug_record` or `tower_debug_traces` |
+| `language`     | string          | yes      | Configured `[debug.<language>]` key                            |
+| `timeout_secs` | integer or null | no       | Override the configured debug timeout for replay startup       |
 
 **Returns** `{"session_id": string, "trace_id": string, "state": "stopped", "stop": object|null, "supportsStepBack": bool}`.
 
@@ -1640,11 +1740,11 @@ tools (`tower_debug_continue`, `tower_debug_step`, `tower_debug_threads`, `tower
 Resume a replay session backward until the previous matching stop, breakpoint, watchpoint, start of
 trace, or timeout.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Replay session returned by `tower_debug_replay` |
-| `thread_id` | integer or null | no | Adapter thread to reverse-continue |
-| `timeout_secs` | integer or null | no | Override the configured timeout for this call |
+| Field          | Type            | Required | Description                                     |
+| -------------- | --------------- | -------- | ----------------------------------------------- |
+| `session_id`   | string          | yes      | Replay session returned by `tower_debug_replay` |
+| `thread_id`    | integer or null | no       | Adapter thread to reverse-continue              |
+| `timeout_secs` | integer or null | no       | Override the configured timeout for this call   |
 
 **Returns** the same stop object as `tower_debug_continue`. Live non-replay sessions return a
 structured `reverse_unsupported` payload.
@@ -1653,12 +1753,12 @@ structured `reverse_unsupported` payload.
 
 Step a replay session backward.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Replay session returned by `tower_debug_replay` |
-| `thread_id` | integer or null | no | Adapter thread to step backward |
-| `granularity` | `"line"`, `"instruction"`, or `"over"` | no | Backward step granularity; defaults to `"line"` |
-| `timeout_secs` | integer or null | no | Override the configured timeout for this call |
+| Field          | Type                                   | Required | Description                                     |
+| -------------- | -------------------------------------- | -------- | ----------------------------------------------- |
+| `session_id`   | string                                 | yes      | Replay session returned by `tower_debug_replay` |
+| `thread_id`    | integer or null                        | no       | Adapter thread to step backward                 |
+| `granularity`  | `"line"`, `"instruction"`, or `"over"` | no       | Backward step granularity; defaults to `"line"` |
+| `timeout_secs` | integer or null                        | no       | Override the configured timeout for this call   |
 
 **Returns** the same stop object as `tower_debug_continue`. Live non-replay sessions return a
 structured `reverse_unsupported` payload.
@@ -1667,14 +1767,14 @@ structured `reverse_unsupported` payload.
 
 Set a replay-session watchpoint by expression or address.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Replay session returned by `tower_debug_replay` |
-| `expression` | string or null | no | Expression to watch, for example a variable name |
-| `address` | string or null | no | Address to watch when expression-based watchpoints are not desired |
-| `kind` | `"write"`, `"read"`, or `"access"` | yes | Watchpoint access kind |
-| `enabled` | boolean or null | no | Defaults to `true` |
-| `timeout_secs` | integer or null | no | Reserved timeout override for adapters that need it |
+| Field          | Type                               | Required | Description                                                        |
+| -------------- | ---------------------------------- | -------- | ------------------------------------------------------------------ |
+| `session_id`   | string                             | yes      | Replay session returned by `tower_debug_replay`                    |
+| `expression`   | string or null                     | no       | Expression to watch, for example a variable name                   |
+| `address`      | string or null                     | no       | Address to watch when expression-based watchpoints are not desired |
+| `kind`         | `"write"`, `"read"`, or `"access"` | yes      | Watchpoint access kind                                             |
+| `enabled`      | boolean or null                    | no       | Defaults to `true`                                                 |
+| `timeout_secs` | integer or null                    | no       | Reserved timeout override for adapters that need it                |
 
 **Returns** `{"ok": bool, "watchpoint": {"watchpoint_id": string, "expression": string|null, "address": string|null, "kind": string, "enabled": bool, "verified": bool}|null, "error": object|null}`.
 
@@ -1682,9 +1782,9 @@ Set a replay-session watchpoint by expression or address.
 
 List recorded traces known to the debug sidecar.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| _(none)_ | — | — | This tool takes no arguments |
+| Field    | Type | Required | Description                  |
+| -------- | ---- | -------- | ---------------------------- |
+| _(none)_ | —    | —        | This tool takes no arguments |
 
 **Returns** `{"traces": [{"trace_id": string, "path": string, "created_unix_secs": uint, "program": string, "args_summary": array, "exit_code": integer|null, "output_summary": array, "output_truncated": bool, "expires_unix_secs": uint|null, "ttl_secs": uint|null, "prune_generation": uint}]}`.
 
@@ -1692,9 +1792,9 @@ List recorded traces known to the debug sidecar.
 
 Delete one recorded trace by id. Deletion is contained to the configured trace root.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `trace_id` | string | yes | Trace id returned by `tower_debug_record` or `tower_debug_traces` |
+| Field      | Type   | Required | Description                                                       |
+| ---------- | ------ | -------- | ----------------------------------------------------------------- |
+| `trace_id` | string | yes      | Trace id returned by `tower_debug_record` or `tower_debug_traces` |
 
 **Returns** `{"deleted": bool, "trace_id": string, "error": object|null}`.
 
@@ -1703,15 +1803,15 @@ Delete one recorded trace by id. Deletion is contained to the configured trace r
 Open replay, seek to a target point, set a write watchpoint for a watched value, reverse-continue to
 the last write, capture bounded evidence, and clean up the replay session before returning.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `trace_id` | string | yes | Trace to inspect |
-| `language` | string | yes | Configured `[debug.<language>]` key |
-| `at` | object | yes | Target point: `{"kind":"crash"}`, `{"kind":"end"}`, or `{"kind":"source","path":"src/main.rs","line":42,"column":1}` |
-| `watch` | string | yes | Watched expression or value location |
-| `timeout_secs` | integer or null | no | Timeout for replay seek and reverse operations |
-| `max_depth` | integer or null | no | Recursive variable expansion depth |
-| `max_children` | integer or null | no | Maximum expanded children per node or scope |
+| Field          | Type            | Required | Description                                                                                                          |
+| -------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `trace_id`     | string          | yes      | Trace to inspect                                                                                                     |
+| `language`     | string          | yes      | Configured `[debug.<language>]` key                                                                                  |
+| `at`           | object          | yes      | Target point: `{"kind":"crash"}`, `{"kind":"end"}`, or `{"kind":"source","path":"src/main.rs","line":42,"column":1}` |
+| `watch`        | string          | yes      | Watched expression or value location                                                                                 |
+| `timeout_secs` | integer or null | no       | Timeout for replay seek and reverse operations                                                                       |
+| `max_depth`    | integer or null | no       | Recursive variable expansion depth                                                                                   |
+| `max_children` | integer or null | no       | Maximum expanded children per node or scope                                                                          |
 
 **Returns** `{"found": bool, "reason": string|null, "trace_id": string|null, "write_frame": object|null, "stack": array, "value": object|null, "locals": array, "args": array, "output": array, "truncated": bool, "error": object|null}`.
 
@@ -1722,10 +1822,10 @@ When reverse execution reaches the start of the trace without finding a prior wr
 
 Record a program and immediately run the origin-finding recipe against the new trace.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `record` | object | yes | Same shape as `tower_debug_record` arguments |
-| `origin` | object | yes | Origin request without `trace_id`: `language`, `at`, `watch`, `timeout_secs`, `max_depth`, and `max_children` |
+| Field    | Type   | Required | Description                                                                                                   |
+| -------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `record` | object | yes      | Same shape as `tower_debug_record` arguments                                                                  |
+| `origin` | object | yes      | Origin request without `trace_id`: `language`, `at`, `watch`, `timeout_secs`, `max_depth`, and `max_children` |
 
 **Returns** `{"record": <tower_debug_record result>, "origin": <tower_debug_find_origin result>|null}`. If recording is unsupported, `origin` is `null`; if recording succeeds but origin search fails, both the trace record result and origin failure are returned.
 
@@ -1733,9 +1833,9 @@ Record a program and immediately run the origin-finding recipe against the new t
 
 Terminate the debuggee and adapter process tree, then remove the session.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| Field        | Type   | Required | Description                              |
+| ------------ | ------ | -------- | ---------------------------------------- |
+| `session_id` | string | yes      | Session returned by `tower_debug_launch` |
 
 **Returns** `{"ok": true}`
 
@@ -1743,9 +1843,9 @@ Terminate the debuggee and adapter process tree, then remove the session.
 
 Ask the adapter to disconnect, then remove the session.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `session_id` | string | yes | Session returned by `tower_debug_launch` |
+| Field        | Type   | Required | Description                              |
+| ------------ | ------ | -------- | ---------------------------------------- |
+| `session_id` | string | yes      | Session returned by `tower_debug_launch` |
 
 **Returns** `{"ok": true}`
 
@@ -1753,9 +1853,9 @@ Ask the adapter to disconnect, then remove the session.
 
 List live ephemeral sessions.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| _(none)_ | — | — | This tool takes no arguments |
+| Field    | Type | Required | Description                  |
+| -------- | ---- | -------- | ---------------------------- |
+| _(none)_ | —    | —        | This tool takes no arguments |
 
 **Returns** `{"sessions": [{"session_id": string, "language": string, "state": "initializing"|"stopped"|"running"|"terminated", "last_stop": object|null}]}`
 
@@ -1805,11 +1905,11 @@ plan with semantic reference analysis and host preflight before applying changes
 
 Supported languages (detected by file extension or language ID):
 
-| Extension / ID           | Language |
-|--------------------------|----------|
-| `.rs`, `rust`, `RUST`    | Rust     |
-| `.go`, `go`              | Go       |
-| `.php`, `php`            | PHP      |
+| Extension / ID        | Language |
+| --------------------- | -------- |
+| `.rs`, `rust`, `RUST` | Rust     |
+| `.go`, `go`           | Go       |
+| `.php`, `php`         | PHP      |
 
 Any other extension or language ID returns `{"unsupported": true, "language": "<hint>"}`.
 
@@ -1822,7 +1922,7 @@ definitions, and PHP classes.
 MCP name: `"tower_ast_get_outline"`
 
 | Field  | Type   | Required | Description                            |
-|--------|--------|----------|----------------------------------------|
+| ------ | ------ | -------- | -------------------------------------- |
 | `path` | string | yes      | Workspace-relative path to source file |
 
 **Returns (supported language)**
@@ -1909,11 +2009,11 @@ string literals.
 
 MCP name: `"tower_ast_find_symbols"`
 
-| Field         | Type   | Required | Description                                          |
-|---------------|--------|----------|------------------------------------------------------|
-| `path`        | string | yes      | Workspace-relative path to source file               |
-| `symbol_name` | string | yes      | Name of the symbol to search for                     |
-| `kind`        | string | yes      | Symbol kind (see table below)                        |
+| Field         | Type   | Required | Description                            |
+| ------------- | ------ | -------- | -------------------------------------- |
+| `path`        | string | yes      | Workspace-relative path to source file |
+| `symbol_name` | string | yes      | Name of the symbol to search for       |
+| `kind`        | string | yes      | Symbol kind (see table below)          |
 
 **Valid `kind` values**
 
@@ -1928,20 +2028,20 @@ Not every kind is valid for every language. Sending a kind that cannot exist in
 the target language returns `{"matches": []}` (not an error), preserving the
 "kind not applicable" contract.
 
-| Kind        | Rust | Go | PHP |
-|-------------|------|----|-----|
-| function    | yes  | yes| yes |
-| struct      | yes  | yes| no  |
-| enum        | yes  | no | no  |
-| trait       | yes  | yes| yes |
-| impl        | yes  | no | no  |
-| method      | yes  | yes| yes |
-| module      | yes  | no | no  |
-| type_alias  | yes  | yes| no  |
-| const       | yes  | yes| no  |
-| static      | yes  | no | no  |
-| macro_def   | yes  | no | no  |
-| class       | no   | no | yes |
+| Kind       | Rust | Go  | PHP |
+| ---------- | ---- | --- | --- |
+| function   | yes  | yes | yes |
+| struct     | yes  | yes | no  |
+| enum       | yes  | no  | no  |
+| trait      | yes  | yes | yes |
+| impl       | yes  | no  | no  |
+| method     | yes  | yes | yes |
+| module     | yes  | no  | no  |
+| type_alias | yes  | yes | no  |
+| const      | yes  | yes | no  |
+| static     | yes  | no  | no  |
+| macro_def  | yes  | no  | no  |
+| class      | no   | no  | yes |
 
 **Returns (symbol found)**
 
@@ -2005,10 +2105,10 @@ files are indexed (index-as-you-go) and keeps current via `fileIndexed` /
 
 MCP name: `"tower_ast_search_symbols"`
 
-| Field  | Type   | Required | Description                                                      |
-|--------|--------|----------|------------------------------------------------------------------|
-| `name` | string | yes      | Exact symbol name to search for                                  |
-| `kind` | string | no       | Optional kind filter (same kind values as `find_symbols`)        |
+| Field  | Type   | Required | Description                                               |
+| ------ | ------ | -------- | --------------------------------------------------------- |
+| `name` | string | yes      | Exact symbol name to search for                           |
+| `kind` | string | no       | Optional kind filter (same kind values as `find_symbols`) |
 
 **Returns**
 
@@ -2019,9 +2119,12 @@ MCP name: `"tower_ast_search_symbols"`
       "path": "src/lib.rs",
       "kind": "function",
       "name": "my_fn",
-      "start_byte": 10, "end_byte": 50,
-      "start_row": 2, "start_col": 0,
-      "end_row": 4, "end_col": 1
+      "start_byte": 10,
+      "end_byte": 50,
+      "start_row": 2,
+      "start_col": 0,
+      "end_row": 4,
+      "end_col": 1
     }
   ]
 }
@@ -2041,9 +2144,9 @@ arguments.
 
 MCP name: `"tower_ast_reindex"`
 
-| Field    | Type | Required | Description                          |
-|----------|------|----------|--------------------------------------|
-| _(none)_ | —    | —        | This tool takes no arguments         |
+| Field    | Type | Required | Description                  |
+| -------- | ---- | -------- | ---------------------------- |
+| _(none)_ | —    | —        | This tool takes no arguments |
 
 **Returns** `{"indexed_files": uint, "symbols": uint}` — the number of files
 indexed and the total number of symbols discovered across them.
@@ -2060,11 +2163,11 @@ a symbol's span, then write that span. (Spec 16.)
 
 MCP name: `"tower_ast_read_symbol"`
 
-| Field         | Type   | Required | Description                                                       |
-|---------------|--------|----------|-------------------------------------------------------------------|
-| `path`        | string | yes      | Workspace-relative path to the source file                        |
-| `symbol_name` | string | yes      | Name of the symbol to read                                        |
-| `kind`        | string | no       | Optional kind filter to disambiguate same-named symbols           |
+| Field         | Type   | Required | Description                                             |
+| ------------- | ------ | -------- | ------------------------------------------------------- |
+| `path`        | string | yes      | Workspace-relative path to the source file              |
+| `symbol_name` | string | yes      | Name of the symbol to read                              |
+| `kind`        | string | no       | Optional kind filter to disambiguate same-named symbols |
 
 **Returns**
 
@@ -2074,8 +2177,10 @@ MCP name: `"tower_ast_read_symbol"`
     {
       "kind": "function",
       "name": "handle",
-      "start_byte": 100, "end_byte": 200,
-      "start_row": 5, "end_row": 12,
+      "start_byte": 100,
+      "end_byte": 200,
+      "start_row": 5,
+      "end_row": 12,
       "content": "pub fn handle() {\n    ...\n}"
     }
   ]
@@ -2091,13 +2196,13 @@ Replace the body of one uniquely resolved symbol. Tower resolves the symbol span
 through the AST index, computes the body-only edit span, and submits one
 host-owned `workspace/applyEdits` request.
 
-| Field         | Type   | Required | Description                                              |
-|---------------|--------|----------|----------------------------------------------------------|
-| `path`        | string | yes      | Workspace-relative path to the source file               |
-| `symbol_name` | string | yes      | Name of the symbol to edit                               |
-| `kind`        | string | no       | Optional kind filter                                     |
-| `replacement` | string | yes      | Replacement text for the symbol body                     |
-| `dry_run`     | bool   | no       | Return preview data without mutating files               |
+| Field         | Type   | Required | Description                                |
+| ------------- | ------ | -------- | ------------------------------------------ |
+| `path`        | string | yes      | Workspace-relative path to the source file |
+| `symbol_name` | string | yes      | Name of the symbol to edit                 |
+| `kind`        | string | no       | Optional kind filter                       |
+| `replacement` | string | yes      | Replacement text for the symbol body       |
+| `dry_run`     | bool   | no       | Return preview data without mutating files |
 
 **Returns**
 
@@ -2146,7 +2251,7 @@ newline, Tower removes that newline too, but it does not chase references or cal
 sites elsewhere in the workspace.
 
 | Field         | Type   | Required | Description                                |
-|---------------|--------|----------|--------------------------------------------|
+| ------------- | ------ | -------- | ------------------------------------------ |
 | `path`        | string | yes      | Workspace-relative path to the source file |
 | `symbol_name` | string | yes      | Name of the symbol to delete               |
 | `kind`        | string | no       | Optional kind filter                       |
@@ -2175,7 +2280,6 @@ success and stable structured error payloads on resolution failures:
 
 Other stable `code` values are `not_found`, `unsupported_language`,
 `invalid_range`, and `backend_error`.
-
 
 ---
 

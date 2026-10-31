@@ -1,3 +1,6 @@
 [mcp_servers.tower]
 command = "tower"
 args = ["mcp", "--workspace-dir", "/home/pocky/Sites/awf-project/tower"]
+
+[mcp_servers.tower.tools.tower_list_projects]
+approval_mode = "approve"

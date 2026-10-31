@@ -41,6 +41,7 @@ pub mod in_memory_storage;
 /// Protocol plumbing only — tool handlers live in spec 10b, extension tool
 /// merging in spec 28. The [`mcp::ToolRegistry`] trait is the seam.
 pub mod mcp;
+mod path_identity;
 pub mod storage;
 pub mod watcher;
 
