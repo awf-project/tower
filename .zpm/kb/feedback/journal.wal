@@ -404,3 +404,21 @@
 {"ts":1793381108,"op":"assert","clause":"trigger('external_project_identity_validate_before_connect','crates/core_engine/src/adapters/config/mod.rs',file)"}
 {"ts":1793381108,"op":"assert","clause":"trigger('external_project_identity_validate_before_connect','crates/core_engine/src/adapters/daemon/client.rs',file)"}
 {"ts":1793403640,"op":"assert","clause":"rule(watcher_toctou_regression_barriers, test, 'Exercise watcher TOCTOU regressions by pausing after disk observation and before workspace lock acquisition, completing a native rename or reindex, then releasing the event; sequential delayed-event tests do not cover this interleaving.', high, 'PR test failure investigation 2026-10-31')"}
+{"ts":1793486138,"op":"assert","clause":"rule(f014_privilege_independent_unreadable_fixture, test, 'Use a Unix-domain socket entry rather than mode 000 when a dependency-scan test must deterministically exercise an unreadable file under privileged runners.', high, 'F014 T007 QA remediation 2026-10-31')"}
+{"ts":1793487832,"op":"assert","clause":"rule(f014_t008_storage_boundary_observation, test, 'When acceptance requires rejection before writable-port access and unchanged storage, instrument every StoragePort writer and compare a complete tracked storage projection after each rejected public call; checking only pre-existing file IDs misses orphan records.', high, 'F014 T008 QA remediation 2026-11-01')"}
+{"ts":1793493134,"op":"assert","clause":"rule(dependency_search_no_follow_containment, pitfall, 'Always apply containment and ignore decisions before loading dependency files, and never follow symlinks during dependency walking.', high, 'implement F014 2026-11-01')"}
+{"ts":1793493135,"op":"assert","clause":"trigger(dependency_search_no_follow_containment, '', project)"}
+{"ts":1793493135,"op":"assert","clause":"rule(dependency_snapshot_atomic_publication, architecture, 'Ensure configured dependency scans complete into an immutable snapshot before publishing it to search handlers; never expose a partially built snapshot.', high, 'implement F014 2026-11-01')"}
+{"ts":1793493135,"op":"assert","clause":"trigger(dependency_snapshot_atomic_publication, '', project)"}
+{"ts":1793493135,"op":"assert","clause":"rule(dependency_locators_reject_mutations, pitfall, 'Always reject dependency locators before executing any mutating or formatting operation; dependency search paths are read-only.', high, 'implement F014 2026-11-01')"}
+{"ts":1793493136,"op":"assert","clause":"trigger(dependency_locators_reject_mutations, '', project)"}
+{"ts":1793493136,"op":"assert","clause":"rule(dependency_scope_requires_explicit_opt_in, architecture, 'Require callers to explicitly select dependency scope and origin; default search behavior must remain workspace-only.', high, 'implement F014 2026-11-01')"}
+{"ts":1793493136,"op":"assert","clause":"trigger(dependency_scope_requires_explicit_opt_in, '', project)"}
+{"ts":1793493141,"op":"assert","clause":"rule('dependency_search_no_follow_containment',pitfall,'Always apply containment and ignore decisions before loading dependency files, and never follow symlinks during dependency walking.',high,'implement')"}
+{"ts":1793493141,"op":"assert","clause":"trigger('dependency_search_no_follow_containment','',project)"}
+{"ts":1793493142,"op":"assert","clause":"rule('dependency_snapshot_atomic_publication',architecture,'Ensure configured dependency scans complete into an immutable snapshot before publishing it to search handlers; never expose a partially built snapshot.',high,'implement')"}
+{"ts":1793493142,"op":"assert","clause":"trigger('dependency_snapshot_atomic_publication','',project)"}
+{"ts":1793493142,"op":"assert","clause":"rule('dependency_locators_reject_mutations',pitfall,'Always reject dependency locators before executing any mutating or formatting operation; dependency search paths are read-only.',high,'implement')"}
+{"ts":1793493143,"op":"assert","clause":"trigger('dependency_locators_reject_mutations','',project)"}
+{"ts":1793493143,"op":"assert","clause":"rule('dependency_scope_requires_explicit_opt_in',architecture,'Require callers to explicitly select dependency scope and origin; default search behavior must remain workspace-only.',high,'implement')"}
+{"ts":1793493144,"op":"assert","clause":"trigger('dependency_scope_requires_explicit_opt_in','',project)"}

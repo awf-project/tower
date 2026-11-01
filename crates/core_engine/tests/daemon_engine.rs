@@ -1,18 +1,19 @@
-//! Engine-builder smoke test (Task 6).
-// Feature: B001
+//! Engine-builder smoke test.
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Duration;
 
 use core_engine::adapters::cli::GlobalOpts;
 use core_engine::adapters::config::lsp::validate_lsp_commands;
-use core_engine::adapters::config::{LspConfig, LspServerConfig, TowerConfig};
+use core_engine::adapters::config::{
+    DependenciesConfig, LspConfig, LspServerConfig, ResolvedDependencyRoot, TowerConfig,
+};
 use core_engine::adapters::daemon::engine::{
     PreparationError, build_early_context, build_engine, start_workspace_preparation,
 };
@@ -23,17 +24,24 @@ use core_engine::adapters::daemon::{
     CommittedEventPublisher, CommittedFileEvent, DaemonLifecycle, ExtensionCatchUpCoordinator,
     ExtensionDependencyPolicy, PublicationError, ReadinessController, SnapshotEntry,
 };
+use core_engine::adapters::fs::dependency_source::DependencyScanError;
 use core_engine::adapters::fs::workspace_scan;
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::native_tools::{
+    DependencySnapshotSource, EngineState, NativeToolRegistry,
+};
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use core_engine::adapters::mcp::types::ToolError;
-use core_engine::adapters::watcher::WatcherError;
+use core_engine::adapters::watcher::{EventProcessor, WatchEvent, WatcherError};
 use core_engine::adapters::{InMemoryStorage, NotifyWatcherAdapter, SledStorageAdapter};
 use core_engine::domain::extension_host::ExtensionId;
 use core_engine::domain::index::InvertedIndex;
+use core_engine::domain::search::{
+    DependencyIndexLimits, DependencyIndexReport, DependencyIndexSnapshot, DependencyRootId,
+};
 use core_engine::domain::token::Token;
 use core_engine::domain::{FileId, ProjectWorkspace, RelativePath};
-use core_engine::ports::{ExtensionHostPort, NoOpExtensionHost, PortError};
+use core_engine::ports::{DocumentSyncPort, ExtensionHostPort, NoOpExtensionHost, PortError};
 use extension_protocol::{LspOutcomeCode, LspOutcomePhase, LspOutcomeStatus};
 use tempfile::tempdir;
 
@@ -60,6 +68,337 @@ fn early_context_fixture(
     };
     let context = build_early_context(&opts, config, &owner).expect("build early daemon context");
     (owner, Arc::new(context))
+}
+
+fn dependency_config(root: &Path) -> TowerConfig {
+    TowerConfig {
+        dependencies: DependenciesConfig {
+            roots: vec![ResolvedDependencyRoot {
+                id: DependencyRootId::new("library".to_owned()).expect("valid root id"),
+                path: root.to_path_buf(),
+            }],
+            ignore: Vec::new(),
+            limits: DependencyIndexLimits::new(100, 1024, 4096).expect("positive limits"),
+        },
+        ..TowerConfig::default()
+    }
+}
+
+fn start_prepared_engine(
+    workspace: &Path,
+    config: TowerConfig,
+) -> (
+    WorkspaceDaemonOwner,
+    Arc<core_engine::adapters::daemon::engine::PreparedEngine>,
+) {
+    let (owner, context) = early_context_fixture(workspace, config);
+    let prepared = start_workspace_preparation(context)
+        .expect("start preparation")
+        .join()
+        .expect("complete preparation");
+    (owner, prepared)
+}
+
+#[test]
+fn dependency_startup_publishes_current_disk_snapshot_before_engine() {
+    let workspace = tempdir().expect("workspace");
+    let dependency = tempdir().expect("dependency");
+    std::fs::write(dependency.path().join("lib.rs"), "pub fn current() {}\n").unwrap();
+
+    let (_owner, prepared) =
+        start_prepared_engine(workspace.path(), dependency_config(dependency.path()));
+
+    assert_eq!(prepared.dependency_snapshot().report().indexed_files, 1);
+}
+
+#[test]
+fn dependency_changes_remain_stale_until_explicit_reindex() {
+    let workspace = tempdir().expect("workspace");
+    let dependency = tempdir().expect("dependency");
+    std::fs::write(dependency.path().join("old.rs"), "pub fn old() {}\n").unwrap();
+    let (_owner, prepared) =
+        start_prepared_engine(workspace.path(), dependency_config(dependency.path()));
+    let before = prepared.dependency_snapshot();
+    std::fs::write(dependency.path().join("new.rs"), "pub fn new() {}\n").unwrap();
+
+    assert!(Arc::ptr_eq(&before, &prepared.dependency_snapshot()));
+    let result = NativeToolRegistry::new(prepared.state())
+        .call(
+            "tower_reindex",
+            serde_json::json!({}),
+            &core_engine::domain::NeverCancelled,
+        )
+        .expect("explicit refresh succeeds");
+
+    assert_eq!(result["dependency_report"]["indexed_files"], 2);
+    assert_eq!(prepared.dependency_snapshot().report().indexed_files, 2);
+}
+
+#[test]
+fn dependency_snapshot_publication_is_atomic_for_concurrent_searches() {
+    let old = Arc::new(DependencyIndexSnapshot::new(
+        Vec::new(),
+        DependencyIndexReport {
+            indexed_files: 1,
+            indexed_bytes: 1,
+            skipped_files: 0,
+            truncated: false,
+            limit_reasons: Vec::new(),
+            issues: Vec::new(),
+        },
+    ));
+    let new = Arc::new(DependencyIndexSnapshot::new(
+        Vec::new(),
+        DependencyIndexReport {
+            indexed_files: 2,
+            indexed_bytes: 2,
+            skipped_files: 0,
+            truncated: false,
+            limit_reasons: Vec::new(),
+            issues: Vec::new(),
+        },
+    ));
+    struct ControlledSource {
+        ready: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+        snapshot: Mutex<Option<DependencyIndexSnapshot>>,
+    }
+    impl DependencySnapshotSource for ControlledSource {
+        fn build_snapshot(
+            &self,
+            _limits: &DependencyIndexLimits,
+        ) -> Result<DependencyIndexSnapshot, DependencyScanError> {
+            self.ready.wait();
+            self.release.wait();
+            Ok(self.snapshot.lock().unwrap().take().unwrap())
+        }
+    }
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let source = Arc::new(ControlledSource {
+        ready: Arc::clone(&ready),
+        release: Arc::clone(&release),
+        snapshot: Mutex::new(Some((*new).clone())),
+    });
+    let engine = Arc::new(RwLock::new(EngineState::new(
+        ProjectWorkspace::new(),
+        InvertedIndex::new(),
+        Box::new(InMemoryStorage::new()),
+        Box::new(core_engine::adapters::InMemoryFs::new()),
+    )));
+    engine.write().unwrap().configure_dependency_index(
+        source,
+        DependencyIndexLimits::new(100, 1024, 4096).unwrap(),
+        Arc::clone(&old),
+    );
+    let refresh = {
+        let engine = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            NativeToolRegistry::new(engine).call(
+                "tower_reindex",
+                serde_json::json!({}),
+                &core_engine::domain::NeverCancelled,
+            )
+        })
+    };
+
+    ready.wait();
+    assert!(Arc::ptr_eq(
+        &engine.read().unwrap().dependency_snapshot(),
+        &old
+    ));
+    release.wait();
+    refresh
+        .join()
+        .expect("refresh joins")
+        .expect("refresh succeeds");
+    let published = engine.read().unwrap().dependency_snapshot();
+    assert_eq!(*published, *new);
+    assert_eq!(published.report().indexed_files, 2);
+    assert_eq!(published.report().indexed_bytes, 2);
+}
+
+#[test]
+fn concurrent_dependency_refreshes_do_not_publish_an_older_scan_last() {
+    struct OrderedSource {
+        next_scan: AtomicUsize,
+        entered: mpsc::Sender<usize>,
+        releases: [Arc<std::sync::Barrier>; 2],
+        snapshots: [DependencyIndexSnapshot; 2],
+    }
+    impl DependencySnapshotSource for OrderedSource {
+        fn build_snapshot(
+            &self,
+            _limits: &DependencyIndexLimits,
+        ) -> Result<DependencyIndexSnapshot, DependencyScanError> {
+            let scan = self.next_scan.fetch_add(1, Ordering::AcqRel);
+            self.entered.send(scan).expect("report entered scan");
+            self.releases[scan].wait();
+            Ok(self.snapshots[scan].clone())
+        }
+    }
+    let snapshot = |indexed_files| {
+        DependencyIndexSnapshot::new(
+            Vec::new(),
+            DependencyIndexReport {
+                indexed_files,
+                indexed_bytes: indexed_files as u64,
+                skipped_files: 0,
+                truncated: false,
+                limit_reasons: Vec::new(),
+                issues: Vec::new(),
+            },
+        )
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let releases = [
+        Arc::new(std::sync::Barrier::new(2)),
+        Arc::new(std::sync::Barrier::new(2)),
+    ];
+    let source = Arc::new(OrderedSource {
+        next_scan: AtomicUsize::new(0),
+        entered: entered_tx,
+        releases: [Arc::clone(&releases[0]), Arc::clone(&releases[1])],
+        snapshots: [snapshot(1), snapshot(2)],
+    });
+    let engine = Arc::new(RwLock::new(EngineState::new(
+        ProjectWorkspace::new(),
+        InvertedIndex::new(),
+        Box::new(InMemoryStorage::new()),
+        Box::new(core_engine::adapters::InMemoryFs::new()),
+    )));
+    engine.write().unwrap().configure_dependency_index(
+        source,
+        DependencyIndexLimits::new(100, 1024, 4096).unwrap(),
+        Arc::new(snapshot(0)),
+    );
+    let run = |state: Arc<RwLock<EngineState>>| {
+        std::thread::spawn(move || {
+            NativeToolRegistry::new(state).call(
+                "tower_reindex",
+                serde_json::json!({}),
+                &core_engine::domain::NeverCancelled,
+            )
+        })
+    };
+
+    let older = run(Arc::clone(&engine));
+    assert_eq!(entered_rx.recv().unwrap(), 0);
+    let newer = run(Arc::clone(&engine));
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "the refresh gate must keep the newer scan outside the scanner"
+    );
+    releases[0].wait();
+    older.join().expect("older joins").expect("older refresh");
+    assert_eq!(entered_rx.recv().unwrap(), 1);
+    releases[1].wait();
+    newer.join().expect("newer joins").expect("newer refresh");
+
+    let published = engine.read().unwrap().dependency_snapshot();
+    assert_eq!(published.report().indexed_files, 2);
+    assert_eq!(published.report().indexed_bytes, 2);
+}
+
+#[test]
+fn dependency_roots_emit_no_workspace_watcher_or_extension_events() {
+    let workspace = tempdir().expect("workspace");
+    let dependency = tempdir().expect("dependency");
+    std::fs::write(dependency.path().join("one.rs"), "one\n").unwrap();
+    let (_owner, prepared) =
+        start_prepared_engine(workspace.path(), dependency_config(dependency.path()));
+    assert_eq!(prepared.watcher_registered_root(), workspace.path());
+    assert_ne!(prepared.watcher_registered_root(), dependency.path());
+    let committed_before = prepared.committed_event_sequence();
+    let workspace_before = prepared
+        .state()
+        .read()
+        .unwrap()
+        .workspace
+        .read()
+        .unwrap()
+        .snapshot();
+
+    std::fs::write(dependency.path().join("two.rs"), "two\n").unwrap();
+    prepared.watcher_barrier().expect("drain workspace watcher");
+
+    let workspace_after = prepared
+        .state()
+        .read()
+        .unwrap()
+        .workspace
+        .read()
+        .unwrap()
+        .snapshot();
+    assert_eq!(workspace_after.files.len(), workspace_before.files.len());
+    assert_eq!(prepared.dependency_snapshot().report().indexed_files, 1);
+    assert!(
+        prepared
+            .watcher_observed_paths()
+            .iter()
+            .all(|path| !path.starts_with(dependency.path())),
+        "the workspace watcher must emit no WatchEvent for a dependency root"
+    );
+    assert_eq!(prepared.committed_event_sequence(), committed_before);
+
+    struct RecordingExtensionHost(Arc<AtomicUsize>);
+    impl ExtensionHostPort for RecordingExtensionHost {
+        fn on_file_indexed(&self, _id: FileId, _path: &RelativePath) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_file_changed(&self, _id: FileId, _path: &RelativePath) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_file_deleted(&self, _path: &RelativePath) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn declared_tools(&self) -> Vec<(ExtensionId, extension_protocol::ToolDecl)> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            name: &str,
+            _params: serde_json::Value,
+            _cancellation: &dyn core_engine::domain::CancellationSignal,
+        ) -> Result<serde_json::Value, core_engine::domain::InvokeError> {
+            Err(core_engine::domain::InvokeError::ToolNotFound(
+                name.to_owned(),
+            ))
+        }
+    }
+    struct RecordingDocumentSync(Arc<AtomicUsize>);
+    impl DocumentSyncPort for RecordingDocumentSync {
+        fn serves(&self, _path: &RelativePath) -> bool {
+            true
+        }
+        fn document_opened(&self, _path: &RelativePath, _text: &str) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn document_changed(&self, _path: &RelativePath, _text: &str) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn document_closed(&self, _path: &RelativePath) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let extension_events = Arc::new(AtomicUsize::new(0));
+    let document_sync_events = Arc::new(AtomicUsize::new(0));
+    let mut routing_probe = EventProcessor::new(
+        workspace.path().to_path_buf(),
+        Arc::new(RwLock::new(ProjectWorkspace::new())),
+        Arc::new(RwLock::new(InvertedIndex::new())),
+        Box::new(InMemoryStorage::new()),
+        Box::new(RecordingExtensionHost(Arc::clone(&extension_events))),
+    )
+    .with_document_sync(
+        Arc::new(RecordingDocumentSync(Arc::clone(&document_sync_events))),
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    routing_probe
+        .process_event(WatchEvent::Create(dependency.path().join("two.rs")))
+        .expect("an out-of-workspace event is ignored");
+    assert_eq!(document_sync_events.load(Ordering::Relaxed), 0);
+    assert_eq!(extension_events.load(Ordering::Relaxed), 0);
 }
 
 #[test]

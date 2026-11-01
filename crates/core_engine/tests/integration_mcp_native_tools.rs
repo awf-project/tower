@@ -5,7 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read as _;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -13,8 +15,8 @@ use extension_protocol::messages::{
     PATH_RENAME_REQUEST_SCHEMA_JSON, PathRenameError, PathRenameErrorCode,
     PathRenameRequest as WirePathRenameRequest, PathRenameResult as WirePathRenameResult,
 };
+use rmcp::RoleClient;
 use rmcp::model::CallToolRequestParams;
-use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
 
 use core_engine::adapters::config::{QueryableProjects, load};
@@ -22,6 +24,7 @@ use core_engine::adapters::daemon::client::{
     ExternalDaemonClient, ExternalDaemonError, ExternalProjectConnector,
 };
 use core_engine::adapters::fs::WorkspacePathExclusion;
+use core_engine::adapters::fs::dependency_source::FsDependencySource;
 use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
 use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
 use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
@@ -32,20 +35,28 @@ use core_engine::adapters::mcp::project_query::ProjectQueryRegistry;
 use core_engine::adapters::mcp::registry::ToolRegistry;
 use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
 use core_engine::adapters::{InMemoryFs, InMemoryStorage, RealFs};
-use core_engine::domain::RelativePath;
 use core_engine::domain::extension_host::ExtensionRegistry;
 use core_engine::domain::index::InvertedIndex;
 use core_engine::domain::mutation::FileMutationService;
 use core_engine::domain::refactor::{
     PathRenameError as DomainPathRenameError, PathRenameRequest, PathRenameSemanticPolicy,
 };
+use core_engine::domain::search::DependencyIndexLimits;
 use core_engine::domain::token::tokenize;
 use core_engine::domain::virtual_file::FileMetadata;
 use core_engine::domain::workspace::ProjectWorkspace;
+use core_engine::domain::{ContentHash, FileId, RelativePath, VirtualFile};
 use core_engine::ports::{
     FileMutationUseCase, FileSystemPort, NoOpExtensionHost, PortError, ReconciliationDelta,
     StoragePort,
 };
+
+#[path = "support/mcp_server.rs"]
+mod mcp_server;
+use mcp_server::start_server;
+#[path = "support/dependency_search.rs"]
+mod dependency_search;
+use dependency_search::dependency_search_state_with_storage;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -117,19 +128,6 @@ fn make_handler(state: Arc<RwLock<EngineState>>) -> TowerMcpHandler {
     TowerMcpHandler::new(merged, diag_reader, sub_reg, vec![])
 }
 
-/// Spin up a real rmcp server around `handler` and return a connected client.
-async fn start_server(handler: TowerMcpHandler) -> rmcp::service::RunningService<RoleClient, ()> {
-    let (server_transport, client_transport) = tokio::io::duplex(65_536);
-    tokio::spawn(async move {
-        if let Ok(server) = handler.serve(server_transport).await {
-            let _ = server.waiting().await;
-        }
-    });
-    ().serve(client_transport)
-        .await
-        .expect("client connect failed")
-}
-
 /// Run an async test body synchronously using a new tokio runtime.
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -197,6 +195,192 @@ fn native_registry_tool_names(state: Arc<RwLock<EngineState>>) -> Vec<String> {
         .into_iter()
         .map(|tool| tool.name)
         .collect()
+}
+
+fn dependency_search_state(workspace_root: &std::path::Path) -> Arc<RwLock<EngineState>> {
+    dependency_search_state_with_storage(workspace_root, Box::new(InMemoryStorage::new()))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StorageProjection {
+    files: BTreeMap<FileId, VirtualFile>,
+    blobs: BTreeMap<[u8; 32], Vec<u8>>,
+    scan_complete: bool,
+}
+
+#[derive(Clone, Default)]
+struct StorageProbe {
+    write_calls: Arc<Mutex<Vec<&'static str>>>,
+    projection: Arc<Mutex<StorageProjection>>,
+}
+
+impl StorageProbe {
+    fn snapshot(&self) -> StorageProjection {
+        self.projection.lock().unwrap().clone()
+    }
+
+    fn assert_no_writes_since(&self, before: usize) {
+        assert_eq!(self.write_calls.lock().unwrap().len(), before);
+    }
+
+    fn write_count(&self) -> usize {
+        self.write_calls.lock().unwrap().len()
+    }
+
+    fn record_write(&self, operation: &'static str) {
+        self.write_calls.lock().unwrap().push(operation);
+    }
+}
+
+struct ObservedStorage {
+    inner: InMemoryStorage,
+    probe: StorageProbe,
+}
+
+impl ObservedStorage {
+    fn new() -> (Self, StorageProbe) {
+        let probe = StorageProbe::default();
+        (
+            Self {
+                inner: InMemoryStorage::new(),
+                probe: probe.clone(),
+            },
+            probe,
+        )
+    }
+}
+
+impl StoragePort for ObservedStorage {
+    fn apply_reconciliation_delta(&mut self, delta: &ReconciliationDelta) -> Result<(), PortError> {
+        self.probe.record_write("apply_reconciliation_delta");
+        self.inner.apply_reconciliation_delta(delta)?;
+        let mut projection = self.probe.projection.lock().unwrap();
+        for id in &delta.removals {
+            projection.files.remove(id);
+        }
+        for file in &delta.additions {
+            projection.files.insert(file.id, file.clone());
+        }
+        Ok(())
+    }
+
+    fn get(&self, id: FileId) -> Result<VirtualFile, PortError> {
+        self.inner.get(id)
+    }
+
+    fn put(&mut self, file: VirtualFile) -> Result<(), PortError> {
+        self.probe.record_write("put");
+        self.inner.put(file.clone())?;
+        self.probe
+            .projection
+            .lock()
+            .unwrap()
+            .files
+            .insert(file.id, file);
+        Ok(())
+    }
+
+    fn put_batch(&mut self, files: &[VirtualFile]) -> Result<(), PortError> {
+        self.probe.record_write("put_batch");
+        self.inner.put_batch(files)?;
+        let mut projection = self.probe.projection.lock().unwrap();
+        for file in files {
+            projection.files.insert(file.id, file.clone());
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, id: FileId) -> Result<(), PortError> {
+        self.probe.record_write("delete");
+        self.inner.delete(id)?;
+        self.probe.projection.lock().unwrap().files.remove(&id);
+        Ok(())
+    }
+
+    fn put_blob(&mut self, hash: ContentHash, bytes: Vec<u8>) -> Result<(), PortError> {
+        self.probe.record_write("put_blob");
+        self.inner.put_blob(hash, bytes.clone())?;
+        self.probe
+            .projection
+            .lock()
+            .unwrap()
+            .blobs
+            .insert(*hash.as_bytes(), bytes);
+        Ok(())
+    }
+
+    fn get_blob(&self, hash: &ContentHash) -> Result<Vec<u8>, PortError> {
+        self.inner.get_blob(hash)
+    }
+
+    fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+        self.probe.record_write("mark_scan_complete");
+        self.inner.mark_scan_complete()?;
+        self.probe.projection.lock().unwrap().scan_complete = true;
+        Ok(())
+    }
+
+    fn is_scan_complete(&self) -> Result<bool, PortError> {
+        self.inner.is_scan_complete()
+    }
+}
+
+fn write_dependency_config(
+    workspace: &std::path::Path,
+    dependency: &std::path::Path,
+    root_id: &str,
+    limits: DependencyIndexLimits,
+    ignore: &[&str],
+) {
+    fs::create_dir_all(workspace.join(".tower")).unwrap();
+    let ignored = ignore
+        .iter()
+        .map(|entry| format!("\"{entry}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(
+        workspace.join(".tower/config.toml"),
+        format!(
+            "[dependencies]\nmax_files = {}\nmax_file_bytes = {}\nmax_total_bytes = {}\nignore = [{}]\n\n[[dependencies.roots]]\nid = {:?}\npath = {:?}\n",
+            limits.max_files(),
+            limits.max_file_bytes(),
+            limits.max_total_bytes(),
+            ignored,
+            root_id,
+            dependency
+        ),
+    )
+    .unwrap();
+}
+
+async fn call_search_tool(
+    client: &rmcp::service::RunningService<RoleClient, ()>,
+    tool: &str,
+    arguments: Value,
+) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
+    client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new(tool.to_owned())
+                .with_arguments(arguments.as_object().unwrap().clone()),
+        )
+        .await
+}
+
+fn search_payload(result: &rmcp::model::CallToolResult) -> Value {
+    serde_json::from_str(first_text(result)).expect("search response must be JSON")
+}
+
+fn assert_dependency_failure_sentinels_are_private(value: &impl std::fmt::Display) {
+    let public = value.to_string();
+    assert!(
+        !public.contains("PRIVATE_ABSOLUTE_PATH_SENTINEL"),
+        "private dependency path must not reach a public boundary: {public}"
+    );
+    assert!(
+        !public.contains("RAW_ERROR_SENTINEL"),
+        "raw dependency error must not reach a public boundary: {public}"
+    );
 }
 
 // ── AC1: tools/list returns native tower_* tools with schemas ────────────────
@@ -1681,4 +1865,579 @@ fn rename_path_persistence_failure_returns_sanitized_structured_partial() {
 
     assert_eq!(result, rename_result_fixture("partial"));
     assert!(!result.to_string().contains("PRIVATE_PERSISTENCE_SENTINEL"));
+}
+
+#[test]
+fn search_includes_configured_dependencies_only_when_requested() {
+    block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let dependency = fixture.path().join("lib #1");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(workspace.join("workspace.rs"), "workspace_unique\n").unwrap();
+        fs::write(dependency.join("src/a b.rs"), "dependency_unique_line\n").unwrap();
+        write_dependency_config(
+            &workspace,
+            &dependency,
+            "lib #1",
+            DependencyIndexLimits::new(10, 1024, 4096).unwrap(),
+            &[],
+        );
+        let client = start_server(make_handler(dependency_search_state(&workspace))).await;
+
+        let legacy_find = call_search_tool(&client, "tower_find_file", json!({"query": "a b.rs"}))
+            .await
+            .unwrap();
+        let legacy_find_payload = search_payload(&legacy_find);
+        assert_eq!(
+            legacy_find_payload
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["paths"]
+        );
+        assert!(
+            legacy_find_payload["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|path| path != "src/a b.rs")
+        );
+        let legacy_text = call_search_tool(
+            &client,
+            "tower_search_text",
+            json!({"pattern": "dependency_unique_line"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_payload(&legacy_text), json!({"matches": []}));
+
+        let scope = json!({"workspace": false, "dependencies": true});
+        let scoped_find = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_find_file",
+                json!({"query": "a b.rs", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            scoped_find["results"],
+            json!([{
+                "locator": "dependency://lib%20%231/src/a%20b.rs",
+                "path": "src/a b.rs",
+                "origin": "dependency",
+                "root_id": "lib #1"
+            }])
+        );
+        let scoped_text = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_search_text",
+                json!({"pattern": "dependency_unique_line", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            scoped_text["matches"],
+            json!([{
+                "locator": "dependency://lib%20%231/src/a%20b.rs",
+                "path": "src/a b.rs",
+                "line_number": 1,
+                "line_content": "dependency_unique_line",
+                "origin": "dependency",
+                "root_id": "lib #1"
+            }])
+        );
+        assert_eq!(scoped_text["dependency_report"]["indexed_files"], 1);
+
+        let invalid = call_search_tool(
+            &client,
+            "tower_find_file",
+            json!({"query": "x", "scope": {"workspace": true}}),
+        )
+        .await;
+        let _ = invalid_params_error(invalid);
+
+        client.cancel().await.unwrap();
+    });
+}
+
+#[test]
+fn dependency_limits_and_ignores_are_observable_through_search() {
+    block_on(async {
+        struct LimitsCase {
+            name: &'static str,
+            limits: DependencyIndexLimits,
+            files: &'static [(&'static str, &'static str)],
+            expected_path: &'static str,
+            expected_bytes: u64,
+            expected_reason: &'static str,
+        }
+        let cases = [
+            LimitsCase {
+                name: "file-size",
+                limits: DependencyIndexLimits::new(10, 5, 100).unwrap(),
+                files: &[("exact.rs", "hit!\n"), ("oversize.rs", "large\n")],
+                expected_path: "exact.rs",
+                expected_bytes: 5,
+                expected_reason: "file_size",
+            },
+            LimitsCase {
+                name: "file-count",
+                limits: DependencyIndexLimits::new(1, 100, 100).unwrap(),
+                files: &[("a.rs", "a\n"), ("b.rs", "b\n")],
+                expected_path: "a.rs",
+                expected_bytes: 2,
+                expected_reason: "file_count",
+            },
+            LimitsCase {
+                name: "total-bytes",
+                limits: DependencyIndexLimits::new(10, 100, 3).unwrap(),
+                files: &[("a.rs", "aa\n"), ("b.rs", "bb\n")],
+                expected_path: "a.rs",
+                expected_bytes: 3,
+                expected_reason: "total_bytes",
+            },
+        ];
+
+        for case in cases {
+            let fixture = tempfile::tempdir().unwrap();
+            let workspace = fixture.path().join("workspace");
+            let dependency = fixture.path().join(case.name);
+            fs::create_dir_all(&workspace).unwrap();
+            fs::create_dir_all(&dependency).unwrap();
+            fs::write(workspace.join("workspace.rs"), "workspace_hit\n").unwrap();
+            fs::write(dependency.join("ignored.rs"), "ignored_private_hit\n").unwrap();
+            for (path, content) in case.files {
+                fs::write(dependency.join(path), content).unwrap();
+            }
+            write_dependency_config(
+                &workspace,
+                &dependency,
+                "library",
+                case.limits,
+                &["ignored.rs"],
+            );
+            let client = start_server(make_handler(dependency_search_state(&workspace))).await;
+            let payload = search_payload(
+                &call_search_tool(
+                    &client,
+                    "tower_find_file",
+                    json!({"query": ".rs", "scope": {"workspace": true, "dependencies": true}}),
+                )
+                .await
+                .unwrap(),
+            );
+            assert!(payload["results"].as_array().unwrap().iter().any(|entry| {
+                entry["origin"] == "workspace" && entry["path"] == "workspace.rs"
+            }));
+            let dependencies = payload["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["origin"] == "dependency")
+                .collect::<Vec<_>>();
+            assert_eq!(dependencies.len(), 1, "{}", case.name);
+            assert_eq!(dependencies[0]["path"], case.expected_path, "{}", case.name);
+            assert_eq!(payload["dependency_report"]["indexed_files"], 1);
+            assert_eq!(
+                payload["dependency_report"]["indexed_bytes"],
+                case.expected_bytes
+            );
+            assert_eq!(payload["dependency_report"]["skipped_files"], 1);
+            assert_eq!(payload["dependency_report"]["truncated"], true);
+            assert_eq!(
+                payload["dependency_report"]["limit_reasons"],
+                json!([case.expected_reason])
+            );
+            assert!(!payload.to_string().contains("ignored_private_hit"));
+            client.cancel().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn search_does_not_discover_unconfigured_dependency_roots() {
+    block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let unconfigured = fixture.path().join("unconfigured-private-root");
+        fs::create_dir_all(workspace.join(".tower")).unwrap();
+        fs::create_dir_all(&unconfigured).unwrap();
+        fs::write(workspace.join("workspace.rs"), "workspace_sentinel\n").unwrap();
+        fs::write(
+            unconfigured.join("private.rs"),
+            "external_private_sentinel\n",
+        )
+        .unwrap();
+        fs::write(workspace.join(".tower/config.toml"), "[dependencies]\n").unwrap();
+        let client = start_server(make_handler(dependency_search_state(&workspace))).await;
+        let payload = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_search_text",
+                json!({"pattern": "external_private_sentinel", "scope": {"workspace": true, "dependencies": true}}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(payload["matches"], json!([]));
+        assert_eq!(payload["dependency_report"]["indexed_files"], 0);
+        assert_eq!(payload["dependency_report"]["indexed_bytes"], 0);
+        assert_eq!(payload["dependency_report"]["skipped_files"], 0);
+        assert!(!payload.to_string().contains("unconfigured-private-root"));
+        client.cancel().await.unwrap();
+    });
+}
+
+#[test]
+fn dependency_scan_failure_preserves_workspace_results() {
+    block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let missing = fixture
+            .path()
+            .join("PRIVATE_ABSOLUTE_PATH_SENTINEL_missing");
+        let non_directory = fixture
+            .path()
+            .join("PRIVATE_ABSOLUTE_PATH_SENTINEL_not_directory");
+        let unreadable = fixture
+            .path()
+            .join("PRIVATE_ABSOLUTE_PATH_SENTINEL_unreadable");
+        let disappearing = fixture
+            .path()
+            .join("PRIVATE_ABSOLUTE_PATH_SENTINEL_disappearing");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&non_directory).unwrap();
+        fs::create_dir_all(&unreadable).unwrap();
+        fs::create_dir_all(&disappearing).unwrap();
+        #[cfg(unix)]
+        let _unreadable_socket =
+            std::os::unix::net::UnixListener::bind(unreadable.join("unreadable.rs"))
+                .expect("Unix socket is a privilege-independent unreadable file fixture");
+        fs::write(workspace.join("workspace.rs"), "workspace_survives\n").unwrap();
+        fs::create_dir_all(workspace.join(".tower")).unwrap();
+        fs::write(
+            workspace.join(".tower/config.toml"),
+            format!(
+                "[[dependencies.roots]]\nid = \"missing\"\npath = {:?}\n\n[[dependencies.roots]]\nid = \"not-directory\"\npath = {:?}\n\n[[dependencies.roots]]\nid = \"unreadable\"\npath = {:?}\n\n[[dependencies.roots]]\nid = \"disappearing\"\npath = {:?}\n",
+                missing, non_directory, unreadable, disappearing
+            ),
+        )
+        .unwrap();
+        let config = load(&workspace).unwrap();
+        fs::remove_dir(&non_directory).unwrap();
+        fs::write(&non_directory, "RAW_ERROR_SENTINEL").unwrap();
+        fs::remove_dir(&disappearing).unwrap();
+        let mut stderr = gag::BufferRedirect::stderr().expect("stderr capture must install");
+        let source = Arc::new(
+            FsDependencySource::new(
+                config.dependencies.roots.clone(),
+                workspace.clone(),
+                config.dependencies.ignore.clone(),
+            )
+            .unwrap(),
+        );
+        let snapshot = Arc::new(source.build_snapshot(&config.dependencies.limits).unwrap());
+        let mut captured_logs = String::new();
+        stderr
+            .read_to_string(&mut captured_logs)
+            .expect("captured stderr must be readable");
+        drop(stderr);
+        fs::remove_file(&non_directory).unwrap();
+        fs::create_dir(&non_directory).unwrap();
+        fs::create_dir(&disappearing).unwrap();
+        let state = dependency_search_state(&workspace);
+        state.write().unwrap().configure_dependency_index(
+            source,
+            config.dependencies.limits,
+            snapshot,
+        );
+        let client = start_server(make_handler(state)).await;
+        let descriptors = client
+            .peer()
+            .list_tools(Default::default())
+            .await
+            .expect("tools/list must succeed");
+        assert_dependency_failure_sentinels_are_private(&format!("{descriptors:?}"));
+        let payload = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_search_text",
+                json!({"pattern": "workspace_survives", "scope": {"workspace": true, "dependencies": true}}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(payload["matches"][0]["path"], "workspace.rs");
+        assert_eq!(payload["matches"][0]["origin"], "workspace");
+        assert_eq!(
+            payload["dependency_report"]["issues"],
+            json!([
+                {"root_id": "disappearing", "path": null, "reason": "root_unavailable"},
+                {"root_id": "missing", "path": null, "reason": "root_unavailable"},
+                {"root_id": "not-directory", "path": null, "reason": "root_not_directory"},
+                {"root_id": "unreadable", "path": "unreadable.rs", "reason": "entry_unreadable"}
+            ]),
+            "each configured failure producer must yield its own sanitized issue"
+        );
+        assert_dependency_failure_sentinels_are_private(&payload);
+
+        let invalid_scope = call_search_tool(
+            &client,
+            "tower_find_file",
+            json!({"query": "workspace", "scope": {"workspace": true}}),
+        )
+        .await;
+        let error = invalid_params_error(invalid_scope);
+        assert_dependency_failure_sentinels_are_private(&error);
+
+        assert_dependency_failure_sentinels_are_private(&captured_logs);
+        client.cancel().await.unwrap();
+    });
+}
+
+#[test]
+fn dependency_changes_require_reindex_and_publish_current_complete_snapshot() {
+    block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let dependency = fixture.path().join("dependency");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(workspace.join("workspace.rs"), "workspace_current\n").unwrap();
+        fs::write(dependency.join("before.rs"), "before_unique\n").unwrap();
+        write_dependency_config(
+            &workspace,
+            &dependency,
+            "library",
+            DependencyIndexLimits::new(10, 1024, 4096).unwrap(),
+            &[],
+        );
+        let client = start_server(make_handler(dependency_search_state(&workspace))).await;
+        let scope = json!({"workspace": false, "dependencies": true});
+        let before = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_find_file",
+                json!({"query": ".rs", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(before["results"][0]["path"], "before.rs");
+
+        fs::remove_file(dependency.join("before.rs")).unwrap();
+        fs::write(dependency.join("after.rs"), "after_unique\n").unwrap();
+        let stale = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_find_file",
+                json!({"query": ".rs", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(stale["results"][0]["path"], "before.rs");
+
+        let refreshed = call_search_tool(&client, "tower_reindex", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            search_payload(&refreshed)["dependency_report"]["indexed_files"],
+            1
+        );
+        let current = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_find_file",
+                json!({"query": ".rs", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(current["results"].as_array().unwrap().len(), 1);
+        assert_eq!(current["results"][0]["path"], "after.rs");
+        assert_eq!(current["dependency_report"]["indexed_files"], 1);
+        client.cancel().await.unwrap();
+    });
+}
+
+#[test]
+fn mutating_tools_reject_dependency_paths() {
+    block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let dependency = fixture
+            .path()
+            .join("PRIVATE_DEPENDENCY_ABSOLUTE_PATH_SENTINEL");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(workspace.join("workspace.rs"), "workspace_anchor\n").unwrap();
+        fs::write(
+            dependency.join("src/shared.rs"),
+            "PRIVATE_DEPENDENCY_CONTENT_SENTINEL\n",
+        )
+        .unwrap();
+        write_dependency_config(
+            &workspace,
+            &dependency,
+            "library",
+            DependencyIndexLimits::new(10, 1024, 4096).unwrap(),
+            &[],
+        );
+
+        let (storage, storage_probe) = ObservedStorage::new();
+        let state = dependency_search_state_with_storage(&workspace, Box::new(storage));
+        let client = start_server(make_handler(Arc::clone(&state))).await;
+        let scope = json!({"workspace": true, "dependencies": true});
+        let initial_search = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_find_file",
+                json!({"query": "shared.rs", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        let dependency_result = initial_search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["origin"] == "dependency")
+            .expect("public dependency search must return the mutation-test locator");
+        let locator = dependency_result["locator"].as_str().unwrap().to_owned();
+        assert_eq!(locator, "dependency://library/src/shared.rs");
+
+        let dependency_before = fs::read(dependency.join("src/shared.rs")).unwrap();
+        let workspace_before = state.read().unwrap().workspace.read().unwrap().snapshot();
+        let storage_before = storage_probe.snapshot();
+
+        let attempts = [
+            (
+                "tower_create_file",
+                json!({"path": locator, "content": "changed"}),
+            ),
+            (
+                "tower_edit_range",
+                json!({"path": locator, "start_byte": 0, "end_byte": 7, "replacement": "changed"}),
+            ),
+            (
+                "tower_global_replace",
+                json!({"target": "PRIVATE", "replacement": "changed", "expected_versions": {locator.clone(): "00"}}),
+            ),
+            (
+                "tower_global_replace",
+                json!({"target": "PRIVATE", "replacement": "changed", "expected_versions": {"dependency://PRIVATE_ROOT/PRIVATE_CONTENT.rs": 1}}),
+            ),
+            ("tower_delete_file", json!({"path": locator})),
+        ];
+
+        let mut stderr = gag::BufferRedirect::stderr().expect("stderr capture must install");
+        for (tool, arguments) in attempts {
+            let writes_before = storage_probe.write_count();
+            let error = invalid_params_error(
+                client
+                    .peer()
+                    .call_tool(
+                        CallToolRequestParams::new(tool)
+                            .with_arguments(arguments.as_object().unwrap().clone()),
+                    )
+                    .await,
+            );
+            assert_eq!(error, "dependency locator is not a workspace path");
+            assert!(!error.contains("PRIVATE_DEPENDENCY_ABSOLUTE_PATH_SENTINEL"));
+            assert!(!error.contains("PRIVATE_DEPENDENCY_CONTENT_SENTINEL"));
+            assert_eq!(
+                fs::read(dependency.join("src/shared.rs")).unwrap(),
+                dependency_before
+            );
+            assert_eq!(
+                state
+                    .read()
+                    .unwrap()
+                    .workspace
+                    .read()
+                    .unwrap()
+                    .snapshot()
+                    .files,
+                workspace_before.files
+            );
+            storage_probe.assert_no_writes_since(writes_before);
+            assert_eq!(storage_probe.snapshot(), storage_before);
+            let search_after = search_payload(
+                &call_search_tool(
+                    &client,
+                    "tower_find_file",
+                    json!({"query": "shared.rs", "scope": scope}),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(search_after, initial_search);
+        }
+        let mut captured_logs = String::new();
+        stderr.read_to_string(&mut captured_logs).unwrap();
+        drop(stderr);
+        assert!(!captured_logs.contains("PRIVATE_DEPENDENCY_ABSOLUTE_PATH_SENTINEL"));
+        assert!(!captured_logs.contains("PRIVATE_DEPENDENCY_CONTENT_SENTINEL"));
+
+        let workspace_result = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("tower_create_file").with_arguments(
+                    json!({"path": "src/shared.rs", "content": "workspace changed\n"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .expect("the colliding workspace suffix must remain writable");
+        assert_eq!(workspace_result.is_error, Some(false));
+        assert_eq!(
+            fs::read(workspace.join("src/shared.rs")).unwrap(),
+            b"workspace changed\n"
+        );
+        assert_eq!(
+            fs::read(dependency.join("src/shared.rs")).unwrap(),
+            dependency_before
+        );
+        let final_search = search_payload(
+            &call_search_tool(
+                &client,
+                "tower_find_file",
+                json!({"query": "shared.rs", "scope": scope}),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            final_search["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|result| {
+                    result["origin"] == "workspace" && result["path"] == "src/shared.rs"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            final_search["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|result| result["origin"] == "dependency")
+                .count(),
+            1
+        );
+
+        client.cancel().await.unwrap();
+    });
 }

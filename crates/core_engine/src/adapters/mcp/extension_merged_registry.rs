@@ -412,12 +412,16 @@ impl ToolRegistry for ExtensionMergedRegistry {
                 } else {
                     None
                 };
+                let extension_name = ext_id.as_str().to_owned();
+                let tool_name = tool_decl.name.clone();
                 return self
                     .extension_host
                     .read()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .invoke_extension(&ext_id, &tool_decl.name, args, cancellation)
-                    .map_err(invoke_error_to_tool_error);
+                    .map_err(|error| {
+                        invoke_error_to_tool_error_for_extension(&extension_name, &tool_name, error)
+                    });
             }
         }
         Err(ToolError::NotFound(name.to_owned()))
@@ -451,6 +455,25 @@ fn invoke_error_to_tool_error(err: InvokeError) -> ToolError {
             ToolError::ExecutionFailed(format!("extension fault: {class}"))
         }
     }
+}
+
+fn invoke_error_to_tool_error_for_extension(
+    extension: &str,
+    tool: &str,
+    err: InvokeError,
+) -> ToolError {
+    if extension == "fmt"
+        && tool == "format"
+        && let InvokeError::Application(error) = &err
+        && error.code == -32602
+        && matches!(
+            error.message.as_str(),
+            "dependency locator is not a workspace path" | "invalid dependency locator"
+        )
+    {
+        return ToolError::InvalidArgs(error.message.clone());
+    }
+    invoke_error_to_tool_error(err)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -663,6 +686,32 @@ mod tests {
                 vec![make_tool(tool_name)],
             )))
             .expect("register");
+        ExtensionMergedRegistry::new(empty_engine_state(), ext_registry)
+    }
+
+    fn merged_with_application_error(
+        ext_name: &str,
+        tool_name: &str,
+        code: i32,
+        message: &str,
+    ) -> ExtensionMergedRegistry {
+        let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
+        let message = message.to_owned();
+        ext_registry
+            .write()
+            .unwrap()
+            .register(Box::new(TestExtension::new(
+                ext_name,
+                vec![make_tool(tool_name)],
+                move |_, _| {
+                    Err(ExtensionCallError::Application(ExtensionApplicationError {
+                        code,
+                        message: message.clone(),
+                        data: Some(json!({"private": "must remain field-for-field"})),
+                    }))
+                },
+            )))
+            .expect("register application-error extension");
         ExtensionMergedRegistry::new(empty_engine_state(), ext_registry)
     }
 
@@ -1439,6 +1488,71 @@ mod tests {
             crate::adapters::mcp::types::ToolError::ExecutionFailed(ref message)
                 if message.contains("Timeout")
         ));
+    }
+
+    #[test]
+    fn format_dependency_rejection_maps_to_invalid_args() {
+        for message in [
+            "dependency locator is not a workspace path",
+            "invalid dependency locator",
+        ] {
+            let mut registry = merged_with_application_error("fmt", "format", -32602, message);
+            let error = registry
+                .call(
+                    "tower_fmt_format",
+                    json!({"path":"dependency://library/src/main.rs"}),
+                    &crate::domain::NeverCancelled,
+                )
+                .expect_err(
+                    "formatter dependency rejection must remain a protocol invalid-params error",
+                );
+            assert!(matches!(
+                error,
+                ToolError::InvalidArgs(ref actual) if actual == message
+            ));
+        }
+    }
+
+    #[test]
+    fn other_extension_application_errors_preserve_mapping() {
+        let cases = [
+            (
+                "ast",
+                "format",
+                -32602,
+                "dependency locator is not a workspace path",
+            ),
+            (
+                "fmt",
+                "other",
+                -32602,
+                "dependency locator is not a workspace path",
+            ),
+            (
+                "fmt",
+                "format",
+                -32000,
+                "dependency locator is not a workspace path",
+            ),
+            ("fmt", "format", -32602, "some other invalid argument"),
+        ];
+
+        for (extension, tool, code, expected_message) in cases {
+            let mut registry =
+                merged_with_application_error(extension, tool, code, expected_message);
+            let public_name = format!("tower_{extension}_{tool}");
+            let error = registry
+                .call(&public_name, json!({}), &crate::domain::NeverCancelled)
+                .expect_err("fixture returns an application error");
+            assert!(matches!(
+                error,
+                ToolError::Application {
+                    code: actual_code,
+                    ref message,
+                    data: Some(_),
+                } if actual_code == code && message == expected_message
+            ));
+        }
     }
 
     // ── EV1: extension tool appears in tools/list beside native tools ──────────

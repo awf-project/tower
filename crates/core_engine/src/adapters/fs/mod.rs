@@ -66,12 +66,14 @@
 //! | other (write context)  | `WriteFailed(reason)`   |
 
 mod atomic;
+pub mod dependency_source;
 pub mod path_exclusion;
 mod real_fs;
 pub mod scan;
 
 pub(crate) use atomic::durable_write;
 
+pub use dependency_source::{DependencyScanError, FsDependencySource};
 pub use path_exclusion::WorkspacePathExclusion;
 pub use real_fs::RealFs;
 pub use scan::{ScanReport, scan as workspace_scan};
@@ -81,3 +83,6 @@ mod tests;
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod dependency_source_tests;

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::refactor::{
     PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult, SafeDeleteSnapshot,
 };
+use crate::domain::search::{ScopedFileSearchResult, ScopedTextSearchResult, SearchScope};
 use crate::domain::{DomainError, FileId, RelativePath};
 use crate::ports::PathExclusionPort;
 
@@ -233,6 +234,12 @@ pub enum WorkspaceApplyEditsErrorCode {
 ///
 /// Object-safe by design: all methods take `&self` and return owned values.
 pub trait SearchUseCase {
+    fn find_file_scoped(
+        &self,
+        query: &str,
+        scope: SearchScope,
+    ) -> Result<ScopedFileSearchResult, DomainError>;
+
     /// Find files whose path contains `query` (fuzzy or substring — algorithm
     /// decided in spec 03b).
     ///
@@ -247,6 +254,12 @@ pub trait SearchUseCase {
     ///
     /// Returns [`DomainError`] on workspace inconsistency.
     fn search_text(&self, pattern: &str) -> Result<Vec<Match>, DomainError>;
+
+    fn search_text_scoped(
+        &self,
+        pattern: &str,
+        scope: SearchScope,
+    ) -> Result<ScopedTextSearchResult, DomainError>;
 
     fn list_dir(&self, request: ListDirRequest) -> Result<ListDirResult, DomainError>;
 

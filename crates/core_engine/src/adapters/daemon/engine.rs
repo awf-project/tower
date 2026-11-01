@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::Write as _;
 use std::path::Path;
+#[cfg(feature = "testing")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
@@ -38,6 +40,7 @@ use crate::adapters::extension::{
     global_extensions_dir, resolve_extension_dirs,
 };
 use crate::adapters::fs::RealFs;
+use crate::adapters::fs::dependency_source::FsDependencySource;
 #[cfg(any(test, feature = "startup-test-hooks"))]
 use crate::adapters::fs::scan::ReconciliationMetrics;
 #[cfg(feature = "startup-test-hooks")]
@@ -53,6 +56,7 @@ use crate::domain::extension_host::{
 };
 use crate::domain::index::InvertedIndex;
 use crate::domain::mutation::FileMutationService;
+use crate::domain::search::DependencyIndexSnapshot;
 use crate::domain::workspace::ProjectWorkspace;
 #[cfg(feature = "startup-test-hooks")]
 use crate::ports::PortError;
@@ -74,6 +78,7 @@ pub enum PreparationError {
     WatcherCatchUp,
     WatcherBarrier,
     ExtensionDiscovery,
+    DependencyIndex,
 }
 
 impl std::fmt::Display for PreparationError {
@@ -86,11 +91,56 @@ impl std::fmt::Display for PreparationError {
             Self::WatcherCatchUp => "workspace watcher catch-up failed",
             Self::WatcherBarrier => "workspace watcher barrier failed",
             Self::ExtensionDiscovery => "workspace extension discovery failed",
+            Self::DependencyIndex => "dependency index preparation failed",
         })
     }
 }
 
 impl std::error::Error for PreparationError {}
+
+pub struct DependencySnapshotState {
+    snapshot: RwLock<Arc<DependencyIndexSnapshot>>,
+}
+
+impl DependencySnapshotState {
+    pub fn new(snapshot: Arc<DependencyIndexSnapshot>) -> Self {
+        Self {
+            snapshot: RwLock::new(snapshot),
+        }
+    }
+
+    pub fn load(&self) -> Arc<DependencyIndexSnapshot> {
+        Arc::clone(
+            &self
+                .snapshot
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    pub fn publish(&self, snapshot: Arc<DependencyIndexSnapshot>) -> Arc<DependencyIndexSnapshot> {
+        std::mem::replace(
+            &mut *self
+                .snapshot
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()),
+            snapshot,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        let _ = std::thread::spawn(move || {
+            let _guard = state
+                .snapshot
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            panic!("poison dependency snapshot state");
+        })
+        .join();
+    }
+}
 
 pub struct PreparedEngine {
     handle: Mutex<Option<EngineHandle>>,
@@ -113,6 +163,61 @@ impl PreparedEngine {
                 .expect("prepared engine resources remain owned")
                 .state,
         )
+    }
+
+    pub fn dependency_snapshot(&self) -> Arc<DependencyIndexSnapshot> {
+        self.state()
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .dependency_snapshot
+            .load()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn watcher_registered_root(&self) -> PathBuf {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .expect("prepared engine resources remain owned")
+            ._watcher
+            .registered_root()
+            .to_path_buf()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn watcher_observed_paths(&self) -> Vec<PathBuf> {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .expect("prepared engine resources remain owned")
+            ._watcher
+            .observed_paths()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn watcher_barrier(&self) -> Result<(), WatcherError> {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .expect("prepared engine resources remain owned")
+            ._watcher
+            .barrier()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn committed_event_sequence(&self) -> u64 {
+        self.state()
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .publication
+            .as_ref()
+            .expect("prepared daemon has a publication boundary")
+            .capture_cut()
+            .expect("prepared daemon publication remains open")
+            .sequence
     }
 
     pub fn extension_registry(&self) -> Arc<RwLock<ExtensionRegistry>> {
@@ -610,16 +715,40 @@ fn prepare_workspace_resources(
         reconciliation.unchanged
     );
     let storage_for_watcher = storage.try_clone();
+    let dependency_source = Arc::new(
+        FsDependencySource::new(
+            config.dependencies.roots.clone(),
+            workspace_root.clone(),
+            config.dependencies.ignore.clone(),
+        )
+        .map_err(|_| PreparationError::DependencyIndex)?,
+    );
+    let dependency_snapshot = Arc::new(
+        dependency_source
+            .build_snapshot(&config.dependencies.limits)
+            .map_err(|error| {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "tower: dependency index preparation failed: {error}"
+                );
+                PreparationError::DependencyIndex
+            })?,
+    );
     let state = Arc::new(RwLock::new(EngineState::new(
         workspace,
         index,
         Box::new(storage),
         Box::new(RealFs::new(&workspace_root)),
     )));
-    state
-        .write()
-        .map_err(|_| PreparationError::Storage)?
-        .publication = Some(Arc::clone(&publisher));
+    {
+        let mut state = state.write().map_err(|_| PreparationError::Storage)?;
+        state.configure_dependency_index(
+            dependency_source,
+            config.dependencies.limits,
+            dependency_snapshot,
+        );
+        state.publication = Some(Arc::clone(&publisher));
+    }
     inject_extension_host(&state, &ext_registry).map_err(|_| PreparationError::Storage)?;
     let rename_coordinator = Arc::new(RenameCoordinator::default());
     let watcher = start_watcher(
@@ -1154,7 +1283,9 @@ fn failure_class(error: &PreparationError) -> StartupFailureClass {
     match error {
         PreparationError::Cancelled => StartupFailureClass::Cancelled,
         PreparationError::Storage => StartupFailureClass::Storage,
-        PreparationError::Reconciliation => StartupFailureClass::Reconciliation,
+        PreparationError::Reconciliation | PreparationError::DependencyIndex => {
+            StartupFailureClass::Reconciliation
+        }
         PreparationError::WatcherRegistration
         | PreparationError::WatcherCatchUp
         | PreparationError::WatcherBarrier => StartupFailureClass::Watcher,

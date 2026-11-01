@@ -15,6 +15,7 @@ pub mod grep;
 pub mod index;
 pub mod mutation;
 pub mod refactor;
+pub mod search;
 pub mod token;
 pub mod virtual_file;
 pub mod workspace;

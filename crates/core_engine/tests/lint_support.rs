@@ -33,7 +33,6 @@ use core_engine::ports::inbound::{
 };
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
 use extension_protocol::{ExtensionManifest, ToolDecl};
-use rmcp::{RoleClient, ServiceExt};
 
 pub const SIMPLE_GENERIC_REGEX: &str =
     r"(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+): (?P<message>.+)";
@@ -607,18 +606,12 @@ pub fn configure_lint_timeout_and_host_budget(
         .expect("fixture configures a lint timeout")
 }
 
+#[path = "support/mcp_server.rs"]
+mod mcp_server;
 pub async fn start_server(
     handler: TowerMcpHandler,
-) -> rmcp::service::RunningService<RoleClient, ()> {
-    let (server_transport, client_transport) = tokio::io::duplex(65_536);
-    tokio::spawn(async move {
-        if let Ok(server) = handler.serve(server_transport).await {
-            let _ = server.waiting().await;
-        }
-    });
-    ().serve(client_transport)
-        .await
-        .expect("client connect failed")
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    mcp_server::start_server(handler).await
 }
 
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {

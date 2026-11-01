@@ -400,13 +400,25 @@ InvalidParams` with a not-a-directory message. Supplying `max_depth` without
 
 ### tower_search_text
 
-Parallel grep across all indexed file contents.
+Parallel grep across indexed workspace contents, or across an explicitly selected
+combination of workspace and configured dependency roots.
 
-| Field     | Type   | Required | Description                                    |
-| --------- | ------ | -------- | ---------------------------------------------- |
-| `pattern` | string | yes      | Text pattern searched across all indexed files |
+| Field     | Type   | Required | Description                                                              |
+| --------- | ------ | -------- | ------------------------------------------------------------------------ |
+| `pattern` | string | yes      | Text pattern searched across selected indexed files                      |
+| `scope`   | object | no       | Optional exact object with boolean `workspace` and `dependencies` fields |
 
-**Returns** `{"matches": [{"path": string, "line_number": uint, "line_content": string}]}`
+When `scope` is omitted, the legacy workspace-only response is returned. With an
+explicit scope, the response is `{"matches": [...], "dependency_report": {...}}`.
+Each scoped match includes `locator`, `path`, `line_number`, `line_content`, and
+`origin`; dependency matches also include `root_id`. Dependency locators use the
+canonical `dependency://<root-id>/<root-relative-path>` form and are read-only.
+
+The report includes `indexed_files`, `indexed_bytes`, `skipped_files`, `truncated`,
+`limit_reasons` (`file_count`, `file_size`, or `total_bytes`), and sanitized
+per-root `issues`. A report can contain issues while the search still succeeds.
+
+**Returns** `{"matches": [{"locator": string, "path": string, "line_number": uint, "line_content": string, "origin": "workspace"|"dependency", "root_id": string?}], "dependency_report": object}`
 
 **Request**
 
@@ -421,6 +433,12 @@ Parallel grep across all indexed file contents.
   }
 }
 ```
+
+`tower_find_file` accepts the same optional `scope` object. Without it, it returns
+the legacy `{"paths": [...]}` payload. With it, it returns
+`{"results": [{"locator", "path", "origin", "root_id"?}], "dependency_report": ...}`.
+See [the dependency-search how-to](user-guide/dependency-search.md) for complete
+configuration and locator examples.
 
 **Success response**
 
@@ -687,14 +705,16 @@ a `CHANGELOG.txt` entry — all rewritten unconditionally.
 ### tower_reindex
 
 Force a full rebuild of the VFS and the inverted text-search index from the
-current filesystem. Use after large external changes or to correct drift. Takes
-no arguments.
+current filesystem. It also refreshes the separate snapshot of configured
+dependency roots. Use after large external changes or to correct drift. Takes
+no arguments. Dependency roots are scanned at startup and on explicit reindex;
+they are not watched for live changes.
 
 | Field    | Type | Required | Description                  |
 | -------- | ---- | -------- | ---------------------------- |
 | _(none)_ | —    | —        | This tool takes no arguments |
 
-**Returns** `{"files_indexed": uint}`
+**Returns** `{"files_indexed": uint, "dependency_report": object}`
 
 **Request**
 
@@ -713,7 +733,12 @@ no arguments.
 {
   "jsonrpc": "2.0",
   "result": {
-    "content": [{ "type": "text", "text": "{\"files_indexed\":128}" }]
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"files_indexed\":128,\"dependency_report\":{\"indexed_files\":0,\"indexed_bytes\":0,\"skipped_files\":0,\"truncated\":false,\"limit_reasons\":[],\"issues\":[]}}"
+      }
+    ]
   },
   "id": 18
 }

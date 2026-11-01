@@ -34,7 +34,9 @@ use serde_json::Value;
 use super::host_deps::{FsAdapter, HostDeps};
 use super::path_validation::validate_capability_path;
 use crate::adapters::mcp::PushEvent;
+use crate::adapters::mcp::native_tools::{LocatorParseError, classify_search_locator};
 use crate::domain::extension_host::{ExtensionApplicationError, ExtensionCallError};
+use crate::domain::search::SearchResultLocator;
 use crate::domain::{DomainError, ExtensionInstance, RelativePath};
 use crate::ports::inbound::{
     PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
@@ -45,6 +47,45 @@ use crate::ports::inbound::{
 enum SidecarWaitError {
     Fault(ExtensionFault),
     Cancelled,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormatPathError {
+    DependencyLocator,
+    InvalidDependencyLocator,
+    InvalidWorkspacePath,
+}
+
+#[cfg(test)]
+pub(crate) fn validate_workspace_format_path(path: &str) -> Result<RelativePath, FormatPathError> {
+    validate_workspace_format_path_detailed(path).map_err(|error| match error {
+        DetailedFormatPathError::DependencyLocator => FormatPathError::DependencyLocator,
+        DetailedFormatPathError::InvalidDependencyLocator => {
+            FormatPathError::InvalidDependencyLocator
+        }
+        DetailedFormatPathError::InvalidWorkspacePath(_) => FormatPathError::InvalidWorkspacePath,
+    })
+}
+
+enum DetailedFormatPathError {
+    DependencyLocator,
+    InvalidDependencyLocator,
+    InvalidWorkspacePath(String),
+}
+
+fn validate_workspace_format_path_detailed(
+    path: &str,
+) -> Result<RelativePath, DetailedFormatPathError> {
+    match classify_search_locator(path) {
+        Ok(SearchResultLocator::Dependency(_)) => Err(DetailedFormatPathError::DependencyLocator),
+        Err(LocatorParseError::InvalidDependencyLocator) => {
+            Err(DetailedFormatPathError::InvalidDependencyLocator)
+        }
+        Ok(SearchResultLocator::Workspace(path)) => validate_capability_path(path.as_str())
+            .map(|()| path)
+            .map_err(DetailedFormatPathError::InvalidWorkspacePath),
+    }
 }
 
 #[cfg(test)]
@@ -1289,12 +1330,22 @@ fn dispatch_host_call(
                     "capability 'request_format' not declared".to_owned(),
                 );
             }
-            let path = params["path"].as_str().unwrap_or("").to_owned();
-            match validate_capability_path(&path) {
-                Err(e) => encode_response_err(call_id, -32602, e),
-                Ok(()) => {
+            let path = params["path"].as_str().unwrap_or("");
+            match validate_workspace_format_path_detailed(path) {
+                Err(DetailedFormatPathError::DependencyLocator) => encode_response_err(
+                    call_id,
+                    -32602,
+                    "dependency locator is not a workspace path".to_owned(),
+                ),
+                Err(DetailedFormatPathError::InvalidDependencyLocator) => {
+                    encode_response_err(call_id, -32602, "invalid dependency locator".to_owned())
+                }
+                Err(DetailedFormatPathError::InvalidWorkspacePath(message)) => {
+                    encode_response_err(call_id, -32602, message)
+                }
+                Ok(path) => {
                     use crate::adapters::formatter::EnqueueResult;
-                    match deps.format_queue.enqueue(path.clone()) {
+                    match deps.format_queue.enqueue(path.as_str().to_owned()) {
                         EnqueueResult::Accepted => {
                             encode_response_ok(call_id, Value::String("accepted".to_owned()))
                         }
@@ -1710,11 +1761,11 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
 
-    use super::{HostDeps, dispatch_host_call};
+    use super::{FormatPathError, HostDeps, dispatch_host_call, validate_workspace_format_path};
     #[cfg(target_os = "linux")]
     use super::{LinuxProcessIdentity, parse_linux_process_stat};
     use crate::adapters::extension::host_deps::ApplyEditsHostPort;
-    use crate::adapters::formatter::NoOpFormatQueue;
+    use crate::adapters::formatter::{EnqueueResult, FormatQueuePort, NoOpFormatQueue};
     use crate::adapters::mcp::PushEvent;
     use crate::adapters::{InMemoryAstIndex, InMemoryFs};
     use crate::domain::{DomainError, RelativePath};
@@ -1766,6 +1817,24 @@ mod tests {
     }
 
     struct VersionConflictApplyEditsHost;
+
+    #[derive(Default)]
+    struct RecordingFormatQueue {
+        paths: Mutex<Vec<String>>,
+    }
+
+    impl RecordingFormatQueue {
+        fn paths(&self) -> Vec<String> {
+            self.paths.lock().expect("format queue lock").clone()
+        }
+    }
+
+    impl FormatQueuePort for RecordingFormatQueue {
+        fn enqueue(&self, path: String) -> EnqueueResult {
+            self.paths.lock().expect("format queue lock").push(path);
+            EnqueueResult::Accepted
+        }
+    }
 
     impl ApplyEditsHostPort for VersionConflictApplyEditsHost {
         fn apply_batch_edits(
@@ -1824,6 +1893,92 @@ mod tests {
 
     fn parse_response(frame: &str) -> Value {
         serde_json::from_str(frame.trim()).expect("parse response frame")
+    }
+
+    fn dispatch_format_path(path: &str, queue: Arc<RecordingFormatQueue>) -> Value {
+        let deps = HostDeps {
+            fs: Arc::new(Mutex::new(InMemoryFs::new())),
+            ast_index: Arc::new(InMemoryAstIndex::new()),
+            format_queue: queue,
+            apply_edits: Arc::new(RecordingApplyEditsHost::default()),
+            push_tx: None,
+        };
+        parse_response(&dispatch_host_call(
+            "workspace/requestFormat",
+            json!(91),
+            json!({"path": path}),
+            &deps,
+            &[Capability::RequestFormat],
+        ))
+    }
+
+    #[test]
+    fn format_path_validation_accepts_workspace_paths() {
+        assert_eq!(
+            validate_workspace_format_path("src/main.rs"),
+            Ok(RelativePath::new("src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn format_path_validation_rejects_dependency_locators() {
+        let queue = Arc::new(RecordingFormatQueue::default());
+        let response = dispatch_format_path("dependency://library/src/main.rs", Arc::clone(&queue));
+
+        assert_eq!(
+            validate_workspace_format_path("dependency://library/src/main.rs"),
+            Err(FormatPathError::DependencyLocator)
+        );
+        assert_eq!(
+            response_error(&response),
+            (
+                -32602,
+                "dependency locator is not a workspace path".to_owned()
+            )
+        );
+        assert!(queue.paths().is_empty());
+    }
+
+    #[test]
+    fn format_path_validation_rejects_malformed_dependency_locators() {
+        for path in [
+            "dependency://",
+            "dependency://library",
+            "dependency://library/../secret.rs",
+        ] {
+            let queue = Arc::new(RecordingFormatQueue::default());
+            let response = dispatch_format_path(path, Arc::clone(&queue));
+            assert_eq!(
+                validate_workspace_format_path(path),
+                Err(FormatPathError::InvalidDependencyLocator),
+                "reserved locator {path:?} must be classified before workspace parsing"
+            );
+            assert_eq!(
+                response_error(&response),
+                (-32602, "invalid dependency locator".to_owned())
+            );
+            assert!(queue.paths().is_empty());
+        }
+    }
+
+    #[test]
+    fn format_path_errors_map_to_fixed_invalid_params_messages() {
+        let cases = [
+            (
+                "dependency://library/src/private.rs",
+                "dependency locator is not a workspace path",
+            ),
+            ("dependency://library", "invalid dependency locator"),
+        ];
+        for (path, expected_message) in cases {
+            let queue = Arc::new(RecordingFormatQueue::default());
+            let response = dispatch_format_path(path, Arc::clone(&queue));
+            assert_eq!(
+                response_error(&response),
+                (-32602, expected_message.to_owned())
+            );
+            assert!(queue.paths().is_empty());
+        }
     }
 
     fn response_error(response: &Value) -> (i64, String) {

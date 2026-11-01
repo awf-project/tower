@@ -31,6 +31,381 @@ pub mod fixtures;
 
 pub use fixtures::{make_virtual_file, sample_content_hash};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DependencySourceFault {
+    #[default]
+    None,
+    RootUnavailable,
+    RootNotDirectory,
+    EntryUnreadable,
+    ChangedDuringRead,
+    InvalidEncoding,
+    BoundaryViolation,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DependencySourceFixture {
+    pub roots: Vec<crate::domain::search::DependencyRootId>,
+    pub entries: Vec<(crate::domain::search::DependencyPath, Vec<u8>)>,
+    pub fault: DependencySourceFault,
+}
+
+pub struct InMemoryDependencySource {
+    fixture: DependencySourceFixture,
+}
+
+impl InMemoryDependencySource {
+    pub fn new(fixture: DependencySourceFixture) -> Self {
+        Self { fixture }
+    }
+}
+
+impl crate::ports::DependencySourcePort for InMemoryDependencySource {
+    fn enumerate(
+        &self,
+        root_id: &crate::domain::search::DependencyRootId,
+    ) -> Result<Vec<crate::ports::DependencyCandidate>, crate::ports::DependencySourceError> {
+        use crate::ports::{DependencyCandidate, DependencySourceError};
+
+        match self.fixture.fault {
+            DependencySourceFault::RootUnavailable => {
+                return Err(DependencySourceError::RootUnavailable {
+                    root_id: root_id.clone(),
+                });
+            }
+            DependencySourceFault::RootNotDirectory => {
+                return Err(DependencySourceError::RootNotDirectory {
+                    root_id: root_id.clone(),
+                });
+            }
+            _ => {}
+        }
+
+        if !self.fixture.roots.contains(root_id) {
+            return Err(DependencySourceError::RootUnavailable {
+                root_id: root_id.clone(),
+            });
+        }
+
+        let mut candidates = self
+            .fixture
+            .entries
+            .iter()
+            .filter(|(path, _)| path.root_id() == root_id)
+            .map(|(path, bytes)| DependencyCandidate {
+                path: path.clone(),
+                size: bytes.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        Ok(candidates)
+    }
+
+    fn read_bounded(
+        &self,
+        path: &crate::domain::search::DependencyPath,
+        max_bytes: std::num::NonZeroU64,
+    ) -> Result<crate::ports::DependencyRead, crate::ports::DependencySourceError> {
+        use crate::ports::{DependencyRead, DependencySourceError};
+
+        let fault = match self.fixture.fault {
+            DependencySourceFault::EntryUnreadable => {
+                Some(DependencySourceError::EntryUnreadable { path: path.clone() })
+            }
+            DependencySourceFault::ChangedDuringRead => {
+                Some(DependencySourceError::ChangedDuringRead { path: path.clone() })
+            }
+            DependencySourceFault::InvalidEncoding => {
+                Some(DependencySourceError::InvalidEncoding { path: path.clone() })
+            }
+            DependencySourceFault::BoundaryViolation => {
+                Some(DependencySourceError::BoundaryViolation { path: path.clone() })
+            }
+            _ => None,
+        };
+        if let Some(error) = fault {
+            return Err(error);
+        }
+
+        let bytes = self
+            .fixture
+            .entries
+            .iter()
+            .find_map(|(entry_path, bytes)| (entry_path == path).then_some(bytes))
+            .ok_or_else(|| DependencySourceError::EntryUnreadable { path: path.clone() })?;
+        if bytes.len() as u64 > max_bytes.get() {
+            return Err(DependencySourceError::LimitExceeded {
+                path: path.clone(),
+                max_bytes,
+            });
+        }
+
+        Ok(DependencyRead {
+            path: path.clone(),
+            bytes: bytes.clone(),
+        })
+    }
+}
+
+#[macro_export]
+macro_rules! dependency_source_contract_tests {
+    ($make:expr) => {
+        mod dependency_source_contract {
+            use std::num::NonZeroU64;
+
+            use $crate::domain::RelativePath;
+            use $crate::domain::search::{DependencyPath, DependencyRootId};
+            use $crate::ports::{DependencyCandidate, DependencySourceError, DependencySourcePort};
+            use $crate::test_support::{DependencySourceFault, DependencySourceFixture};
+
+            fn root(value: &str) -> DependencyRootId {
+                DependencyRootId::new(value.to_owned()).expect("valid dependency root")
+            }
+
+            fn path(root_id: &str, relative_path: &str) -> DependencyPath {
+                DependencyPath::new(root(root_id), RelativePath::new(relative_path))
+                    .expect("valid dependency path")
+            }
+
+            fn fixture(
+                entries: Vec<(DependencyPath, Vec<u8>)>,
+                fault: DependencySourceFault,
+            ) -> DependencySourceFixture {
+                DependencySourceFixture {
+                    roots: vec![root("primary")],
+                    entries,
+                    fault,
+                }
+            }
+
+            fn make(fixture: DependencySourceFixture) -> Box<dyn DependencySourcePort> {
+                ($make)(fixture)
+            }
+
+            #[test]
+            fn dependency_source_enumerates_in_deterministic_order() {
+                let port = make(DependencySourceFixture {
+                    roots: vec![root("secondary"), root("primary")],
+                    entries: vec![
+                        (path("secondary", "z.rs"), b"z".to_vec()),
+                        (path("primary", "src/z.rs"), b"zzz".to_vec()),
+                        (path("primary", "src/a.rs"), b"a".to_vec()),
+                    ],
+                    fault: DependencySourceFault::None,
+                });
+
+                assert_eq!(
+                    port.enumerate(&root("primary")),
+                    Ok(vec![
+                        DependencyCandidate {
+                            path: path("primary", "src/a.rs"),
+                            size: 1,
+                        },
+                        DependencyCandidate {
+                            path: path("primary", "src/z.rs"),
+                            size: 3,
+                        },
+                    ])
+                );
+            }
+
+            #[test]
+            fn dependency_source_reads_within_bound() {
+                let expected_path = path("primary", "src/file.rs");
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"hello".to_vec())],
+                    DependencySourceFault::None,
+                ));
+
+                let read = port
+                    .read_bounded(&expected_path, NonZeroU64::new(6).unwrap())
+                    .expect("entry within the bound must be readable");
+
+                assert_eq!(read.path, expected_path);
+                assert_eq!(read.bytes, b"hello");
+            }
+
+            #[test]
+            fn dependency_source_accepts_exact_size() {
+                let expected_path = path("primary", "src/file.rs");
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"exact".to_vec())],
+                    DependencySourceFault::None,
+                ));
+
+                let read = port
+                    .read_bounded(&expected_path, NonZeroU64::new(5).unwrap())
+                    .expect("an exact-size entry must be accepted");
+
+                assert_eq!(read.bytes, b"exact");
+            }
+
+            #[test]
+            fn dependency_source_rejects_one_byte_oversize() {
+                let expected_path = path("primary", "src/file.rs");
+                let max_bytes = NonZeroU64::new(4).unwrap();
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"12345".to_vec())],
+                    DependencySourceFault::None,
+                ));
+
+                assert_eq!(
+                    port.read_bounded(&expected_path, max_bytes),
+                    Err(DependencySourceError::LimitExceeded {
+                        path: expected_path,
+                        max_bytes,
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_reports_unavailable_root() {
+                let port = make(fixture(vec![], DependencySourceFault::RootUnavailable));
+
+                assert_eq!(
+                    port.enumerate(&root("primary")),
+                    Err(DependencySourceError::RootUnavailable {
+                        root_id: root("primary"),
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_reports_non_directory_root() {
+                let port = make(fixture(vec![], DependencySourceFault::RootNotDirectory));
+
+                assert_eq!(
+                    port.enumerate(&root("primary")),
+                    Err(DependencySourceError::RootNotDirectory {
+                        root_id: root("primary"),
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_reports_unreadable_entry() {
+                let expected_path = path("primary", "src/file.rs");
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"content".to_vec())],
+                    DependencySourceFault::EntryUnreadable,
+                ));
+
+                assert_eq!(
+                    port.read_bounded(&expected_path, NonZeroU64::new(32).unwrap()),
+                    Err(DependencySourceError::EntryUnreadable {
+                        path: expected_path,
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_reports_changed_entry() {
+                let expected_path = path("primary", "src/file.rs");
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"content".to_vec())],
+                    DependencySourceFault::ChangedDuringRead,
+                ));
+
+                assert_eq!(
+                    port.read_bounded(&expected_path, NonZeroU64::new(32).unwrap()),
+                    Err(DependencySourceError::ChangedDuringRead {
+                        path: expected_path,
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_reports_invalid_encoding() {
+                let expected_path = path("primary", "src/file.rs");
+                let port = make(fixture(
+                    vec![(expected_path.clone(), vec![0xff])],
+                    DependencySourceFault::InvalidEncoding,
+                ));
+
+                assert_eq!(
+                    port.read_bounded(&expected_path, NonZeroU64::new(32).unwrap()),
+                    Err(DependencySourceError::InvalidEncoding {
+                        path: expected_path,
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_reports_boundary_violation() {
+                let expected_path = path("primary", "src/file.rs");
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"content".to_vec())],
+                    DependencySourceFault::BoundaryViolation,
+                ));
+
+                assert_eq!(
+                    port.read_bounded(&expected_path, NonZeroU64::new(32).unwrap()),
+                    Err(DependencySourceError::BoundaryViolation {
+                        path: expected_path,
+                    })
+                );
+            }
+
+            #[test]
+            fn dependency_source_error_display_is_sanitized() {
+                let expected_path = path("primary", "src/file.rs");
+                let cases = [
+                    (DependencySourceFault::RootUnavailable, true, "primary"),
+                    (DependencySourceFault::RootNotDirectory, true, "primary"),
+                    (DependencySourceFault::EntryUnreadable, false, "src/file.rs"),
+                    (
+                        DependencySourceFault::ChangedDuringRead,
+                        false,
+                        "src/file.rs",
+                    ),
+                    (DependencySourceFault::InvalidEncoding, false, "src/file.rs"),
+                    (
+                        DependencySourceFault::BoundaryViolation,
+                        false,
+                        "src/file.rs",
+                    ),
+                ];
+
+                for (fault, enumerate, public_label) in cases {
+                    let port = make(fixture(
+                        vec![(expected_path.clone(), b"SUPER_SECRET_CONTENT".to_vec())],
+                        fault,
+                    ));
+                    let error = if enumerate {
+                        port.enumerate(&root("primary")).unwrap_err()
+                    } else {
+                        port.read_bounded(&expected_path, NonZeroU64::new(32).unwrap())
+                            .unwrap_err()
+                    };
+                    let display = error.to_string();
+
+                    assert!(display.contains(public_label), "{display:?}");
+                    assert!(!display.contains("SUPER_SECRET_CONTENT"), "{display:?}");
+                    assert!(!display.contains("/private/absolute"), "{display:?}");
+                    assert!(!display.contains("\\private\\absolute"), "{display:?}");
+                }
+
+                let port = make(fixture(
+                    vec![(expected_path.clone(), b"SUPER_SECRET_CONTENT".to_vec())],
+                    DependencySourceFault::None,
+                ));
+                let display = port
+                    .read_bounded(&expected_path, NonZeroU64::new(4).unwrap())
+                    .unwrap_err()
+                    .to_string();
+                assert!(display.contains("src/file.rs"), "{display:?}");
+                assert!(!display.contains("SUPER_SECRET_CONTENT"), "{display:?}");
+                assert!(!display.contains("/private/absolute"), "{display:?}");
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+dependency_source_contract_tests!(|fixture| Box::new(
+    crate::test_support::InMemoryDependencySource::new(fixture)
+));
+
 #[derive(Clone, Debug, Default)]
 pub struct PathExclusionFixture {
     pub files: Vec<(crate::domain::RelativePath, Vec<u8>)>,

@@ -169,15 +169,11 @@ fn main() {
                                     &Response::ToolResult(value),
                                 );
                             }
-                            Err(err_msg) => {
+                            Err(error) => {
                                 protocol::send_response(
                                     &stdout_lock,
                                     &id,
-                                    &Response::Error(ProtocolError {
-                                        code: -32000,
-                                        message: err_msg,
-                                        data: None,
-                                    }),
+                                    &Response::Error(error.into_protocol_error()),
                                 );
                             }
                         }
@@ -258,13 +254,44 @@ fn main() {
 /// - `{}` (no path) → `workspace/listFiles` then enqueue each returned path.
 ///
 /// Returns `{"requested":N,"accepted":A,"dropped":D}`.
+#[derive(Debug)]
+enum FormatToolError {
+    Validation {
+        code: i32,
+        message: String,
+        data: Option<Value>,
+    },
+    Other(String),
+}
+
+impl FormatToolError {
+    fn into_protocol_error(self) -> ProtocolError {
+        match self {
+            Self::Validation {
+                code,
+                message,
+                data,
+            } => ProtocolError {
+                code,
+                message,
+                data,
+            },
+            Self::Other(message) => ProtocolError {
+                code: -32000,
+                message,
+                data: None,
+            },
+        }
+    }
+}
+
 fn handle_format_tool<R>(
     params: Value,
     out: &Arc<Mutex<impl Write>>,
     lines: &mut R,
     next_id: &mut u64,
     deferred: &mut VecDeque<(Option<Value>, String, Value)>,
-) -> Result<Value, String>
+) -> Result<Value, FormatToolError>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
 {
@@ -285,14 +312,19 @@ where
             "workspace/listFiles",
             &HostCall::ListFiles,
             deferred,
-        )?;
+        )
+        .map_err(|error| FormatToolError::Other(error.to_string()))?;
         // Response is a JSON array of path strings.
         match resp {
             Value::Array(arr) => arr
                 .into_iter()
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect(),
-            _ => return Err(format!("unexpected listFiles response: {resp}")),
+            _ => {
+                return Err(FormatToolError::Other(format!(
+                    "unexpected listFiles response: {resp}"
+                )));
+            }
         }
     };
 
@@ -312,6 +344,21 @@ where
         ) {
             Ok(Value::String(s)) if s == "accepted" => accepted += 1,
             Ok(_) => dropped += 1,
+            Err(protocol::HostCallError::Host {
+                code: -32602,
+                message,
+                data,
+            }) if matches!(
+                message.as_str(),
+                "dependency locator is not a workspace path" | "invalid dependency locator"
+            ) =>
+            {
+                return Err(FormatToolError::Validation {
+                    code: -32602,
+                    message,
+                    data,
+                });
+            }
             Err(_) => dropped += 1,
         }
     }
@@ -321,4 +368,108 @@ where
         "accepted": accepted,
         "dropped": dropped,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+
+    use super::handle_format_tool;
+
+    fn invoke_with_host_frames(
+        path: &str,
+        frames: Vec<Result<String, io::Error>>,
+    ) -> Result<serde_json::Value, super::FormatToolError> {
+        invoke_with_host_frames_and_outbound(path, frames).0
+    }
+
+    fn invoke_with_host_frames_and_outbound(
+        path: &str,
+        frames: Vec<Result<String, io::Error>>,
+    ) -> (Result<serde_json::Value, super::FormatToolError>, String) {
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut lines = frames.into_iter();
+        let result = handle_format_tool(
+            json!({"path": path}),
+            &output,
+            &mut lines,
+            &mut 10_000,
+            &mut VecDeque::new(),
+        );
+        let outbound = String::from_utf8(output.lock().unwrap().clone())
+            .expect("outbound host call must be UTF-8");
+        (result, outbound)
+    }
+
+    fn validation_error_frame(message: &str) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10_000,
+            "error": {"code": -32602, "message": message}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn format_validation_rejections_are_not_counted_as_dropped() {
+        for message in [
+            "dependency locator is not a workspace path",
+            "invalid dependency locator",
+        ] {
+            let error = invoke_with_host_frames(
+                "dependency://library/src/main.rs",
+                vec![Ok(validation_error_frame(message))],
+            )
+            .expect_err("dependency validation must be propagated before accounting");
+            assert!(format!("{error:?}").contains(message));
+        }
+    }
+
+    #[test]
+    fn format_queue_full_and_other_errors_preserve_best_effort_accounting() {
+        let dropped = invoke_with_host_frames(
+            "src/main.rs",
+            vec![Ok(
+                json!({"jsonrpc":"2.0","id":10_000,"result":"dropped"}).to_string()
+            )],
+        )
+        .expect("queue-full remains a successful best-effort result");
+        assert_eq!(dropped, json!({"requested":1,"accepted":0,"dropped":1}));
+
+        let other_error = invoke_with_host_frames(
+            "src/main.rs",
+            vec![Ok(json!({"jsonrpc":"2.0","id":10_000,"error":{"code":-32603,"message":"formatter unavailable"}}).to_string())],
+        )
+        .expect("non-validation errors remain best-effort");
+        assert_eq!(other_error, json!({"requested":1,"accepted":0,"dropped":1}));
+    }
+
+    #[test]
+    fn format_reserved_locators_reach_host_validation_unchanged() {
+        for (path, message) in [
+            (
+                "dependency://library/src/main.rs.tmp_write",
+                "dependency locator is not a workspace path",
+            ),
+            (
+                "dependency://library/.tmp_write/..",
+                "invalid dependency locator",
+            ),
+        ] {
+            let (result, outbound) = invoke_with_host_frames_and_outbound(
+                path,
+                vec![Ok(validation_error_frame(message))],
+            );
+            let frame: serde_json::Value =
+                serde_json::from_str(&outbound).expect("requestFormat frame must be JSON");
+            assert_eq!(frame["method"], "workspace/requestFormat");
+            assert_eq!(frame["params"]["path"], path);
+            let error = result.expect_err("explicit reserved locator must reach host validation");
+            assert!(format!("{error:?}").contains(message));
+        }
+    }
 }

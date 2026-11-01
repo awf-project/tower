@@ -21,20 +21,35 @@
 
 #![allow(clippy::pedantic)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost;
 use core_engine::adapters::extension::{HostDeps, SidecarHostAdapter};
 use core_engine::adapters::formatter::{EnqueueResult, FormatQueuePort, NoOpFormatQueue};
-use core_engine::adapters::{InMemoryAstIndex, InMemoryFs};
+use core_engine::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
+use core_engine::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry;
+use core_engine::adapters::mcp::lsp_tools::SubscriptionRegistry;
+use core_engine::adapters::mcp::native_tools::EngineState;
+use core_engine::adapters::mcp::rmcp_server::TowerMcpHandler;
+use core_engine::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage};
+use core_engine::domain::extension_host::ExtensionRegistry;
 use core_engine::ports::FileSystemPort;
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
 use extension_protocol::{Event, ExtensionManifest};
+use rmcp::model::CallToolRequestParams;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[path = "support/mcp_server.rs"]
+mod mcp_server;
+use mcp_server::start_server;
+#[path = "support/dependency_search.rs"]
+mod dependency_search;
+use dependency_search::dependency_search_state_with_storage;
 
 // ── Recording test double ─────────────────────────────────────────────────────
 
@@ -132,6 +147,45 @@ fn make_deps() -> HostDeps {
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
     }
+}
+
+fn write_dependency_config(
+    workspace: &std::path::Path,
+    dependency: &std::path::Path,
+    root_id: &str,
+) {
+    fs::create_dir_all(workspace.join(".tower")).unwrap();
+    fs::write(
+        workspace.join(".tower/config.toml"),
+        format!(
+            "[dependencies]\nmax_files = 10\nmax_file_bytes = 1024\nmax_total_bytes = 4096\nignore = []\n\n[[dependencies.roots]]\nid = {:?}\npath = {:?}\n",
+            root_id, dependency
+        ),
+    )
+    .unwrap();
+}
+
+fn dependency_search_state(workspace_root: &std::path::Path) -> Arc<RwLock<EngineState>> {
+    dependency_search_state_with_storage(workspace_root, Box::new(InMemoryStorage::new()))
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
+}
+
+fn first_text(result: &rmcp::model::CallToolResult) -> &str {
+    result
+        .content
+        .first()
+        .and_then(|content| match &content.raw {
+            rmcp::model::RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .unwrap_or("")
 }
 
 // ── AC1/U1: spawn and initialize ─────────────────────────────────────────────
@@ -371,6 +425,119 @@ fn fmt_tool_without_path_enqueues_all_files() {
         vec!["src/lib.rs", "src/main.rs"],
         "requestFormat must be called for each file; got: {recorded:?}"
     );
+}
+
+#[test]
+fn formatting_rejects_dependency_paths_before_enqueue() {
+    block_on(async {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let dependency = fixture
+            .path()
+            .join("PRIVATE_DEPENDENCY_ABSOLUTE_PATH_SENTINEL");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(workspace.join("workspace.rs"), "workspace_anchor\n").unwrap();
+        let dependency_file = dependency.join("src/shared.rs");
+        fs::write(&dependency_file, "PRIVATE_DEPENDENCY_CONTENT_SENTINEL\n").unwrap();
+        write_dependency_config(&workspace, &dependency, "library");
+
+        let mut stderr = gag::BufferRedirect::stderr().expect("stderr capture must install");
+        let state = dependency_search_state(&workspace);
+        let recording = RecordingFormatQueue::new();
+        let adapter = SidecarHostAdapter::spawn(
+            fmt_manifest(&fmt_extension_bin()),
+            make_deps_with_recording(recording.clone()),
+            TEST_TIMEOUT,
+            None,
+        )
+        .expect("real fmt sidecar must initialize");
+        let extensions = Arc::new(RwLock::new(ExtensionRegistry::new()));
+        extensions
+            .write()
+            .unwrap()
+            .register(adapter)
+            .expect("fmt sidecar must register");
+        let merged = ExtensionMergedRegistry::new(state, extensions);
+        let handler = TowerMcpHandler::new(
+            merged,
+            Arc::new(NoOpDiagnosticsReader),
+            Arc::new(Mutex::new(SubscriptionRegistry::new())),
+            vec![],
+        );
+        let client = start_server(handler).await;
+
+        let search = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("tower_find_file").with_arguments(
+                    serde_json::json!({
+                        "query": "shared.rs",
+                        "scope": {"workspace": true, "dependencies": true}
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await
+            .expect("public dependency search must succeed");
+        let payload: serde_json::Value =
+            serde_json::from_str(first_text(&search)).expect("search payload must be JSON");
+        let locator = payload["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["origin"] == "dependency")
+            .and_then(|result| result["locator"].as_str())
+            .expect("public search must return a dependency locator")
+            .to_owned();
+        assert_eq!(locator, "dependency://library/src/shared.rs");
+        let bytes_before = fs::read(&dependency_file).unwrap();
+
+        for (path, expected_message) in [
+            (locator, "dependency locator is not a workspace path"),
+            (
+                "dependency://library/src/shared.rs.tmp_write".to_owned(),
+                "dependency locator is not a workspace path",
+            ),
+            (
+                "dependency://library/.tmp_write/..".to_owned(),
+                "invalid dependency locator",
+            ),
+        ] {
+            let result = client
+                .peer()
+                .call_tool(
+                    CallToolRequestParams::new("tower_fmt_format").with_arguments(
+                        serde_json::json!({"path": path})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await;
+            let error = match result.expect_err("formatter locator must be invalid params") {
+                rmcp::ServiceError::McpError(error) => {
+                    assert_eq!(error.code.0, -32602);
+                    error.message.to_string()
+                }
+                other => panic!("expected MCP invalid-params error, got {other:?}"),
+            };
+            assert_eq!(error, expected_message);
+            assert!(!error.contains("PRIVATE_DEPENDENCY_ABSOLUTE_PATH_SENTINEL"));
+            assert!(!error.contains("PRIVATE_DEPENDENCY_CONTENT_SENTINEL"));
+            assert!(recording.recorded().is_empty());
+            assert_eq!(fs::read(&dependency_file).unwrap(), bytes_before);
+        }
+        let mut captured_logs = String::new();
+        stderr
+            .read_to_string(&mut captured_logs)
+            .expect("captured logs must be readable");
+        assert!(!captured_logs.contains("PRIVATE_DEPENDENCY_ABSOLUTE_PATH_SENTINEL"));
+        assert!(!captured_logs.contains("PRIVATE_DEPENDENCY_CONTENT_SENTINEL"));
+        client.cancel().await.unwrap();
+    });
 }
 
 // ── Concurrency stress: no deadlock ──────────────────────────────────────────

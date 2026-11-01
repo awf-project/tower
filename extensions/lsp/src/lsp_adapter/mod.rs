@@ -3888,9 +3888,8 @@ mod tests {
                 "private source text",
             )
         });
-        let request_count = |method| method_count(&written_messages(&sink), method);
         let admission_deadline = Instant::now() + Duration::from_secs(1);
-        while request_count("textDocument/prepareTypeHierarchy") != 1 {
+        while written_method_count(&sink, "textDocument/prepareTypeHierarchy") != 1 {
             assert!(
                 Instant::now() < admission_deadline,
                 "prepare request was not admitted before the test gate"
@@ -3900,7 +3899,7 @@ mod tests {
         first_admitted_tx
             .send(())
             .expect("release prepare response after its admission");
-        while request_count("typeHierarchy/supertypes") != 1 {
+        while written_method_count(&sink, "typeHierarchy/supertypes") != 1 {
             assert!(
                 Instant::now() < admission_deadline,
                 "nested request was not admitted after the prepare response"

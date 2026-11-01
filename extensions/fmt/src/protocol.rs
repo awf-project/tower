@@ -6,10 +6,37 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use extension_protocol::{HostCall, Response};
+
+/// A response to a host capability call.
+#[derive(Debug, PartialEq)]
+pub enum HostCallError {
+    Host {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    Transport(String),
+    Parse(String),
+    Closed,
+    MalformedResponse,
+}
+
+impl fmt::Display for HostCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Host { message, .. } => f.write_str(message),
+            Self::Transport(message) => write!(f, "stdin error: {message}"),
+            Self::Parse(message) => write!(f, "parse error: {message}"),
+            Self::Closed => f.write_str("stdin closed while waiting for host response"),
+            Self::MalformedResponse => f.write_str("malformed host response (no result or error)"),
+        }
+    }
+}
 
 // ── Outbound helpers ──────────────────────────────────────────────────────────
 
@@ -105,15 +132,15 @@ pub fn read_host_response<R>(
         String,
         serde_json::Value,
     )>,
-) -> Result<serde_json::Value, String>
+) -> Result<serde_json::Value, HostCallError>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
 {
     loop {
         let line = match lines.next() {
             Some(Ok(l)) => l,
-            Some(Err(e)) => return Err(format!("stdin error: {e}")),
-            None => return Err("stdin closed while waiting for host response".to_owned()),
+            Some(Err(e)) => return Err(HostCallError::Transport(e.to_string())),
+            None => return Err(HostCallError::Closed),
         };
         let line = line.trim().to_owned();
         if line.is_empty() {
@@ -122,7 +149,7 @@ where
 
         let envelope: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(e) => return Err(format!("parse error: {e}")),
+            Err(e) => return Err(HostCallError::Parse(e.to_string())),
         };
 
         let frame_id = envelope.get("id");
@@ -134,13 +161,23 @@ where
                 return Ok(result.clone());
             }
             if let Some(error) = envelope.get("error") {
-                let msg = error
+                let message = error
                     .get("message")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                return Err(msg.to_owned());
+                    .unwrap_or("unknown error")
+                    .to_owned();
+                let code = error
+                    .get("code")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or_default();
+                let data = error.get("data").cloned();
+                return Err(HostCallError::Host {
+                    code,
+                    message,
+                    data,
+                });
             }
-            return Err("malformed host response (no result or error)".to_owned());
+            return Err(HostCallError::MalformedResponse);
         }
 
         // Not our response. Classify the frame:
@@ -182,10 +219,51 @@ pub fn host_call<R>(
         String,
         serde_json::Value,
     )>,
-) -> Result<serde_json::Value, String>
+) -> Result<serde_json::Value, HostCallError>
 where
     R: Iterator<Item = Result<String, std::io::Error>>,
 {
     let id = send_host_call(out, next_id, method, call);
     read_host_response(lines, id, deferred)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+
+    use super::{HostCallError, read_host_response};
+
+    #[test]
+    fn format_host_call_errors_preserve_validation_code_and_message() {
+        let mut lines = vec![Ok::<_, io::Error>(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"dependency locator is not a workspace path","data":{"kind":"validation_data_sentinel"}}}"#.to_owned(),
+        )]
+        .into_iter();
+        let error = read_host_response(&mut lines, 7, &mut VecDeque::new())
+            .expect_err("host validation error must remain an error");
+        assert_eq!(
+            error,
+            HostCallError::Host {
+                code: -32602,
+                message: "dependency locator is not a workspace path".to_owned(),
+                data: Some(serde_json::json!({"kind":"validation_data_sentinel"})),
+            }
+        );
+    }
+
+    #[test]
+    fn format_host_call_transport_errors_remain_distinct() {
+        let mut lines = vec![Err::<String, _>(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "transport sentinel",
+        ))]
+        .into_iter();
+        let error = read_host_response(&mut lines, 8, &mut VecDeque::new())
+            .expect_err("transport failure must remain an error");
+        assert_eq!(
+            error,
+            HostCallError::Transport("transport sentinel".to_owned())
+        );
+    }
 }

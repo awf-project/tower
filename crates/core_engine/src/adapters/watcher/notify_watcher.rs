@@ -44,6 +44,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+#[cfg(feature = "testing")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -119,6 +121,10 @@ pub struct NotifyWatcherAdapter {
     worker: Option<thread::JoinHandle<()>>,
     rename_coordinator: Arc<RenameCoordinator>,
     cancelled: Arc<AtomicBool>,
+    #[cfg(feature = "testing")]
+    registered_root: PathBuf,
+    #[cfg(feature = "testing")]
+    observed_paths: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl std::fmt::Debug for NotifyWatcherAdapter {
@@ -255,7 +261,13 @@ impl NotifyWatcherAdapter {
 
         // Clone root for the notify callback closure.
         let root_for_callback = root.clone();
+        #[cfg(feature = "testing")]
+        let registered_root = root.clone();
         let tx_for_callback = tx.clone();
+        #[cfg(feature = "testing")]
+        let observed_paths = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "testing")]
+        let callback_observed_paths = Arc::clone(&observed_paths);
 
         // Build the notify watcher.
         //
@@ -272,6 +284,21 @@ impl NotifyWatcherAdapter {
                         raw_to_watch_events(event, &root_for_callback);
                     let coalesced = debounce_events(raw_events);
                     for watch_event in coalesced {
+                        #[cfg(feature = "testing")]
+                        {
+                            let mut paths = callback_observed_paths
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            match &watch_event {
+                                WatchEvent::Create(path)
+                                | WatchEvent::Modify(path)
+                                | WatchEvent::Delete(path) => paths.push(path.clone()),
+                                WatchEvent::Rename { from, to } => {
+                                    paths.push(from.clone());
+                                    paths.push(to.clone());
+                                }
+                            }
+                        }
                         // This is an unbounded channel: sending does not wait for
                         // the worker to finish extension callbacks. Deletion
                         // events are index-correctness signals, so dropping them
@@ -384,7 +411,24 @@ impl NotifyWatcherAdapter {
             worker: Some(worker),
             rename_coordinator,
             cancelled,
+            #[cfg(feature = "testing")]
+            registered_root,
+            #[cfg(feature = "testing")]
+            observed_paths,
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn registered_root(&self) -> &Path {
+        &self.registered_root
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn observed_paths(&self) -> Vec<PathBuf> {
+        self.observed_paths
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     pub fn request_catch_up(&self) -> Result<(), WatcherError> {

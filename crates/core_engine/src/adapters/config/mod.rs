@@ -21,6 +21,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::adapters::path_identity::lexical_normalize;
+use crate::domain::search::{DependencyIndexLimits, DependencyRootId};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -160,6 +161,81 @@ pub enum QueryableProjectPathReason {
     NotDirectory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyRootPathReason {
+    Empty,
+    Unsafe,
+    Prohibited,
+    NotDirectory,
+    InvalidId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDependencyRoot {
+    pub id: DependencyRootId,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependenciesConfig {
+    pub roots: Vec<ResolvedDependencyRoot>,
+    pub ignore: Vec<String>,
+    pub limits: DependencyIndexLimits,
+}
+
+impl Default for DependenciesConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            ignore: Vec::new(),
+            limits: default_dependency_limits(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDependenciesConfig {
+    #[serde(default)]
+    pub roots: Vec<RawDependencyRoot>,
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    #[serde(default = "default_dependency_max_files")]
+    pub max_files: u64,
+    #[serde(default = "default_dependency_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_dependency_max_total_bytes")]
+    pub max_total_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDependencyRoot {
+    pub id: String,
+    pub path: String,
+}
+
+const fn default_dependency_max_files() -> u64 {
+    10_000
+}
+
+const fn default_dependency_max_file_bytes() -> u64 {
+    1_048_576
+}
+
+const fn default_dependency_max_total_bytes() -> u64 {
+    67_108_864
+}
+
+fn default_dependency_limits() -> DependencyIndexLimits {
+    DependencyIndexLimits::new(
+        default_dependency_max_files() as usize,
+        default_dependency_max_file_bytes(),
+        default_dependency_max_total_bytes(),
+    )
+    .expect("dependency defaults are positive")
+}
+
 /// Parsed `.tower/config.toml`. Unknown top-level keys are rejected.
 #[derive(Debug, Default)]
 pub struct TowerConfig {
@@ -180,6 +256,7 @@ pub struct TowerConfig {
     /// Absent → `DaemonConfig::default()` (30-second idle timeout).
     pub daemon: DaemonConfig,
     pub projects: ProjectsConfig,
+    pub dependencies: DependenciesConfig,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +276,8 @@ struct RawTowerConfig {
     daemon: DaemonConfig,
     #[serde(default)]
     projects: Option<toml::Value>,
+    #[serde(default)]
+    dependencies: RawDependenciesConfig,
 }
 
 impl<'de> Deserialize<'de> for TowerConfig {
@@ -209,7 +288,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
         let value = toml::Value::deserialize(deserializer)?;
         validate_timeout_values(&value).map_err(serde::de::Error::custom)?;
         let raw: RawTowerConfig = value.try_into().map_err(serde::de::Error::custom)?;
-        let _ = raw.projects;
+        let _ = (raw.projects, raw.dependencies);
         Ok(Self {
             formatter: raw.formatter,
             lsp: raw.lsp,
@@ -218,6 +297,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
             extensions: raw.extensions,
             daemon: raw.daemon,
             projects: ProjectsConfig::default(),
+            dependencies: DependenciesConfig::default(),
         })
     }
 }
@@ -491,6 +571,20 @@ pub enum ConfigError {
     InvalidExternalAvailabilityTimeout {
         value: i64,
     },
+    InvalidDependencyLimit {
+        field: &'static str,
+        value: u64,
+    },
+    InvalidDependencyRoot {
+        index: usize,
+        reason: DependencyRootPathReason,
+    },
+    DuplicateDependencyRootId {
+        id: DependencyRootId,
+    },
+    InvalidDependencyIgnore {
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -560,6 +654,18 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "invalid projects.external_availability_timeout_secs: {value}"
             ),
+            ConfigError::InvalidDependencyLimit { field, value } => {
+                write!(f, "invalid dependency limit {field}: {value}")
+            }
+            ConfigError::InvalidDependencyRoot { index, reason } => {
+                write!(f, "invalid dependency root at index {index}: {reason:?}")
+            }
+            ConfigError::DuplicateDependencyRootId { .. } => {
+                f.write_str("duplicate dependency root id")
+            }
+            ConfigError::InvalidDependencyIgnore { index } => {
+                write!(f, "invalid dependency ignore rule at index {index}")
+            }
         }
     }
 }
@@ -631,7 +737,7 @@ fn load_with_path_canonicalizer(
             path: path.clone(),
             source,
         })?;
-    config.projects = parse_projects_config(&raw, workspace_root, canonicalize_path).map_err(
+    config.projects = parse_projects_config(&raw, workspace_root, &canonicalize_path).map_err(
         |error| match error {
             ProjectConfigLoadError::Parse(source) => ConfigError::Parse {
                 path: path.clone(),
@@ -640,6 +746,14 @@ fn load_with_path_canonicalizer(
             ProjectConfigLoadError::Config(error) => error,
         },
     )?;
+    config.dependencies = parse_dependencies_config(&raw, workspace_root, &canonicalize_path)
+        .map_err(|error| match error {
+            DependencyConfigLoadError::Parse(source) => ConfigError::Parse {
+                path: path.clone(),
+                source,
+            },
+            DependencyConfigLoadError::Config(error) => error,
+        })?;
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
     config.lint_request_timeout()?;
@@ -647,6 +761,317 @@ fn load_with_path_canonicalizer(
         config.extensions.lsp_diagnostics_timeout()?;
     }
     Ok(config)
+}
+
+enum DependencyConfigLoadError {
+    Parse(toml::de::Error),
+    Config(ConfigError),
+}
+
+fn parse_dependencies_config(
+    raw: &toml::Value,
+    workspace_root: &Path,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<DependenciesConfig, DependencyConfigLoadError> {
+    let raw_dependencies = raw
+        .get("dependencies")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let raw_dependencies: RawDependenciesConfig = raw_dependencies
+        .try_into()
+        .map_err(DependencyConfigLoadError::Parse)?;
+
+    let limits = parse_dependency_limits(&raw_dependencies)?;
+    validate_dependency_ignores(&raw_dependencies.ignore, workspace_root)?;
+    let roots =
+        resolve_dependency_roots(raw_dependencies.roots, workspace_root, canonicalize_path)?;
+
+    Ok(DependenciesConfig {
+        roots,
+        ignore: raw_dependencies.ignore,
+        limits,
+    })
+}
+
+fn parse_dependency_limits(
+    raw: &RawDependenciesConfig,
+) -> Result<DependencyIndexLimits, DependencyConfigLoadError> {
+    let max_files = dependency_usize_limit("max_files", raw.max_files)
+        .map_err(DependencyConfigLoadError::Config)?;
+    validate_dependency_limit("max_file_bytes", raw.max_file_bytes)
+        .map_err(DependencyConfigLoadError::Config)?;
+    validate_dependency_limit("max_total_bytes", raw.max_total_bytes)
+        .map_err(DependencyConfigLoadError::Config)?;
+    Ok(
+        DependencyIndexLimits::new(max_files, raw.max_file_bytes, raw.max_total_bytes)
+            .expect("dependency limits were checked as positive"),
+    )
+}
+
+fn validate_dependency_ignores(
+    rules: &[String],
+    workspace_root: &Path,
+) -> Result<(), DependencyConfigLoadError> {
+    for (index, rule) in rules.iter().enumerate() {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(workspace_root);
+        if !dependency_ignore_syntax_is_valid(rule)
+            || builder.add_line(None, rule).is_err()
+            || builder.build().is_err()
+        {
+            return Err(DependencyConfigLoadError::Config(
+                ConfigError::InvalidDependencyIgnore { index },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_dependency_roots(
+    raw_roots: Vec<RawDependencyRoot>,
+    workspace_root: &Path,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<Vec<ResolvedDependencyRoot>, DependencyConfigLoadError> {
+    if raw_roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let absolute_workspace = absolute_lexical_path(workspace_root).map_err(|()| {
+        DependencyConfigLoadError::Config(ConfigError::InvalidDependencyRoot {
+            index: 0,
+            reason: DependencyRootPathReason::Unsafe,
+        })
+    })?;
+    let canonical_workspace = canonicalize_path(&absolute_workspace)
+        .map(|path| lexical_normalize(&path))
+        .map_err(|_| {
+            DependencyConfigLoadError::Config(ConfigError::InvalidDependencyRoot {
+                index: 0,
+                reason: DependencyRootPathReason::Unsafe,
+            })
+        })?;
+
+    let mut identified = Vec::with_capacity(raw_roots.len());
+    for (index, root) in raw_roots.into_iter().enumerate() {
+        let id = DependencyRootId::new(root.id).map_err(|_| {
+            DependencyConfigLoadError::Config(ConfigError::InvalidDependencyRoot {
+                index,
+                reason: DependencyRootPathReason::InvalidId,
+            })
+        })?;
+        if identified
+            .iter()
+            .any(|(existing, _, _): &(DependencyRootId, String, usize)| existing == &id)
+        {
+            return Err(DependencyConfigLoadError::Config(
+                ConfigError::DuplicateDependencyRootId { id },
+            ));
+        }
+        identified.push((id, root.path, index));
+    }
+
+    let mut roots = Vec::<ResolvedDependencyRoot>::with_capacity(identified.len());
+    for (id, raw_path, index) in identified {
+        let path = resolve_dependency_root(
+            raw_path,
+            &absolute_workspace,
+            &canonical_workspace,
+            index,
+            canonicalize_path,
+        )
+        .map_err(DependencyConfigLoadError::Config)?;
+
+        if roots
+            .iter()
+            .any(|root| root.path == path || path.starts_with(&root.path))
+        {
+            continue;
+        }
+        roots.retain(|root| !root.path.starts_with(&path));
+        roots.push(ResolvedDependencyRoot { id, path });
+    }
+    roots.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(roots)
+}
+
+fn dependency_ignore_syntax_is_valid(rule: &str) -> bool {
+    if rule.is_empty() || rule.chars().any(char::is_control) {
+        return false;
+    }
+    let mut escaped = false;
+    let mut character_class_open = false;
+    for character in rule.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !character_class_open => character_class_open = true,
+            ']' if character_class_open => character_class_open = false,
+            _ => {}
+        }
+    }
+    !escaped && !character_class_open
+}
+
+fn dependency_usize_limit(field: &'static str, value: u64) -> Result<usize, ConfigError> {
+    validate_dependency_limit(field, value)?;
+    usize::try_from(value).map_err(|_| ConfigError::InvalidDependencyLimit { field, value })
+}
+
+fn validate_dependency_limit(field: &'static str, value: u64) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::InvalidDependencyLimit { field, value });
+    }
+    Ok(())
+}
+
+fn absolute_lexical_path(path: &Path) -> Result<PathBuf, ()> {
+    if path.is_absolute() {
+        return Ok(lexical_normalize(path));
+    }
+    std::env::current_dir()
+        .map(|current| lexical_normalize(&current.join(path)))
+        .map_err(|_| ())
+}
+
+fn resolve_dependency_root(
+    raw_path: String,
+    absolute_workspace: &Path,
+    canonical_workspace: &Path,
+    index: usize,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<PathBuf, ConfigError> {
+    let invalid = |reason| ConfigError::InvalidDependencyRoot { index, reason };
+    if raw_path.is_empty() {
+        return Err(invalid(DependencyRootPathReason::Empty));
+    }
+    if raw_path.contains('\0') || is_ambiguous_dependency_path(&raw_path) {
+        return Err(invalid(DependencyRootPathReason::Unsafe));
+    }
+    let configured = PathBuf::from(raw_path);
+    let absolute = if configured.is_absolute() {
+        configured
+    } else {
+        absolute_workspace.join(configured)
+    };
+    let lexical = lexical_normalize(&absolute);
+    if !lexical.is_absolute() || dependency_path_is_prohibited(&lexical, canonical_workspace) {
+        return Err(invalid(if lexical.is_absolute() {
+            DependencyRootPathReason::Prohibited
+        } else {
+            DependencyRootPathReason::Unsafe
+        }));
+    }
+
+    let resolved = match canonicalize_path(&absolute) {
+        Ok(path) => {
+            let path = lexical_normalize(&path);
+            let metadata =
+                fs::metadata(&path).map_err(|_| invalid(DependencyRootPathReason::Unsafe))?;
+            if !metadata.is_dir() {
+                return Err(invalid(DependencyRootPathReason::NotDirectory));
+            }
+            path
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+            return Err(invalid(DependencyRootPathReason::NotDirectory));
+        }
+        Err(error) => resolve_unavailable_dependency_root(
+            &lexical,
+            absolute_workspace,
+            error.kind(),
+            canonicalize_path,
+        )
+        .ok_or_else(|| invalid(DependencyRootPathReason::Unsafe))?,
+    };
+
+    if dependency_path_is_prohibited(&resolved, canonical_workspace) {
+        return Err(invalid(DependencyRootPathReason::Prohibited));
+    }
+    Ok(resolved)
+}
+
+fn is_ambiguous_dependency_path(_raw_path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        if matches!(Path::new(_raw_path).components().next(), Some(Component::Prefix(prefix)) if !prefix.kind().is_verbatim() && !Path::new(_raw_path).is_absolute())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_unavailable_dependency_root(
+    lexical: &Path,
+    workspace: &Path,
+    error_kind: io::ErrorKind,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Option<PathBuf> {
+    let mut ancestor = lexical.parent()?;
+    let mut suffix = Vec::new();
+    suffix.push(lexical.file_name()?.to_owned());
+
+    loop {
+        if error_kind != io::ErrorKind::NotFound && ancestor == workspace {
+            return None;
+        }
+        if let Ok(canonical) = canonicalize_path(ancestor) {
+            let metadata = fs::metadata(&canonical).ok()?;
+            if !metadata.is_dir() {
+                return None;
+            }
+            let mut resolved = lexical_normalize(&canonical);
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        suffix.push(ancestor.file_name()?.to_owned());
+        ancestor = ancestor.parent()?;
+    }
+}
+
+fn dependency_path_is_prohibited(path: &Path, workspace: &Path) -> bool {
+    if path.parent().is_none() || (workspace.starts_with(path) && workspace != path) {
+        return true;
+    }
+
+    let workspace_metadata = [workspace.join(".tower"), workspace.join(".git")];
+    if workspace_metadata
+        .iter()
+        .any(|metadata| path.starts_with(metadata))
+    {
+        return true;
+    }
+    if path != workspace
+        && [path.join(".tower"), path.join(".git")]
+            .iter()
+            .any(|metadata| metadata.exists())
+    {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if ["/proc", "/sys", "/dev", "/etc", "/boot", "/run"]
+        .iter()
+        .map(Path::new)
+        .any(|system_tree| path.starts_with(system_tree) || system_tree.starts_with(path))
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        let system_root = lexical_normalize(Path::new(&system_root));
+        if path.starts_with(&system_root) || system_root.starts_with(path) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1117,6 +1542,441 @@ mod tests {
             }
         }
         lower
+    }
+
+    fn dependency_contract_example() -> &'static str {
+        let guide = include_str!("../../../../../docs/user-guide/configuration.md");
+        guide
+            .split("```toml\n")
+            .find(|block| block.starts_with("[dependencies]\n"))
+            .expect("documented dependency TOML example")
+            .split_once("\n```")
+            .expect("dependency TOML closing fence")
+            .0
+    }
+
+    fn dependency_root_ids(config: &TowerConfig) -> Vec<DependencyRootId> {
+        config
+            .dependencies
+            .roots
+            .iter()
+            .map(|root| root.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn dependency_configuration_parses_documented_example_and_defaults() {
+        let fixture = tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let sibling = fixture.path().join("library-src");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        write_config(&workspace, dependency_contract_example());
+
+        let config = load(&workspace).expect("documented dependency configuration must load");
+
+        assert_eq!(
+            config.dependencies.roots,
+            vec![ResolvedDependencyRoot {
+                id: DependencyRootId::new("library".to_owned()).unwrap(),
+                path: sibling.canonicalize().unwrap(),
+            }]
+        );
+        assert_eq!(config.dependencies.ignore, ["target/", "*.generated.rs"]);
+        assert_eq!(
+            config.dependencies.limits,
+            DependencyIndexLimits::new(10_000, 1_048_576, 67_108_864).unwrap()
+        );
+
+        write_config(
+            &workspace,
+            "[dependencies]\n\n[[dependencies.roots]]\nid = \"library\"\npath = \"../library-src\"\n",
+        );
+        let defaults = load(&workspace).expect("omitted dependency fields must use defaults");
+        assert!(defaults.dependencies.ignore.is_empty());
+        assert_eq!(defaults.dependencies.limits, config.dependencies.limits);
+    }
+
+    #[test]
+    fn dependency_search_configuration_rejects_invalid_limits_and_roots() {
+        let workspace = tempdir().unwrap();
+
+        for field in ["max_files", "max_file_bytes", "max_total_bytes"] {
+            write_config(workspace.path(), &format!("[dependencies]\n{field} = 0\n"));
+            assert!(matches!(
+                load(workspace.path()),
+                Err(ConfigError::InvalidDependencyLimit {
+                    field: actual,
+                    value: 0,
+                }) if actual == field
+            ));
+        }
+
+        for body in [
+            "[dependencies\n",
+            "[dependencies]\nunknown = true\n",
+            "[dependencies]\nmax_files = -1\n",
+            "[[dependencies.roots]]\nid = \"missing-path\"\n",
+        ] {
+            write_config(workspace.path(), body);
+            assert!(matches!(
+                load(workspace.path()),
+                Err(ConfigError::Parse { .. })
+            ));
+        }
+
+        let cases = [
+            ("", DependencyRootPathReason::Empty),
+            ("unsafe\\u0000root", DependencyRootPathReason::Unsafe),
+        ];
+        for (configured_path, reason) in cases {
+            write_config(
+                workspace.path(),
+                &format!("[[dependencies.roots]]\nid = \"root\"\npath = \"{configured_path}\"\n"),
+            );
+            let error = load(workspace.path()).expect_err("invalid root must be rejected");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidDependencyRoot {
+                    index: 0,
+                    reason: actual,
+                } if actual == reason
+            ));
+        }
+
+        let regular_file = workspace.path().join("dependency-file");
+        fs::write(&regular_file, "private-content-sentinel").unwrap();
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"file\"\npath = \"dependency-file\"\n",
+        );
+        let error = load(workspace.path()).expect_err("regular file must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidDependencyRoot {
+                index: 0,
+                reason: DependencyRootPathReason::NotDirectory,
+            }
+        ));
+        let rendered = error.to_string();
+        assert!(!rendered.contains("private-content-sentinel"));
+        assert!(!rendered.contains(regular_file.to_string_lossy().as_ref()));
+
+        let external_with_git = tempdir().unwrap();
+        fs::create_dir_all(external_with_git.path().join(".git")).unwrap();
+        let external_with_tower = tempdir().unwrap();
+        fs::create_dir_all(external_with_tower.path().join(".tower")).unwrap();
+        fs::create_dir_all(workspace.path().join(".git")).unwrap();
+        fs::create_dir_all(workspace.path().join(".git/hooks")).unwrap();
+        fs::create_dir_all(workspace.path().join(".tower/cache")).unwrap();
+        let mut prohibited_paths = vec![
+            workspace.path().parent().unwrap().to_path_buf(),
+            workspace.path().join(".tower"),
+            workspace.path().join(".tower/cache"),
+            workspace.path().join(".git"),
+            workspace.path().join(".git/hooks"),
+            external_with_git.path().to_path_buf(),
+            external_with_tower.path().to_path_buf(),
+        ];
+        #[cfg(unix)]
+        prohibited_paths.extend(
+            [
+                "/",
+                "/proc",
+                "/proc/self",
+                "/sys",
+                "/sys/kernel",
+                "/dev",
+                "/dev/shm",
+                "/etc",
+                "/etc/..",
+                "/boot",
+                "/run",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+        #[cfg(windows)]
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            prohibited_paths.push(PathBuf::from(system_root));
+        }
+
+        for prohibited in prohibited_paths {
+            write_config(
+                workspace.path(),
+                &format!(
+                    "[[dependencies.roots]]\nid = \"metadata\"\npath = {:?}\n",
+                    prohibited.to_string_lossy()
+                ),
+            );
+            let error = load(workspace.path()).expect_err("prohibited root must be rejected");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidDependencyRoot {
+                    index: 0,
+                    reason: DependencyRootPathReason::Prohibited,
+                }
+            ));
+            assert!(
+                !error
+                    .to_string()
+                    .contains(prohibited.to_string_lossy().as_ref())
+            );
+        }
+
+        fs::create_dir_all(workspace.path().join("dependency")).unwrap();
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"duplicate\"\npath = \"dependency\"\n\n[[dependencies.roots]]\nid = \"duplicate\"\npath = \"dependency/.\"\n",
+        );
+        assert!(matches!(
+            load(workspace.path()),
+            Err(ConfigError::DuplicateDependencyRootId { id })
+                if id == DependencyRootId::new("duplicate".to_owned()).unwrap()
+        ));
+
+        let raw_os_sentinel = "raw-os-error-sentinel";
+        let private_path_sentinel = workspace.path().join("unrelated-private-path-sentinel");
+        let unreadable = workspace.path().join("unreadable-root");
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"unreadable\"\npath = \"unreadable-root\"\n",
+        );
+        let error = load_with_path_canonicalizer(workspace.path(), |path| {
+            if path == unreadable {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{raw_os_sentinel}: {}", private_path_sentinel.display()),
+                ))
+            } else {
+                fs::canonicalize(path)
+            }
+        })
+        .expect_err("canonicalizer failure must be sanitized through load");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidDependencyRoot {
+                index: 0,
+                reason: DependencyRootPathReason::Unsafe,
+            }
+        ));
+        let rendered = error.to_string();
+        assert!(!rendered.contains(raw_os_sentinel), "{rendered}");
+        assert!(
+            !rendered.contains(private_path_sentinel.to_string_lossy().as_ref()),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn dependency_configuration_preserves_outermost_root_in_both_orders() {
+        let workspace = tempdir().unwrap();
+        let parent = workspace.path().join("dependency");
+        let child = parent.join("nested");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(parent.join("parent-only.rs"), "pub struct ParentOnly;").unwrap();
+
+        let equal = "[[dependencies.roots]]\nid = \"z-first\"\npath = \"dependency\"\n\n[[dependencies.roots]]\nid = \"a-second\"\npath = \"dependency/.\"\n";
+        write_config(workspace.path(), equal);
+        let config = load(workspace.path()).expect("equivalent roots must deduplicate");
+        assert_eq!(
+            dependency_root_ids(&config),
+            [DependencyRootId::new("z-first".to_owned()).unwrap()]
+        );
+
+        #[cfg(unix)]
+        {
+            let alias = workspace.path().join("dependency-alias");
+            std::os::unix::fs::symlink(&parent, &alias).unwrap();
+            write_config(
+                workspace.path(),
+                "[[dependencies.roots]]\nid = \"alias-first\"\npath = \"dependency-alias\"\n\n[[dependencies.roots]]\nid = \"original-second\"\npath = \"dependency\"\n",
+            );
+            let config = load(workspace.path()).expect("directory aliases must deduplicate");
+            assert_eq!(
+                config.dependencies.roots,
+                [ResolvedDependencyRoot {
+                    id: DependencyRootId::new("alias-first".to_owned()).unwrap(),
+                    path: parent.canonicalize().unwrap(),
+                }]
+            );
+        }
+
+        for body in [
+            "[[dependencies.roots]]\nid = \"z-parent\"\npath = \"dependency\"\n\n[[dependencies.roots]]\nid = \"a-child\"\npath = \"dependency/nested\"\n",
+            "[[dependencies.roots]]\nid = \"a-child\"\npath = \"dependency/nested\"\n\n[[dependencies.roots]]\nid = \"z-parent\"\npath = \"dependency\"\n",
+        ] {
+            write_config(workspace.path(), body);
+            let config = load(workspace.path()).expect("nested roots must deduplicate");
+            assert_eq!(
+                config.dependencies.roots,
+                [ResolvedDependencyRoot {
+                    id: DependencyRootId::new("z-parent".to_owned()).unwrap(),
+                    path: parent.canonicalize().unwrap(),
+                }]
+            );
+            assert!(
+                config.dependencies.roots[0]
+                    .path
+                    .join("parent-only.rs")
+                    .is_file()
+            );
+        }
+
+        fs::create_dir_all(workspace.path().join("another")).unwrap();
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"z-root\"\npath = \"dependency\"\n\n[[dependencies.roots]]\nid = \"a-root\"\npath = \"another\"\n",
+        );
+        let sorted = load(workspace.path()).expect("distinct roots must load");
+        assert_eq!(
+            dependency_root_ids(&sorted),
+            [
+                DependencyRootId::new("a-root".to_owned()).unwrap(),
+                DependencyRootId::new("z-root".to_owned()).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dependency_configuration_accepts_missing_roots_for_scan_reporting() {
+        let workspace = tempdir().unwrap();
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"missing\"\npath = \"vendor/not-yet-installed\"\n",
+        );
+
+        let config = load(workspace.path()).expect("safe missing root must remain configured");
+
+        assert_eq!(
+            config.dependencies.roots,
+            [ResolvedDependencyRoot {
+                id: DependencyRootId::new("missing".to_owned()).unwrap(),
+                path: workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("vendor/not-yet-installed"),
+            }]
+        );
+        assert!(!config.dependencies.roots[0].path.exists());
+
+        let unreadable = workspace.path().join("vendor/unreadable");
+        fs::create_dir_all(unreadable.parent().unwrap()).unwrap();
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"unreadable\"\npath = \"vendor/unreadable\"\n",
+        );
+        let config = load_with_path_canonicalizer(workspace.path(), |path| {
+            if path == unreadable {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                fs::canonicalize(path)
+            }
+        })
+        .expect("a safely bounded unreadable root must remain configured");
+        assert_eq!(
+            config.dependencies.roots,
+            [ResolvedDependencyRoot {
+                id: DependencyRootId::new("unreadable".to_owned()).unwrap(),
+                path: workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("vendor/unreadable"),
+            }]
+        );
+    }
+
+    #[test]
+    fn dependency_configuration_rejects_invalid_ids_and_ignore_rules() {
+        let workspace = tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join("dependency")).unwrap();
+
+        for invalid_id in ["", ".", "..", "with/slash", "with\\\\slash"] {
+            write_config(
+                workspace.path(),
+                &format!(
+                    "[[dependencies.roots]]\nid = {:?}\npath = \"dependency\"\n",
+                    invalid_id
+                ),
+            );
+            assert!(matches!(
+                load(workspace.path()),
+                Err(ConfigError::InvalidDependencyRoot {
+                    index: 0,
+                    reason: DependencyRootPathReason::InvalidId,
+                })
+            ));
+        }
+
+        write_config(workspace.path(), "[dependencies]\nignore = [\"[\"]\n");
+        let error = load(workspace.path()).expect_err("invalid ignore rule must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidDependencyIgnore { index: 0 }
+        ));
+        assert!(!error.to_string().contains('['));
+    }
+
+    #[test]
+    fn dependency_configuration_preserves_workspace_source_ownership() {
+        let workspace = tempdir().unwrap();
+        let source = workspace.path().join("src");
+        fs::create_dir_all(&source).unwrap();
+        write_config(
+            workspace.path(),
+            "[[dependencies.roots]]\nid = \"workspace\"\npath = \".\"\n\n[[dependencies.roots]]\nid = \"source\"\npath = \"src\"\n",
+        );
+
+        let config = load(workspace.path()).expect("workspace source roots are valid");
+
+        assert_eq!(
+            config.dependencies.roots,
+            [ResolvedDependencyRoot {
+                id: DependencyRootId::new("workspace".to_owned()).unwrap(),
+                path: workspace.path().canonicalize().unwrap(),
+            }]
+        );
+
+        #[cfg(unix)]
+        {
+            let ordinary_etc = workspace.path().join("src/etc/dependency");
+            fs::create_dir_all(&ordinary_etc).unwrap();
+            write_config(
+                workspace.path(),
+                "[[dependencies.roots]]\nid = \"ordinary-etc\"\npath = \"src/etc/dependency\"\n",
+            );
+
+            let config = load(workspace.path())
+                .expect("ordinary directories named like system roots must remain valid");
+            assert_eq!(
+                config.dependencies.roots,
+                [ResolvedDependencyRoot {
+                    id: DependencyRootId::new("ordinary-etc".to_owned()).unwrap(),
+                    path: ordinary_etc.canonicalize().unwrap(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_search_configuration_absence_preserves_defaults() {
+        let workspace = tempdir().unwrap();
+        write_config(workspace.path(), "[extensions]\ndisabled = [\"ast\"]\n");
+
+        let config = load_with_path_canonicalizer(workspace.path(), |_| {
+            panic!("zero dependency roots must not invoke path canonicalization")
+        })
+        .expect("unrelated configuration must load without dependency discovery");
+
+        assert!(config.dependencies.roots.is_empty());
+        assert!(config.dependencies.ignore.is_empty());
+        assert_eq!(
+            config.dependencies.limits,
+            DependenciesConfig::default().limits
+        );
+        assert_eq!(config.extensions.disabled, ["ast"]);
     }
 
     #[test]

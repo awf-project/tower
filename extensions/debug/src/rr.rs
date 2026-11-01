@@ -1139,7 +1139,17 @@ mod tests {
     }
 
     fn write_executable(path: PathBuf, script: &str) -> PathBuf {
-        fs::write(&path, script).expect("write test executable");
+        // Keep writable executable descriptors out of the test process: a
+        // concurrent spawn can inherit one until exec and cause ETXTBSY.
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\"")
+            .arg("write-fixture-executable")
+            .arg(&path)
+            .arg(script)
+            .status()
+            .expect("spawn test executable writer");
+        assert!(status.success(), "write test executable: {status}");
         let mut permissions = fs::metadata(&path)
             .expect("test executable metadata")
             .permissions();
@@ -1856,7 +1866,7 @@ mod tests {
         let mut store = TraceStore::new(request.trace_policy.clone());
         let result = RealRrRecorder::new().record(request, &mut store);
 
-        assert!(result.recordable);
+        assert!(result.recordable, "recording failed: {result:?}");
         assert_eq!(
             result
                 .output
