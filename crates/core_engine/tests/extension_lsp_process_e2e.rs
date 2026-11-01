@@ -2531,7 +2531,14 @@ fn f008_bare_rename_failure_table_preserves_read_only_and_rename_server_failure_
                 .contains("SENTINEL_PRIVATE_BACKEND_DETAIL")
         );
 
-        let mut rename_child = RawLspChild::spawn_with_workspace(Some(workspace.path()));
+        // Crash after consuming the rename request. Exiting on didOpen races the
+        // next write against EOF and legitimately produces a transport error.
+        let rename_workspace = fake_lsp_workspace(if mode == "server_crashed" {
+            "server_crashed_on_prepare_rename"
+        } else {
+            mode
+        });
+        let mut rename_child = RawLspChild::spawn_with_workspace(Some(rename_workspace.path()));
         initialize_raw_lsp_child(&mut rename_child);
         let rename_response =
             invoke_bare_rename_without_apply_edits(&mut rename_child, 530 + offset as u64);
@@ -2548,6 +2555,16 @@ fn f008_bare_rename_failure_table_preserves_read_only_and_rename_server_failure_
         );
         assert_eq!(rename["message"], rename["outcome"]["message"]);
         assert_eq!(rename["path"], rename["outcome"]["path"]);
+        if mode == "server_crashed" {
+            assert_eq!(
+                read_trace(&rename_workspace)
+                    .iter()
+                    .filter(|event| event["event"] == "prepareRenameCrash")
+                    .count(),
+                1,
+                "crash must occur at the rename request boundary"
+            );
+        }
         assert!(
             !rename_response
                 .to_string()
@@ -2556,6 +2573,7 @@ fn f008_bare_rename_failure_table_preserves_read_only_and_rename_server_failure_
         drop(read_child);
         drop(rename_child);
         assert_fixture_servers_stopped(workspace.path());
+        assert_fixture_servers_stopped(rename_workspace.path());
     }
 
     for (offset, code) in [

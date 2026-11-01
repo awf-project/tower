@@ -15,6 +15,7 @@ Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 | ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | **Persistent workspace index**  | Fast file lookup and directory listing from a `sled`-backed VFS.                                           |
 | **Parallel text search**        | Rayon-backed grep across indexed file contents.                                                            |
+| **Dependency source search**    | Opt-in, bounded search of explicitly configured, read-only source roots.                                   |
 | **Safe mutations**              | Atomic writes and CAS-style `expected_version` checks for agent-safe edits.                                |
 | **Path rename**                 | Preview or move indexed files and directories, with optional language-server reference updates.            |
 | **Reference-aware safe delete** | Check references before deleting a declaration and apply validated backend cleanup edits safely.           |
@@ -147,6 +148,11 @@ and serves file/search tools from the repaired index.
 **`.towerignore` is the source of truth.** Tower does not inherit `.gitignore`. This keeps the agent
 visibility policy explicit and project-local.
 
+**Dependency search is opt-in per query.** Configure source roots in `.tower/config.toml`, then pass
+`scope: {"workspace": true, "dependencies": true}` to `tower_find_file` or `tower_search_text`.
+Omitting `scope` keeps the existing workspace-only response. Dependency results carry read-only
+locators. See [searching dependency sources](docs/user-guide/dependency-search.md).
+
 **Edits are CAS-aware.** Mutating tools can use an `expected_version` token returned by
 `tower_read_file` to reject writes when a file changed since it was read.
 
@@ -188,6 +194,7 @@ stable error codes.
 | [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)                                                                   | Previewing and applying structured linter fixes.                                         |
 | [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md)                                                           | Interactive DAP sessions and rr-backed reverse-debug workflows.                          |
 | [docs/user-guide/project-queries.md](docs/user-guide/project-queries.md)                                                         | Configure trusted external projects and route read-only queries with source attribution. |
+| [docs/user-guide/dependency-search.md](docs/user-guide/dependency-search.md)                                                     | Configure bounded dependency roots and opt into origin-aware file and text searches.     |
 | [docs/development.md](docs/development.md)                                                                                       | Contribution workflow, CI checks, tests, and project conventions.                        |
 | [docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md](docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md) | B001 startup ownership and capability-readiness decision.                                |
 

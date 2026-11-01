@@ -24,6 +24,18 @@ fn run_init(workspace: &Path) -> Output {
         .expect("run tower init")
 }
 
+fn run_daemon(workspace: &Path) -> Output {
+    ProcessCommand::new(env!("CARGO_BIN_EXE_tower"))
+        .arg("daemon")
+        .arg("--workspace-dir")
+        .arg(workspace)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", workspace)
+        .output()
+        .expect("run tower daemon")
+}
+
 fn generated_files(root: &Path) -> Vec<PathBuf> {
     fn visit(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(current).unwrap() {
@@ -101,6 +113,43 @@ fn version_flag_is_recognized() {
 #[test]
 fn unknown_subcommand_is_rejected() {
     assert!(Cli::try_parse_from(["tower", "bogus"]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn dependency_configuration_startup_diagnostic_redacts_path_and_os_error() {
+    let workspace = tempfile::tempdir().unwrap();
+    let private_path = workspace.path().join("unrelated-private-path-sentinel");
+    std::os::unix::fs::symlink(&private_path, &private_path).unwrap();
+    std::fs::create_dir_all(workspace.path().join(".tower")).unwrap();
+    std::fs::write(
+        workspace.path().join(".tower/config.toml"),
+        "[[dependencies.roots]]\nid = \"private\"\npath = \"unrelated-private-path-sentinel\"\n",
+    )
+    .unwrap();
+
+    let output = run_daemon(workspace.path());
+    assert!(
+        !output.status.success(),
+        "invalid dependency root must fail startup"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "startup failure stdout must be empty"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("startup stderr must be UTF-8");
+    assert!(
+        stderr.contains("tower: invalid dependency root at index 0: Unsafe"),
+        "unexpected startup diagnostic: {stderr}"
+    );
+    assert!(
+        !stderr.contains(private_path.to_string_lossy().as_ref()),
+        "startup diagnostic leaked the configured path: {stderr}"
+    );
+    assert!(
+        !stderr.contains("os error") && !stderr.contains("Too many levels"),
+        "startup diagnostic leaked the raw canonicalization error: {stderr}"
+    );
 }
 
 #[test]

@@ -35,6 +35,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::domain::grep::TextSearch;
+use crate::domain::search::{
+    DependencyIndexReport, DependencyIndexSnapshot, ScopedFileSearchResult, ScopedTextSearchResult,
+    SearchScope, compose_filename_results, compose_text_results,
+};
 use crate::domain::token::tokenize;
 use crate::domain::workspace::ProjectWorkspace;
 use crate::domain::{DomainError, FileId, RelativePath};
@@ -82,6 +86,7 @@ pub struct FileSearch<'ws> {
     /// `Sync` bound required so the reference can be shared across Rayon
     /// worker threads inside `TextSearch`.
     fs: Option<&'ws (dyn FileSystemPort + Sync)>,
+    dependency_snapshot: Option<&'ws DependencyIndexSnapshot>,
 }
 
 impl<'ws> FileSearch<'ws> {
@@ -95,6 +100,7 @@ impl<'ws> FileSearch<'ws> {
             index,
             workspace,
             fs: None,
+            dependency_snapshot: None,
         }
     }
 
@@ -126,6 +132,12 @@ impl<'ws> FileSearch<'ws> {
     #[must_use]
     pub fn with_fs(mut self, fs: &'ws (dyn FileSystemPort + Sync)) -> Self {
         self.fs = Some(fs);
+        self
+    }
+
+    #[must_use]
+    pub fn with_dependency_snapshot(mut self, snapshot: &'ws DependencyIndexSnapshot) -> Self {
+        self.dependency_snapshot = Some(snapshot);
         self
     }
 
@@ -188,6 +200,27 @@ impl<'ws> FileSearch<'ws> {
 }
 
 impl SearchUseCase for FileSearch<'_> {
+    fn find_file_scoped(
+        &self,
+        query: &str,
+        scope: SearchScope,
+    ) -> Result<ScopedFileSearchResult, DomainError> {
+        let workspace_hits = if scope.workspace {
+            self.find_file(query)?
+        } else {
+            Vec::new()
+        };
+        let empty_snapshot = empty_dependency_snapshot();
+        let snapshot = self.dependency_snapshot.unwrap_or(&empty_snapshot);
+
+        Ok(compose_filename_results(
+            workspace_hits,
+            snapshot,
+            query,
+            scope,
+        ))
+    }
+
     /// Find files matching `query`, ranked by relevance (spec EV3 / AC1/AC2).
     ///
     /// Returns `Ok(Vec::new())` for empty or whitespace queries (spec UN1 / AC5).
@@ -221,6 +254,27 @@ impl SearchUseCase for FileSearch<'_> {
             Some(fs) => TextSearch::new(self.workspace, fs).search(pattern, None),
             None => Ok(Vec::new()),
         }
+    }
+
+    fn search_text_scoped(
+        &self,
+        pattern: &str,
+        scope: SearchScope,
+    ) -> Result<ScopedTextSearchResult, DomainError> {
+        let workspace_hits = if scope.workspace {
+            self.search_text(pattern)?
+        } else {
+            Vec::new()
+        };
+        let empty_snapshot = empty_dependency_snapshot();
+        let snapshot = self.dependency_snapshot.unwrap_or(&empty_snapshot);
+
+        Ok(compose_text_results(
+            workspace_hits,
+            snapshot,
+            pattern,
+            scope,
+        ))
     }
 
     fn list_dir(&self, request: ListDirRequest) -> Result<ListDirResult, DomainError> {
@@ -279,6 +333,20 @@ impl SearchUseCase for FileSearch<'_> {
             None => Ok(Vec::new()),
         }
     }
+}
+
+fn empty_dependency_snapshot() -> DependencyIndexSnapshot {
+    DependencyIndexSnapshot::new(
+        Vec::new(),
+        DependencyIndexReport {
+            indexed_files: 0,
+            indexed_bytes: 0,
+            skipped_files: 0,
+            truncated: false,
+            limit_reasons: Vec::new(),
+            issues: Vec::new(),
+        },
+    )
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -368,6 +436,10 @@ fn join_path(base: &str, child: &str) -> RelativePath {
 mod tests {
     use super::*;
     use crate::adapters::InMemoryFs;
+    use crate::domain::search::{
+        DependencyIndexIssue, DependencyIndexIssueReason, DependencyIndexReport, DependencyPath,
+        DependencyRootId, IndexedDependencyFile, SearchResultLocator, SearchResultOrigin,
+    };
     use crate::domain::token::tokenize;
     use crate::domain::virtual_file::FileMetadata;
     use crate::domain::workspace::ProjectWorkspace;
@@ -389,6 +461,199 @@ mod tests {
 
     fn make_search<'a>(idx: &'a InvertedIndex, ws: &'a ProjectWorkspace) -> FileSearch<'a> {
         FileSearch::new(idx, ws)
+    }
+
+    fn dependency_root(value: &str) -> DependencyRootId {
+        DependencyRootId::new(value.to_owned()).expect("valid dependency root")
+    }
+
+    fn dependency_path(root: &str, relative_path: &str) -> DependencyPath {
+        DependencyPath::new(dependency_root(root), path(relative_path))
+            .expect("valid dependency path")
+    }
+
+    fn dependency_file(root: &str, relative_path: &str, content: &str) -> IndexedDependencyFile {
+        IndexedDependencyFile::new(
+            dependency_path(root, relative_path),
+            content.len() as u64,
+            content.to_owned(),
+        )
+    }
+
+    fn dependency_snapshot(files: Vec<IndexedDependencyFile>) -> DependencyIndexSnapshot {
+        let indexed_files = files.len();
+        DependencyIndexSnapshot::new(
+            files,
+            DependencyIndexReport {
+                indexed_files,
+                indexed_bytes: 0,
+                skipped_files: 0,
+                truncated: false,
+                limit_reasons: Vec::new(),
+                issues: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn filename_search_respects_workspace_dependency_combined_and_empty_scopes() {
+        let mut ws = ProjectWorkspace::new();
+        let mut idx = InvertedIndex::new();
+        add_file(&mut ws, &mut idx, "workspace/lib.rs");
+        let snapshot = dependency_snapshot(vec![dependency_file(
+            "library",
+            "dependency/lib.rs",
+            "dependency",
+        )]);
+        let search = make_search(&idx, &ws).with_dependency_snapshot(&snapshot);
+
+        for (scope, expected) in [
+            (
+                SearchScope::workspace_only(),
+                vec![SearchResultOrigin::Workspace],
+            ),
+            (
+                SearchScope::dependencies_only(),
+                vec![SearchResultOrigin::Dependency {
+                    root_id: dependency_root("library"),
+                }],
+            ),
+            (
+                SearchScope::all(),
+                vec![
+                    SearchResultOrigin::Workspace,
+                    SearchResultOrigin::Dependency {
+                        root_id: dependency_root("library"),
+                    },
+                ],
+            ),
+            (SearchScope::none(), Vec::new()),
+        ] {
+            let result = search.find_file_scoped("lib", scope).unwrap();
+            assert_eq!(
+                result
+                    .results
+                    .into_iter()
+                    .map(|entry| entry.origin)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        let without_snapshot = make_search(&idx, &ws)
+            .find_file_scoped("lib", SearchScope::all())
+            .unwrap();
+        assert_eq!(without_snapshot.results.len(), 1);
+        assert_eq!(
+            without_snapshot.results[0].origin,
+            SearchResultOrigin::Workspace
+        );
+    }
+
+    #[test]
+    fn filename_search_orders_and_deduplicates_owned_results() {
+        let mut ws = ProjectWorkspace::new();
+        let mut idx = InvertedIndex::new();
+        add_file(&mut ws, &mut idx, "src/lib.rs");
+        let duplicate = dependency_file("zeta", "src/lib.rs", "dependency");
+        let snapshot = dependency_snapshot(vec![
+            duplicate.clone(),
+            dependency_file("alpha", "src/a_lib.rs", "dependency"),
+            duplicate,
+        ]);
+
+        let result = make_search(&idx, &ws)
+            .with_dependency_snapshot(&snapshot)
+            .find_file_scoped("lib", SearchScope::all())
+            .unwrap();
+
+        assert_eq!(
+            result
+                .results
+                .into_iter()
+                .map(|entry| entry.locator)
+                .collect::<Vec<_>>(),
+            vec![
+                SearchResultLocator::Workspace(path("src/lib.rs")),
+                SearchResultLocator::Dependency(dependency_path("alpha", "src/a_lib.rs")),
+                SearchResultLocator::Dependency(dependency_path("zeta", "src/lib.rs")),
+            ]
+        );
+    }
+
+    #[test]
+    fn filename_search_preserves_workspace_only_compatibility_and_empty_queries() {
+        let mut ws = ProjectWorkspace::new();
+        let mut idx = InvertedIndex::new();
+        add_file(&mut ws, &mut idx, "workspace/lib.rs");
+        let snapshot = dependency_snapshot(vec![dependency_file(
+            "library",
+            "dependency/lib.rs",
+            "dependency",
+        )]);
+        let search = make_search(&idx, &ws).with_dependency_snapshot(&snapshot);
+
+        assert_eq!(
+            search.find_file("lib").unwrap(),
+            vec![path("workspace/lib.rs")]
+        );
+        assert!(search.find_file("").unwrap().is_empty());
+        assert!(search.find_file("  ").unwrap().is_empty());
+        assert!(
+            search
+                .find_file_scoped("", SearchScope::all())
+                .unwrap()
+                .results
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn filename_search_propagates_dependency_report_without_converting_issues_to_errors() {
+        let issue = DependencyIndexIssue {
+            root_id: dependency_root("library"),
+            path: Some(path("unreadable.rs")),
+            reason: DependencyIndexIssueReason::EntryUnreadable,
+        };
+        let report = DependencyIndexReport {
+            indexed_files: 0,
+            indexed_bytes: 0,
+            skipped_files: 1,
+            truncated: false,
+            limit_reasons: Vec::new(),
+            issues: vec![issue],
+        };
+        let snapshot = DependencyIndexSnapshot::new(Vec::new(), report.clone());
+        let ws = ProjectWorkspace::new();
+        let idx = InvertedIndex::new();
+
+        let result = make_search(&idx, &ws)
+            .with_dependency_snapshot(&snapshot)
+            .find_file_scoped("lib", SearchScope::dependencies_only())
+            .unwrap();
+
+        assert!(result.results.is_empty());
+        assert_eq!(result.dependency_report, report);
+    }
+
+    #[test]
+    fn filename_search_preserves_infallible_workspace_behavior() {
+        let mut ws = ProjectWorkspace::new();
+        let mut idx = InvertedIndex::new();
+        let stale = add_file(&mut ws, &mut idx, "stale/lib.rs");
+        ws.remove(stale).unwrap();
+        add_file(&mut ws, &mut idx, "valid/lib.rs");
+
+        let result = make_search(&idx, &ws)
+            .find_file_scoped("lib", SearchScope::workspace_only())
+            .unwrap();
+
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].path, path("valid/lib.rs"));
+        assert_eq!(
+            result.results[0].locator,
+            SearchResultLocator::Workspace(path("valid/lib.rs"))
+        );
     }
 
     mod list_dir {

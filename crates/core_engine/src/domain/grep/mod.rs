@@ -223,8 +223,16 @@ mod tests {
     use super::*;
     use crate::adapters::InMemoryFs;
     use crate::domain::RelativePath;
+    use crate::domain::index::{FileSearch, InvertedIndex};
+    use crate::domain::search::{
+        DependencyIndexIssue, DependencyIndexIssueReason, DependencyIndexReport,
+        DependencyIndexSnapshot, DependencyPath, DependencyRootId, IndexedDependencyFile,
+        SearchResultLocator, SearchResultOrigin, SearchScope,
+    };
+    use crate::domain::token::tokenize;
     use crate::domain::virtual_file::FileMetadata;
     use crate::ports::FileSystemPort;
+    use crate::ports::inbound::SearchUseCase;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -238,6 +246,276 @@ mod tests {
         let id = ws.insert(rel.clone(), FileMetadata::default()).unwrap();
         fs.write(rel, content.to_vec()).unwrap();
         id
+    }
+
+    fn add_searchable_file(
+        ws: &mut ProjectWorkspace,
+        fs: &mut InMemoryFs,
+        index: &mut InvertedIndex,
+        p: &str,
+        content: &[u8],
+    ) -> FileId {
+        let id = add_file(ws, fs, p, content);
+        index.insert(id, &tokenize(p));
+        id
+    }
+
+    fn dependency_root(value: &str) -> DependencyRootId {
+        DependencyRootId::new(value.to_owned()).expect("valid dependency root")
+    }
+
+    fn dependency_path(root: &str, relative_path: &str) -> DependencyPath {
+        DependencyPath::new(dependency_root(root), path(relative_path))
+            .expect("valid dependency path")
+    }
+
+    fn dependency_file(root: &str, relative_path: &str, content: &str) -> IndexedDependencyFile {
+        IndexedDependencyFile::new(
+            dependency_path(root, relative_path),
+            content.len() as u64,
+            content.to_owned(),
+        )
+    }
+
+    fn dependency_snapshot(files: Vec<IndexedDependencyFile>) -> DependencyIndexSnapshot {
+        let indexed_files = files.len();
+        DependencyIndexSnapshot::new(
+            files,
+            DependencyIndexReport {
+                indexed_files,
+                indexed_bytes: 0,
+                skipped_files: 0,
+                truncated: false,
+                limit_reasons: Vec::new(),
+                issues: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn text_search_respects_workspace_dependency_combined_and_empty_scopes() {
+        let mut ws = ProjectWorkspace::new();
+        let mut fs = InMemoryFs::new();
+        let mut index = InvertedIndex::new();
+        add_searchable_file(
+            &mut ws,
+            &mut fs,
+            &mut index,
+            "workspace.rs",
+            b"needle workspace\n",
+        );
+        let snapshot = dependency_snapshot(vec![dependency_file(
+            "library",
+            "dependency.rs",
+            "needle dependency\n",
+        )]);
+        let search = FileSearch::new(&index, &ws)
+            .with_fs(&fs)
+            .with_dependency_snapshot(&snapshot);
+
+        for (scope, expected) in [
+            (
+                SearchScope::workspace_only(),
+                vec![SearchResultOrigin::Workspace],
+            ),
+            (
+                SearchScope::dependencies_only(),
+                vec![SearchResultOrigin::Dependency {
+                    root_id: dependency_root("library"),
+                }],
+            ),
+            (
+                SearchScope::all(),
+                vec![
+                    SearchResultOrigin::Workspace,
+                    SearchResultOrigin::Dependency {
+                        root_id: dependency_root("library"),
+                    },
+                ],
+            ),
+            (SearchScope::none(), Vec::new()),
+        ] {
+            let result = search.search_text_scoped("needle", scope).unwrap();
+            assert_eq!(
+                result
+                    .matches
+                    .into_iter()
+                    .map(|entry| entry.origin)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn text_search_orders_and_deduplicates_owned_results() {
+        let mut ws = ProjectWorkspace::new();
+        let mut fs = InMemoryFs::new();
+        let mut index = InvertedIndex::new();
+        add_searchable_file(
+            &mut ws,
+            &mut fs,
+            &mut index,
+            "src/lib.rs",
+            b"needle workspace\n",
+        );
+        let duplicate = dependency_file("zeta", "src/lib.rs", "needle dependency\n");
+        let snapshot = dependency_snapshot(vec![
+            duplicate.clone(),
+            dependency_file("alpha", "src/a.rs", "needle alpha\n"),
+            duplicate,
+        ]);
+
+        let result = FileSearch::new(&index, &ws)
+            .with_fs(&fs)
+            .with_dependency_snapshot(&snapshot)
+            .search_text_scoped("needle", SearchScope::all())
+            .unwrap();
+
+        assert_eq!(
+            result
+                .matches
+                .into_iter()
+                .map(|entry| entry.locator)
+                .collect::<Vec<_>>(),
+            vec![
+                SearchResultLocator::Workspace(path("src/lib.rs")),
+                SearchResultLocator::Dependency(dependency_path("alpha", "src/a.rs")),
+                SearchResultLocator::Dependency(dependency_path("zeta", "src/lib.rs")),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_search_preserves_workspace_only_and_capped_compatibility() {
+        let mut ws = ProjectWorkspace::new();
+        let mut fs = InMemoryFs::new();
+        let mut index = InvertedIndex::new();
+        add_searchable_file(
+            &mut ws,
+            &mut fs,
+            &mut index,
+            "workspace.rs",
+            b"needle one\nneedle two\n",
+        );
+        let snapshot = dependency_snapshot(vec![dependency_file(
+            "library",
+            "dependency.rs",
+            "needle dependency\n",
+        )]);
+        let search = FileSearch::new(&index, &ws)
+            .with_fs(&fs)
+            .with_dependency_snapshot(&snapshot);
+
+        let compatible = search.search_text("needle").unwrap();
+        assert_eq!(compatible.len(), 2);
+        assert!(
+            compatible
+                .iter()
+                .all(|entry| entry.path == path("workspace.rs"))
+        );
+
+        let capped = search.search_text_capped("needle", 1).unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].path, path("workspace.rs"));
+    }
+
+    #[test]
+    fn text_search_preserves_empty_pattern_behavior() {
+        let mut ws = ProjectWorkspace::new();
+        let mut fs = InMemoryFs::new();
+        let mut index = InvertedIndex::new();
+        add_searchable_file(
+            &mut ws,
+            &mut fs,
+            &mut index,
+            "workspace.rs",
+            b"workspace one\nworkspace two\n",
+        );
+        let snapshot = dependency_snapshot(vec![dependency_file(
+            "library",
+            "dependency.rs",
+            "dependency one\ndependency two\n",
+        )]);
+
+        let result = FileSearch::new(&index, &ws)
+            .with_fs(&fs)
+            .with_dependency_snapshot(&snapshot)
+            .search_text_scoped("", SearchScope::all())
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 4);
+        assert_eq!(
+            result
+                .matches
+                .iter()
+                .map(|entry| entry.line_content.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "workspace one",
+                "workspace two",
+                "dependency one",
+                "dependency two",
+            ]
+        );
+    }
+
+    #[test]
+    fn text_search_propagates_dependency_report_without_converting_issues_to_errors() {
+        let issue = DependencyIndexIssue {
+            root_id: dependency_root("library"),
+            path: Some(path("unreadable.rs")),
+            reason: DependencyIndexIssueReason::EntryUnreadable,
+        };
+        let report = DependencyIndexReport {
+            indexed_files: 0,
+            indexed_bytes: 0,
+            skipped_files: 1,
+            truncated: false,
+            limit_reasons: Vec::new(),
+            issues: vec![issue],
+        };
+        let snapshot = DependencyIndexSnapshot::new(Vec::new(), report.clone());
+        let ws = ProjectWorkspace::new();
+        let fs = InMemoryFs::new();
+        let index = InvertedIndex::new();
+
+        let result = FileSearch::new(&index, &ws)
+            .with_fs(&fs)
+            .with_dependency_snapshot(&snapshot)
+            .search_text_scoped("needle", SearchScope::dependencies_only())
+            .unwrap();
+
+        assert!(result.matches.is_empty());
+        assert_eq!(result.dependency_report, report);
+    }
+
+    #[test]
+    fn text_search_preserves_workspace_read_failure_skipping() {
+        let mut ws = ProjectWorkspace::new();
+        let mut fs = InMemoryFs::new();
+        let mut index = InvertedIndex::new();
+        add_searchable_file(
+            &mut ws,
+            &mut fs,
+            &mut index,
+            "readable.rs",
+            b"needle readable\n",
+        );
+        let missing_path = path("missing.rs");
+        let missing_id = ws
+            .insert(missing_path.clone(), FileMetadata::default())
+            .unwrap();
+        index.insert(missing_id, &tokenize(missing_path.as_str()));
+
+        let result = FileSearch::new(&index, &ws)
+            .with_fs(&fs)
+            .search_text_scoped("needle", SearchScope::workspace_only())
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].path, path("readable.rs"));
+        assert_eq!(result.matches[0].origin, SearchResultOrigin::Workspace);
     }
 
     // ── TDD step 1/2: single-file match with line numbers ────────────────────

@@ -121,6 +121,10 @@ impl Server {
     fn prepare_rename(&self, id: &Value) -> io::Result<()> {
         match self.mode.as_str() {
             "server_crashed" => std::process::exit(71),
+            "server_crashed_on_prepare_rename" => {
+                self.trace("prepareRenameCrash", json!({"requestId": id}))?;
+                std::process::exit(71);
+            }
             "server_timeout" => {
                 std::thread::sleep(Duration::from_secs(30));
                 Ok(())

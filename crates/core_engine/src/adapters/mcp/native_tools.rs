@@ -78,6 +78,7 @@ use extension_protocol::messages as wire;
 use serde_json::{Value, json};
 
 use crate::adapters::fs::WorkspacePathExclusion;
+use crate::adapters::fs::dependency_source::{DependencyScanError, FsDependencySource};
 use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::mcp::types::{ToolDesc, ToolError};
 use crate::adapters::watcher::RenameCoordinator;
@@ -86,6 +87,11 @@ use crate::domain::mutation::{FileMutationService, compute_content_version};
 use crate::domain::refactor::{
     PathRenameError, PathRenamePlan, PathRenameRequest, PathRenameResult, PathRenameSemanticPolicy,
     PathRenameStatus, SafeDeleteService, SafeDeleteSnapshot,
+};
+use crate::domain::search::{
+    DependencyIndexIssueReason, DependencyIndexLimits, DependencyIndexReport,
+    DependencyIndexSnapshot, DependencyLimitReason, DependencyPath, DependencyRootId,
+    SearchResultLocator, SearchResultOrigin, SearchScope,
 };
 use crate::domain::token::tokenize;
 use crate::domain::virtual_file::FileMetadata;
@@ -141,6 +147,10 @@ pub struct EngineState {
     pub index: Arc<RwLock<InvertedIndex>>,
     pub storage: Box<dyn StoragePort + Send + Sync>,
     pub fs: Box<dyn FileSystemPort + Send + Sync>,
+    pub(crate) dependency_snapshot: Arc<crate::adapters::daemon::engine::DependencySnapshotState>,
+    pub(crate) dependency_source: Arc<dyn DependencySnapshotSource>,
+    pub(crate) dependency_limits: DependencyIndexLimits,
+    pub(crate) dependency_refresh_gate: Arc<Mutex<()>>,
     /// Extension lifecycle hook receiver. Defaults to a no-op until the real
     /// extension host is injected via [`EngineState::set_plugin_host`] (the host
     /// is built after `EngineState` in `main.rs`). Wired so MCP-driven
@@ -165,6 +175,14 @@ impl EngineState {
             index: Arc::new(RwLock::new(index)),
             storage,
             fs,
+            dependency_snapshot: Arc::new(
+                crate::adapters::daemon::engine::DependencySnapshotState::new(Arc::new(
+                    DependencyIndexSnapshot::empty(),
+                )),
+            ),
+            dependency_source: Arc::new(EmptyDependencySnapshotSource),
+            dependency_limits: crate::adapters::config::DependenciesConfig::default().limits,
+            dependency_refresh_gate: Arc::new(Mutex::new(())),
             extension_host: Arc::new(NoOpExtensionHost),
             publication: None,
         }
@@ -177,6 +195,24 @@ impl EngineState {
     /// registry exists. Until then the no-op host is used.
     pub fn set_plugin_host(&mut self, host: Arc<dyn ExtensionHostPort + Send + Sync>) {
         self.extension_host = host;
+    }
+
+    #[doc(hidden)]
+    pub fn configure_dependency_index(
+        &mut self,
+        source: Arc<dyn DependencySnapshotSource>,
+        limits: DependencyIndexLimits,
+        snapshot: Arc<DependencyIndexSnapshot>,
+    ) {
+        self.dependency_source = source;
+        self.dependency_limits = limits;
+        self.dependency_snapshot =
+            Arc::new(crate::adapters::daemon::engine::DependencySnapshotState::new(snapshot));
+    }
+
+    #[must_use]
+    pub fn dependency_snapshot(&self) -> Arc<DependencyIndexSnapshot> {
+        self.dependency_snapshot.load()
     }
 
     pub(crate) fn extension_host(&self) -> Arc<dyn ExtensionHostPort + Send + Sync> {
@@ -199,6 +235,33 @@ impl EngineState {
     #[must_use]
     pub fn index_arc(&self) -> Arc<RwLock<InvertedIndex>> {
         Arc::clone(&self.index)
+    }
+}
+
+pub trait DependencySnapshotSource: Send + Sync {
+    fn build_snapshot(
+        &self,
+        limits: &DependencyIndexLimits,
+    ) -> Result<DependencyIndexSnapshot, DependencyScanError>;
+}
+
+impl DependencySnapshotSource for FsDependencySource {
+    fn build_snapshot(
+        &self,
+        limits: &DependencyIndexLimits,
+    ) -> Result<DependencyIndexSnapshot, DependencyScanError> {
+        FsDependencySource::build_snapshot(self, limits)
+    }
+}
+
+struct EmptyDependencySnapshotSource;
+
+impl DependencySnapshotSource for EmptyDependencySnapshotSource {
+    fn build_snapshot(
+        &self,
+        _limits: &DependencyIndexLimits,
+    ) -> Result<DependencyIndexSnapshot, DependencyScanError> {
+        Ok(DependencyIndexSnapshot::empty())
     }
 }
 
@@ -386,16 +449,19 @@ pub(crate) fn validate_native_call(name: &str, args: &Value) -> Result<(), ToolE
         "tower_search_text" => {
             require_str(args, "pattern")?;
         }
-        "tower_read_file" | "tower_list_dir" | "tower_create_directory" | "tower_delete_file" => {
+        "tower_read_file" | "tower_list_dir" | "tower_create_directory" => {
             require_str(args, "path")?;
         }
+        "tower_delete_file" => {
+            workspace_path_from_search_locator(require_str(args, "path")?)?;
+        }
         "tower_create_file" => {
-            require_str(args, "path")?;
+            workspace_path_from_search_locator(require_str(args, "path")?)?;
             require_str(args, "content")?;
             optional_version(args, "expected_version")?;
         }
         "tower_edit_range" => {
-            require_str(args, "path")?;
+            workspace_path_from_search_locator(require_str(args, "path")?)?;
             require_usize(args, "start_byte")?;
             require_usize(args, "end_byte")?;
             require_str(args, "replacement")?;
@@ -422,6 +488,159 @@ pub(crate) fn validate_native_call(name: &str, args: &Value) -> Result<(), ToolE
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScopedSearchRequest {
+    scope: SearchScope,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LocatorParseError {
+    InvalidDependencyLocator,
+}
+
+fn optional_search_scope(args: &Value) -> Result<Option<ScopedSearchRequest>, ToolError> {
+    let Some(scope) = args.get("scope") else {
+        return Ok(None);
+    };
+    let object = scope
+        .as_object()
+        .ok_or_else(|| ToolError::InvalidArgs("field 'scope' must be an object".to_owned()))?;
+    if object.len() != 2
+        || !object.contains_key("workspace")
+        || !object.contains_key("dependencies")
+    {
+        return Err(ToolError::InvalidArgs(
+            "field 'scope' must contain exactly boolean fields 'workspace' and 'dependencies'"
+                .to_owned(),
+        ));
+    }
+    let workspace = object["workspace"].as_bool().ok_or_else(|| {
+        ToolError::InvalidArgs("field 'scope.workspace' must be a boolean".to_owned())
+    })?;
+    let dependencies = object["dependencies"].as_bool().ok_or_else(|| {
+        ToolError::InvalidArgs("field 'scope.dependencies' must be a boolean".to_owned())
+    })?;
+    Ok(Some(ScopedSearchRequest {
+        scope: SearchScope {
+            workspace,
+            dependencies,
+        },
+    }))
+}
+
+pub(crate) fn classify_search_locator(
+    locator: &str,
+) -> Result<SearchResultLocator, LocatorParseError> {
+    if locator
+        .get(.."dependency:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("dependency:"))
+    {
+        let reserved = locator
+            .strip_prefix("dependency://")
+            .ok_or(LocatorParseError::InvalidDependencyLocator)?;
+        let (encoded_root, encoded_path) = reserved
+            .split_once('/')
+            .ok_or(LocatorParseError::InvalidDependencyLocator)?;
+        let root = decode_locator_component(encoded_root, false)?;
+        let path = decode_locator_component(encoded_path, true)?;
+        let dependency = DependencyPath::new(
+            DependencyRootId::new(root).map_err(|_| LocatorParseError::InvalidDependencyLocator)?,
+            RelativePath::new(path),
+        )
+        .map_err(|_| LocatorParseError::InvalidDependencyLocator)?;
+        let parsed = SearchResultLocator::Dependency(dependency);
+        if canonical_search_locator(&parsed) != locator {
+            return Err(LocatorParseError::InvalidDependencyLocator);
+        }
+        return Ok(parsed);
+    }
+    Ok(SearchResultLocator::Workspace(RelativePath::new(locator)))
+}
+
+pub(crate) fn workspace_path_from_search_locator(locator: &str) -> Result<RelativePath, ToolError> {
+    match classify_search_locator(locator) {
+        Ok(SearchResultLocator::Workspace(path)) => Ok(path),
+        Ok(SearchResultLocator::Dependency(_)) => Err(ToolError::InvalidArgs(
+            "dependency locator is not a workspace path".to_owned(),
+        )),
+        Err(LocatorParseError::InvalidDependencyLocator) => Err(ToolError::InvalidArgs(
+            "invalid dependency locator".to_owned(),
+        )),
+    }
+}
+
+fn canonical_search_locator(locator: &SearchResultLocator) -> String {
+    match locator {
+        SearchResultLocator::Workspace(path) => path.as_str().to_owned(),
+        SearchResultLocator::Dependency(path) => format!(
+            "dependency://{}/{}",
+            encode_locator_component(path.root_id().as_str(), false),
+            encode_locator_component(path.relative_path().as_str(), true)
+        ),
+    }
+}
+
+fn encode_locator_component(value: &str, preserve_slashes: bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (preserve_slashes && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+#[allow(dead_code)]
+fn decode_locator_component(value: &str, allow_slashes: bool) -> Result<String, LocatorParseError> {
+    if value.is_empty() {
+        return Err(LocatorParseError::InvalidDependencyLocator);
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let high = *bytes
+                    .get(index + 1)
+                    .ok_or(LocatorParseError::InvalidDependencyLocator)?;
+                let low = *bytes
+                    .get(index + 2)
+                    .ok_or(LocatorParseError::InvalidDependencyLocator)?;
+                let high = hex_value(high).ok_or(LocatorParseError::InvalidDependencyLocator)?;
+                let low = hex_value(low).ok_or(LocatorParseError::InvalidDependencyLocator)?;
+                decoded.push(high << 4 | low);
+                index += 3;
+            }
+            b'/' if allow_slashes => {
+                decoded.push(b'/');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| LocatorParseError::InvalidDependencyLocator)
+}
+
+#[allow(dead_code)]
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 // ── Tool descriptions ─────────────────────────────────────────────────────────
 
 fn tool_find_file_desc() -> ToolDesc {
@@ -434,9 +653,14 @@ fn tool_find_file_desc() -> ToolDesc {
                 "query": {
                     "type": "string",
                     "description": "Substring or fuzzy query to match against file paths."
-                }
+                },
+                "scope": search_scope_schema()
             },
-            "required": ["query"]
+            "required": ["query"],
+            "examples": [
+                {"query": "client", "scope": {"workspace": true, "dependencies": false}},
+                {"query": "client", "scope": {"workspace": false, "dependencies": true}}
+            ]
         }),
     }
 }
@@ -479,11 +703,28 @@ fn tool_search_text_desc() -> ToolDesc {
                 "pattern": {
                     "type": "string",
                     "description": "Text pattern to search for across all indexed files."
-                }
+                },
+                "scope": search_scope_schema()
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "examples": [
+                {"pattern": "needle", "scope": {"workspace": true, "dependencies": false}},
+                {"pattern": "needle", "scope": {"workspace": false, "dependencies": true}}
+            ]
         }),
     }
+}
+
+fn search_scope_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "workspace": {"type": "boolean"},
+            "dependencies": {"type": "boolean"}
+        },
+        "required": ["workspace", "dependencies"],
+        "additionalProperties": false
+    })
 }
 
 fn tool_read_file_desc() -> ToolDesc {
@@ -710,14 +951,30 @@ fn tool_safe_delete_symbol_desc() -> ToolDesc {
 
 fn call_find_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let query = require_str(&args, "query")?;
+    let scoped = optional_search_scope(&args)?;
 
     let guard = state.read().map_err(lock_poisoned)?;
     let ws_arc = Arc::clone(&guard.workspace);
     let idx_arc = Arc::clone(&guard.index);
+    let dependency_snapshot = guard.dependency_snapshot();
     drop(guard); // release outer read-lock before acquiring inner read-locks
     let ws = ws_arc.read().map_err(lock_poisoned)?;
     let idx = idx_arc.read().map_err(lock_poisoned)?;
-    let search = FileSearch::new(&idx, &ws);
+    let search = FileSearch::new(&idx, &ws).with_dependency_snapshot(&dependency_snapshot);
+    if let Some(request) = scoped {
+        let result = search
+            .find_file_scoped(query, request.scope)
+            .map_err(domain_err_to_tool_error)?;
+        let results = result
+            .results
+            .iter()
+            .map(scoped_file_result_json)
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "results": results,
+            "dependency_report": dependency_report_json(&result.dependency_report),
+        }));
+    }
     let paths = search.find_file(query).map_err(domain_err_to_tool_error)?;
 
     let paths_json: Vec<Value> = paths
@@ -776,19 +1033,37 @@ fn call_list_dir(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value,
 
 fn call_search_text(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let pattern = require_str(&args, "pattern")?;
+    let scoped = optional_search_scope(&args)?;
 
     // We need both workspace/index and fs under the outer read-lock to ensure
     // fs is not replaced while we're iterating. Clone Arcs then release guard.
     let guard = state.read().map_err(lock_poisoned)?;
     let ws_arc = Arc::clone(&guard.workspace);
     let idx_arc = Arc::clone(&guard.index);
+    let dependency_snapshot = guard.dependency_snapshot();
     // Keep the outer guard alive here to borrow fs safely for the search.
     // FileSearch::with_fs requires `FileSystemPort + Sync`. The EngineState
     // fs field is `Box<dyn FileSystemPort + Send + Sync>`, which satisfies the
     // `Sync` bound by coercion to `&dyn FileSystemPort + Sync`.
     let ws = ws_arc.read().map_err(lock_poisoned)?;
     let idx = idx_arc.read().map_err(lock_poisoned)?;
-    let search = FileSearch::new(&idx, &ws).with_fs(guard.fs.as_ref());
+    let search = FileSearch::new(&idx, &ws)
+        .with_fs(guard.fs.as_ref())
+        .with_dependency_snapshot(&dependency_snapshot);
+    if let Some(request) = scoped {
+        let result = search
+            .search_text_scoped(pattern, request.scope)
+            .map_err(domain_err_to_tool_error)?;
+        let matches = result
+            .matches
+            .iter()
+            .map(scoped_text_match_json)
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "matches": matches,
+            "dependency_report": dependency_report_json(&result.dependency_report),
+        }));
+    }
     let matches = search
         .search_text(pattern)
         .map_err(domain_err_to_tool_error)?;
@@ -865,12 +1140,13 @@ fn optional_version_map(
         Some(Value::Object(obj)) => {
             let mut map = std::collections::HashMap::with_capacity(obj.len());
             for (k, v) in obj {
+                let path = workspace_path_from_search_locator(k)?;
                 let s = v.as_str().ok_or_else(|| {
                     ToolError::InvalidArgs(format!(
                         "`{key}[\"{k}\"]` must be a string (hex SHA-256 version); got {v}"
                     ))
                 })?;
-                map.insert(RelativePath::new(k), s.to_owned());
+                map.insert(path, s.to_owned());
             }
             Ok(map)
         }
@@ -968,7 +1244,7 @@ fn call_create_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Val
     // Optional CAS guard: absent → unconditional write (U2); malformed → reject.
     let expected_version = optional_version(&args, "expected_version")?;
 
-    let rel = RelativePath::new(path);
+    let rel = workspace_path_from_search_locator(path)?;
     let bytes = content.as_bytes().to_vec();
 
     with_mutation_service(state, |svc| {
@@ -992,7 +1268,7 @@ fn call_create_directory(
 
 fn call_delete_file(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Value, ToolError> {
     let path = require_str(&args, "path")?;
-    let rel = RelativePath::new(path);
+    let rel = workspace_path_from_search_locator(path)?;
 
     with_mutation_service(state, |svc| svc.delete_file(&rel))?;
 
@@ -1031,7 +1307,7 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
     // Optional CAS guard: absent → unconditional write (U2); malformed → reject.
     let expected_version = optional_version(&args, "expected_version")?;
 
-    let rel = RelativePath::new(path);
+    let rel = workspace_path_from_search_locator(path)?;
 
     let report = with_mutation_service(state, |svc| {
         svc.edit_range_cas(&rel, start_byte, end_byte, replacement, expected_version)
@@ -1055,7 +1331,20 @@ fn call_edit_range(state: &Arc<RwLock<EngineState>>, args: Value) -> Result<Valu
 fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
     use crate::adapters::daemon::publication::snapshot_events;
     use crate::ports::storage::ReconciliationDelta;
-    let publication = state.read().map_err(lock_poisoned)?.publication.clone();
+    let (publication, dependency_source, dependency_limits, dependency_snapshot, refresh_gate) = {
+        let guard = state.read().map_err(lock_poisoned)?;
+        (
+            guard.publication.clone(),
+            Arc::clone(&guard.dependency_source),
+            guard.dependency_limits,
+            Arc::clone(&guard.dependency_snapshot),
+            Arc::clone(&guard.dependency_refresh_gate),
+        )
+    };
+    let _refresh = refresh_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let dependency_candidate = dependency_source.build_snapshot(&dependency_limits);
     let baseline = publication
         .as_ref()
         .map(|publisher| publisher.capture_cut())
@@ -1154,7 +1443,75 @@ fn call_reindex(state: &Arc<RwLock<EngineState>>) -> Result<Value, ToolError> {
             .commit_events(snapshot_events(&before, &after))
             .map_err(|_| ToolError::ExecutionFailed("commit publication unavailable".to_owned()))?;
     }
-    Ok(json!({"files_indexed": after.files.len()}))
+    let dependency_candidate = Arc::new(dependency_candidate.map_err(|_error| {
+        eprintln!("tower: dependency index refresh failed");
+        ToolError::ExecutionFailed("dependency index refresh failed".to_owned())
+    })?);
+    let dependency_report = dependency_report_json(dependency_candidate.report());
+    dependency_snapshot.publish(dependency_candidate);
+    Ok(json!({
+        "files_indexed": after.files.len(),
+        "dependency_report": dependency_report,
+    }))
+}
+
+fn dependency_report_json(report: &DependencyIndexReport) -> Value {
+    json!({
+        "indexed_files": report.indexed_files,
+        "indexed_bytes": report.indexed_bytes,
+        "skipped_files": report.skipped_files,
+        "truncated": report.truncated,
+        "limit_reasons": report.limit_reasons.iter().map(|reason| match reason {
+            DependencyLimitReason::FileCount => "file_count",
+            DependencyLimitReason::FileSize => "file_size",
+            DependencyLimitReason::TotalBytes => "total_bytes",
+        }).collect::<Vec<_>>(),
+        "issues": report.issues.iter().map(|issue| json!({
+            "root_id": issue.root_id.as_str(),
+            "path": issue.path.as_ref().map(RelativePath::as_str),
+            "reason": match issue.reason {
+                DependencyIndexIssueReason::RootUnavailable => "root_unavailable",
+                DependencyIndexIssueReason::RootNotDirectory => "root_not_directory",
+                DependencyIndexIssueReason::EntryUnreadable => "entry_unreadable",
+                DependencyIndexIssueReason::ChangedDuringRead => "changed_during_read",
+                DependencyIndexIssueReason::InvalidEncoding => "invalid_encoding",
+                DependencyIndexIssueReason::BoundaryViolation => "boundary_violation",
+            },
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn scoped_file_result_json(result: &crate::domain::search::ScopedFileResult) -> Value {
+    let mut value = json!({
+        "locator": canonical_search_locator(&result.locator),
+        "path": result.path.as_str(),
+        "origin": search_origin_name(&result.origin),
+    });
+    if let SearchResultOrigin::Dependency { root_id } = &result.origin {
+        value["root_id"] = Value::String(root_id.as_str().to_owned());
+    }
+    value
+}
+
+fn scoped_text_match_json(result: &crate::domain::search::ScopedTextMatch) -> Value {
+    let mut value = json!({
+        "locator": canonical_search_locator(&result.locator),
+        "path": result.path.as_str(),
+        "line_number": result.line_number,
+        "line_content": result.line_content,
+        "origin": search_origin_name(&result.origin),
+    });
+    if let SearchResultOrigin::Dependency { root_id } = &result.origin {
+        value["root_id"] = Value::String(root_id.as_str().to_owned());
+    }
+    value
+}
+
+fn search_origin_name(origin: &SearchResultOrigin) -> &'static str {
+    match origin {
+        SearchResultOrigin::Workspace => "workspace",
+        SearchResultOrigin::Dependency { .. } => "dependency",
+    }
 }
 
 fn call_rename_path(
@@ -1990,20 +2347,138 @@ fn lock_poisoned<G>(_: std::sync::PoisonError<G>) -> ToolError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
 
     use serde_json::{Value, json};
 
-    use super::{EXPECTED_NATIVE_TOOL_NAMES, EngineState, NativeToolRegistry};
+    use super::{
+        DependencyScanError, DependencySnapshotSource, EXPECTED_NATIVE_TOOL_NAMES, EngineState,
+        LocatorParseError, NativeToolRegistry, canonical_search_locator, classify_search_locator,
+        optional_search_scope, tool_find_file_desc, tool_search_text_desc,
+        workspace_path_from_search_locator,
+    };
     use crate::adapters::mcp::registry::ToolRegistry;
     use crate::adapters::mcp::types::ToolError;
     use crate::adapters::{InMemoryFs, InMemoryStorage};
     use crate::domain::RelativePath;
     use crate::domain::index::InvertedIndex;
+    use crate::domain::search::{
+        DependencyIndexIssue, DependencyIndexIssueReason, DependencyIndexLimits,
+        DependencyIndexReport, DependencyIndexSnapshot, DependencyPath, DependencyRootId,
+        IndexedDependencyFile, SearchResultLocator, SearchScope,
+    };
     use crate::domain::token::tokenize;
     use crate::domain::virtual_file::FileMetadata;
     use crate::domain::workspace::ProjectWorkspace;
-    use crate::ports::FileSystemPort;
+    use crate::ports::{
+        FileSystemPort, PortError, ReconciliationDelta, StoragePort as StoragePortTrait,
+    };
+
+    #[derive(Clone, Default)]
+    struct WritablePortSpy {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WritablePortSpy {
+        fn assert_not_called(&self) {
+            assert_eq!(self.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    impl FileSystemPort for WritablePortSpy {
+        fn read(&self, _path: &RelativePath) -> Result<Vec<u8>, PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PortError::NotFound)
+        }
+
+        fn write(&mut self, _path: RelativePath, _bytes: Vec<u8>) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn rename(&mut self, _from: &RelativePath, _to: RelativePath) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn delete(&mut self, _path: &RelativePath) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn mkdir(&mut self, _path: RelativePath) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn scan(&self) -> Vec<RelativePath> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct StorageWriteSpy {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StorageWriteSpy {
+        fn assert_not_called(&self) {
+            assert_eq!(self.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    impl StoragePortTrait for StorageWriteSpy {
+        fn apply_reconciliation_delta(
+            &mut self,
+            _delta: &ReconciliationDelta,
+        ) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get(&self, _id: crate::domain::FileId) -> Result<crate::domain::VirtualFile, PortError> {
+            Err(PortError::NotFound)
+        }
+
+        fn put(&mut self, _file: crate::domain::VirtualFile) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn put_batch(&mut self, _files: &[crate::domain::VirtualFile]) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn delete(&mut self, _id: crate::domain::FileId) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn put_blob(
+            &mut self,
+            _hash: crate::domain::ContentHash,
+            _bytes: Vec<u8>,
+        ) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn get_blob(&self, _hash: &crate::domain::ContentHash) -> Result<Vec<u8>, PortError> {
+            Err(PortError::NotFound)
+        }
+
+        fn mark_scan_complete(&mut self) -> Result<(), PortError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_scan_complete(&self) -> Result<bool, PortError> {
+            Ok(false)
+        }
+    }
 
     struct CancelledExtensionHost;
 
@@ -2096,6 +2571,493 @@ mod tests {
 
     fn make_registry(state: Arc<RwLock<EngineState>>) -> NativeToolRegistry {
         NativeToolRegistry::new(state)
+    }
+
+    fn mutation_registry_with_spy() -> (NativeToolRegistry, WritablePortSpy, StorageWriteSpy) {
+        let fs_spy = WritablePortSpy::default();
+        let storage_spy = StorageWriteSpy::default();
+        let state = Arc::new(RwLock::new(EngineState::new(
+            ProjectWorkspace::new(),
+            InvertedIndex::new(),
+            Box::new(storage_spy.clone()),
+            Box::new(fs_spy.clone()),
+        )));
+        (make_registry(state), fs_spy, storage_spy)
+    }
+
+    fn assert_dependency_rejection(
+        registry: &mut NativeToolRegistry,
+        fs_spy: &WritablePortSpy,
+        storage_spy: &StorageWriteSpy,
+        tool: &str,
+        args: Value,
+    ) {
+        let error = registry
+            .call(tool, args, &crate::domain::NeverCancelled)
+            .expect_err("dependency locator must be rejected");
+        assert!(matches!(
+            error,
+            ToolError::InvalidArgs(ref message)
+                if message == "dependency locator is not a workspace path"
+        ));
+        fs_spy.assert_not_called();
+        storage_spy.assert_not_called();
+    }
+
+    #[test]
+    fn search_locator_classifies_workspace_and_dependency_inputs() {
+        assert_eq!(
+            classify_search_locator("src/shared.rs").unwrap(),
+            SearchResultLocator::Workspace(RelativePath::new("src/shared.rs"))
+        );
+        assert_eq!(
+            classify_search_locator("dependency://library/src/shared.rs").unwrap(),
+            SearchResultLocator::Dependency(
+                DependencyPath::new(
+                    DependencyRootId::new("library".to_owned()).unwrap(),
+                    RelativePath::new("src/shared.rs"),
+                )
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            classify_search_locator("dependency://library/%252E%252E/shared.rs").unwrap(),
+            SearchResultLocator::Dependency(
+                DependencyPath::new(
+                    DependencyRootId::new("library".to_owned()).unwrap(),
+                    RelativePath::new("%2E%2E/shared.rs"),
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn search_locator_rejects_malformed_dependency_inputs() {
+        for malformed in [
+            "dependency:library/src/shared.rs",
+            "DEPENDENCY://library/src/shared.rs",
+            "dependency://library/src%2Fshared.rs",
+            "dependency://library/../shared.rs",
+        ] {
+            assert_eq!(
+                classify_search_locator(malformed),
+                Err(LocatorParseError::InvalidDependencyLocator),
+                "{malformed}"
+            );
+            let error = workspace_path_from_search_locator(malformed).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ToolError::InvalidArgs(ref message)
+                        if message == "invalid dependency locator"
+                ),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_locator_validation_preserves_existing_paths() {
+        for path in ["src/shared.rs", "src/dependency:notes.rs", "src/a%2Fb.rs"] {
+            assert_eq!(
+                workspace_path_from_search_locator(path).unwrap(),
+                RelativePath::new(path)
+            );
+        }
+    }
+
+    #[test]
+    fn create_file_rejects_dependency_locators_before_mutation() {
+        let (mut registry, fs_spy, storage_spy) = mutation_registry_with_spy();
+        assert_dependency_rejection(
+            &mut registry,
+            &fs_spy,
+            &storage_spy,
+            "tower_create_file",
+            json!({"path": "dependency://library/src/shared.rs", "content": "changed"}),
+        );
+    }
+
+    #[test]
+    fn edit_range_rejects_dependency_locators_before_mutation() {
+        let (mut registry, fs_spy, storage_spy) = mutation_registry_with_spy();
+        assert_dependency_rejection(
+            &mut registry,
+            &fs_spy,
+            &storage_spy,
+            "tower_edit_range",
+            json!({"path": "dependency://library/src/shared.rs", "start_byte": 0, "end_byte": 0, "replacement": "changed"}),
+        );
+    }
+
+    #[test]
+    fn global_replace_rejects_dependency_locator_version_keys_before_mutation() {
+        let (mut registry, fs_spy, storage_spy) = mutation_registry_with_spy();
+        assert_dependency_rejection(
+            &mut registry,
+            &fs_spy,
+            &storage_spy,
+            "tower_global_replace",
+            json!({"target": "old", "replacement": "new", "expected_versions": {"dependency://library/src/shared.rs": "00"}}),
+        );
+        assert_dependency_rejection(
+            &mut registry,
+            &fs_spy,
+            &storage_spy,
+            "tower_global_replace",
+            json!({"target": "old", "replacement": "new", "expected_versions": {"dependency://PRIVATE_ROOT/PRIVATE_CONTENT.rs": 1}}),
+        );
+    }
+
+    #[test]
+    fn delete_file_rejects_dependency_locators_before_mutation() {
+        let (mut registry, fs_spy, storage_spy) = mutation_registry_with_spy();
+        assert_dependency_rejection(
+            &mut registry,
+            &fs_spy,
+            &storage_spy,
+            "tower_delete_file",
+            json!({"path": "dependency://library/src/shared.rs"}),
+        );
+    }
+
+    #[test]
+    fn dependency_locator_errors_map_to_invalid_params_without_secrets() {
+        for (locator, expected) in [
+            (
+                "dependency://PRIVATE_ROOT/PRIVATE_CONTENT.rs",
+                "dependency locator is not a workspace path",
+            ),
+            (
+                "dependency:PRIVATE_ROOT/PRIVATE_CONTENT.rs",
+                "invalid dependency locator",
+            ),
+        ] {
+            let tool_error = workspace_path_from_search_locator(locator).unwrap_err();
+            let error = crate::adapters::mcp::rmcp_server::tool_error_to_rmcp(tool_error)
+                .expect_err("locator validation must be a protocol error");
+            assert_eq!(error.code.0, -32602);
+            assert_eq!(error.message.as_ref(), expected);
+            let public = format!("{error:?}");
+            assert!(!public.contains("PRIVATE_ROOT"));
+            assert!(!public.contains("PRIVATE_CONTENT"));
+        }
+    }
+
+    fn state_with_dependency_file() -> Arc<RwLock<EngineState>> {
+        let state = state_with_client_file();
+        let root_id = DependencyRootId::new("lib #1".to_owned()).unwrap();
+        let dependency_path =
+            DependencyPath::new(root_id, RelativePath::new("src/a b.rs")).unwrap();
+        let content = "fn dependency_needle() {}\n";
+        let report = DependencyIndexReport {
+            indexed_files: 1,
+            indexed_bytes: content.len() as u64,
+            skipped_files: 1,
+            truncated: false,
+            limit_reasons: Vec::new(),
+            issues: vec![DependencyIndexIssue {
+                root_id: DependencyRootId::new("lib #1".to_owned()).unwrap(),
+                path: Some(RelativePath::new("missing.rs")),
+                reason: DependencyIndexIssueReason::EntryUnreadable,
+            }],
+        };
+        let snapshot = Arc::new(DependencyIndexSnapshot::new(
+            vec![IndexedDependencyFile::new(
+                dependency_path,
+                content.len() as u64,
+                content.to_owned(),
+            )],
+            report,
+        ));
+        state.write().unwrap().configure_dependency_index(
+            Arc::new(super::EmptyDependencySnapshotSource),
+            DependencyIndexLimits::new(10, 1024, 4096).unwrap(),
+            snapshot,
+        );
+        state
+    }
+
+    #[test]
+    fn search_scope_validation_accepts_all_boolean_combinations() {
+        assert_eq!(optional_search_scope(&json!({})).unwrap(), None);
+
+        for (workspace, dependencies, expected) in [
+            (true, false, SearchScope::workspace_only()),
+            (false, true, SearchScope::dependencies_only()),
+            (true, true, SearchScope::all()),
+            (false, false, SearchScope::none()),
+        ] {
+            let parsed = optional_search_scope(&json!({
+                "scope": {"workspace": workspace, "dependencies": dependencies}
+            }))
+            .unwrap()
+            .expect("an explicit scope must remain distinguishable from omission");
+            assert_eq!(parsed.scope, expected);
+        }
+    }
+
+    #[test]
+    fn search_scope_validation_rejects_malformed_and_unknown_fields() {
+        for malformed in [
+            json!({"scope": true}),
+            json!({"scope": {}}),
+            json!({"scope": {"workspace": true}}),
+            json!({"scope": {"dependencies": false}}),
+            json!({"scope": {"workspace": 1, "dependencies": false}}),
+            json!({"scope": {"workspace": true, "dependencies": "no"}}),
+            json!({"scope": {"workspace": true, "dependencies": false, "extra": true}}),
+        ] {
+            assert!(matches!(
+                optional_search_scope(&malformed),
+                Err(ToolError::InvalidArgs(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn search_tool_descriptors_publish_parseable_scope_examples() {
+        let expected_scope_schema = json!({
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "boolean"},
+                "dependencies": {"type": "boolean"}
+            },
+            "required": ["workspace", "dependencies"],
+            "additionalProperties": false
+        });
+        let cases = [
+            (
+                tool_find_file_desc(),
+                "query",
+                "client",
+                json!([
+                    {"query": "client", "scope": {"workspace": true, "dependencies": false}},
+                    {"query": "client", "scope": {"workspace": false, "dependencies": true}}
+                ]),
+            ),
+            (
+                tool_search_text_desc(),
+                "pattern",
+                "needle",
+                json!([
+                    {"pattern": "needle", "scope": {"workspace": true, "dependencies": false}},
+                    {"pattern": "needle", "scope": {"workspace": false, "dependencies": true}}
+                ]),
+            ),
+        ];
+        let state = state_with_dependency_file();
+        let mut registry = make_registry(state);
+
+        for (descriptor, required_field, required_value, expected_examples) in cases {
+            assert_eq!(
+                descriptor.input_schema["properties"]["scope"],
+                expected_scope_schema
+            );
+            assert_eq!(descriptor.input_schema["required"], json!([required_field]));
+            assert_eq!(descriptor.input_schema["examples"], expected_examples);
+            assert_eq!(
+                descriptor.input_schema["examples"][0][required_field],
+                required_value
+            );
+
+            for example in descriptor.input_schema["examples"].as_array().unwrap() {
+                let response = registry
+                    .call(
+                        &descriptor.name,
+                        example.clone(),
+                        &crate::domain::NeverCancelled,
+                    )
+                    .expect("every published example must be executable");
+                assert!(response.get("dependency_report").is_some());
+                if descriptor.name == "tower_find_file" {
+                    assert!(response["results"].is_array());
+                } else {
+                    assert!(response["matches"].is_array());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dependency_locators_round_trip_reserved_characters() {
+        for (wire, expected) in [
+            (
+                "dependency://library/src/lib.rs",
+                SearchResultLocator::Dependency(
+                    DependencyPath::new(
+                        DependencyRootId::new("library".into()).unwrap(),
+                        RelativePath::new("src/lib.rs"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "dependency://lib%20%231/src/a%20b.rs",
+                SearchResultLocator::Dependency(
+                    DependencyPath::new(
+                        DependencyRootId::new("lib #1".into()).unwrap(),
+                        RelativePath::new("src/a b.rs"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "dependency://library/%252E%252E",
+                SearchResultLocator::Dependency(
+                    DependencyPath::new(
+                        DependencyRootId::new("library".into()).unwrap(),
+                        RelativePath::new("%2E%2E"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "dependency://library/a%252Fb.rs",
+                SearchResultLocator::Dependency(
+                    DependencyPath::new(
+                        DependencyRootId::new("library".into()).unwrap(),
+                        RelativePath::new("a%2Fb.rs"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "dependency://library/%C3%A9.rs",
+                SearchResultLocator::Dependency(
+                    DependencyPath::new(
+                        DependencyRootId::new("library".into()).unwrap(),
+                        RelativePath::new("é.rs"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "src/lib.rs",
+                SearchResultLocator::Workspace(RelativePath::new("src/lib.rs")),
+            ),
+            (
+                "src/a%2Fb.rs",
+                SearchResultLocator::Workspace(RelativePath::new("src/a%2Fb.rs")),
+            ),
+        ] {
+            let parsed = classify_search_locator(wire).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(canonical_search_locator(&parsed), wire);
+        }
+    }
+
+    #[test]
+    fn dependency_locator_parser_rejects_malformed_reserved_inputs() {
+        for malformed in [
+            "dependency:library/a.rs",
+            "DEPENDENCY://library/a.rs",
+            "dependency:///a.rs",
+            "dependency://library/",
+            "dependency://library/a//b",
+            "dependency://library/../a.rs",
+            "dependency://library/%2E%2E/a.rs",
+            "dependency://library/a%2Fb",
+            "dependency://library/a%5Cb",
+            "dependency://library/a%",
+            "dependency://library/a%GG",
+            "dependency://library/%FF",
+            "dependency://library/%61.rs",
+            "dependency://library/%c3%a9.rs",
+            "dependency://library/a?b",
+            "dependency://library/a#b",
+            "dependency://library/C:/a",
+        ] {
+            assert_eq!(
+                classify_search_locator(malformed),
+                Err(LocatorParseError::InvalidDependencyLocator)
+            );
+        }
+        assert!(
+            !format!("{:?}", LocatorParseError::InvalidDependencyLocator).contains("dependency://")
+        );
+    }
+
+    #[test]
+    fn scoped_filename_results_map_origin_and_report_to_wire() {
+        let mut registry = make_registry(state_with_dependency_file());
+        let response = registry
+            .call(
+                "tower_find_file",
+                json!({"query": "src", "scope": {"workspace": true, "dependencies": true}}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap();
+
+        assert_eq!(
+            response["results"],
+            json!([
+                {"locator": "src/client.rs", "path": "src/client.rs", "origin": "workspace"},
+                {"locator": "dependency://lib%20%231/src/a%20b.rs", "path": "src/a b.rs", "origin": "dependency", "root_id": "lib #1"}
+            ])
+        );
+        assert_eq!(response["dependency_report"]["indexed_files"], 1);
+        assert_eq!(
+            response["dependency_report"]["issues"][0],
+            json!({
+                "root_id": "lib #1", "path": "missing.rs", "reason": "entry_unreadable"
+            })
+        );
+    }
+
+    #[test]
+    fn scoped_text_results_map_origin_and_report_to_wire() {
+        let mut registry = make_registry(state_with_dependency_file());
+        let response = registry
+            .call(
+                "tower_search_text",
+                json!({"pattern": "needle", "scope": {"workspace": false, "dependencies": true}}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap();
+
+        assert_eq!(
+            response["matches"],
+            json!([{
+                "locator": "dependency://lib%20%231/src/a%20b.rs",
+                "path": "src/a b.rs",
+                "line_number": 1,
+                "line_content": "fn dependency_needle() {}",
+                "origin": "dependency",
+                "root_id": "lib #1"
+            }])
+        );
+        assert_eq!(response["dependency_report"]["indexed_bytes"], 26);
+    }
+
+    #[test]
+    fn scoped_search_errors_preserve_owned_public_mappings() {
+        let mut registry = make_registry(empty_state());
+        for (tool, arguments) in [
+            ("tower_find_file", json!({"query": "x", "scope": []})),
+            (
+                "tower_search_text",
+                json!({"pattern": "x", "scope": {"workspace": true}}),
+            ),
+        ] {
+            assert!(matches!(
+                registry.call(tool, arguments, &crate::domain::NeverCancelled),
+                Err(ToolError::InvalidArgs(_))
+            ));
+        }
+        assert!(matches!(
+            registry.call("tower_find_file", json!({}), &crate::domain::NeverCancelled),
+            Err(ToolError::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            registry.call(
+                "tower_search_text",
+                json!({}),
+                &crate::domain::NeverCancelled
+            ),
+            Err(ToolError::InvalidArgs(_))
+        ));
     }
 
     #[test]
@@ -2540,8 +3502,6 @@ mod tests {
 
     // ── Extension-host notification on MCP mutations ──────────────────────────
 
-    use std::sync::Mutex;
-
     use crate::domain::FileId;
     use crate::ports::{ExtensionHostPort, StoragePort};
 
@@ -2964,6 +3924,214 @@ mod tests {
             0,
             "reindex on empty state must report 0 files_indexed"
         );
+    }
+
+    struct ScriptedDependencySource {
+        results: Mutex<Vec<Result<DependencyIndexSnapshot, DependencyScanError>>>,
+    }
+
+    impl DependencySnapshotSource for ScriptedDependencySource {
+        fn build_snapshot(
+            &self,
+            _limits: &DependencyIndexLimits,
+        ) -> Result<DependencyIndexSnapshot, DependencyScanError> {
+            self.results.lock().unwrap().remove(0)
+        }
+    }
+
+    fn dependency_snapshot(
+        indexed_files: usize,
+        issues: Vec<crate::domain::search::DependencyIndexIssue>,
+    ) -> DependencyIndexSnapshot {
+        DependencyIndexSnapshot::new(
+            Vec::new(),
+            DependencyIndexReport {
+                indexed_files,
+                indexed_bytes: 0,
+                skipped_files: issues.len(),
+                truncated: false,
+                limit_reasons: Vec::new(),
+                issues,
+            },
+        )
+    }
+
+    fn install_dependency_source(
+        state: &Arc<RwLock<EngineState>>,
+        results: Vec<Result<DependencyIndexSnapshot, DependencyScanError>>,
+    ) {
+        state.write().unwrap().dependency_source = Arc::new(ScriptedDependencySource {
+            results: Mutex::new(results),
+        });
+    }
+
+    #[test]
+    fn reindex_publishes_complete_dependency_snapshot_and_report() {
+        let state = empty_state();
+        install_dependency_source(&state, vec![Ok(dependency_snapshot(2, Vec::new()))]);
+        let before = state.read().unwrap().dependency_snapshot.load();
+
+        let value = make_registry(Arc::clone(&state))
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
+
+        let after = state.read().unwrap().dependency_snapshot.load();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.report().indexed_files, 2);
+        assert_eq!(value["dependency_report"]["indexed_files"], 2);
+    }
+
+    #[test]
+    fn reindex_publishes_non_fatal_dependency_issues() {
+        use crate::domain::search::{
+            DependencyIndexIssue, DependencyIndexIssueReason, DependencyRootId,
+        };
+        let state = empty_state();
+        let issue = DependencyIndexIssue {
+            root_id: DependencyRootId::new("missing".to_owned()).unwrap(),
+            path: None,
+            reason: DependencyIndexIssueReason::RootUnavailable,
+        };
+        install_dependency_source(
+            &state,
+            vec![Ok(dependency_snapshot(0, vec![issue.clone()]))],
+        );
+
+        let value = make_registry(Arc::clone(&state))
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
+
+        assert_eq!(
+            state
+                .read()
+                .unwrap()
+                .dependency_snapshot
+                .load()
+                .report()
+                .issues,
+            [issue]
+        );
+        assert_eq!(
+            value["dependency_report"]["issues"][0]["root_id"],
+            "missing"
+        );
+    }
+
+    #[test]
+    fn reindex_retains_prior_dependency_snapshot_after_fatal_scan() {
+        const PRIVATE_PATH_SENTINEL: &str = "private/dependency/SECRET_PATH_SENTINEL.rs";
+        const RAW_ERROR_SENTINEL: &str = "RAW_OS_ERROR_SENTINEL";
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve native-tools test executable"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "adapters::mcp::native_tools::tests::fatal_dependency_refresh_diagnostic_fixture",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run isolated fatal-refresh diagnostic fixture");
+        assert!(
+            output.status.success(),
+            "fatal-refresh fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostics.contains("tower: dependency index refresh failed"));
+        assert!(!diagnostics.contains(PRIVATE_PATH_SENTINEL));
+        assert!(!diagnostics.contains(RAW_ERROR_SENTINEL));
+
+        let state = empty_state();
+        state
+            .write()
+            .unwrap()
+            .fs
+            .write(RelativePath::new("available.rs"), b"available".to_vec())
+            .unwrap();
+        let before = state.read().unwrap().dependency_snapshot.load();
+        install_dependency_source(
+            &state,
+            vec![
+                Err(DependencyScanError::InvariantViolation),
+                Ok(dependency_snapshot(1, Vec::new())),
+            ],
+        );
+        let mut registry = make_registry(Arc::clone(&state));
+
+        let error = registry
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::ExecutionFailed(message)
+                if message == "dependency index refresh failed"
+        ));
+        assert!(Arc::ptr_eq(
+            &before,
+            &state.read().unwrap().dependency_snapshot.load()
+        ));
+        let available = registry
+            .call(
+                "tower_find_file",
+                json!({"query": "available"}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap();
+        assert_eq!(available["paths"], json!(["available.rs"]));
+        let recovered = registry
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .unwrap();
+        assert_eq!(recovered["dependency_report"]["indexed_files"], 1);
+        registry
+            .call(
+                "tower_find_file",
+                json!({"query": "anything"}),
+                &crate::domain::NeverCancelled,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "isolated subprocess fixture"]
+    fn fatal_dependency_refresh_diagnostic_fixture() {
+        let path = DependencyPath::new(
+            DependencyRootId::new("private-root".to_owned()).unwrap(),
+            RelativePath::new("private/dependency/SECRET_PATH_SENTINEL.rs/RAW_OS_ERROR_SENTINEL"),
+        )
+        .unwrap();
+        let state = empty_state();
+        install_dependency_source(
+            &state,
+            vec![Err(DependencyScanError::Source(
+                crate::ports::DependencySourceError::EntryUnreadable { path },
+            ))],
+        );
+        let error = make_registry(state)
+            .call("tower_reindex", json!({}), &crate::domain::NeverCancelled)
+            .expect_err("fatal dependency refresh must fail");
+        assert!(matches!(
+            error,
+            ToolError::ExecutionFailed(message)
+                if message == "dependency index refresh failed"
+        ));
+    }
+
+    #[test]
+    fn dependency_snapshot_state_replacement_preserves_complete_generations() {
+        let old = Arc::new(dependency_snapshot(1, Vec::new()));
+        let state = Arc::new(
+            crate::adapters::daemon::engine::DependencySnapshotState::new(Arc::clone(&old)),
+        );
+        state.poison_for_test();
+        let new = Arc::new(dependency_snapshot(2, Vec::new()));
+
+        let replaced = state.publish(Arc::clone(&new));
+
+        assert!(Arc::ptr_eq(&replaced, &old));
+        assert!(Arc::ptr_eq(&state.load(), &new));
+        assert_eq!(replaced.report().indexed_files, 1);
+        assert_eq!(state.load().report().indexed_files, 2);
     }
 
     // ── tower_reindex: reconciles additions ──────────────────────────────────

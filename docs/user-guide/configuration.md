@@ -40,6 +40,29 @@ path remains listed but a query against it returns a bounded, project-attributed
 error; it does not impair local workspace queries. See [cross-project
 queries](project-queries.md) for the tool workflow and selector rules.
 
+Dependency search roots use the strict `[dependencies]` section. They are indexed
+as a separate, bounded read-only snapshot and are included only when a search
+request explicitly sets `scope.dependencies = true`.
+
+```toml
+[dependencies]
+ignore = ["target/", "*.generated.rs"]
+max_files = 10000
+max_file_bytes = 1048576
+max_total_bytes = 67108864
+
+[[dependencies.roots]]
+id = "library"
+path = "../library-src"
+```
+
+Root paths resolve relative to the workspace, and each root requires a unique
+validated `id`. The limits must be positive. Missing or temporarily unavailable
+roots remain non-fatal and are reported by scoped search results; invalid TOML,
+unknown fields, unsafe roots, invalid ignore rules, duplicate IDs, and invalid
+limits fail startup. See [dependency search](dependency-search.md) for the
+request and result contract.
+
 Native sidecars are controlled by `[extensions]`:
 
 ```toml
