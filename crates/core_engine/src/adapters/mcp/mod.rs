@@ -37,6 +37,7 @@ pub mod nav_tools;
 pub mod project_query;
 pub mod registry;
 pub mod rmcp_server;
+pub mod shell_command;
 pub mod types;
 
 pub use diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader, PushEvent};
@@ -50,6 +51,7 @@ pub use project_query::{
 };
 pub use registry::ToolRegistry;
 pub use rmcp_server::{TowerMcpHandler, spawn_push_task};
+pub use shell_command::ShellCommandRegistry;
 pub use types::{ToolDesc, ToolError};
 
 #[cfg(test)]

@@ -40,6 +40,33 @@ path remains listed but a query against it returns a bounded, project-attributed
 error; it does not impair local workspace queries. See [cross-project
 queries](project-queries.md) for the tool workflow and selector rules.
 
+Command execution is opt-in under `[shell]`. When disabled or absent, the
+`tower_run_command` tool is not exposed. Each command is a direct argv entry;
+Tower does not interpret request input as shell syntax, pipelines, redirections,
+or background jobs.
+
+```toml
+[shell]
+enabled = true
+timeout_secs = 30
+stdout_max_bytes = 65536
+stderr_max_bytes = 65536
+
+[[shell.commands]]
+name = "check"
+argv = ["cargo", "check", "--workspace"]
+```
+
+Command names must be unique identifiers beginning with a letter or digit. The
+configured executable and its fixed arguments are combined with request
+arguments. Requests may supply an optional workspace-relative `cwd`; absolute
+paths, traversal, missing directories, files, and symlink escapes are rejected
+before spawning a process. See [running configured commands](shell-commands.md)
+for the MCP request and result contract.
+
+`timeout_secs` must be between 1 and 86,400 seconds. Each output limit must be
+between 1 and 16,777,216 bytes. Unknown fields and invalid values fail startup.
+
 Dependency search roots use the strict `[dependencies]` section. They are indexed
 as a separate, bounded read-only snapshot and are included only when a search
 request explicitly sets `scope.dependencies = true`.

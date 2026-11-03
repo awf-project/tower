@@ -31,16 +31,19 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::adapters::config::{FormatterConfig, FormatterMode};
 use crate::adapters::fs::durable_write;
+use crate::adapters::process::{
+    ProcessError, ProcessOutcome, ProcessRequest, TerminationStatus, run_supervised_process,
+};
+use crate::domain::NeverCancelled;
 use extension_protocol::TimeoutDetail;
+
+const PROCESS_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
 
 // ── FormatJob ─────────────────────────────────────────────────────────────────
 
@@ -53,8 +56,8 @@ pub struct FormatJob {
 
 enum FormatterCommandError {
     Timeout(TimeoutDetail),
-    Spawn(io::Error),
-    Io(io::Error),
+    Spawn(ProcessError),
+    Io(ProcessError),
     Exit,
     InvalidTimeout,
 }
@@ -63,8 +66,8 @@ impl fmt::Debug for FormatterCommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Timeout(detail) => formatter.debug_tuple("Timeout").field(detail).finish(),
-            Self::Spawn(error) => formatter.debug_tuple("Spawn").field(&error.kind()).finish(),
-            Self::Io(error) => formatter.debug_tuple("Io").field(&error.kind()).finish(),
+            Self::Spawn(error) => formatter.debug_tuple("Spawn").field(error).finish(),
+            Self::Io(error) => formatter.debug_tuple("Io").field(error).finish(),
             Self::Exit => formatter.write_str("Exit"),
             Self::InvalidTimeout => formatter.write_str("InvalidTimeout"),
         }
@@ -362,20 +365,22 @@ fn run_filter_command(
     timeout: Option<Duration>,
 ) -> Result<Vec<u8>, FormatterCommandError> {
     let wait_budget = WaitBudget::new(timeout)?;
-    let mut command = formatter_command(argv, cwd)?;
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_process_group(&mut command);
-    let mut child = command.spawn().map_err(FormatterCommandError::Spawn)?;
-    let stdin = child.stdin.take().ok_or_else(pipe_error)?;
-    let writer = Some(spawn_writer(stdin, input.to_vec()));
-    let output = wait_with_timeout(child, wait_budget, writer)?;
-    if !output.status.success() {
+    let outcome = run_formatter_process(ProcessRequest {
+        argv: argv.to_vec(),
+        cwd: cwd.to_path_buf(),
+        deadline: wait_budget.deadline,
+        stdin: Some(input.to_vec()),
+        stdout_limit: None,
+        stderr_limit: None,
+        cleanup_budget: PROCESS_CLEANUP_BUDGET,
+    })?;
+    if outcome.timed_out {
+        return Err(wait_budget.timeout_error());
+    }
+    if outcome.status != (TerminationStatus::Exited { code: 0 }) {
         return Err(FormatterCommandError::Exit);
     }
-    Ok(output.stdout)
+    Ok(outcome.stdout.bytes)
 }
 
 /// Run an inplace-mode command: the tool writes to the temp copy in place.
@@ -388,15 +393,36 @@ fn run_inplace_command(
     timeout: Option<Duration>,
 ) -> Result<bool, FormatterCommandError> {
     let wait_budget = WaitBudget::new(timeout)?;
-    let mut command = formatter_command(argv, cwd)?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    configure_process_group(&mut command);
-    let child = command.spawn().map_err(FormatterCommandError::Spawn)?;
-    let output = wait_with_timeout(child, wait_budget, None)?;
-    Ok(output.status.success())
+    let outcome = run_formatter_process(ProcessRequest {
+        argv: argv.to_vec(),
+        cwd: cwd.to_path_buf(),
+        deadline: wait_budget.deadline,
+        stdin: None,
+        stdout_limit: None,
+        stderr_limit: None,
+        cleanup_budget: PROCESS_CLEANUP_BUDGET,
+    })?;
+    if outcome.timed_out {
+        return Err(wait_budget.timeout_error());
+    }
+    Ok(outcome.status == (TerminationStatus::Exited { code: 0 }))
+}
+
+fn run_formatter_process(request: ProcessRequest) -> Result<ProcessOutcome, FormatterCommandError> {
+    map_process_result(run_supervised_process(request, &NeverCancelled))
+}
+
+fn map_process_result(
+    result: Result<ProcessOutcome, ProcessError>,
+) -> Result<ProcessOutcome, FormatterCommandError> {
+    result.map_err(|error| match error {
+        ProcessError::SpawnFailed => FormatterCommandError::Spawn(error),
+        ProcessError::StdinWriteFailed
+        | ProcessError::PipeReadFailed { .. }
+        | ProcessError::WaitFailed
+        | ProcessError::CleanupFailed
+        | ProcessError::Cancelled => FormatterCommandError::Io(error),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -426,216 +452,15 @@ impl WaitBudget {
             budget_ms: Some(budget_ms),
         })
     }
-}
-
-fn formatter_command(argv: &[String], cwd: &Path) -> Result<Command, FormatterCommandError> {
-    let executable = argv.first().ok_or(FormatterCommandError::InvalidTimeout)?;
-    let mut command = Command::new(executable);
-    command.args(&argv[1..]).current_dir(cwd);
-    Ok(command)
-}
-
-#[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
-
-/// Collect output from a child process, killing its process tree if its optional
-/// operation deadline expires. `WaitBudget` is validated before the spawn.
-fn wait_with_timeout(
-    mut child: Child,
-    budget: WaitBudget,
-    writer: Option<PipeWorker<()>>,
-) -> Result<Output, FormatterCommandError> {
-    let stdout = child.stdout.take().map(spawn_reader);
-    let stderr = child.stderr.take().map(spawn_reader);
-    wait_with_pipe_workers(child, budget, writer, stdout, stderr)
-}
-
-fn wait_with_pipe_workers(
-    mut child: Child,
-    budget: WaitBudget,
-    mut writer: Option<PipeWorker<()>>,
-    mut stdout: Option<PipeWorker<Vec<u8>>>,
-    mut stderr: Option<PipeWorker<Vec<u8>>>,
-) -> Result<Output, FormatterCommandError> {
-    let mut status = None;
-    let mut writer_done = writer.is_none();
-    let mut stdout_bytes = stdout.is_none().then(Vec::new);
-    let mut stderr_bytes = stderr.is_none().then(Vec::new);
-
-    loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(next_status) => status = next_status,
-                Err(error) => {
-                    return cleanup_failed_wait(
-                        &mut child,
-                        writer,
-                        stdout,
-                        stderr,
-                        FormatterCommandError::Io(error),
-                    );
-                }
-            }
-        }
-        if let Err(error) = poll_pipe(&mut writer, &mut writer_done) {
-            return cleanup_failed_wait(&mut child, writer, stdout, stderr, error);
-        }
-        if let Err(error) = poll_pipe(&mut stdout, &mut stdout_bytes) {
-            return cleanup_failed_wait(&mut child, writer, stdout, stderr, error);
-        }
-        if let Err(error) = poll_pipe(&mut stderr, &mut stderr_bytes) {
-            return cleanup_failed_wait(&mut child, writer, stdout, stderr, error);
-        }
-
-        let now = Instant::now();
-        if budget.deadline.is_some_and(|deadline| now > deadline) {
-            return cleanup_failed_wait(
-                &mut child,
-                writer,
-                stdout,
-                stderr,
-                FormatterCommandError::Timeout(TimeoutDetail {
-                    operation: "format".to_owned(),
-                    layer: "subprocess".to_owned(),
-                    budget_ms: budget
-                        .budget_ms
-                        .expect("an expired formatter deadline has a budget"),
-                }),
-            );
-        }
-        if let Some(status) = status
-            && writer_done
-            && stdout_bytes.is_some()
-            && stderr_bytes.is_some()
-        {
-            return Ok(Output {
-                status,
-                stdout: stdout_bytes.unwrap_or_default(),
-                stderr: stderr_bytes.unwrap_or_default(),
-            });
-        }
-        thread::sleep(
-            budget
-                .deadline
-                .map_or(Duration::from_millis(10), |deadline| {
-                    Duration::from_millis(10).min(deadline.saturating_duration_since(now))
-                }),
-        );
+    fn timeout_error(self) -> FormatterCommandError {
+        FormatterCommandError::Timeout(TimeoutDetail {
+            operation: "format".to_owned(),
+            layer: "subprocess".to_owned(),
+            budget_ms: self
+                .budget_ms
+                .expect("a timed-out formatter request has a configured budget"),
+        })
     }
-}
-
-fn cleanup_failed_wait(
-    child: &mut Child,
-    writer: Option<PipeWorker<()>>,
-    stdout: Option<PipeWorker<Vec<u8>>>,
-    stderr: Option<PipeWorker<Vec<u8>>>,
-    original_error: FormatterCommandError,
-) -> Result<Output, FormatterCommandError> {
-    terminate_process_tree(child);
-    let _ = child.wait();
-    let _ = join_pipe(writer);
-    let _ = join_pipe(stdout);
-    let _ = join_pipe(stderr);
-    Err(original_error)
-}
-
-struct PipeWorker<T> {
-    receiver: mpsc::Receiver<io::Result<T>>,
-    handle: thread::JoinHandle<()>,
-}
-
-fn spawn_reader<R>(mut reader: R) -> PipeWorker<Vec<u8>>
-where
-    R: Read + Send + 'static,
-{
-    spawn_pipe_worker(move || {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })
-}
-
-fn spawn_writer(mut writer: impl IoWrite + Send + 'static, input: Vec<u8>) -> PipeWorker<()> {
-    spawn_pipe_worker(move || match writer.write_all(&input) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(error),
-    })
-}
-
-fn spawn_pipe_worker<T: Send + 'static>(
-    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> PipeWorker<T> {
-    let (sender, receiver) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let _ = sender.send(operation());
-    });
-    PipeWorker { receiver, handle }
-}
-
-trait PipeOutput<T> {
-    fn store(&mut self, value: T);
-}
-
-impl<T> PipeOutput<T> for Option<T> {
-    fn store(&mut self, value: T) {
-        *self = Some(value);
-    }
-}
-
-impl PipeOutput<()> for bool {
-    fn store(&mut self, (): ()) {
-        *self = true;
-    }
-}
-
-fn poll_pipe<T>(
-    worker: &mut Option<PipeWorker<T>>,
-    output: &mut impl PipeOutput<T>,
-) -> Result<(), FormatterCommandError> {
-    let Some(active) = worker.as_ref() else {
-        return Ok(());
-    };
-    match active.receiver.try_recv() {
-        Ok(result) => {
-            let active = worker.take().expect("active pipe worker");
-            active.handle.join().map_err(|_| pipe_error())?;
-            output.store(result.map_err(FormatterCommandError::Io)?);
-            Ok(())
-        }
-        Err(mpsc::TryRecvError::Empty) => Ok(()),
-        Err(mpsc::TryRecvError::Disconnected) => {
-            let active = worker.take().expect("active pipe worker");
-            active.handle.join().map_err(|_| pipe_error())?;
-            Err(pipe_error())
-        }
-    }
-}
-
-fn join_pipe<T>(worker: Option<PipeWorker<T>>) -> Result<(), FormatterCommandError> {
-    if let Some(worker) = worker {
-        worker.handle.join().map_err(|_| pipe_error())?;
-    }
-    Ok(())
-}
-
-fn pipe_error() -> FormatterCommandError {
-    FormatterCommandError::Io(io::Error::other("formatter pipe worker failed"))
-}
-
-fn terminate_process_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = rustix::process::Pid::from_child(child);
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    let _ = child.kill();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -666,40 +491,13 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn executable(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        fs::write(path, body).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[cfg(unix)]
-    fn assert_recorded_process_exits(pid_path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !pid_path.exists() && Instant::now() < deadline {
-            thread::yield_now();
-        }
-        let pid = fs::read_to_string(pid_path).unwrap_or_else(|error| {
-            panic!("read descendant pid from {}: {error}", pid_path.display())
-        });
-        let pid = pid.trim();
-        while Instant::now() < deadline {
-            let alive = std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            if !alive {
-                return;
-            }
-            thread::yield_now();
-        }
-        panic!("timed-out formatter descendant {pid} remained alive");
-    }
+    use crate::adapters::process::test_support::{
+        assert_recorded_process_exits, assert_recorded_process_is_dead, executable,
+    };
 
     #[cfg(unix)]
     fn assert_timed_out_formatter_reaps_process_tree(mode: FormatterMode) {
+        let _fixture_lock = crate::adapters::process::process_fixture_lock();
         let dir = tempdir().unwrap();
         let pid_path = dir.path().join("descendant.pid");
         let target = dir.path().join("source.txt");
@@ -721,23 +519,48 @@ mod tests {
             ],
         };
 
+        let timeout = Duration::from_millis(100);
+        let completion_deadline = Instant::now() + timeout + Duration::from_secs(2);
         let error = match mode {
-            FormatterMode::Filter => run_filter_command(
-                &argv,
-                b"unchanged\n",
-                dir.path(),
-                Some(Duration::from_millis(100)),
-            )
-            .expect_err("filter formatter must expire"),
-            FormatterMode::Inplace => run_inplace_command(
-                &substitute_path(&argv, target.to_str().unwrap()),
-                dir.path(),
-                Some(Duration::from_millis(100)),
-            )
-            .expect_err("inplace formatter must expire"),
+            FormatterMode::Filter => {
+                let argv = argv.clone();
+                let cwd = dir.path().to_path_buf();
+                let (result_tx, result_rx) = mpsc::channel();
+                thread::spawn(move || {
+                    result_tx
+                        .send(run_filter_command(
+                            &argv,
+                            b"unchanged\n",
+                            &cwd,
+                            Some(timeout),
+                        ))
+                        .unwrap();
+                });
+                result_rx
+                    .recv_timeout(completion_deadline.saturating_duration_since(Instant::now()))
+                    .expect("filter timeout cleanup must finish within its separate budget")
+                    .expect_err("filter formatter must expire")
+            }
+            FormatterMode::Inplace => {
+                let argv = substitute_path(&argv, target.to_str().unwrap());
+                let cwd = dir.path().to_path_buf();
+                let (result_tx, result_rx) = mpsc::channel();
+                thread::spawn(move || {
+                    result_tx
+                        .send(run_inplace_command(&argv, &cwd, Some(timeout)))
+                        .unwrap();
+                });
+                result_rx
+                    .recv_timeout(completion_deadline.saturating_duration_since(Instant::now()))
+                    .expect("inplace timeout cleanup must finish within its separate budget")
+                    .expect_err("inplace formatter must expire")
+            }
         };
-        assert!(matches!(error, FormatterCommandError::Timeout(_)));
-        assert_recorded_process_exits(&pid_path);
+        assert!(
+            matches!(error, FormatterCommandError::Timeout(_)),
+            "expected formatter timeout, received {error:?}"
+        );
+        assert_recorded_process_is_dead(&pid_path);
         assert_eq!(fs::read(&target).unwrap(), b"unchanged\n");
     }
 
@@ -970,25 +793,36 @@ mod tests {
             "#!/bin/sh\nsh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; while :; do sleep 1; done' -- \"$1\" &\nwhile [ ! -s \"$1\" ]; do :; done\nwait\n",
         );
 
-        let mut command = Command::new(&script);
-        command.arg(&pid_path).stdin(Stdio::null());
-        configure_process_group(&mut command);
-        let child = command.spawn().unwrap();
-        while !pid_path.exists() {
-            thread::yield_now();
-        }
-
         let io_sentinel = "formatter-io-secret-source-bytes";
-        let stdout = Some(spawn_pipe_worker(move || {
-            Err::<Vec<u8>, _>(io::Error::other(io_sentinel))
-        }));
-        let io_failure =
-            wait_with_pipe_workers(child, WaitBudget::new(None).unwrap(), None, stdout, None)
-                .expect_err("pipe I/O failure must fail the formatter wait");
+        let io_failure = map_process_result(
+            crate::adapters::process::run_supervised_process_with_stdout_failure(
+                ProcessRequest {
+                    argv: vec![
+                        script.to_string_lossy().into_owned(),
+                        pid_path.to_string_lossy().into_owned(),
+                    ],
+                    cwd: dir.path().to_path_buf(),
+                    deadline: None,
+                    stdin: None,
+                    stdout_limit: None,
+                    stderr_limit: None,
+                    cleanup_budget: PROCESS_CLEANUP_BUDGET,
+                },
+                &NeverCancelled,
+                pid_path.clone(),
+                io_sentinel.to_owned(),
+            ),
+        )
+        .expect_err("pipe I/O failure must fail the formatter wait");
 
         match &io_failure {
             FormatterCommandError::Io(error) => {
-                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert_eq!(
+                    *error,
+                    ProcessError::PipeReadFailed {
+                        stream: crate::adapters::process::OutputStream::Stdout,
+                    }
+                );
             }
             other => panic!("expected deterministic I/O classification, got {other:?}"),
         }
@@ -1035,11 +869,9 @@ mod tests {
 
         let path_str = file_path.to_str().unwrap().to_owned();
 
-        // Use a tool that just outputs "formatted\n" (echo -n on stdin → stdout).
-        // We use `cat` style: on Linux `rev` reverses lines, but for predictability
-        // use a Python one-liner if available, otherwise skip.
-        // Instead, we test the worker logic directly with a mock argv that uses
-        // `sh -c 'echo formatted'` to produce a different output.
+        // Consume the filter input before emitting deterministic formatted output.
+        // A command that closes stdin early intentionally exercises the separate
+        // `StdinWriteFailed` contract and is not a successful filter fixture.
         let mut tools = BTreeMap::new();
         tools.insert(
             "txt".to_owned(),
@@ -1048,7 +880,7 @@ mod tests {
                 argv: vec![
                     "sh".to_owned(),
                     "-c".to_owned(),
-                    "printf 'formatted\\n'".to_owned(),
+                    "cat >/dev/null; printf 'formatted\\n'".to_owned(),
                 ],
                 extensions: vec!["txt".to_owned()],
                 timeout_secs: None,
@@ -1061,7 +893,7 @@ mod tests {
             &[
                 "sh".to_owned(),
                 "-c".to_owned(),
-                "printf 'formatted\\n'".to_owned(),
+                "cat >/dev/null; printf 'formatted\\n'".to_owned(),
             ],
             None,
         );

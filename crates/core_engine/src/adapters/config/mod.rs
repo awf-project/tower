@@ -11,9 +11,11 @@
 pub mod debug;
 pub mod lint;
 pub mod lsp;
+pub mod shell;
 pub use debug::{DebugConfig, DebugLanguageConfig};
 pub use lint::{LintCommandConfig, LintConfig, ParserFormat, TargetMode};
 pub use lsp::{LspConfig, LspServerConfig, parse_lsp_config};
+pub use shell::{AllowedCommand, ShellConfig, ShellConfigurationReason};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -240,6 +242,7 @@ fn default_dependency_limits() -> DependencyIndexLimits {
 #[derive(Debug, Default)]
 pub struct TowerConfig {
     pub formatter: FormatterConfig,
+    pub shell: ShellConfig,
     /// `[lsp]` section — language-server bindings (LSP plan 1, Task 8).
     ///
     /// Absent → `LspConfig::default()` (empty; no servers). Populated by
@@ -264,6 +267,8 @@ pub struct TowerConfig {
 struct RawTowerConfig {
     #[serde(default)]
     formatter: FormatterConfig,
+    #[serde(default)]
+    shell: ShellConfig,
     #[serde(default)]
     lsp: LspConfig,
     #[serde(default)]
@@ -291,6 +296,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
         let _ = (raw.projects, raw.dependencies);
         Ok(Self {
             formatter: raw.formatter,
+            shell: raw.shell,
             lsp: raw.lsp,
             lint: raw.lint,
             debug: raw.debug,
@@ -545,6 +551,10 @@ pub enum ConfigError {
         field: &'static str,
         reason: ExtensionConfigurationReason,
     },
+    InvalidShellConfiguration {
+        field: &'static str,
+        reason: ShellConfigurationReason,
+    },
     LegacySection {
         path: PathBuf,
         section: &'static str,
@@ -612,6 +622,9 @@ impl std::fmt::Display for ConfigError {
             ),
             ConfigError::InvalidExtensionConfiguration { field, reason } => {
                 write!(f, "invalid extension configuration {field}: {reason:?}")
+            }
+            ConfigError::InvalidShellConfiguration { field, reason } => {
+                write!(f, "invalid shell configuration {field}: {reason:?}")
             }
             ConfigError::LegacySection {
                 path,
@@ -695,9 +708,11 @@ fn load_with_path_canonicalizer(
         Err(source) => return Err(ConfigError::Io { path, source }),
     };
 
-    let raw: toml::Value = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-        path: path.clone(),
-        source: timeout_parse_error(&contents, &source).unwrap_or(source),
+    let raw: toml::Value = toml::from_str(&contents).map_err(|source| {
+        shell_parse_error(&contents, &source).unwrap_or_else(|| ConfigError::Parse {
+            path: path.clone(),
+            source: timeout_parse_error(&contents, &source).unwrap_or(source),
+        })
     })?;
 
     if let Some(plugins) = raw.get("plugins") {
@@ -756,6 +771,7 @@ fn load_with_path_canonicalizer(
         })?;
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
+    config.shell.validate()?;
     config.lint_request_timeout()?;
     if config.lsp_budget_required() {
         config.extensions.lsp_diagnostics_timeout()?;
@@ -1290,6 +1306,29 @@ fn timeout_parse_error(contents: &str, source: &toml::de::Error) -> Option<toml:
     )))
 }
 
+fn shell_parse_error(contents: &str, source: &toml::de::Error) -> Option<ConfigError> {
+    let offset = source.span()?.start.min(contents.len());
+    let prefix = &contents[..offset];
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let line_end = contents[offset..]
+        .find('\n')
+        .map_or(contents.len(), |index| offset + index);
+    let (key, value) = contents[line_start..line_end].trim().split_once('=')?;
+    let table = prefix
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('[') && line.ends_with(']'))?;
+    if table != "[shell]" || key.trim() != "timeout_secs" {
+        return None;
+    }
+    value.trim().parse::<u64>().ok()?;
+    Some(ConfigError::InvalidShellConfiguration {
+        field: "shell.timeout_secs",
+        reason: ShellConfigurationReason::InvalidTimeout,
+    })
+}
+
 fn validate_deadline_seconds(seconds: u64) -> Option<()> {
     seconds.checked_mul(1_000)?;
     std::time::Instant::now().checked_add(std::time::Duration::from_secs(seconds))?;
@@ -1499,6 +1538,225 @@ mod tests {
         let dir = root.join(".tower");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn assert_invalid_shell_configuration(
+        body: &str,
+        expected_field: &'static str,
+        expected_reason: ShellConfigurationReason,
+    ) {
+        let fixture = tempdir().unwrap();
+        write_config(fixture.path(), body);
+
+        match load(fixture.path()).expect_err("invalid shell policy must be rejected") {
+            ConfigError::InvalidShellConfiguration { field, reason } => {
+                assert_eq!(field, expected_field);
+                assert_eq!(reason, expected_reason);
+            }
+            other => panic!("expected InvalidShellConfiguration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_config_absent_and_disabled_are_inert() {
+        let absent = tempdir().unwrap();
+        let absent_config = load(absent.path()).expect("absent configuration must use defaults");
+        assert_eq!(absent_config.shell.enabled_policy(), None);
+        assert!(!absent_config.shell.enabled);
+        assert!(absent_config.shell.commands.is_empty());
+        assert_eq!(absent_config.shell.timeout_secs, 30);
+        assert_eq!(absent_config.shell.stdout_max_bytes, 65_536);
+        assert_eq!(absent_config.shell.stderr_max_bytes, 65_536);
+
+        let disabled = tempdir().unwrap();
+        write_config(
+            disabled.path(),
+            "[shell]\nenabled = false\ntimeout_secs = 1\nstdout_max_bytes = 1\nstderr_max_bytes = 16777216\n",
+        );
+        let disabled_config = load(disabled.path()).expect("disabled policy must remain valid");
+        assert_eq!(disabled_config.shell.enabled_policy(), None);
+    }
+
+    #[test]
+    fn shell_config_preserves_named_direct_argv_and_limits() {
+        let fixture = tempdir().unwrap();
+        write_config(
+            fixture.path(),
+            "[shell]\nenabled = true\ntimeout_secs = 86400\nstdout_max_bytes = 16777216\nstderr_max_bytes = 7\n\
+             [[shell.commands]]\nname = \"check\"\nargv = [\"cargo\", \"check\", \"\"]\n\
+             [[shell.commands]]\nname = \"literal-shell-syntax\"\nargv = [\"printf\", \"a | b > c & d\"]\n",
+        );
+
+        let config = load(fixture.path()).expect("valid shell policy must load");
+        let policy = config
+            .shell
+            .enabled_policy()
+            .expect("enabled policy must be exposed");
+        assert_eq!(
+            policy.commands,
+            [
+                AllowedCommand {
+                    name: "check".to_owned(),
+                    argv: vec!["cargo".to_owned(), "check".to_owned(), String::new()],
+                },
+                AllowedCommand {
+                    name: "literal-shell-syntax".to_owned(),
+                    argv: vec!["printf".to_owned(), "a | b > c & d".to_owned()],
+                },
+            ]
+        );
+        assert_eq!(
+            std::time::Duration::from_secs(policy.timeout_secs),
+            std::time::Duration::from_secs(86_400)
+        );
+        assert_eq!(policy.stdout_max_bytes, 16_777_216);
+        assert_eq!(policy.stderr_max_bytes, 7);
+    }
+
+    #[test]
+    fn shell_config_rejects_invalid_policy() {
+        let valid_limits =
+            "timeout_secs = 30\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n";
+        let cases = [
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}"),
+                "shell.commands",
+                ShellConfigurationReason::EmptyCommands,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"\"\nargv = [\"true\"]\n"),
+                "shell.commands.name",
+                ShellConfigurationReason::InvalidName,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"bad.name\"\nargv = [\"true\"]\n"),
+                "shell.commands.name",
+                ShellConfigurationReason::InvalidName,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"-leading-dash\"\nargv = [\"true\"]\n"),
+                "shell.commands.name",
+                ShellConfigurationReason::InvalidName,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"{}\"\nargv = [\"true\"]\n", "a".repeat(65)),
+                "shell.commands.name",
+                ShellConfigurationReason::InvalidName,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"same\"\nargv = [\"true\"]\n[[shell.commands]]\nname = \"same\"\nargv = [\"false\"]\n"),
+                "shell.commands.name",
+                ShellConfigurationReason::DuplicateName,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"empty\"\nargv = []\n"),
+                "shell.commands.argv",
+                ShellConfigurationReason::EmptyArgv,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"empty\"\nargv = [\"\", \"literal\"]\n"),
+                "shell.commands.argv",
+                ShellConfigurationReason::EmptyArgv,
+            ),
+            (
+                format!("[shell]\nenabled = true\n{valid_limits}[[shell.commands]]\nname = \"nul\"\nargv = [\"true\", \"a\\u0000b\"]\n"),
+                "shell.commands.argv",
+                ShellConfigurationReason::InvalidArgv,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 0\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.timeout_secs",
+                ShellConfigurationReason::InvalidTimeout,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 86401\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.timeout_secs",
+                ShellConfigurationReason::InvalidTimeout,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 18446744073709551615\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.timeout_secs",
+                ShellConfigurationReason::InvalidTimeout,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 30\nstdout_max_bytes = 0\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.stdout_max_bytes",
+                ShellConfigurationReason::InvalidOutputLimit,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 30\nstdout_max_bytes = 16777217\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.stdout_max_bytes",
+                ShellConfigurationReason::InvalidOutputLimit,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 30\nstdout_max_bytes = 65536\nstderr_max_bytes = 0\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.stderr_max_bytes",
+                ShellConfigurationReason::InvalidOutputLimit,
+            ),
+            (
+                "[shell]\nenabled = true\ntimeout_secs = 30\nstdout_max_bytes = 65536\nstderr_max_bytes = 16777217\n[[shell.commands]]\nname = \"ok\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.stderr_max_bytes",
+                ShellConfigurationReason::InvalidOutputLimit,
+            ),
+            (
+                "[shell]\nenabled = false\ntimeout_secs = 30\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"-disabled-invalid-name\"\nargv = [\"true\"]\n".to_owned(),
+                "shell.commands.name",
+                ShellConfigurationReason::InvalidName,
+            ),
+            (
+                "[shell]\nenabled = false\ntimeout_secs = 30\nstdout_max_bytes = 0\nstderr_max_bytes = 65536\n".to_owned(),
+                "shell.stdout_max_bytes",
+                ShellConfigurationReason::InvalidOutputLimit,
+            ),
+        ];
+
+        for (body, field, reason) in cases {
+            assert_invalid_shell_configuration(&body, field, reason);
+        }
+
+        let valid_maximum_name = "a".repeat(64);
+        let valid_name_fixture = tempdir().unwrap();
+        write_config(
+            valid_name_fixture.path(),
+            &format!(
+                "[shell]\nenabled = true\ntimeout_secs = 30\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"{valid_maximum_name}\"\nargv = [\"true\"]\n"
+            ),
+        );
+        let valid_name_config =
+            load(valid_name_fixture.path()).expect("a 64-byte command name must load");
+        assert_eq!(valid_name_config.shell.commands[0].name, valid_maximum_name);
+
+        let rejected_value_sentinel = "shell-rejected-value-sentinel";
+        let redaction_fixture = tempdir().unwrap();
+        write_config(
+            redaction_fixture.path(),
+            &format!(
+                "[shell]\nenabled = true\ntimeout_secs = 30\nstdout_max_bytes = 65536\nstderr_max_bytes = 65536\n[[shell.commands]]\nname = \"{rejected_value_sentinel}.\"\nargv = [\"true\"]\n"
+            ),
+        );
+        let redaction_error =
+            load(redaction_fixture.path()).expect_err("the sentinel command name must be rejected");
+        assert!(matches!(
+            &redaction_error,
+            ConfigError::InvalidShellConfiguration {
+                field: "shell.commands.name",
+                reason: ShellConfigurationReason::InvalidName,
+            }
+        ));
+        let rendered = redaction_error.to_string();
+        assert!(rendered.contains("shell.commands.name"), "{rendered}");
+        assert!(rendered.contains("InvalidName"), "{rendered}");
+        assert!(!rendered.contains(rejected_value_sentinel), "{rendered}");
+
+        let unknown = tempdir().unwrap();
+        write_config(
+            unknown.path(),
+            "[shell]\nenabled = false\nunexpected = true\n",
+        );
+        assert!(matches!(
+            load(unknown.path()),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     fn assert_parse_error_names(body: &str, field: &str, value: &str) {

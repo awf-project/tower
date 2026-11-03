@@ -1940,6 +1940,31 @@ mod tests {
     }
 
     #[test]
+    fn shell_host_call_is_rejected_without_spawning_process() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("shell-host-call-marker");
+        let response = parse_response(&dispatch_host_call(
+            "tower_run_command",
+            json!(92),
+            json!({
+                "command": "sh",
+                "args": ["-c", format!("touch {}", marker.display())]
+            }),
+            &make_deps_no_push(),
+            &[],
+        ));
+
+        assert_eq!(
+            response_error(&response),
+            (
+                -32601,
+                "unknown host capability method: tower_run_command".to_owned()
+            )
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn format_path_validation_rejects_malformed_dependency_locators() {
         for path in [
             "dependency://",

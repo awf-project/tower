@@ -25,7 +25,7 @@ use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_works
 use crate::adapters::config::lsp::{
     lsp_initialize_payload_with_diagnostics_timeout, validate_lsp_commands,
 };
-use crate::adapters::config::{QueryableProjects, TowerConfig};
+use crate::adapters::config::{QueryableProjects, ShellConfig, TowerConfig};
 use crate::adapters::daemon::instrumentation::StartupInstrumentation;
 use crate::adapters::daemon::lifecycle::{
     CapabilityDependency, CapabilityReadiness, DaemonLifecycle, ReadinessController,
@@ -311,6 +311,7 @@ pub struct EarlyDaemonContext {
     external_availability_timeout: Duration,
     opts: Mutex<Option<GlobalOpts>>,
     config: Mutex<Option<TowerConfig>>,
+    shell_policy: Option<Arc<ShellConfig>>,
     shared: Arc<PreparationShared>,
     preparation_timeout: Option<Duration>,
     dependency_policy: Arc<ExtensionDependencyPolicy>,
@@ -343,6 +344,10 @@ impl EarlyDaemonContext {
 
     pub fn dependency_policy(&self) -> Arc<ExtensionDependencyPolicy> {
         Arc::clone(&self.dependency_policy)
+    }
+
+    pub fn shell_policy(&self) -> Option<Arc<ShellConfig>> {
+        self.shell_policy.clone()
     }
 
     pub fn prepared_if_available(&self) -> Option<Arc<PreparedEngine>> {
@@ -526,6 +531,7 @@ pub fn build_early_context(
     config: TowerConfig,
     owner: &WorkspaceDaemonOwner,
 ) -> Result<EarlyDaemonContext, PreparationError> {
+    let shell_policy = config.shell.enabled_policy().cloned().map(Arc::new);
     let preparation_timeout = config.daemon.preparation_timeout();
     let dependency_policy = Arc::new(extension_dependency_policy(&config));
     let workspace_root = resolve_workspace_root(opts);
@@ -556,6 +562,7 @@ pub fn build_early_context(
             extensions_dir: opts.extensions_dir.clone(),
         })),
         config: Mutex::new(Some(config)),
+        shell_policy,
         shared: Arc::new(PreparationShared {
             published: Mutex::new(None),
             complete: Mutex::new(false),
@@ -2209,6 +2216,41 @@ mod tests {
         assert_eq!(projects[0].id.as_str(), "snapshot-id");
         assert_eq!(projects[0].name, "Snapshot target");
         assert_eq!(projects[0].resolved_path, target.path());
+    }
+
+    #[test]
+    fn early_daemon_context_retains_enabled_shell_policy() {
+        let workspace = TempDir::new().expect("create workspace");
+        let config_dir = workspace.path().join(".tower");
+        std::fs::create_dir_all(&config_dir).expect("create configuration directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[shell]\nenabled = true\ntimeout_secs = 9\nstdout_max_bytes = 17\nstderr_max_bytes = 23\n\
+             [[shell.commands]]\nname = \"check\"\nargv = [\"cargo\", \"check\"]\n",
+        )
+        .expect("write shell configuration");
+        let config = load(workspace.path()).expect("load shell configuration");
+        let expected = config.shell.clone();
+        let owner = WorkspaceDaemonOwner::acquire(workspace.path()).expect("acquire owner");
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        };
+        let context = Arc::new(
+            build_early_context(&opts, config, &owner).expect("build early daemon context"),
+        );
+
+        let preparation =
+            start_workspace_preparation(Arc::clone(&context)).expect("start workspace preparation");
+        assert!(
+            context
+                .config
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_none()
+        );
+        assert_eq!(context.shell_policy().as_deref(), Some(&expected));
+        drop(preparation);
     }
 
     use crate::adapters::extension::timeout_test_support::{

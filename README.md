@@ -16,6 +16,7 @@ Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 | **Persistent workspace index**  | Fast file lookup and directory listing from a `sled`-backed VFS.                                           |
 | **Parallel text search**        | Rayon-backed grep across indexed file contents.                                                            |
 | **Dependency source search**    | Opt-in, bounded search of explicitly configured, read-only source roots.                                   |
+| **Optional command execution**  | Host-owned, allowlisted direct commands with workspace-contained working directories and bounded output.   |
 | **Safe mutations**              | Atomic writes and CAS-style `expected_version` checks for agent-safe edits.                                |
 | **Path rename**                 | Preview or move indexed files and directories, with optional language-server reference updates.            |
 | **Reference-aware safe delete** | Check references before deleting a declaration and apply validated backend cleanup edits safely.           |
@@ -162,18 +163,19 @@ host, and exposed as namespaced MCP tools such as `tower_ast_get_outline` or
 
 ## Tool Surface
 
-Native tools are always available. Extension tools appear when their sidecars are installed and
-enabled.
+Core native tools are always available. `tower_run_command` appears when enabled in `[shell]`;
+extension tools appear when their sidecars are installed and enabled.
 
-| Area             | Examples                                                                                                                                            |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Files and search | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text`                                                                         |
-| Safe mutations   | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`, `tower_rename_path`, `tower_safe_delete_symbol`               |
-| AST              | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol`                                                                          |
-| LSP              | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover`, `tower_lsp_implementations`, `tower_lsp_type_hierarchy` |
-| Lint             | `tower_lint_check`, `tower_lint_fix`                                                                                                                |
-| Debug            | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin`                                                                   |
-| Cross-project    | `tower_list_projects`, `tower_query_project`                                                                                                        |
+| Area              | Examples                                                                                                                                            |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Files and search  | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text`                                                                         |
+| Safe mutations    | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`, `tower_rename_path`, `tower_safe_delete_symbol`               |
+| AST               | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol`                                                                          |
+| LSP               | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover`, `tower_lsp_implementations`, `tower_lsp_type_hierarchy` |
+| Lint              | `tower_lint_check`, `tower_lint_fix`                                                                                                                |
+| Debug             | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin`                                                                   |
+| Command execution | `tower_run_command` (opt-in; configured allowlist only)                                                                                             |
+| Cross-project     | `tower_list_projects`, `tower_query_project`                                                                                                        |
 
 See [docs/mcp-tools.md](docs/mcp-tools.md) for the full wire protocol, tool schemas, responses, and
 stable error codes.
@@ -195,6 +197,7 @@ stable error codes.
 | [docs/user-guide/debug-sessions.md](docs/user-guide/debug-sessions.md)                                                           | Interactive DAP sessions and rr-backed reverse-debug workflows.                          |
 | [docs/user-guide/project-queries.md](docs/user-guide/project-queries.md)                                                         | Configure trusted external projects and route read-only queries with source attribution. |
 | [docs/user-guide/dependency-search.md](docs/user-guide/dependency-search.md)                                                     | Configure bounded dependency roots and opt into origin-aware file and text searches.     |
+| [docs/user-guide/shell-commands.md](docs/user-guide/shell-commands.md)                                                           | Enable and use the host-owned, allowlisted `tower_run_command` tool.                     |
 | [docs/development.md](docs/development.md)                                                                                       | Contribution workflow, CI checks, tests, and project conventions.                        |
 | [docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md](docs/ADR/0010-stage-daemon-startup-and-capability-readiness.md) | B001 startup ownership and capability-readiness decision.                                |
 
