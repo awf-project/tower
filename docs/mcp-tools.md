@@ -880,6 +880,79 @@ cross-file rename work is intentionally not a single transaction. See
 
 ---
 
+## tower_run_command
+
+`tower_run_command` is an optional host-owned capability. It appears in
+`tools/list` only when `[shell].enabled = true` and a valid command allowlist is
+configured. It is not an extension tool and cannot be invoked through a sidecar
+HostCall.
+
+Configure named commands with direct argv entries:
+
+```toml
+[shell]
+enabled = true
+timeout_secs = 30
+stdout_max_bytes = 65536
+stderr_max_bytes = 65536
+
+[[shell.commands]]
+name = "check"
+argv = ["cargo", "check", "--workspace"]
+```
+
+The tool accepts this input schema:
+
+```json
+{
+  "command": "check",
+  "args": ["--all-targets"],
+  "cwd": "crates/core_engine"
+}
+```
+
+`command` is required. `args` defaults to an empty array, and `cwd` defaults to
+the workspace root. The configured executable and fixed arguments are combined
+with `args`; Tower does not evaluate shell syntax. `cwd` must resolve to an
+existing directory inside the workspace. Absolute paths, traversal, and
+symlink escapes are rejected before process creation.
+
+Successful calls return:
+
+```json
+{
+  "status": { "kind": "exited", "code": 0 },
+  "stdout": {
+    "kind": "text",
+    "text": "Finished\n",
+    "byte_count": 9,
+    "truncated": false
+  },
+  "stderr": {
+    "kind": "text",
+    "text": "",
+    "byte_count": 0,
+    "truncated": false
+  },
+  "timed_out": false
+}
+```
+
+Each stream is bounded independently by its configured byte limit and continues
+draining after its retained prefix is full. UTF-8 output uses `kind: "text"`;
+non-UTF-8 output uses `kind: "bytes"` with base64 data. Timeouts terminate and
+reap the complete process tree and return `timed_out: true`. A normal nonzero
+exit remains a structured result with its numeric exit code. Caller
+cancellation returns the standard cancellation error after cleanup.
+
+Invalid or disallowed commands and invalid working directories use the stable
+invalid-arguments mapping. Spawn and other process failures use sanitized
+execution errors; command arguments, output, executable paths, and raw OS
+diagnostics are not included in public errors or default logs. See [Run
+Configured Commands](user-guide/shell-commands.md) for an operational guide.
+
+---
+
 ## Code-intelligence tools (LSP)
 
 The declared planning tools `tower_lsp_plan_path_rename` and

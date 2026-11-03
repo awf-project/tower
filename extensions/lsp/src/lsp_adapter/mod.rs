@@ -3925,15 +3925,12 @@ mod tests {
         );
     }
 
-    fn adapter_with_malformed_server_output(output: &str) -> LspClientAdapter {
-        let initialize =
-            r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"definitionProvider":true}}}"#;
-        let script = format!(
-            "initialize='{initialize}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${{#initialize}}\" \"$initialize\"; printf '%b' '{output}'; sleep 60"
-        );
+    fn adapter_with_malformed_server_output(mode: &str) -> LspClientAdapter {
         LspClientAdapter::spawn(
-            "/bin/sh",
-            &["-c".to_owned(), script],
+            fixture_lsp_server::binary_path()
+                .to_str()
+                .expect("fixture path is UTF-8"),
+            &[mode.to_owned()],
             vec!["rs".to_owned()],
             "rust".to_owned(),
             std::env::current_dir().expect("test process has a current directory"),
@@ -4439,11 +4436,14 @@ mod tests {
         let (adapter, _sink, responses) = test_adapter();
         let dispatcher = super::Dispatcher::new(Arc::clone(&responses));
         for id in 1..=32 {
+            // Leave enough time for the writer thread to register the pending
+            // request under full-suite load. The test is about expiry after
+            // registration and late-response cleanup, not writer scheduling.
             let result = adapter
                 .send_request_once_until(
                     "textDocument/diagnostic",
                     json!({}),
-                    Some(Instant::now() + Duration::from_millis(1)),
+                    Some(Instant::now() + Duration::from_millis(100)),
                 )
                 .unwrap();
             assert!(matches!(
@@ -5018,7 +5018,7 @@ mod tests {
 
     #[test]
     fn f008_failure_classification_classifies_invalid_framing_as_malformed_response() {
-        let adapter = adapter_with_malformed_server_output("Content-Length: nope\\r\\n\\r\\n");
+        let adapter = adapter_with_malformed_server_output("invalid_framing_after_initialized");
         wait_until_reader_exits(&adapter);
 
         let error = PooledSession::definition_lsp(
@@ -5041,7 +5041,7 @@ mod tests {
 
     #[test]
     fn f008_failure_classification_classifies_invalid_json_as_malformed_response() {
-        let adapter = adapter_with_malformed_server_output("Content-Length: 1\\r\\n\\r\\n{");
+        let adapter = adapter_with_malformed_server_output("invalid_json_after_initialized");
         wait_until_reader_exits(&adapter);
 
         let error = PooledSession::definition_lsp(

@@ -100,6 +100,27 @@ impl TowerMcpHandler {
             resource_uris,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_list_tools(&self) -> Vec<ToolDesc> {
+        self.registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .list()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_call_tool(
+        &self,
+        name: &str,
+        args: Value,
+        cancellation: &dyn crate::domain::CancellationSignal,
+    ) -> Result<Value, ToolError> {
+        self.registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .call(name, args, cancellation)
+    }
 }
 
 // ── ServerHandler impl ────────────────────────────────────────────────────────

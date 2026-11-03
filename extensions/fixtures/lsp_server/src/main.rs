@@ -300,6 +300,20 @@ impl Server {
                 self.synchronize(method, params, uri)?;
                 continue;
             }
+            // Wait for the client to consume initialize before injecting a reader fault.
+            // Sending both frames together can kill the reader during initialization.
+            if method == "initialized" {
+                let malformed = match self.mode.as_str() {
+                    "invalid_framing_after_initialized" => Some("Content-Length: nope\r\n\r\n"),
+                    "invalid_json_after_initialized" => Some("Content-Length: 1\r\n\r\n{"),
+                    _ => None,
+                };
+                if let Some(malformed) = malformed {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(malformed.as_bytes())?;
+                    stdout.flush()?;
+                }
+            }
             let Some(id) = message.get("id") else {
                 continue;
             };

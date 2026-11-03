@@ -1077,4 +1077,31 @@ mod tests {
         }
         assert!(connector.calls().is_empty());
     }
+
+    #[test]
+    fn shell_tool_is_not_available_to_extensions_or_external_projects() {
+        let fixture = Fixture::new();
+        let connector = RecordingConnector::default();
+        let mut registry = fixture.registry(connector.clone());
+
+        assert_application(
+            registry.call(
+                "tower_query_project",
+                query(
+                    json!({"id": "alpha-id"}),
+                    "tower_run_command",
+                    json!({"command": "fixture"}),
+                ),
+                &NeverCancelled,
+            ),
+            EXTERNAL_READ_ONLY_BOUNDARY,
+            "external project operation is not permitted",
+            json!({
+                "code": "external_read_only_boundary",
+                "project": {"id": "alpha-id", "name": "Alpha"},
+                "operation": "tower_run_command"
+            }),
+        );
+        assert!(connector.calls().is_empty());
+    }
 }

@@ -42,6 +42,8 @@ pub mod in_memory_storage;
 /// merging in spec 28. The [`mcp::ToolRegistry`] trait is the seam.
 pub mod mcp;
 mod path_identity;
+pub mod process;
+pub mod shell;
 pub mod storage;
 pub mod watcher;
 

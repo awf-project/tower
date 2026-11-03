@@ -23,12 +23,12 @@ use crate::adapters::daemon::wire::{
     ClientRole, ControlRequest, ControlResponse, StatusSnapshot, read_handshake, read_line_capped,
     write_line,
 };
-use crate::adapters::mcp::ProjectQueryRegistry;
 use crate::adapters::mcp::chain_registry::ChainRegistry;
 use crate::adapters::mcp::diagnostics::NoOpDiagnosticsReader;
 use crate::adapters::mcp::extension_merged_registry::ReadinessAwareRegistry;
 use crate::adapters::mcp::lsp_tools::SubscriptionRegistry;
 use crate::adapters::mcp::rmcp_server::TowerMcpHandler;
+use crate::adapters::mcp::{ProjectQueryRegistry, ShellCommandRegistry};
 
 /// A sticky broadcast: shutdown cannot be lost between select iterations or
 /// before a newly accepted connection starts waiting.
@@ -111,7 +111,7 @@ impl DaemonCtx {
 /// Build a fresh per-connection MCP handler over the shared engine state.
 fn build_handler(ctx: &DaemonCtx) -> (TowerMcpHandler, Arc<Mutex<SubscriptionRegistry>>) {
     let sub = Arc::new(Mutex::new(SubscriptionRegistry::new()));
-    let registry = ChainRegistry::new(vec![
+    let mut registries: Vec<Box<dyn crate::adapters::mcp::ToolRegistry + Send>> = vec![
         Box::new(ProjectQueryRegistry::new(
             ctx.early.workspace_root().to_path_buf(),
             ctx.early.queryable_projects().clone(),
@@ -119,7 +119,14 @@ fn build_handler(ctx: &DaemonCtx) -> (TowerMcpHandler, Arc<Mutex<SubscriptionReg
             Arc::new(ExternalDaemonClient::new()),
         )),
         Box::new(ReadinessAwareRegistry::new(Arc::clone(&ctx.early))),
-    ]);
+    ];
+    if let Some(policy) = ctx.early.shell_policy() {
+        registries.push(Box::new(ShellCommandRegistry::new(
+            policy,
+            ctx.early.workspace_root().to_path_buf(),
+        )));
+    }
+    let registry = ChainRegistry::new(registries);
     let handler = TowerMcpHandler::new(
         registry,
         Arc::new(NoOpDiagnosticsReader),
@@ -487,6 +494,115 @@ fn pre_bind_test_milestone() -> Result<(), String> {
 #[cfg(test)]
 mod shutdown_signal_tests {
     use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use crate::adapters::config::{AllowedCommand, ShellConfig};
+    use crate::domain::NeverCancelled;
+
+    fn daemon_context(
+        workspace: &TempDir,
+        shell: ShellConfig,
+    ) -> (DaemonCtx, WorkspaceDaemonOwner) {
+        let owner = WorkspaceDaemonOwner::acquire(workspace.path()).expect("acquire daemon owner");
+        let opts = GlobalOpts {
+            workspace_dir: Some(workspace.path().to_path_buf()),
+            extensions_dir: None,
+        };
+        let config = TowerConfig {
+            shell,
+            ..TowerConfig::default()
+        };
+        let early = Arc::new(build_early_context(&opts, config, &owner).expect("build context"));
+        (
+            DaemonCtx {
+                generation: owner.generation(),
+                started: Instant::now(),
+                registry: SessionRegistry::new(),
+                early,
+                shutdown: Arc::new(ShutdownSignal::default()),
+            },
+            owner,
+        )
+    }
+
+    fn assert_shell_unavailable(ctx: &DaemonCtx) {
+        let (handler, _subscriptions) = build_handler(ctx);
+        assert!(
+            handler
+                .test_list_tools()
+                .iter()
+                .all(|descriptor| descriptor.name != "tower_run_command")
+        );
+        assert!(matches!(
+            handler.test_call_tool(
+                "tower_run_command",
+                json!({"command": "fixture"}),
+                &NeverCancelled,
+            ),
+            Err(crate::adapters::mcp::ToolError::NotFound(name))
+                if name == "tower_run_command"
+        ));
+    }
+
+    #[test]
+    fn shell_command_registry_is_conditionally_composed_by_build_handler() {
+        let absent_workspace = TempDir::new().expect("create absent-policy workspace");
+        let (absent, _absent_owner) = daemon_context(&absent_workspace, ShellConfig::default());
+        assert_shell_unavailable(&absent);
+
+        let disabled_workspace = TempDir::new().expect("create disabled-policy workspace");
+        let disabled_policy = ShellConfig {
+            enabled: false,
+            commands: vec![AllowedCommand {
+                name: "fixture".to_owned(),
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf disabled".to_owned(),
+                ],
+            }],
+            ..ShellConfig::default()
+        };
+        let (disabled, _disabled_owner) = daemon_context(&disabled_workspace, disabled_policy);
+        assert_shell_unavailable(&disabled);
+
+        let enabled_workspace = TempDir::new().expect("create enabled-policy workspace");
+        let enabled_policy = ShellConfig {
+            enabled: true,
+            commands: vec![AllowedCommand {
+                name: "fixture".to_owned(),
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf enabled".to_owned(),
+                ],
+            }],
+            timeout_secs: 2,
+            stdout_max_bytes: 256,
+            stderr_max_bytes: 256,
+        };
+        let (enabled, _enabled_owner) = daemon_context(&enabled_workspace, enabled_policy);
+        let (handler, _subscriptions) = build_handler(&enabled);
+        assert_eq!(
+            handler
+                .test_list_tools()
+                .iter()
+                .filter(|descriptor| descriptor.name == "tower_run_command")
+                .count(),
+            1
+        );
+        let result = handler
+            .test_call_tool(
+                "tower_run_command",
+                json!({"command": "fixture"}),
+                &NeverCancelled,
+            )
+            .expect("enabled production handler dispatches shell command");
+        assert_eq!(result["stdout"]["text"], "enabled");
+        assert_eq!(result["status"], json!({"kind": "exited", "code": 0}));
+    }
+
     #[tokio::test]
     async fn shutdown_before_wait_and_between_accept_iterations_is_not_lost() {
         let signal = Arc::new(ShutdownSignal::default());

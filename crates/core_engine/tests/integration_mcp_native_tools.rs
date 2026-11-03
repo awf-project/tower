@@ -1,7 +1,7 @@
 //! End-to-end integration tests for the native `tower_*` MCP tools (spec 10b).
 //!
-//! All tests use an in-process rmcp server driven via `tokio::io::duplex`.
-//! No spawned processes, no real stdio.
+//! Most tests use an in-process rmcp server driven via `tokio::io::duplex`.
+//! Shell-command scenarios use the production daemon socket and real processes.
 
 #![forbid(unsafe_code)]
 
@@ -57,6 +57,43 @@ use mcp_server::start_server;
 #[path = "support/dependency_search.rs"]
 mod dependency_search;
 use dependency_search::dependency_search_state_with_storage;
+#[path = "support/shell_command.rs"]
+mod shell_command;
+
+#[cfg(unix)]
+static SHELL_SCENARIO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+macro_rules! shell_scenario {
+    ($name:ident) => {
+        #[test]
+        fn $name() {
+            let _guard = SHELL_SCENARIO_LOCK.lock().unwrap();
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(shell_command::$name());
+        }
+    };
+}
+
+#[cfg(unix)]
+shell_scenario!(disabled_shell_tool_is_absent_from_discovery);
+#[cfg(unix)]
+shell_scenario!(enabled_shell_tool_executes_allowed_command);
+#[cfg(unix)]
+shell_scenario!(shell_command_uses_default_and_contained_working_directories);
+#[cfg(unix)]
+shell_scenario!(escaping_working_directory_is_rejected_before_spawn);
+#[cfg(unix)]
+shell_scenario!(long_running_shell_command_is_terminated_after_timeout);
+#[cfg(unix)]
+shell_scenario!(shell_command_output_is_independently_bounded);
+#[cfg(unix)]
+shell_scenario!(shell_failures_and_logs_do_not_disclose_private_inputs);
+#[cfg(unix)]
+shell_scenario!(unsuccessful_shell_command_preserves_exit_status_and_output);
+#[cfg(unix)]
+shell_scenario!(malformed_shell_arguments_are_rejected_before_spawn);
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
