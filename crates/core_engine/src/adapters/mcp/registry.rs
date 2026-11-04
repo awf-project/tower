@@ -56,6 +56,12 @@ use super::types::{ToolDesc, ToolError};
 /// Implementors MUST NOT panic. Any runtime failure must be returned as
 /// [`ToolError::ExecutionFailed`].
 pub trait ToolRegistry {
+    /// Subscribe before reading the inventory so startup changes cannot be lost.
+    /// Static registries do not need an inventory observer.
+    fn tool_list_changes(&self) -> Vec<tokio::sync::watch::Receiver<()>> {
+        Vec::new()
+    }
+
     /// Return a description of every tool in this registry.
     ///
     /// An empty `Vec` is valid (AC2: empty registry returns empty list).

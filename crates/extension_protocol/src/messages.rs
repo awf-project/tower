@@ -2022,6 +2022,9 @@ pub enum HostCall {
     ReadFile {
         /// Workspace-relative path.
         path: String,
+        /// Opt in to the typed workspace-read result. Omitted for legacy callers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
     },
     /// List all indexed files in the workspace (`workspace/listFiles`).
     ListFiles,
@@ -2065,6 +2068,25 @@ pub enum HostCall {
         /// The resource URI that was updated (e.g. a `file://…` diagnostics URI).
         uri: String,
     },
+}
+
+/// Stable failure vocabulary for strict workspace reads.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceReadFailure {
+    InvalidPath,
+    NotFound,
+    UnsupportedFileType,
+    InvalidUtf8,
+    HostUnavailable,
+}
+
+/// Result returned by `workspace/readFile` when `strict: true` is requested.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkspaceReadResult {
+    Ok { content: String },
+    Error { kind: WorkspaceReadFailure },
 }
 
 #[cfg(test)]

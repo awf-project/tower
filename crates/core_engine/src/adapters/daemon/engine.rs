@@ -934,6 +934,10 @@ fn extension_dependency_policy(config: &TowerConfig) -> ExtensionDependencyPolic
     let mut dependencies: HashMap<ExtensionId, CapabilityDependency> = [
         (ExtensionId::new("ast"), CapabilityDependency::Ast),
         (ExtensionId::new("lsp"), CapabilityDependency::Lsp),
+        (
+            ExtensionId::new("semantic_context"),
+            CapabilityDependency::SemanticContext,
+        ),
     ]
     .into_iter()
     .collect();
@@ -946,6 +950,9 @@ fn extension_dependency_policy(config: &TowerConfig) -> ExtensionDependencyPolic
                 let dependency = match family {
                     crate::adapters::config::ReadinessFamily::Ast => CapabilityDependency::Ast,
                     crate::adapters::config::ReadinessFamily::Lsp => CapabilityDependency::Lsp,
+                    crate::adapters::config::ReadinessFamily::SemanticContext => {
+                        CapabilityDependency::SemanticContext
+                    }
                 };
                 (ExtensionId::new(identity), dependency)
             }),
@@ -1033,6 +1040,10 @@ fn extension_dependency_bindings(
     let mut bindings = HashMap::from([
         (ExtensionId::new("ast"), CapabilityDependency::Ast),
         (ExtensionId::new("lsp"), CapabilityDependency::Lsp),
+        (
+            ExtensionId::new("semantic_context"),
+            CapabilityDependency::SemanticContext,
+        ),
     ]);
     if config.lsp.servers.is_empty() {
         bindings.remove(&ExtensionId::new("lsp"));
@@ -1043,6 +1054,9 @@ fn extension_dependency_bindings(
             match family {
                 crate::adapters::config::ReadinessFamily::Ast => CapabilityDependency::Ast,
                 crate::adapters::config::ReadinessFamily::Lsp => CapabilityDependency::Lsp,
+                crate::adapters::config::ReadinessFamily::SemanticContext => {
+                    CapabilityDependency::SemanticContext
+                }
             },
         );
     }
@@ -1088,10 +1102,22 @@ fn drive_extension_catch_up(
                         Ok(count) => (count, None),
                         Err((count, fault)) => (count, Some(fault)),
                     };
-                let deadline = config
-                    .extensions
-                    .request_timeout()
-                    .map(|timeout| Instant::now() + timeout);
+                let supervision_timeout = config.extensions.request_timeout().map(|host| {
+                    if id.as_str() == "semantic_context" {
+                        config
+                            .semantic_context
+                            .timeouts
+                            .reindex_ms
+                            .and_then(|budget_ms| {
+                                Duration::from_millis(budget_ms)
+                                    .checked_add(Duration::from_secs(5))
+                            })
+                            .map_or(host, |operation| host.max(operation))
+                    } else {
+                        host
+                    }
+                });
+                let deadline = supervision_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
                 while failure.is_none() {
                     if cancellation.cancelled.load(Ordering::Acquire) {
                         failure = Some(CatchUpFailure::protocol(id.clone(), CatchUpError::Cancelled { extension_id: id.clone() }));
@@ -1831,6 +1857,63 @@ fn extension_init_configs(
     if let Some(debug_config) = tower_config.debug.for_extension_initialize() {
         init_configs.insert("debug".to_owned(), debug_config);
     }
+    let semantic = &tower_config.semantic_context;
+    let mut embedding = serde_json::Map::new();
+    embedding.insert(
+        "provider".to_owned(),
+        semantic.embedding.provider.clone().into(),
+    );
+    embedding.insert(
+        "base_url".to_owned(),
+        semantic.embedding.base_url.clone().into(),
+    );
+    embedding.insert("model".to_owned(), semantic.embedding.model.clone().into());
+    embedding.insert(
+        "timeout_ms".to_owned(),
+        semantic.embedding.timeout_ms.into(),
+    );
+    embedding.insert(
+        "batch_size".to_owned(),
+        semantic.embedding.batch_size.into(),
+    );
+    if let Some(dimensions) = semantic.embedding.dimensions {
+        embedding.insert("dimensions".to_owned(), dimensions.into());
+    }
+    embedding.insert(
+        "allow_remote".to_owned(),
+        semantic.embedding.allow_remote.into(),
+    );
+    if let Some(api_key_env) = &semantic.embedding.api_key_env {
+        embedding.insert("api_key_env".to_owned(), api_key_env.clone().into());
+    }
+    let mut timeouts = serde_json::Map::new();
+    timeouts.insert("search_ms".to_owned(), semantic.timeouts.search_ms.into());
+    if let Some(reindex_ms) = semantic.timeouts.reindex_ms {
+        timeouts.insert("reindex_ms".to_owned(), reindex_ms.into());
+    }
+    init_configs.insert(
+        "semantic_context".to_owned(),
+        serde_json::Value::Object(serde_json::Map::from_iter([
+            ("enabled".to_owned(), semantic.enabled.into()),
+            ("embedding".to_owned(), embedding.into()),
+            ("timeouts".to_owned(), timeouts.into()),
+            (
+                "chunking".to_owned(),
+                serde_json::json!({
+                    "target_bytes": semantic.chunking.target_bytes,
+                    "overlap_bytes": semantic.chunking.overlap_bytes,
+                    "max_file_bytes": semantic.chunking.max_file_bytes,
+                }),
+            ),
+            (
+                "store".to_owned(),
+                serde_json::json!({
+                    "backend": semantic.store.backend,
+                    "path": ".tower/semantic_context/index.sqlite3",
+                }),
+            ),
+        ])),
+    );
     Ok(init_configs)
 }
 
@@ -2173,6 +2256,119 @@ mod tests {
             apply_edits: Arc::new(UnsupportedApplyEditsHost),
             push_tx: None,
         }
+    }
+
+    #[test]
+    fn semantic_context_initialization_preserves_validated_effective_config_across_restart() {
+        let workspace = TempDir::new().expect("create workspace");
+        std::fs::create_dir_all(workspace.path().join(".tower")).unwrap();
+        std::fs::write(
+            workspace.path().join(".tower/config.toml"),
+            "[semantic_context]\nenabled=true\n\
+             [semantic_context.embedding]\nbase_url=\"https://embeddings.example/v1\"\nallow_remote=true\napi_key_env=\"TOWER_EMBEDDING_KEY\"\ndimensions=768\n\
+             [semantic_context.timeouts]\nsearch_ms=1200\nreindex_ms=90000\n\
+             [semantic_context.chunking]\ntarget_bytes=8192\noverlap_bytes=1024\nmax_file_bytes=4194304\n",
+        )
+        .unwrap();
+        let first = extension_init_configs(
+            &load(workspace.path()).expect("first startup loads valid semantic configuration"),
+        )
+        .expect("validated semantic DTO")
+        .remove("semantic_context")
+        .expect("semantic extension initialization config");
+        let restarted = extension_init_configs(
+            &load(workspace.path()).expect("restart reloads semantic configuration from disk"),
+        )
+        .expect("restart semantic DTO")
+        .remove("semantic_context")
+        .expect("restart preserves semantic config");
+        let expected = serde_json::json!({
+            "enabled": true,
+            "embedding": {
+                "provider": "openai_compatible",
+                "base_url": "https://embeddings.example/v1",
+                "model": "nomic-embed-text",
+                "timeout_ms": 30000,
+                "batch_size": 32,
+                "dimensions": 768,
+                "allow_remote": true,
+                "api_key_env": "TOWER_EMBEDDING_KEY"
+            },
+            "timeouts": {"search_ms": 1200, "reindex_ms": 90000},
+            "chunking": {
+                "target_bytes": 8192,
+                "overlap_bytes": 1024,
+                "max_file_bytes": 4194304
+            },
+            "store": {
+                "backend": "sqlite",
+                "path": ".tower/semantic_context/index.sqlite3"
+            }
+        });
+        assert_eq!(first, expected);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&restarted).unwrap()
+        );
+        assert!(!serde_json::to_string(&first).unwrap().contains("secret"));
+
+        let defaults = TempDir::new().expect("create omitted-defaults workspace");
+        std::fs::create_dir_all(defaults.path().join(".tower")).unwrap();
+        std::fs::write(
+            defaults.path().join(".tower/config.toml"),
+            "[semantic_context]\nenabled=true\n",
+        )
+        .unwrap();
+        let explicit_defaults = TempDir::new().expect("create explicit-defaults workspace");
+        std::fs::create_dir_all(explicit_defaults.path().join(".tower")).unwrap();
+        std::fs::write(
+            explicit_defaults.path().join(".tower/config.toml"),
+            "[semantic_context]\nenabled=true\n\
+             [semantic_context.embedding]\nprovider=\"openai_compatible\"\nbase_url=\"http://127.0.0.1:11434/v1\"\nmodel=\"nomic-embed-text\"\ntimeout_ms=30000\nbatch_size=32\nallow_remote=false\n\
+             [semantic_context.timeouts]\nsearch_ms=30000\n\
+             [semantic_context.chunking]\ntarget_bytes=4096\noverlap_bytes=512\nmax_file_bytes=2097152\n\
+             [semantic_context.store]\nbackend=\"sqlite\"\n",
+        )
+        .unwrap();
+        let omitted = extension_init_configs(
+            &load(defaults.path()).expect("omitted defaults load on first startup"),
+        )
+        .expect("omitted defaults form an initialization DTO")
+        .remove("semantic_context")
+        .expect("semantic DTO is registered for omitted defaults");
+        let explicit = extension_init_configs(
+            &load(explicit_defaults.path()).expect("explicit defaults load on restart"),
+        )
+        .expect("explicit defaults form an initialization DTO")
+        .remove("semantic_context")
+        .expect("semantic DTO is registered for explicit defaults");
+        let expected_defaults = serde_json::json!({
+            "enabled": true,
+            "embedding": {
+                "provider": "openai_compatible",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "nomic-embed-text",
+                "timeout_ms": 30000,
+                "batch_size": 32,
+                "allow_remote": false
+            },
+            "timeouts": {"search_ms": 30000},
+            "chunking": {
+                "target_bytes": 4096,
+                "overlap_bytes": 512,
+                "max_file_bytes": 2097152
+            },
+            "store": {
+                "backend": "sqlite",
+                "path": ".tower/semantic_context/index.sqlite3"
+            }
+        });
+        assert_eq!(omitted, expected_defaults);
+        assert_eq!(
+            serde_json::to_vec(&omitted).unwrap(),
+            serde_json::to_vec(&explicit).unwrap(),
+            "omitted defaults and explicit equal defaults serialize identically"
+        );
     }
 
     #[test]
@@ -2630,6 +2826,265 @@ target = "append"
 mod fence_contract_tests {
     use super::*;
     use serde_json::json;
+
+    struct SemanticFenceFixture {
+        manifest: ExtensionManifest,
+        fence_calls: Arc<std::sync::atomic::AtomicUsize>,
+        search_calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_fence: bool,
+    }
+
+    struct SemanticCatchUpFixture {
+        config: TowerConfig,
+        readiness: Arc<ReadinessController>,
+        publisher: Arc<CommittedEventPublisher>,
+        registry: Arc<RwLock<ExtensionRegistry>>,
+        fence_calls: Arc<std::sync::atomic::AtomicUsize>,
+        search_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::domain::extension_host::ExtensionInstance for SemanticFenceFixture {
+        fn manifest(&self) -> &ExtensionManifest {
+            &self.manifest
+        }
+
+        fn call_tool(
+            &mut self,
+            name: &str,
+            _: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<serde_json::Value, crate::domain::extension_host::ExtensionCallError> {
+            match name {
+                "_tower_catch_up_fence" if self.fail_fence => {
+                    Err(ExtensionFault::Crashed { code: Some(1) }.into())
+                }
+                "_tower_catch_up_fence" => {
+                    self.fence_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"epoch": 1, "processed_events": 0, "ready": true}))
+                }
+                "search" => {
+                    self.search_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({
+                        "status": "unsupported",
+                        "reason": "semantic context is disabled"
+                    }))
+                }
+                other => Err(ExtensionFault::ProtocolError {
+                    message: format!("unexpected semantic fixture tool {other}"),
+                }
+                .into()),
+            }
+        }
+
+        fn deliver_event(&mut self, _: extension_protocol::Event) -> Result<(), ExtensionFault> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    fn semantic_fence_manifest() -> ExtensionManifest {
+        toml::from_str(
+            r#"
+name = "semantic_context"
+version = "0.1.0"
+command = ["unused"]
+activation = "eager"
+[[tools]]
+name = "search"
+description = "semantic search"
+schema_json = '{}'
+[[tools]]
+name = "_tower_catch_up_fence"
+description = "private catch-up fence"
+schema_json = '{}'
+"#,
+        )
+        .expect("semantic test manifest is valid")
+    }
+
+    fn semantic_catch_up_fixture(fail_fence: bool) -> SemanticCatchUpFixture {
+        let fence_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let search_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publisher = Arc::new(CommittedEventPublisher::new(1));
+        let (instance, delivery) = super::super::delivery::OrderedExtension::spawn(
+            Box::new(SemanticFenceFixture {
+                manifest: semantic_fence_manifest(),
+                fence_calls: Arc::clone(&fence_calls),
+                search_calls: Arc::clone(&search_calls),
+                fail_fence,
+            }),
+            Arc::clone(&publisher),
+            vec![],
+            true,
+        )
+        .expect("spawn ordered semantic fixture");
+        publisher
+            .subscribe(ExtensionId::new("semantic_context"), delivery)
+            .expect("subscribe semantic fixture");
+        let mut registry = ExtensionRegistry::new();
+        registry
+            .register(instance)
+            .expect("register semantic fixture");
+        let registry = Arc::new(RwLock::new(registry));
+        let readiness = Arc::new(ReadinessController::new(1));
+        readiness
+            .transition_capability(CapabilityDependency::Workspace, CapabilityReadiness::Ready)
+            .expect("workspace is ready before extension catch-up");
+        let config = TowerConfig::default();
+        register_extension_readiness(&config, &readiness, &registry, &publisher)
+            .expect("semantic fixture enters preparation");
+        SemanticCatchUpFixture {
+            config,
+            readiness,
+            publisher,
+            registry,
+            fence_calls,
+            search_calls,
+        }
+    }
+
+    #[test]
+    fn semantic_context_readiness_waits_for_successful_catch_up() {
+        let fixture = semantic_catch_up_fixture(false);
+        let extension_id = ExtensionId::new("semantic_context");
+        assert!(matches!(
+            fixture.readiness.snapshot().semantic_context,
+            CapabilityReadiness::Preparing {
+                phase: StartupPhase::CapabilitiesCatchingUp
+            }
+        ));
+        let policy = Arc::new(extension_dependency_policy(&fixture.config));
+        let mut merged = crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry::with_readiness(
+            Arc::new(RwLock::new(EngineState::new(
+                ProjectWorkspace::new(),
+                InvertedIndex::new(),
+                Box::new(crate::adapters::InMemoryStorage::new()),
+                Box::new(crate::adapters::InMemoryFs::new()),
+            ))),
+            Arc::clone(&fixture.registry),
+            Arc::new(RenameCoordinator::default()),
+            Arc::clone(&fixture.readiness),
+            policy,
+            Some(Duration::ZERO),
+        );
+        use crate::adapters::mcp::registry::ToolRegistry as _;
+        let pending = merged
+            .call(
+                "tower_semantic_context_search",
+                json!({"query":"needle"}),
+                &crate::domain::NeverCancelled,
+            )
+            .expect_err("merged gate must not dispatch before catch-up completes");
+        let crate::adapters::mcp::ToolError::Application {
+            code,
+            message,
+            data,
+        } = pending
+        else {
+            panic!("preparing semantic retrieval must return an application error");
+        };
+        assert_eq!(code, -32_004);
+        assert_eq!(message, "capability initialization is still in progress");
+        assert_eq!(
+            data,
+            Some(json!({
+                "dependency":"semantic_context",
+                "phase":"capabilities_catching_up",
+                "wait_expired":true
+            }))
+        );
+        assert_eq!(fixture.search_calls.load(Ordering::SeqCst), 0);
+
+        let cancellation = PreparationCancellation {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(
+            drive_extension_catch_up(
+                &fixture.config,
+                &fixture.readiness,
+                &fixture.publisher,
+                &fixture.registry,
+                &cancellation,
+                &StartupInstrumentation::new(),
+            )
+            .expect("catch-up coordinator succeeds")
+        );
+        assert_eq!(fixture.fence_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            fixture.readiness.snapshot().semantic_context,
+            CapabilityReadiness::Ready
+        ));
+        let result = merged
+            .call(
+                "tower_semantic_context_search",
+                json!({"query":"needle"}),
+                &crate::domain::NeverCancelled,
+            )
+            .expect("real catch-up admits the merged semantic tool");
+        assert_eq!(
+            result,
+            json!({"status":"unsupported","reason":"semantic context is disabled"})
+        );
+        assert_eq!(fixture.search_calls.load(Ordering::SeqCst), 1);
+
+        let failed_fixture = semantic_catch_up_fixture(true);
+        assert!(
+            !drive_extension_catch_up(
+                &failed_fixture.config,
+                &failed_fixture.readiness,
+                &failed_fixture.publisher,
+                &failed_fixture.registry,
+                &cancellation,
+                &StartupInstrumentation::new(),
+            )
+            .expect("failed fence is recorded rather than panicking")
+        );
+        assert!(matches!(
+            failed_fixture.readiness.snapshot().semantic_context,
+            CapabilityReadiness::Failed { .. }
+        ));
+        let failed_policy = Arc::new(extension_dependency_policy(&failed_fixture.config));
+        let mut failed_merged = crate::adapters::mcp::extension_merged_registry::ExtensionMergedRegistry::with_readiness(
+            Arc::new(RwLock::new(EngineState::new(
+                ProjectWorkspace::new(),
+                InvertedIndex::new(),
+                Box::new(crate::adapters::InMemoryStorage::new()),
+                Box::new(crate::adapters::InMemoryFs::new()),
+            ))),
+            Arc::clone(&failed_fixture.registry),
+            Arc::new(RenameCoordinator::default()),
+            Arc::clone(&failed_fixture.readiness),
+            failed_policy,
+            Some(Duration::ZERO),
+        );
+        let failure = failed_merged
+            .call(
+                "tower_semantic_context_search",
+                json!({"query":"needle"}),
+                &crate::domain::NeverCancelled,
+            )
+            .expect_err("failed catch-up must remain blocked by the merged gate");
+        let crate::adapters::mcp::ToolError::Application {
+            code,
+            message,
+            data,
+        } = failure
+        else {
+            panic!("failed semantic readiness must return an application error");
+        };
+        assert_eq!(code, -32_005);
+        assert_eq!(message, "capability initialization failed");
+        assert_eq!(
+            data,
+            Some(json!({
+                "dependency":"semantic_context",
+                "failure_class":"extension_crash"
+            }))
+        );
+        assert_eq!(failed_fixture.search_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(extension_id.as_str(), "semantic_context");
+    }
 
     #[test]
     fn production_fence_errors_preserve_typed_cause_identity_and_fixed_class() {

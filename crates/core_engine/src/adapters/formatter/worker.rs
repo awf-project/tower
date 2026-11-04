@@ -509,10 +509,12 @@ mod tests {
         );
         let argv = match mode {
             FormatterMode::Filter => vec![
+                "sh".to_owned(),
                 script.to_string_lossy().into_owned(),
                 pid_path.to_string_lossy().into_owned(),
             ],
             FormatterMode::Inplace => vec![
+                "sh".to_owned(),
                 script.to_string_lossy().into_owned(),
                 pid_path.to_string_lossy().into_owned(),
                 "{path}".to_owned(),
@@ -573,16 +575,19 @@ mod tests {
         let source = dir.path().join("source.txt");
         fs::write(&source, b"unformatted\n").unwrap();
         let script = dir.path().join("formatter.sh");
-        executable(
+        // Interpret this fixture instead of executing a freshly written file,
+        // which can fail with ETXTBSY. No executable permission is required.
+        fs::write(
             &script,
             "#!/bin/sh\nprintf started > \"$1\"\nwhile [ ! -e \"$2\" ]; do :; done\ncat >/dev/null\nprintf 'formatted\\n'\n",
-        );
+        ).unwrap();
         let mut tools = BTreeMap::new();
         tools.insert(
             "fixture".to_owned(),
             ToolConfig {
                 mode: FormatterMode::Filter,
                 argv: vec![
+                    "sh".to_owned(),
                     script.to_string_lossy().into_owned(),
                     marker.to_string_lossy().into_owned(),
                     release.to_string_lossy().into_owned(),
@@ -639,6 +644,7 @@ mod tests {
         let tool = ToolConfig {
             mode: FormatterMode::Filter,
             argv: vec![
+                "sh".to_owned(),
                 script.to_string_lossy().into_owned(),
                 pid_path.to_string_lossy().into_owned(),
             ],
@@ -701,6 +707,7 @@ mod tests {
             ToolConfig {
                 mode: FormatterMode::Inplace,
                 argv: vec![
+                    "sh".to_owned(),
                     script.to_string_lossy().into_owned(),
                     pid_path.to_string_lossy().into_owned(),
                     "{path}".to_owned(),
@@ -798,6 +805,8 @@ mod tests {
             crate::adapters::process::run_supervised_process_with_stdout_failure(
                 ProcessRequest {
                     argv: vec![
+                        // parallel filesystem activity can make exec return ETXTBSY.
+                        "sh".to_owned(),
                         script.to_string_lossy().into_owned(),
                         pid_path.to_string_lossy().into_owned(),
                     ],

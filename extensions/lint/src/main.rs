@@ -1152,6 +1152,7 @@ where
         "workspace/readFile",
         &HostCall::ReadFile {
             path: path.to_owned(),
+            strict: None,
         },
         queued,
     )?;

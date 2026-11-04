@@ -30,6 +30,8 @@ members = [
     "extensions/lint",
     # F004 debug sidecar extension.
     "extensions/debug",
+    # F016 semantic-context sidecar domain crate.
+    "extensions/semantic_context",
 ]
 
 default-members = [
@@ -64,6 +66,8 @@ default-members = [
     "extensions/lint",
     # F004 debug sidecar extension.
     "extensions/debug",
+    # F016 semantic-context sidecar extension.
+    "extensions/semantic_context",
 ]
 
 [workspace.package]

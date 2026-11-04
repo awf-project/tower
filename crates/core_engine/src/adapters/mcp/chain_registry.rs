@@ -30,6 +30,13 @@ impl ChainRegistry {
 }
 
 impl ToolRegistry for ChainRegistry {
+    fn tool_list_changes(&self) -> Vec<tokio::sync::watch::Receiver<()>> {
+        self.inner
+            .iter()
+            .flat_map(|r| r.tool_list_changes())
+            .collect()
+    }
+
     fn list(&self) -> Vec<ToolDesc> {
         self.inner.iter().flat_map(|r| r.list()).collect()
     }

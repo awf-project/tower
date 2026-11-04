@@ -38,6 +38,7 @@ pub mod project_query;
 pub mod registry;
 pub mod rmcp_server;
 pub mod shell_command;
+pub(crate) mod transport;
 pub mod types;
 
 pub use diagnostics::{DiagnosticsReader, NoOpDiagnosticsReader, PushEvent};

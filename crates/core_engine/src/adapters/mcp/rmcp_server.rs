@@ -6,10 +6,9 @@
 //! [`TowerMcpHandler`] wraps the existing [`ExtensionMergedRegistry`] (which
 //! provides native + sidecar-extension tools) behind a `Mutex` so the async
 //! handler methods can mutably borrow it without holding a synchronous lock
-//! across await points. All registry calls are short-lived synchronous CPU
-//! work — no blocking I/O — so wrapping in a plain `std::sync::Mutex` (and
-//! taking the lock only for the duration of the registry call) keeps the
-//! critical section small and avoids the overhead of a tokio Mutex.
+//! across await points. Tool dispatch can block on sidecars, so dispatch and
+//! background inventory observation run on the blocking pool to keep the async
+//! runtime available for cancellation notifications.
 //!
 //! # Resource subscription
 //!
@@ -37,7 +36,7 @@ use rmcp::model::{
     ResourcesCapability, ServerCapabilities, ServerInfo, SubscribeRequestParams, Tool,
     UnsubscribeRequestParams,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::{Peer, ServerHandler};
 use serde_json::Value;
 
@@ -57,13 +56,17 @@ use crate::adapters::mcp::types::{ToolDesc, ToolError};
 ///
 /// # Thread safety
 ///
-/// The struct is `Send + Sync` (required by `ServerHandler`). All mutable
-/// state is accessed through `Mutex` guards whose critical sections contain
-/// only non-blocking CPU work.
+/// The struct is `Send + Sync` (required by `ServerHandler`). Registry dispatch
+/// holds a synchronous mutex on the blocking pool; background inventory reads
+/// use that same pool so waiting for dispatch cannot stall cancellation.
 pub struct TowerMcpHandler {
     /// The unified tool registry (native tower_* + sidecar extension tools).
     /// Wrapped in a plain Mutex: registry calls are sync/non-blocking.
     registry: Arc<Mutex<Box<dyn ToolRegistry + Send>>>,
+
+    tool_list_changes: Mutex<Vec<tokio::sync::watch::Receiver<()>>>,
+    advertised_tools: Arc<Mutex<Vec<ToolDesc>>>,
+    tool_list_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 
     /// Diagnostics provider for resources/read. No-op in the extension model.
     diag_reader: Arc<dyn DiagnosticsReader>,
@@ -93,8 +96,13 @@ impl TowerMcpHandler {
     where
         R: ToolRegistry + Send + 'static,
     {
+        let tool_list_changes = registry.tool_list_changes();
+        let advertised_tools = registry.list();
         Self {
             registry: Arc::new(Mutex::new(Box::new(registry))),
+            tool_list_changes: Mutex::new(tool_list_changes),
+            advertised_tools: Arc::new(Mutex::new(advertised_tools)),
+            tool_list_tasks: Mutex::new(Vec::new()),
             diag_reader,
             sub_reg,
             resource_uris,
@@ -126,6 +134,53 @@ impl TowerMcpHandler {
 // ── ServerHandler impl ────────────────────────────────────────────────────────
 
 impl ServerHandler for TowerMcpHandler {
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        let changes = std::mem::take(
+            &mut *self
+                .tool_list_changes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        for mut changes in changes {
+            let registry = Arc::clone(&self.registry);
+            let advertised_tools = Arc::clone(&self.advertised_tools);
+            let peer = context.peer.clone();
+            let task = tokio::spawn(async move {
+                while changes.changed().await.is_ok() {
+                    let registry = Arc::clone(&registry);
+                    let advertised_tools = Arc::clone(&advertised_tools);
+                    // Dispatch can hold the registry during an unlimited call.
+                    // Waiting for it must not block rmcp cancellation processing.
+                    let changed = tokio::task::spawn_blocking(move || {
+                        // Match tools/list's lock order and compare the whole schema,
+                        // not only names. Lifecycle progress alone needs no push.
+                        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                        let tools = registry.list();
+                        let mut advertised =
+                            advertised_tools.lock().unwrap_or_else(|p| p.into_inner());
+                        if *advertised == tools {
+                            false
+                        } else {
+                            *advertised = tools;
+                            true
+                        }
+                    })
+                    .await;
+                    let Ok(changed) = changed else {
+                        break;
+                    };
+                    if changed && peer.notify_tool_list_changed().await.is_err() {
+                        break;
+                    }
+                }
+            });
+            self.tool_list_tasks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(task);
+        }
+    }
+
     /// Advertise server identity and capabilities.
     ///
     /// Tools and resources (with subscribe enabled) are advertised. rmcp
@@ -134,6 +189,7 @@ impl ServerHandler for TowerMcpHandler {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .enable_resources_with(ResourcesCapability {
                     subscribe: Some(true),
                     list_changed: Some(false),
@@ -149,11 +205,12 @@ impl ServerHandler for TowerMcpHandler {
         _req: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = self
-            .registry
+        let registry = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let tools = registry.list();
+        *self
+            .advertised_tools
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .list();
+            .unwrap_or_else(|p| p.into_inner()) = tools.clone();
         let rmcp_tools: Vec<Tool> = tools.into_iter().map(tool_desc_to_rmcp).collect();
         Ok(ListToolsResult {
             meta: None,
@@ -288,6 +345,19 @@ impl ServerHandler for TowerMcpHandler {
             .unwrap_or_else(|p| p.into_inner())
             .unsubscribe(&req.uri);
         Ok(())
+    }
+}
+
+impl Drop for TowerMcpHandler {
+    fn drop(&mut self) {
+        for task in self
+            .tool_list_tasks
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
     }
 }
 

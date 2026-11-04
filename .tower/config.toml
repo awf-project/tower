@@ -38,6 +38,16 @@ record_timeout_secs = 30
 # Disabled extensions are not loaded and expose no tools or event hooks.
 disabled = []
 
+# Local semantic retrieval; source snippets stay on the local Ollama service.
+[semantic_context]
+enabled = true
+
+[semantic_context.embedding]
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:50000/v1"
+model = "nomic-embed-text"
+allow_remote = false
+
 # [formatter.tools.<id>] — external formatters run by the host format queue when a
 # file changes. mode = "filter" (default, stdin->stdout) or "inplace".
 # `{path}` is substituted with the file path (filter) or temp copy (inplace).

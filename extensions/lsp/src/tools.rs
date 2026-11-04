@@ -376,6 +376,7 @@ where
 {
     let call = HostCall::ReadFile {
         path: path.to_owned(),
+        strict: None,
     };
     let raw = protocol::host_call(out, lines, next_id, "workspace/readFile", &call, deferred)?;
     match raw {

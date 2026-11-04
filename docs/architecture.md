@@ -116,6 +116,11 @@ extensions/                Native sidecar extensions (separate binaries)
 │                                 threads, stack, variables, evaluate, terminate,
 │                                 disconnect, sessions
 │                          Owns adapter/debuggee processes and ephemeral sessions
+├── semantic_context/      Opt-in embedding retrieval sidecar (eager)
+│                          Pure chunking/retrieval domain, embedding/workspace/index ports,
+│                          HTTP provider and private SQLite index adapters
+│                          Tools: semantic_reindex, semantic_search,
+│                                 semantic_related_files, semantic_context_for_task
 └── fixtures/              Test-only fault-isolation fixtures
 ```
 
@@ -251,7 +256,7 @@ daemon start
        ├─ open Sled and reconcile the eligible filesystem inventory
        ├─ catch up the watcher and publish committed events in order
        ├─ discover extensions and complete their snapshot/live handoff
-       └─ publish workspace, AST, and LSP readiness independently
+       └─ publish workspace, AST, LSP, and semantic-context readiness independently
 ```
 
 Startup reconciliation runs regardless of any historical scan-completion marker. It preserves
@@ -262,10 +267,18 @@ filesystem before the affected capability reports `ready`. A client disconnect d
 joined preparation worker; ownership and cleanup remain daemon-scoped.
 
 The daemon exposes explicit `starting`, `ready`, `degraded`, `failed`, and `stopping` lifecycle
-states. Workspace, AST, and LSP dependencies have independent readiness states, so a slow or failed
+states. Workspace, AST, LSP, and semantic-context dependencies have independent readiness states, so a slow or failed
 extension does not make unrelated native tools unavailable. Calls that require a preparing family
 use the configured bounded preparation deadline and return stable application errors when the family
 is pending, failed, stopping, or unavailable.
+
+The semantic sidecar catches up from an ordered workspace snapshot and subsequent file events before
+its readiness gate admits retrieval calls. Its application and domain code depend on
+`EmbeddingProviderPort`, `SemanticIndexPort`, and `WorkspaceReadPort`. The host permits workspace
+reads through declared read-only capabilities; the trusted sidecar writes only its private derived
+SQLite index at `.tower/semantic_context/index.sqlite3`. A rebuild publishes a complete index
+generation, while file events replace or delete only the affected path. The index can be rebuilt
+from the workspace. See [semantic retrieval](user-guide/semantic-retrieval.md) for operation.
 
 ### Configuration boundary
 

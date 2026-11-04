@@ -40,12 +40,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use extension_protocol::{Activation, ExtensionManifest};
+use extension_protocol::{Activation, ExtensionFault, ExtensionManifest};
 use serde_json::Value;
 
 use super::host_deps::HostDeps;
 use super::supervisor::ExtensionSupervisor;
-use crate::domain::extension_host::{ExtensionInstance, ExtensionRegistry};
+use crate::domain::extension_host::{
+    CancellationSignal, ExtensionCallError, ExtensionInstance, ExtensionRegistry,
+};
 
 // ── Default directory constants ───────────────────────────────────────────────
 
@@ -57,6 +59,35 @@ pub const DEFAULT_EXTENSIONS_SUBDIR: &str = ".tower/extensions";
 pub const XDG_EXTENSIONS_SUBDIR: &str = "tower/extensions";
 
 pub type ExtensionInitConfigMap = BTreeMap<String, Value>;
+
+/// Retains a discovered eager extension's public contract when its initialize
+/// handshake fails. The readiness gate then returns the typed host-boundary
+/// failure instead of degrading the declared capability into "tool not found".
+struct FailedEagerExtension {
+    manifest: ExtensionManifest,
+    fault: ExtensionFault,
+}
+
+impl ExtensionInstance for FailedEagerExtension {
+    fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    fn call_tool(
+        &mut self,
+        _: &str,
+        _: Value,
+        _: &dyn CancellationSignal,
+    ) -> Result<Value, ExtensionCallError> {
+        Err(self.fault.clone().into())
+    }
+
+    fn deliver_event(&mut self, _: extension_protocol::Event) -> Result<(), ExtensionFault> {
+        Err(self.fault.clone())
+    }
+
+    fn shutdown(&mut self) {}
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExtensionRequestTimeouts {
@@ -641,7 +672,7 @@ fn load_extensions_with_register_cancellable_inner(
                                     "tower: warning — failed to spawn eager extension '{name}' from {}: {e}",
                                     ext_dir.display()
                                 );
-                                continue;
+                                Box::new(FailedEagerExtension { manifest, fault: e })
                             }
                         }
                     }
@@ -1111,7 +1142,11 @@ activation = "lazy"
             );
 
             if activation == "eager" {
-                assert!(instances.is_empty(), "failed eager spawn must degrade");
+                assert_eq!(
+                    instances.len(),
+                    1,
+                    "failed eager spawn must retain its public failure contract"
+                );
                 assert!(started.elapsed() >= Duration::from_millis(240));
             } else {
                 assert_eq!(instances.len(), 1);

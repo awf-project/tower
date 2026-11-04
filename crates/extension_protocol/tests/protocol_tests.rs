@@ -326,11 +326,15 @@ fn event_file_changed_round_trips_json() {
 fn host_call_read_file_round_trips_json() {
     let call = HostCall::ReadFile {
         path: "/src/lib.rs".to_owned(),
+        strict: None,
     };
     let json = serde_json::to_string(&call).expect("serialize");
     let decoded: HostCall = serde_json::from_str(&json).expect("deserialize");
     match decoded {
-        HostCall::ReadFile { path } => assert_eq!(path, "/src/lib.rs"),
+        HostCall::ReadFile { path, strict } => {
+            assert_eq!(path, "/src/lib.rs");
+            assert_eq!(strict, None);
+        }
         _ => panic!("wrong variant"),
     }
 }
@@ -407,6 +411,7 @@ fn host_call_log_round_trips_json() {
 fn existing_host_call_and_manifest_serialization_contracts_stay_unchanged() {
     let read_file = serde_json::to_value(HostCall::ReadFile {
         path: "/src/lib.rs".to_owned(),
+        strict: None,
     })
     .expect("serialize readFile host call");
     assert_eq!(

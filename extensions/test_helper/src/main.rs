@@ -226,7 +226,10 @@ fn main() {
                             .to_owned();
 
                         // Make a host call: workspace/readFile
-                        let host_call = HostCall::ReadFile { path: path.clone() };
+                        let host_call = HostCall::ReadFile {
+                            path: path.clone(),
+                            strict: None,
+                        };
                         let call_id = serde_json::json!(9001_u64);
                         send_host_call(&mut out, &call_id, "workspace/readFile", &host_call);
                         out.flush().unwrap();
@@ -309,7 +312,7 @@ fn main() {
                             .unwrap_or("")
                             .to_owned();
 
-                        let host_call = HostCall::ReadFile { path };
+                        let host_call = HostCall::ReadFile { path, strict: None };
                         let call_id = serde_json::json!(9004_u64);
                         send_host_call(&mut out, &call_id, "workspace/readFile", &host_call);
                         out.flush().unwrap();

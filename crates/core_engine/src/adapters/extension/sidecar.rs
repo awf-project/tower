@@ -123,6 +123,34 @@ fn effective_request_timeout(timeout: Option<Duration>) -> Option<Duration> {
     }
 }
 
+fn semantic_operation_timeout(
+    host_timeout: Option<Duration>,
+    extension_config: Option<&Value>,
+    rebuild: bool,
+) -> Result<Option<Duration>, ExtensionFault> {
+    let Some(host_timeout) = host_timeout else {
+        // Without an explicit host cap the sidecar owns operation expiry.
+        return Ok(None);
+    };
+    let budget_pointer = if rebuild {
+        "/timeouts/reindex_ms"
+    } else {
+        "/timeouts/search_ms"
+    };
+    let Some(budget_ms) = extension_config
+        .and_then(|config| config.pointer(budget_pointer))
+        .and_then(Value::as_u64)
+    else {
+        return Ok(Some(host_timeout));
+    };
+    let operation_allowance = Duration::from_millis(budget_ms)
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| ExtensionFault::ProtocolError {
+            message: "semantic operation supervision allowance overflow".to_owned(),
+        })?;
+    Ok(Some(host_timeout.max(operation_allowance)))
+}
+
 // ── Wire helpers ──────────────────────────────────────────────────────────────
 
 /// Serialize a JSON-RPC request to a newline-terminated JSON frame.
@@ -278,6 +306,8 @@ pub struct SidecarHostAdapter {
     reader_thread: Option<JoinHandle<()>>,
     /// Per-request wall-clock deadline (spec 24 U1).
     request_timeout: Option<Duration>,
+    /// Validated host configuration retained for operation-aware supervision.
+    extension_config: Option<Value>,
 }
 
 impl std::fmt::Debug for SidecarHostAdapter {
@@ -291,6 +321,18 @@ impl std::fmt::Debug for SidecarHostAdapter {
 }
 
 impl SidecarHostAdapter {
+    /// Dispatch a capability call through the same policy boundary used by the
+    /// sidecar reader loop.
+    pub fn dispatch_capability_call(
+        method: &str,
+        call_id: Value,
+        params: Value,
+        deps: &HostDeps,
+        allowed_caps: &[Capability],
+    ) -> String {
+        dispatch_host_call(method, call_id, params, deps, allowed_caps)
+    }
+
     /// Spawn the extension described by `manifest` and complete the `initialize`
     /// handshake.
     ///
@@ -381,6 +423,7 @@ impl SidecarHostAdapter {
 
         // Perform the initialize handshake before starting the reader loop.
         // We read directly from stdout here (single-threaded, before reader starts).
+        let retained_extension_config = extension_config.clone();
         let (init_result, reader_thread) = match Self::do_initialize(
             &stdin,
             stdout,
@@ -432,6 +475,7 @@ impl SidecarHostAdapter {
             child,
             reader_thread: Some(reader_thread),
             request_timeout,
+            extension_config: retained_extension_config,
         }))
     }
 
@@ -580,7 +624,8 @@ impl SidecarHostAdapter {
         method: &str,
         params: Value,
     ) -> Result<PendingResponse, ExtensionFault> {
-        validate_request_timeout(self.request_timeout)?;
+        let request_timeout = self.operation_request_timeout(method, &params)?;
+        validate_request_timeout(request_timeout)?;
         let frame = self.begin_request(method, params);
         self.write_request_frame(&frame, None)
             .map_err(|error| match error {
@@ -592,7 +637,7 @@ impl SidecarHostAdapter {
 
         Self::wait_response_timed(
             &self.pending,
-            self.request_timeout,
+            request_timeout,
             Some(&mut self.child),
             method,
         )
@@ -611,12 +656,15 @@ impl SidecarHostAdapter {
             return Err(SidecarWaitError::Cancelled);
         }
 
-        validate_request_timeout(self.request_timeout).map_err(SidecarWaitError::Fault)?;
+        let request_timeout = self
+            .operation_request_timeout(method, &params)
+            .map_err(SidecarWaitError::Fault)?;
+        validate_request_timeout(request_timeout).map_err(SidecarWaitError::Fault)?;
         let frame = self.begin_request(method, params);
         self.write_request_frame(&frame, Some(cancellation))?;
 
         const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
-        let request_timeout = effective_request_timeout(self.request_timeout);
+        let request_timeout = effective_request_timeout(request_timeout);
         let started = Instant::now();
         let (lock, cvar) = &*self.pending;
         let mut slot = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -653,6 +701,20 @@ impl SidecarHostAdapter {
         }
 
         Self::take_pending_response(&mut slot).map_err(SidecarWaitError::Fault)
+    }
+
+    fn operation_request_timeout(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Option<Duration>, ExtensionFault> {
+        operation_request_timeout_for(
+            &self.manifest.name,
+            self.request_timeout,
+            self.extension_config.as_ref(),
+            method,
+            params,
+        )
     }
 
     fn write_request_frame(
@@ -790,6 +852,23 @@ impl SidecarHostAdapter {
             );
         }
     }
+}
+
+fn operation_request_timeout_for(
+    manifest_name: &str,
+    request_timeout: Option<Duration>,
+    extension_config: Option<&Value>,
+    method: &str,
+    params: &Value,
+) -> Result<Option<Duration>, ExtensionFault> {
+    if manifest_name != "semantic_context" {
+        return Ok(request_timeout);
+    }
+
+    let tool = params.get("name").and_then(Value::as_str);
+    let rebuild = method == "deliverEvent"
+        || matches!(tool, Some("semantic_reindex" | "_tower_catch_up_fence"));
+    semantic_operation_timeout(request_timeout, extension_config, rebuild)
 }
 
 fn validate_request_timeout(timeout: Option<Duration>) -> Result<(), ExtensionFault> {
@@ -1249,6 +1328,31 @@ fn dispatch_host_call(
                 );
             }
             let path = params["path"].as_str().unwrap_or("").to_owned();
+            let strict = params["strict"].as_bool().unwrap_or(false);
+            if strict {
+                let result = match validate_capability_path(&path) {
+                    Err(_) => extension_protocol::WorkspaceReadResult::Error {
+                        kind: extension_protocol::WorkspaceReadFailure::InvalidPath,
+                    },
+                    Ok(()) => match deps.fs.read_file_confined(&path) {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(content) => extension_protocol::WorkspaceReadResult::Ok { content },
+                            Err(_) => extension_protocol::WorkspaceReadResult::Error {
+                                kind: extension_protocol::WorkspaceReadFailure::InvalidUtf8,
+                            },
+                        },
+                        Err(kind) => extension_protocol::WorkspaceReadResult::Error { kind },
+                    },
+                };
+                return match serde_json::to_value(result) {
+                    Ok(value) => encode_response_ok(call_id, value),
+                    Err(_) => encode_response_err(
+                        call_id,
+                        -32603,
+                        "strict workspace read serialization failed".to_owned(),
+                    ),
+                };
+            }
             match validate_capability_path(&path) {
                 Err(e) => encode_response_err(call_id, -32602, e),
                 Ok(()) if read_path_escapes_workspace(deps.fs.as_ref(), &path) => {
@@ -1761,7 +1865,10 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
 
-    use super::{FormatPathError, HostDeps, dispatch_host_call, validate_workspace_format_path};
+    use super::{
+        FormatPathError, HostDeps, dispatch_host_call, operation_request_timeout_for,
+        semantic_operation_timeout, validate_workspace_format_path,
+    };
     #[cfg(target_os = "linux")]
     use super::{LinuxProcessIdentity, parse_linux_process_stat};
     use crate::adapters::extension::host_deps::ApplyEditsHostPort;
@@ -1773,6 +1880,56 @@ mod tests {
         PerFileEditResult, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
     };
     use extension_protocol::Capability;
+
+    #[test]
+    fn semantic_host_supervision_uses_operation_scope_without_embedding_budget_leakage() {
+        let config = json!({
+            "embedding": {"timeout_ms": 3_600_000},
+            "timeouts": {"search_ms": 2_000, "reindex_ms": 20_000}
+        });
+        let host = Some(std::time::Duration::from_secs(3));
+
+        assert_eq!(
+            semantic_operation_timeout(host, Some(&config), false).unwrap(),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(
+            semantic_operation_timeout(host, Some(&config), true).unwrap(),
+            Some(std::time::Duration::from_secs(25))
+        );
+        assert_eq!(
+            semantic_operation_timeout(None, Some(&config), true).unwrap(),
+            None,
+            "absent host cap leaves sidecar operation policy authoritative"
+        );
+
+        let unlimited_rebuild = json!({
+            "embedding": {"timeout_ms": 30_000},
+            "timeouts": {"search_ms": 4_000}
+        });
+        assert_eq!(
+            semantic_operation_timeout(host, Some(&unlimited_rebuild), true).unwrap(),
+            host,
+            "explicit host cap still bounds an otherwise unlimited rebuild"
+        );
+    }
+
+    #[test]
+    fn semantic_reindex_invocation_uses_rebuild_supervision_allowance() {
+        let config = json!({
+            "timeouts": {"search_ms": 2_000, "reindex_ms": 20_000}
+        });
+        let timeout = operation_request_timeout_for(
+            "semantic_context",
+            Some(std::time::Duration::from_secs(3)),
+            Some(&config),
+            "invokeTool",
+            &json!({"name": "semantic_reindex", "arguments": {}}),
+        )
+        .unwrap();
+
+        assert_eq!(timeout, Some(std::time::Duration::from_secs(25)));
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum RecordedApplyEditsCall {

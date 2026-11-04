@@ -29,10 +29,163 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 pub enum ReadinessFamily {
+    #[serde(rename = "ast")]
     Ast,
+    #[serde(rename = "lsp")]
     Lsp,
+    #[serde(rename = "semantic_context")]
+    SemanticContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticContextConfigurationReason {
+    Empty,
+    Zero,
+    OutOfRange,
+    OverlapNotLessThanTarget,
+    UrlCredentialsForbidden,
+    RemoteOptInRequired,
+    RemoteHttpsRequired,
+    UnsupportedProvider,
+    UnsupportedStoreBackend,
+    PathEscape,
+    SymlinkEscape,
+    InvalidEndpoint,
+    InvalidEnvironmentVariable,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticContextConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub embedding: SemanticEmbeddingConfig,
+    #[serde(default)]
+    pub timeouts: SemanticTimeoutConfig,
+    #[serde(default)]
+    pub chunking: SemanticChunkingConfig,
+    #[serde(default)]
+    pub store: SemanticStoreConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticEmbeddingConfig {
+    #[serde(default = "semantic_default_provider")]
+    pub provider: String,
+    #[serde(default = "semantic_default_base_url")]
+    pub base_url: String,
+    #[serde(default = "semantic_default_model")]
+    pub model: String,
+    #[serde(default = "semantic_default_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "semantic_default_batch_size")]
+    pub batch_size: u64,
+    #[serde(default)]
+    pub dimensions: Option<u64>,
+    #[serde(default)]
+    pub allow_remote: bool,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticTimeoutConfig {
+    #[serde(default = "semantic_default_timeout_ms")]
+    pub search_ms: u64,
+    #[serde(default)]
+    pub reindex_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticChunkingConfig {
+    #[serde(default = "semantic_default_target_bytes")]
+    pub target_bytes: u64,
+    #[serde(default = "semantic_default_overlap_bytes")]
+    pub overlap_bytes: u64,
+    #[serde(default = "semantic_default_max_file_bytes")]
+    pub max_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticStoreConfig {
+    #[serde(default = "semantic_default_store_backend")]
+    pub backend: String,
+}
+
+impl Default for SemanticEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: semantic_default_provider(),
+            base_url: semantic_default_base_url(),
+            model: semantic_default_model(),
+            timeout_ms: semantic_default_timeout_ms(),
+            batch_size: semantic_default_batch_size(),
+            dimensions: None,
+            allow_remote: false,
+            api_key_env: None,
+        }
+    }
+}
+
+impl Default for SemanticTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            search_ms: semantic_default_timeout_ms(),
+            reindex_ms: None,
+        }
+    }
+}
+
+impl Default for SemanticChunkingConfig {
+    fn default() -> Self {
+        Self {
+            target_bytes: semantic_default_target_bytes(),
+            overlap_bytes: semantic_default_overlap_bytes(),
+            max_file_bytes: semantic_default_max_file_bytes(),
+        }
+    }
+}
+
+impl Default for SemanticStoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: semantic_default_store_backend(),
+        }
+    }
+}
+
+fn semantic_default_provider() -> String {
+    "openai_compatible".to_owned()
+}
+fn semantic_default_base_url() -> String {
+    "http://127.0.0.1:11434/v1".to_owned()
+}
+fn semantic_default_model() -> String {
+    "nomic-embed-text".to_owned()
+}
+const fn semantic_default_timeout_ms() -> u64 {
+    30_000
+}
+const fn semantic_default_batch_size() -> u64 {
+    32
+}
+const fn semantic_default_target_bytes() -> u64 {
+    4_096
+}
+const fn semantic_default_overlap_bytes() -> u64 {
+    512
+}
+const fn semantic_default_max_file_bytes() -> u64 {
+    2_097_152
+}
+fn semantic_default_store_backend() -> String {
+    "sqlite".to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +404,7 @@ pub struct TowerConfig {
     pub lsp: LspConfig,
     pub lint: LintConfig,
     pub debug: DebugConfig,
+    pub semantic_context: SemanticContextConfig,
     /// `[extensions]` section — sidecar extension runtime settings (spec 24).
     ///
     /// Absent → `ExtensionConfig::default()` (no request timeout).
@@ -276,6 +430,8 @@ struct RawTowerConfig {
     #[serde(default)]
     debug: DebugConfig,
     #[serde(default)]
+    semantic_context: SemanticContextConfig,
+    #[serde(default)]
     extensions: ExtensionConfig,
     #[serde(default)]
     daemon: DaemonConfig,
@@ -300,6 +456,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
             lsp: raw.lsp,
             lint: raw.lint,
             debug: raw.debug,
+            semantic_context: raw.semantic_context,
             extensions: raw.extensions,
             daemon: raw.daemon,
             projects: ProjectsConfig::default(),
@@ -555,6 +712,10 @@ pub enum ConfigError {
         field: &'static str,
         reason: ShellConfigurationReason,
     },
+    InvalidSemanticContextConfiguration {
+        field: &'static str,
+        reason: SemanticContextConfigurationReason,
+    },
     LegacySection {
         path: PathBuf,
         section: &'static str,
@@ -625,6 +786,12 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::InvalidShellConfiguration { field, reason } => {
                 write!(f, "invalid shell configuration {field}: {reason:?}")
+            }
+            ConfigError::InvalidSemanticContextConfiguration { field, reason } => {
+                write!(
+                    f,
+                    "invalid semantic context configuration {field}: {reason:?}"
+                )
             }
             ConfigError::LegacySection {
                 path,
@@ -771,12 +938,259 @@ fn load_with_path_canonicalizer(
         })?;
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
+    validate_semantic_context_configuration(
+        &config.semantic_context,
+        workspace_root,
+        &canonicalize_path,
+    )?;
     config.shell.validate()?;
     config.lint_request_timeout()?;
     if config.lsp_budget_required() {
         config.extensions.lsp_diagnostics_timeout()?;
     }
     Ok(config)
+}
+
+fn invalid_semantic(
+    field: &'static str,
+    reason: SemanticContextConfigurationReason,
+) -> ConfigError {
+    ConfigError::InvalidSemanticContextConfiguration { field, reason }
+}
+
+fn validate_semantic_context_configuration(
+    config: &SemanticContextConfig,
+    workspace_root: &Path,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<(), ConfigError> {
+    use SemanticContextConfigurationReason::{
+        Empty, InvalidEnvironmentVariable, OutOfRange, OverlapNotLessThanTarget,
+        RemoteHttpsRequired, RemoteOptInRequired, UnsupportedProvider, UnsupportedStoreBackend,
+        UrlCredentialsForbidden,
+    };
+
+    let embedding = &config.embedding;
+    if embedding.provider != "openai_compatible" {
+        return Err(invalid_semantic(
+            "semantic_context.embedding.provider",
+            UnsupportedProvider,
+        ));
+    }
+    if embedding.model.is_empty() {
+        return Err(invalid_semantic("semantic_context.embedding.model", Empty));
+    }
+    validate_semantic_number(
+        "semantic_context.embedding.timeout_ms",
+        embedding.timeout_ms,
+        3_600_000,
+    )?;
+    validate_semantic_number(
+        "semantic_context.embedding.batch_size",
+        embedding.batch_size,
+        256,
+    )?;
+    if let Some(dimensions) = embedding.dimensions {
+        validate_semantic_number("semantic_context.embedding.dimensions", dimensions, 65_536)?;
+    }
+    if let Some(name) = &embedding.api_key_env
+        && !is_environment_variable_name(name)
+    {
+        return Err(invalid_semantic(
+            "semantic_context.embedding.api_key_env",
+            InvalidEnvironmentVariable,
+        ));
+    }
+
+    let endpoint = parse_semantic_endpoint(&embedding.base_url)
+        .map_err(|reason| invalid_semantic("semantic_context.embedding.base_url", reason))?;
+    if endpoint.has_credentials {
+        return Err(invalid_semantic(
+            "semantic_context.embedding.base_url",
+            UrlCredentialsForbidden,
+        ));
+    }
+    if !endpoint.local && !embedding.allow_remote {
+        return Err(invalid_semantic(
+            "semantic_context.embedding.base_url",
+            RemoteOptInRequired,
+        ));
+    }
+    if !endpoint.local && endpoint.scheme != "https" {
+        return Err(invalid_semantic(
+            "semantic_context.embedding.base_url",
+            RemoteHttpsRequired,
+        ));
+    }
+
+    validate_semantic_number(
+        "semantic_context.timeouts.search_ms",
+        config.timeouts.search_ms,
+        3_600_000,
+    )?;
+    if let Some(reindex_ms) = config.timeouts.reindex_ms {
+        validate_semantic_number(
+            "semantic_context.timeouts.reindex_ms",
+            reindex_ms,
+            86_400_000,
+        )?;
+    }
+    if !(4..=1_048_576).contains(&config.chunking.target_bytes) {
+        return Err(invalid_semantic(
+            "semantic_context.chunking.target_bytes",
+            OutOfRange,
+        ));
+    }
+    if config.chunking.max_file_bytes < config.chunking.target_bytes
+        || config.chunking.max_file_bytes > 67_108_864
+    {
+        return Err(invalid_semantic(
+            "semantic_context.chunking.max_file_bytes",
+            OutOfRange,
+        ));
+    }
+    if config.chunking.overlap_bytes >= config.chunking.target_bytes {
+        return Err(invalid_semantic(
+            "semantic_context.chunking.overlap_bytes",
+            OverlapNotLessThanTarget,
+        ));
+    }
+    if config.store.backend != "sqlite" {
+        return Err(invalid_semantic(
+            "semantic_context.store.backend",
+            UnsupportedStoreBackend,
+        ));
+    }
+    if config.enabled {
+        validate_semantic_store_path(workspace_root, canonicalize_path)?;
+    }
+    Ok(())
+}
+
+fn validate_semantic_number(
+    field: &'static str,
+    value: u64,
+    maximum: u64,
+) -> Result<(), ConfigError> {
+    if value == 0 {
+        return Err(invalid_semantic(
+            field,
+            SemanticContextConfigurationReason::Zero,
+        ));
+    }
+    if value > maximum {
+        return Err(invalid_semantic(
+            field,
+            SemanticContextConfigurationReason::OutOfRange,
+        ));
+    }
+    Ok(())
+}
+
+struct SemanticEndpoint {
+    scheme: String,
+    local: bool,
+    has_credentials: bool,
+}
+
+fn parse_semantic_endpoint(
+    value: &str,
+) -> Result<SemanticEndpoint, SemanticContextConfigurationReason> {
+    use SemanticContextConfigurationReason::{Empty, InvalidEndpoint};
+    if value.is_empty() {
+        return Err(Empty);
+    }
+    let endpoint = url::Url::parse(value).map_err(|_| InvalidEndpoint)?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !has_valid_percent_encoding(endpoint.path())
+    {
+        return Err(InvalidEndpoint);
+    }
+    let host = endpoint.host_str().ok_or(InvalidEndpoint)?;
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    Ok(SemanticEndpoint {
+        scheme: endpoint.scheme().to_owned(),
+        local,
+        has_credentials: !endpoint.username().is_empty() || endpoint.password().is_some(),
+    })
+}
+
+fn has_valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn is_environment_variable_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn validate_semantic_store_path(
+    workspace_root: &Path,
+    canonicalize_path: &impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<(), ConfigError> {
+    let field = "semantic_context.store.path";
+    let workspace = canonicalize_path(workspace_root)
+        .map_err(|_| invalid_semantic(field, SemanticContextConfigurationReason::PathEscape))?;
+    let derived_directory = workspace_root.join(".tower/semantic_context");
+    let existing_ancestor = derived_directory
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .expect("semantic store path always has an existing workspace ancestor");
+    let resolved_ancestor = canonicalize_path(existing_ancestor)
+        .map_err(|_| invalid_semantic(field, SemanticContextConfigurationReason::PathEscape))?;
+    if !resolved_ancestor.starts_with(&workspace) {
+        return Err(invalid_semantic(
+            field,
+            SemanticContextConfigurationReason::SymlinkEscape,
+        ));
+    }
+    fs::create_dir_all(&derived_directory)
+        .map_err(|_| invalid_semantic(field, SemanticContextConfigurationReason::PathEscape))?;
+    let resolved_directory = canonicalize_path(&derived_directory)
+        .map_err(|_| invalid_semantic(field, SemanticContextConfigurationReason::PathEscape))?;
+    if !resolved_directory.starts_with(&workspace) {
+        return Err(invalid_semantic(
+            field,
+            SemanticContextConfigurationReason::SymlinkEscape,
+        ));
+    }
+
+    let database = derived_directory.join("index.sqlite3");
+    if fs::symlink_metadata(&database).is_ok() {
+        let resolved_database = canonicalize_path(&database).map_err(|_| {
+            invalid_semantic(field, SemanticContextConfigurationReason::SymlinkEscape)
+        })?;
+        if !resolved_database.starts_with(&workspace) {
+            return Err(invalid_semantic(
+                field,
+                SemanticContextConfigurationReason::SymlinkEscape,
+            ));
+        }
+    }
+    Ok(())
 }
 
 enum DependencyConfigLoadError {
@@ -1538,6 +1952,274 @@ mod tests {
         let dir = root.join(".tower");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn assert_invalid_semantic_context(
+        body: &str,
+        expected_field: &'static str,
+        expected_reason: SemanticContextConfigurationReason,
+    ) {
+        let fixture = tempdir().unwrap();
+        write_config(fixture.path(), body);
+        match load(fixture.path()).expect_err("invalid semantic configuration must be rejected") {
+            ConfigError::InvalidSemanticContextConfiguration { field, reason } => {
+                assert_eq!(field, expected_field);
+                assert_eq!(reason, expected_reason);
+            }
+            other => panic!("expected InvalidSemanticContextConfiguration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_context_defaults_are_disabled_and_provider_free() {
+        let fixture = tempdir().unwrap();
+        let config = load(fixture.path()).expect("absent configuration uses inert defaults");
+        let semantic = config.semantic_context;
+        assert!(!semantic.enabled);
+        assert_eq!(semantic.embedding.provider, "openai_compatible");
+        assert_eq!(semantic.embedding.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(semantic.embedding.model, "nomic-embed-text");
+        assert_eq!(semantic.embedding.timeout_ms, 30_000);
+        assert_eq!(semantic.embedding.batch_size, 32);
+        assert_eq!(semantic.embedding.dimensions, None);
+        assert!(!semantic.embedding.allow_remote);
+        assert_eq!(semantic.embedding.api_key_env, None);
+        assert_eq!(semantic.timeouts.search_ms, 30_000);
+        assert_eq!(semantic.timeouts.reindex_ms, None);
+        assert_eq!(semantic.chunking.target_bytes, 4_096);
+        assert_eq!(semantic.chunking.overlap_bytes, 512);
+        assert_eq!(semantic.chunking.max_file_bytes, 2_097_152);
+        assert_eq!(semantic.store.backend, "sqlite");
+        assert!(!fixture.path().join(".tower/semantic_context").exists());
+    }
+
+    #[test]
+    fn semantic_context_enabled_defaults_match_public_contract() {
+        let fixture = tempdir().unwrap();
+        write_config(fixture.path(), "[semantic_context]\nenabled = true\n");
+        let semantic = load(fixture.path())
+            .expect("enabled defaults are valid")
+            .semantic_context;
+        assert!(semantic.enabled);
+        assert_eq!(semantic.embedding.timeout_ms, 30_000);
+        assert_eq!(semantic.timeouts.search_ms, 30_000);
+        assert_eq!(semantic.timeouts.reindex_ms, None);
+        assert_eq!(semantic.embedding.batch_size, 32);
+        assert_eq!(semantic.embedding.dimensions, None);
+        assert_eq!(semantic.chunking.target_bytes, 4_096);
+        assert_eq!(semantic.chunking.overlap_bytes, 512);
+        assert_eq!(semantic.chunking.max_file_bytes, 2_097_152);
+    }
+
+    #[test]
+    fn semantic_context_rejects_invalid_numeric_boundaries_before_spawn() {
+        let valid = [
+            "[semantic_context]\nenabled=true\n[semantic_context.embedding]\ntimeout_ms=1\nbatch_size=1\ndimensions=1\n[semantic_context.timeouts]\nsearch_ms=1\nreindex_ms=1\n[semantic_context.chunking]\ntarget_bytes=4\noverlap_bytes=0\nmax_file_bytes=4\n",
+            "[semantic_context]\nenabled=true\n[semantic_context.embedding]\ntimeout_ms=3600000\nbatch_size=256\ndimensions=65536\n[semantic_context.timeouts]\nsearch_ms=3600000\nreindex_ms=86400000\n[semantic_context.chunking]\ntarget_bytes=1048576\noverlap_bytes=1048575\nmax_file_bytes=67108864\n",
+        ];
+        for body in valid {
+            let fixture = tempdir().unwrap();
+            write_config(fixture.path(), body);
+            load(fixture.path()).expect("documented numeric boundary must be accepted");
+        }
+
+        let invalid = [
+            (
+                "[semantic_context.embedding]\ntimeout_ms=0\n",
+                "semantic_context.embedding.timeout_ms",
+                SemanticContextConfigurationReason::Zero,
+            ),
+            (
+                "[semantic_context.embedding]\ntimeout_ms=3600001\n",
+                "semantic_context.embedding.timeout_ms",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.embedding]\nbatch_size=0\n",
+                "semantic_context.embedding.batch_size",
+                SemanticContextConfigurationReason::Zero,
+            ),
+            (
+                "[semantic_context.embedding]\nbatch_size=257\n",
+                "semantic_context.embedding.batch_size",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.embedding]\ndimensions=0\n",
+                "semantic_context.embedding.dimensions",
+                SemanticContextConfigurationReason::Zero,
+            ),
+            (
+                "[semantic_context.embedding]\ndimensions=65537\n",
+                "semantic_context.embedding.dimensions",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.timeouts]\nsearch_ms=0\n",
+                "semantic_context.timeouts.search_ms",
+                SemanticContextConfigurationReason::Zero,
+            ),
+            (
+                "[semantic_context.timeouts]\nsearch_ms=3600001\n",
+                "semantic_context.timeouts.search_ms",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.timeouts]\nreindex_ms=0\n",
+                "semantic_context.timeouts.reindex_ms",
+                SemanticContextConfigurationReason::Zero,
+            ),
+            (
+                "[semantic_context.timeouts]\nreindex_ms=86400001\n",
+                "semantic_context.timeouts.reindex_ms",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.chunking]\ntarget_bytes=3\n",
+                "semantic_context.chunking.target_bytes",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.chunking]\ntarget_bytes=1048577\n",
+                "semantic_context.chunking.target_bytes",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.chunking]\ntarget_bytes=4\noverlap_bytes=4\n",
+                "semantic_context.chunking.overlap_bytes",
+                SemanticContextConfigurationReason::OverlapNotLessThanTarget,
+            ),
+            (
+                "[semantic_context.chunking]\ntarget_bytes=4\nmax_file_bytes=3\n",
+                "semantic_context.chunking.max_file_bytes",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+            (
+                "[semantic_context.chunking]\nmax_file_bytes=67108865\n",
+                "semantic_context.chunking.max_file_bytes",
+                SemanticContextConfigurationReason::OutOfRange,
+            ),
+        ];
+        for (fragment, field, reason) in invalid {
+            assert_invalid_semantic_context(
+                &format!("[semantic_context]\nenabled=true\n{fragment}"),
+                field,
+                reason,
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_context_rejects_remote_and_credentialed_endpoints_before_spawn() {
+        let invalid = [
+            (
+                "provider=\"other\"",
+                "semantic_context.embedding.provider",
+                SemanticContextConfigurationReason::UnsupportedProvider,
+            ),
+            (
+                "model=\"\"",
+                "semantic_context.embedding.model",
+                SemanticContextConfigurationReason::Empty,
+            ),
+            (
+                "base_url=\"not-a-url\"",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::InvalidEndpoint,
+            ),
+            (
+                "base_url=\"ftp://localhost/v1\"",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::InvalidEndpoint,
+            ),
+            (
+                "base_url=\"http://localhost:70000/v1\"",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::InvalidEndpoint,
+            ),
+            (
+                "base_url=\"http://localhost/%zz\"",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::InvalidEndpoint,
+            ),
+            (
+                "base_url=\"http://user@localhost/v1\"",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::UrlCredentialsForbidden,
+            ),
+            (
+                "base_url=\"https://example.com/v1\"",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::RemoteOptInRequired,
+            ),
+            (
+                "base_url=\"http://example.com/v1\"\nallow_remote=true",
+                "semantic_context.embedding.base_url",
+                SemanticContextConfigurationReason::RemoteHttpsRequired,
+            ),
+            (
+                "api_key_env=\"9INVALID\"",
+                "semantic_context.embedding.api_key_env",
+                SemanticContextConfigurationReason::InvalidEnvironmentVariable,
+            ),
+        ];
+        for (fragment, field, reason) in invalid {
+            assert_invalid_semantic_context(
+                &format!(
+                    "[semantic_context]\nenabled=true\n[semantic_context.embedding]\n{fragment}\n"
+                ),
+                field,
+                reason,
+            );
+        }
+        assert_invalid_semantic_context(
+            "[semantic_context]\nenabled=true\n[semantic_context.store]\nbackend=\"memory\"\n",
+            "semantic_context.store.backend",
+            SemanticContextConfigurationReason::UnsupportedStoreBackend,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_context_store_path_is_symlink_confined_before_spawn() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join(".tower")).unwrap();
+        symlink(
+            outside.path(),
+            fixture.path().join(".tower/semantic_context"),
+        )
+        .unwrap();
+        write_config(fixture.path(), "[semantic_context]\nenabled=true\n");
+        match load(fixture.path()).expect_err("derived store symlink escape must be rejected") {
+            ConfigError::InvalidSemanticContextConfiguration { field, reason } => {
+                assert_eq!(field, "semantic_context.store.path");
+                assert_eq!(reason, SemanticContextConfigurationReason::SymlinkEscape);
+            }
+            other => panic!("expected semantic store confinement error, got {other:?}"),
+        }
+        assert!(!outside.path().join("index.sqlite3").exists());
+
+        let fixture = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join(".tower/semantic_context")).unwrap();
+        symlink(
+            outside.path().join("outside.sqlite3"),
+            fixture.path().join(".tower/semantic_context/index.sqlite3"),
+        )
+        .unwrap();
+        write_config(fixture.path(), "[semantic_context]\nenabled=true\n");
+        match load(fixture.path()).expect_err("derived store leaf symlink escape must be rejected")
+        {
+            ConfigError::InvalidSemanticContextConfiguration { field, reason } => {
+                assert_eq!(field, "semantic_context.store.path");
+                assert_eq!(reason, SemanticContextConfigurationReason::SymlinkEscape);
+            }
+            other => panic!("expected semantic store confinement error, got {other:?}"),
+        }
+        assert!(!outside.path().join("outside.sqlite3").exists());
     }
 
     fn assert_invalid_shell_configuration(
@@ -3082,11 +3764,19 @@ extensions = ["rs"]
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
-            "[extensions]\ndisabled = [\"slow_start\"]\n[extensions.readiness]\nslow_start = \"ast\"\nsemantic = \"lsp\"\n",
+            "[extensions]\ndisabled = [\"slow_start\"]\n[extensions.readiness]\nslow_start = \"ast\"\nsemantic = \"lsp\"\nsemantic_search = \"semantic_context\"\n",
         );
         let cfg = load(tmp.path()).unwrap();
         assert_eq!(cfg.extensions.readiness["slow_start"], ReadinessFamily::Ast);
         assert_eq!(cfg.extensions.readiness["semantic"], ReadinessFamily::Lsp);
+        assert_eq!(
+            cfg.extensions.readiness["semantic_search"],
+            ReadinessFamily::SemanticContext
+        );
+        assert_eq!(
+            serde_json::to_value(ReadinessFamily::SemanticContext).unwrap(),
+            serde_json::json!("semantic_context")
+        );
         assert!(
             cfg.extensions
                 .disabled

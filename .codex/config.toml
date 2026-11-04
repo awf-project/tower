@@ -4,3 +4,15 @@ args = ["mcp", "--workspace-dir", "/home/pocky/Sites/awf-project/tower"]
 
 [mcp_servers.tower.tools.tower_list_projects]
 approval_mode = "approve"
+
+[mcp_servers.tower.tools.tower_semantic_search]
+approval_mode = "approve"
+
+[mcp_servers.tower.tools.tower_semantic_related_files]
+approval_mode = "approve"
+
+[mcp_servers.tower.tools.tower_semantic_context_for_task]
+approval_mode = "approve"
+
+[mcp_servers.tower.tools.tower_semantic_reindex]
+approval_mode = "approve"

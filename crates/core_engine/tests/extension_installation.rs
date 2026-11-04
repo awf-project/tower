@@ -7,6 +7,8 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+use core_engine::adapters::extension::discovery::read_manifests_from_dir;
+
 const CURRENT_BINARY: &[u8] = b"current lint extension\n";
 const STALE_MANIFEST: &[u8] = b"stale manifest\n";
 const STALE_BINARY: &[u8] = b"stale binary\n";
@@ -366,4 +368,137 @@ fn extension_installation_reports_copy_failure() {
             .exists()
     );
     fixture.assert_daemon_untouched();
+}
+
+#[test]
+fn semantic_context_is_a_default_workspace_binary() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("core_engine crate belongs to the workspace");
+    let workspace_manifest =
+        fs::read_to_string(repo_root.join("Cargo.toml")).expect("read workspace manifest");
+    let workspace: toml::Value =
+        toml::from_str(&workspace_manifest).expect("parse workspace manifest");
+    let workspace = workspace
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .expect("workspace table");
+    let values = |key: &str| {
+        workspace[key]
+            .as_array()
+            .expect("workspace member list")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>()
+    };
+
+    assert!(values("members").contains(&"extensions/semantic_context"));
+    assert!(
+        values("default-members").contains(&"extensions/semantic_context"),
+        "the native semantic sidecar must be built by default workspace commands"
+    );
+    let package_manifest =
+        fs::read_to_string(repo_root.join("extensions/semantic_context/Cargo.toml"))
+            .expect("read semantic package manifest");
+    let package: toml::Value =
+        toml::from_str(&package_manifest).expect("parse semantic package manifest");
+    assert_eq!(
+        package["package"]["name"].as_str(),
+        Some("semantic_context_extension")
+    );
+    assert!(
+        repo_root
+            .join("extensions/semantic_context/src/main.rs")
+            .is_file()
+    );
+
+    let makefile = fs::read_to_string(repo_root.join("Makefile")).expect("read Makefile");
+    assert!(
+        makefile.contains("semantic-index-durability-real-disk:"),
+        "the durability check needs a dedicated local target"
+    );
+    assert!(makefile.contains(
+        "cargo test -p semantic_context_extension --test semantic_index_benchmark --release -- --ignored --exact semantic_index_durability_on_real_disk"
+    ));
+    let default_test_recipe = makefile
+        .split(".PHONY: test\n")
+        .nth(1)
+        .and_then(|tail| tail.split(".PHONY:").next())
+        .expect("default test recipe");
+    assert!(!default_test_recipe.contains("semantic_index_durability_on_real_disk"));
+    let gate_recipe = makefile
+        .split(".PHONY: gate\n")
+        .nth(1)
+        .and_then(|tail| tail.split(".PHONY:").next())
+        .expect("gate recipe");
+    assert!(!gate_recipe.contains("semantic_index_durability_on_real_disk"));
+}
+
+#[test]
+fn packaged_semantic_context_is_discovered_from_manifest() {
+    let sandbox = tempfile::tempdir().expect("create semantic packaging sandbox");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("core_engine crate belongs to the workspace");
+    let makefile =
+        fs::read_to_string(repo_root.join("Makefile")).expect("read repository Makefile");
+    let default_extensions = makefile
+        .lines()
+        .find_map(|line| line.strip_prefix("EXTENSIONS   ?= "))
+        .expect("default shipped extension list");
+    assert!(
+        default_extensions
+            .split_whitespace()
+            .any(|extension| extension == "semantic_context"),
+        "the default shipped extension list includes semantic_context"
+    );
+    let working_tree = sandbox.path().join("working tree");
+    let bin_dir = sandbox.path().join("bin");
+    let destination = sandbox.path().join("extensions");
+    fs::create_dir_all(working_tree.join("extensions/semantic_context"))
+        .expect("create semantic source fixture");
+    fs::create_dir_all(&bin_dir).expect("create fixture bin directory");
+    fs::copy(repo_root.join("Makefile"), working_tree.join("Makefile"))
+        .expect("copy repository Makefile");
+    fs::copy(
+        repo_root.join("extensions/semantic_context/extension.toml"),
+        working_tree.join("extensions/semantic_context/extension.toml"),
+    )
+    .expect("copy semantic manifest");
+    write_executable(
+        &bin_dir.join("cargo"),
+        "#!/bin/sh\nset -eu\nmkdir -p target/release\nprintf '#!/bin/sh\\nexit 0\\n' > target/release/semantic_context_extension\nchmod 755 target/release/semantic_context_extension\n",
+    );
+
+    let output = Command::new("make")
+        .current_dir(&working_tree)
+        .env_clear()
+        .env("HOME", sandbox.path().join("home"))
+        .env(
+            "PATH",
+            std::env::join_paths([bin_dir, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                .expect("construct fixture PATH"),
+        )
+        .arg("EXTENSIONS=semantic_context")
+        .arg(format!("EXT_DEST={}", destination.display()))
+        .arg("install-extensions")
+        .output()
+        .expect("install packaged semantic extension");
+    assert_success(&output, "semantic extension installation");
+
+    let extension_dir = destination.join("semantic_context");
+    assert!(extension_dir.join("extension.toml").is_file());
+    assert!(extension_dir.join("semantic_context_extension").is_file());
+    let mut errors = Vec::new();
+    let discovered = read_manifests_from_dir(&destination, &mut errors);
+    assert!(errors.is_empty(), "packaged manifest errors: {errors:?}");
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].0, extension_dir);
+    assert_eq!(discovered[0].1.name, "semantic_context");
+    assert_eq!(
+        discovered[0].1.command,
+        vec!["semantic_context_extension".to_owned()]
+    );
 }

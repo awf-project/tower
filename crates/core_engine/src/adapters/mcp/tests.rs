@@ -40,6 +40,47 @@ use crate::domain::workspace::ProjectWorkspace;
 
 // ── Handler construction helpers ──────────────────────────────────────────────
 
+#[tokio::test]
+async fn tool_inventory_observer_is_released_when_client_disconnects() {
+    struct ObservedRegistry(tokio::sync::watch::Sender<()>);
+    impl ToolRegistry for ObservedRegistry {
+        fn tool_list_changes(&self) -> Vec<tokio::sync::watch::Receiver<()>> {
+            vec![self.0.subscribe()]
+        }
+
+        fn list(&self) -> Vec<ToolDesc> {
+            vec![]
+        }
+
+        fn call(
+            &mut self,
+            name: &str,
+            _: serde_json::Value,
+            _: &dyn crate::domain::CancellationSignal,
+        ) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::NotFound(name.to_owned()))
+        }
+    }
+
+    let (changes, _) = tokio::sync::watch::channel(());
+    let handler = TowerMcpHandler::new(
+        ObservedRegistry(changes.clone()),
+        null_diag_reader(),
+        empty_sub_reg(),
+        vec![],
+    );
+    let client = start_server(handler).await;
+    assert_eq!(changes.receiver_count(), 1);
+    client.cancel().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while changes.receiver_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must stop the inventory observer even without a later readiness change");
+}
+
 fn make_empty_engine_state() -> Arc<std::sync::RwLock<EngineState>> {
     Arc::new(std::sync::RwLock::new(EngineState::new(
         ProjectWorkspace::new(),
@@ -540,10 +581,42 @@ fn ac3_call_tool_dispatches_and_returns_result() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cancelling_an_unlimited_extension_call_reaps_the_child_and_the_next_call_recovers() {
+    struct ObservedRegistry {
+        inner: ExtensionMergedRegistry,
+        changes: tokio::sync::watch::Sender<()>,
+    }
+    impl ToolRegistry for ObservedRegistry {
+        fn tool_list_changes(&self) -> Vec<tokio::sync::watch::Receiver<()>> {
+            vec![self.changes.subscribe()]
+        }
+
+        fn list(&self) -> Vec<ToolDesc> {
+            self.inner.list()
+        }
+
+        fn call(
+            &mut self,
+            name: &str,
+            args: serde_json::Value,
+            cancellation: &dyn crate::domain::CancellationSignal,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.inner.call(name, args, cancellation)
+        }
+    }
+
     block_on(async {
         let temp = tempfile::tempdir().expect("temporary cancellation fixture directory");
         let marker = temp.path().join("first-child-entered");
-        let handler = make_handler_from_merged(make_cancellable_sidecar_registry(&marker), vec![]);
+        let (changes, _) = tokio::sync::watch::channel(());
+        let handler = TowerMcpHandler::new(
+            ObservedRegistry {
+                inner: make_cancellable_sidecar_registry(&marker),
+                changes: changes.clone(),
+            },
+            null_diag_reader(),
+            empty_sub_reg(),
+            vec![],
+        );
         let client = start_server(handler).await;
 
         let request = rmcp::model::ClientRequest::CallToolRequest(rmcp::model::Request::new(
@@ -575,6 +648,10 @@ fn cancelling_an_unlimited_extension_call_reaps_the_child_and_the_next_call_reco
             .expect("sidecar must publish its descendant pid");
         assert!(process_is_alive(child_pid));
         assert!(process_is_alive(descendant_pid));
+        // Inventory observation must not seize the async runtime while dispatch
+        // holds the registry: rmcp still needs to process cancellation.
+        changes.send_replace(());
+        tokio::task::yield_now().await;
         pending
             .cancel(Some("test cancellation".to_owned()))
             .await

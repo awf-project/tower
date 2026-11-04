@@ -18,7 +18,7 @@ INSTALL_DIR  ?= $(HOME)/.local/bin
 #   EXT_DEST    — discovery scope to install into. Default: local project scope.
 #                 GLOBAL=1 selects the XDG global scope unless EXT_DEST is explicit.
 #   EXT_PROFILE — release (default, deployable) or debug (fast, reuses dev build).
-EXTENSIONS   ?= ast debug fmt lint lsp
+EXTENSIONS   ?= ast debug fmt lint lsp semantic_context
 ifeq ($(GLOBAL),1)
 ifneq ($(strip $(XDG_DATA_HOME)),)
 EXT_DEST     ?= $(XDG_DATA_HOME)/tower/extensions
@@ -74,6 +74,12 @@ clippy: ## Lint, warnings as errors (CI step 2)
 test: ## Run the workspace test suite (compiles native extensions first)
 	cargo build --workspace --bins
 	cargo test --workspace
+
+# Manual durability evidence only. The test preflight rejects /tmp, memory-backed
+# filesystems, and missing filesystem/device provenance.
+.PHONY: semantic-index-durability-real-disk
+semantic-index-durability-real-disk: ## Run the ignored semantic-index durability check on operator-selected TMPDIR
+	cargo test -p semantic_context_extension --test semantic_index_benchmark --release -- --ignored --exact semantic_index_durability_on_real_disk --nocapture
 
 .PHONY: deny
 deny: ## License & advisory policy
