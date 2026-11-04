@@ -24,6 +24,7 @@ Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 | **Native sidecar extensions**   | Out-of-process extension binaries that contribute `tower_<ext>_*` MCP tools.                               |
 | **Semantic workflows**          | AST outline/symbol tools, LSP navigation including type hierarchies, lint fixes, and opt-in DAP debugging. |
 | **Semantic code retrieval**     | Opt-in embedding search, related files, and token-bounded task context from a local SQLite index.          |
+| **Project agent memory**        | Explicit, durable project-scoped records with compact search, timeline, and task-context retrieval.        |
 | **No runtime VM**               | Native binaries only; no JVM, Node, WASM runtime, or container required at runtime.                        |
 
 ## Quick Start
@@ -167,22 +168,28 @@ host, and exposed as namespaced MCP tools such as `tower_ast_get_outline` or
 OpenAI-compatible Ollama endpoint when enabled; it does not start or install the service.
 See [semantic retrieval](docs/user-guide/semantic-retrieval.md) for setup and examples.
 
+**Agent memory is explicit.** The first-party `agent_memory` sidecar stores structured project
+knowledge when a client calls `tower_memory_remember`; it does not capture transcripts automatically.
+Search returns compact hits, and `tower_memory_get` retrieves full records by ID. See
+[project agent memory](docs/user-guide/agent-memory.md) for setup, privacy, and recovery behavior.
+
 ## Tool Surface
 
 Core native tools are always available. `tower_run_command` appears when enabled in `[shell]`;
 extension tools appear when their sidecars are installed and enabled.
 
-| Area               | Examples                                                                                                                                            |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Files and search   | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text`                                                                         |
-| Safe mutations     | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`, `tower_rename_path`, `tower_safe_delete_symbol`               |
-| AST                | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol`                                                                          |
-| LSP                | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover`, `tower_lsp_implementations`, `tower_lsp_type_hierarchy` |
-| Semantic retrieval | `tower_semantic_reindex`, `tower_semantic_search`, `tower_semantic_related_files`, `tower_semantic_context_for_task`                                |
-| Lint               | `tower_lint_check`, `tower_lint_fix`                                                                                                                |
-| Debug              | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin`                                                                   |
-| Command execution  | `tower_run_command` (opt-in; configured allowlist only)                                                                                             |
-| Cross-project      | `tower_list_projects`, `tower_query_project`                                                                                                        |
+| Area               | Examples                                                                                                                                                                   |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Files and search   | `tower_read_file`, `tower_list_dir`, `tower_find_file`, `tower_search_text`                                                                                                |
+| Safe mutations     | `tower_create_file`, `tower_edit_range`, `tower_global_replace`, `tower_delete_file`, `tower_rename_path`, `tower_safe_delete_symbol`                                      |
+| AST                | `tower_ast_get_outline`, `tower_ast_find_symbols`, `tower_ast_read_symbol`                                                                                                 |
+| LSP                | `tower_lsp_diagnostics`, `tower_lsp_definition`, `tower_lsp_references`, `tower_lsp_hover`, `tower_lsp_implementations`, `tower_lsp_type_hierarchy`                        |
+| Semantic retrieval | `tower_semantic_reindex`, `tower_semantic_search`, `tower_semantic_related_files`, `tower_semantic_context_for_task`                                                       |
+| Agent memory       | `tower_memory_remember`, `tower_memory_update`, `tower_memory_forget`, `tower_memory_search`, `tower_memory_timeline`, `tower_memory_get`, `tower_memory_context_for_task` |
+| Lint               | `tower_lint_check`, `tower_lint_fix`                                                                                                                                       |
+| Debug              | `tower_debug_launch`, `tower_debug_eval_at`, `tower_debug_record_and_find_origin`                                                                                          |
+| Command execution  | `tower_run_command` (opt-in; configured allowlist only)                                                                                                                    |
+| Cross-project      | `tower_list_projects`, `tower_query_project`                                                                                                                               |
 
 See [docs/mcp-tools.md](docs/mcp-tools.md) for the full wire protocol, tool schemas, responses, and
 stable error codes.
@@ -199,6 +206,7 @@ stable error codes.
 | [docs/mcp-tools.md](docs/mcp-tools.md)                                                                                           | Complete MCP tool reference and JSON-RPC details.                                        |
 | [docs/user-guide/semantic-edits.md](docs/user-guide/semantic-edits.md)                                                           | Semantic rename, reference-aware safe delete, and AST edit workflows.                    |
 | [docs/user-guide/semantic-retrieval.md](docs/user-guide/semantic-retrieval.md)                                                   | Configure embeddings, search code by meaning, find related files, and pack task context. |
+| [docs/user-guide/agent-memory.md](docs/user-guide/agent-memory.md)                                                               | Store, retrieve, revise, and forget structured project memories.                         |
 | [docs/user-guide/path-rename.md](docs/user-guide/path-rename.md)                                                                 | Preview and apply file or directory moves with optional reference updates.               |
 | [docs/user-guide/type-hierarchy.md](docs/user-guide/type-hierarchy.md)                                                           | Explore supertypes and subtypes through a configured language server.                    |
 | [docs/user-guide/lint-fixes.md](docs/user-guide/lint-fixes.md)                                                                   | Previewing and applying structured linter fixes.                                         |

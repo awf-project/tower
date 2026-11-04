@@ -4,34 +4,23 @@ members = [
     "crates/core_engine",
     "crates/extension_sidecar_harness",
     "crates/extension_protocol",
-    # Test-only sidecar extension binary for spec 23 integration tests.
     "extensions/test_helper",
-    # Spec 24 fault-isolation fixtures (native binaries, not WASM).
     "extensions/fixtures/hang_forever",
     "extensions/fixtures/crash_on_init",
     "extensions/fixtures/exit_nonzero",
     "extensions/fixtures/garbage_frames",
-    # Regression fixture: completes init then ignores `shutdown` (forces host kill escalation).
     "extensions/fixtures/ignore_shutdown",
-    # F004 deterministic Debug Adapter Protocol fixture for debug e2e tests.
     "extensions/fixtures/debug_adapter",
-    # Shared native LSP peer for dispatch and process tests.
     "extensions/fixtures/lsp_server",
-    # B001 deterministic slow-start fixture for daemon readiness tests.
     "extensions/fixtures/slow_start",
-    # Spec 26 native extensions (native binaries, no WASM).
     "extensions/ast",
     "extensions/hello",
-    # Spec 27 LSP sidecar extension (native binary, no WASM).
     "extensions/lsp",
-    # Fmt sidecar extension — subscribes to fileChanged and triggers the format queue.
     "extensions/fmt",
-    # F002 lint sidecar extension.
     "extensions/lint",
-    # F004 debug sidecar extension.
     "extensions/debug",
-    # F016 semantic-context sidecar domain crate.
     "extensions/semantic_context",
+    "extensions/agent_memory",
 ]
 
 default-members = [
@@ -68,6 +57,8 @@ default-members = [
     "extensions/debug",
     # F016 semantic-context sidecar extension.
     "extensions/semantic_context",
+    # F017 agent-memory sidecar extension.
+    "extensions/agent_memory",
 ]
 
 [workspace.package]

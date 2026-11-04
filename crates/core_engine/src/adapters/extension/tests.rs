@@ -27,6 +27,7 @@ use serde_json::json;
 
 use super::host_deps::{ApplyEditsHostPort, HostDeps, UnsupportedApplyEditsHost};
 use super::sidecar::{SidecarHostAdapter, with_request_timeout_test_cap};
+use super::supervisor::ExtensionSupervisor;
 use crate::adapters::cli::GlobalOpts;
 use crate::adapters::config::TowerConfig;
 use crate::adapters::daemon::engine::build_engine;
@@ -36,14 +37,18 @@ use crate::adapters::mcp::registry::ToolRegistry;
 use crate::adapters::{InMemoryAstIndex, InMemoryFs, RealFs};
 use crate::domain::extension_host::{ExtensionApplicationError, ExtensionCallError};
 use crate::domain::mutation::compute_content_version;
-use crate::domain::{DomainError, RelativePath};
-use crate::ports::FileSystemPort;
+use crate::domain::{DomainError, ExtensionInstance, RelativePath};
 use crate::ports::inbound::{
     PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
     WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
 };
+use crate::ports::{
+    AgentMemoryGetRequest, AgentMemoryGetResult, AgentMemoryNamespace, AgentMemoryScanRequest,
+    AgentMemoryScanResult, AgentMemoryStorageError, AgentMemoryStoragePort,
+    AgentMemoryTransactionOutcome, AgentMemoryTransactionRequest, FileSystemPort,
+};
 use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
-use extension_protocol::{ExtensionFault, ExtensionManifest};
+use extension_protocol::{Capability, ExtensionFault, ExtensionManifest};
 
 /// Default timeout for spec 23 tests — long enough that cooperative extensions
 /// always respond well within it.
@@ -95,6 +100,8 @@ fn make_deps(fs: InMemoryFs) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -105,6 +112,8 @@ fn make_deps_with_index(fs: InMemoryFs, index: InMemoryAstIndex) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -115,7 +124,411 @@ fn make_deps_with_apply_edits(apply_edits: Arc<dyn ApplyEditsHostPort>) -> HostD
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits,
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AgentMemorySpyBehavior {
+    Success,
+    Errors,
+}
+
+#[derive(Debug)]
+struct AgentMemoryStorageSpy {
+    behavior: AgentMemorySpyBehavior,
+    calls: Mutex<Vec<(String, AgentMemoryNamespace)>>,
+}
+
+impl AgentMemoryStorageSpy {
+    fn new(behavior: AgentMemorySpyBehavior) -> Self {
+        Self {
+            behavior,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<(String, AgentMemoryNamespace)> {
+        self.calls.lock().expect("storage spy lock").clone()
+    }
+
+    fn record(&self, operation: &str, namespace: &AgentMemoryNamespace) {
+        self.calls
+            .lock()
+            .expect("storage spy lock")
+            .push((operation.to_owned(), namespace.clone()));
+    }
+}
+
+impl AgentMemoryStoragePort for AgentMemoryStorageSpy {
+    fn get(
+        &self,
+        namespace: &AgentMemoryNamespace,
+        _request: AgentMemoryGetRequest,
+    ) -> Result<AgentMemoryGetResult, AgentMemoryStorageError> {
+        self.record("get", namespace);
+        match self.behavior {
+            AgentMemorySpyBehavior::Success => Ok(AgentMemoryGetResult {
+                value: Some(vec![4]),
+                generation: 7,
+            }),
+            AgentMemorySpyBehavior::Errors => Err(AgentMemoryStorageError::BoundsExceeded),
+        }
+    }
+
+    fn scan(
+        &self,
+        namespace: &AgentMemoryNamespace,
+        _request: AgentMemoryScanRequest,
+    ) -> Result<AgentMemoryScanResult, AgentMemoryStorageError> {
+        self.record("scan", namespace);
+        match self.behavior {
+            AgentMemorySpyBehavior::Success => Ok(AgentMemoryScanResult {
+                entries: vec![],
+                next_cursor: None,
+                generation: 7,
+            }),
+            AgentMemorySpyBehavior::Errors => Err(AgentMemoryStorageError::Unavailable),
+        }
+    }
+
+    fn transact(
+        &self,
+        namespace: &AgentMemoryNamespace,
+        request: AgentMemoryTransactionRequest,
+    ) -> Result<AgentMemoryTransactionOutcome, AgentMemoryStorageError> {
+        self.record("transact", namespace);
+        match self.behavior {
+            AgentMemorySpyBehavior::Success if request.conditions.is_empty() => {
+                Ok(AgentMemoryTransactionOutcome::Committed {
+                    generation: 8,
+                    durable: true,
+                })
+            }
+            AgentMemorySpyBehavior::Success => Ok(AgentMemoryTransactionOutcome::Conflict),
+            AgentMemorySpyBehavior::Errors => Err(AgentMemoryStorageError::CommitOutcomeUnknown),
+        }
+    }
+}
+
+fn agent_memory_deps(storage: Arc<AgentMemoryStorageSpy>) -> (HostDeps, AgentMemoryNamespace) {
+    let namespace =
+        AgentMemoryNamespace::from_trusted_identity(b"canonical-project", b"agent_memory")
+            .expect("trusted identity derives a namespace");
+    let deps = HostDeps {
+        fs: Arc::new(Mutex::new(InMemoryFs::new())),
+        ast_index: Arc::new(InMemoryAstIndex::new()),
+        format_queue: Arc::new(NoOpFormatQueue),
+        apply_edits: Arc::new(UnsupportedApplyEditsHost),
+        push_tx: None,
+        agent_memory_storage: Some(storage),
+        agent_memory_namespace: Some(namespace.clone()),
+    };
+    (deps, namespace)
+}
+
+fn dispatch_agent_memory(
+    method: &str,
+    params: serde_json::Value,
+    deps: &HostDeps,
+) -> serde_json::Value {
+    serde_json::from_str(&SidecarHostAdapter::dispatch_capability_call(
+        method,
+        json!(41),
+        params,
+        deps,
+        &[Capability::AgentMemoryStorage],
+    ))
+    .expect("host response is valid JSON-RPC")
+}
+
+#[test]
+fn agent_memory_capability_dispatches_declared_requests() {
+    let storage = Arc::new(AgentMemoryStorageSpy::new(AgentMemorySpyBehavior::Success));
+    let (deps, namespace) = agent_memory_deps(Arc::clone(&storage));
+
+    let get = dispatch_agent_memory(
+        "agent_memory/storage/get",
+        json!({"type":"AgentMemoryStorageGet","request":{"key":[1]}}),
+        &deps,
+    );
+    let scan = dispatch_agent_memory(
+        "agent_memory/storage/scan",
+        json!({"type":"AgentMemoryStorageScan","request":{"prefix":[],"cursor":null,"limit":2}}),
+        &deps,
+    );
+    let committed = dispatch_agent_memory(
+        "agent_memory/storage/transact",
+        json!({"type":"AgentMemoryStorageTransact","request":{"conditions":[],"mutations":[{"type":"Put","key":[1],"value":[4]}]}}),
+        &deps,
+    );
+    let conflict = dispatch_agent_memory(
+        "agent_memory/storage/transact",
+        json!({"type":"AgentMemoryStorageTransact","request":{"conditions":[{"type":"KeyAbsent","key":[1]}],"mutations":[{"type":"Delete","key":[1]}]}}),
+        &deps,
+    );
+
+    assert_eq!(get["result"], json!({"value":[4],"generation":7}));
+    assert_eq!(
+        scan["result"],
+        json!({"entries":[],"next_cursor":null,"generation":7})
+    );
+    assert_eq!(
+        committed["result"],
+        json!({"type":"Committed","generation":8,"durable":true})
+    );
+    assert_eq!(conflict["result"], json!({"type":"Conflict"}));
+    assert_eq!(
+        storage.calls(),
+        vec![
+            ("get".to_owned(), namespace.clone()),
+            ("scan".to_owned(), namespace.clone()),
+            ("transact".to_owned(), namespace.clone()),
+            ("transact".to_owned(), namespace),
+        ]
+    );
+}
+
+#[test]
+fn agent_memory_capability_rejects_undeclared_requests_before_storage() {
+    let storage = Arc::new(AgentMemoryStorageSpy::new(AgentMemorySpyBehavior::Success));
+    let (deps, _) = agent_memory_deps(Arc::clone(&storage));
+
+    let response: serde_json::Value =
+        serde_json::from_str(&SidecarHostAdapter::dispatch_capability_call(
+            "agent_memory/storage/get",
+            json!(42),
+            json!({"type":"AgentMemoryStorageGet","request":{"key":[1]}}),
+            &deps,
+            &[],
+        ))
+        .expect("host response is valid JSON-RPC");
+
+    assert_eq!(response["error"]["code"], -32603);
+    assert_eq!(
+        response["error"]["message"],
+        "capability 'agent_memory_storage' not declared"
+    );
+    assert!(storage.calls().is_empty());
+}
+
+#[test]
+fn untrusted_extension_cannot_self_declare_agent_memory_storage() {
+    let temp = tempfile::tempdir().expect("temporary sentinel directory");
+    let started = temp.path().join("child-started");
+    let script = r#"
+: > "$1"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"type":"Initialized","data":{"tools":[],"events":[],"capabilities":["agent_memory_storage"]}}}'
+read -r shutdown
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"Ack"}}'
+"#;
+    let manifest = ExtensionManifest {
+        name: "agent_memory".to_owned(),
+        version: "0.1.0".to_owned(),
+        command: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "storage-fixture".to_owned(),
+            started.to_string_lossy().into_owned(),
+        ],
+        activation: Activation::Eager,
+        tools: vec![],
+        events: EventsSection::default(),
+        capabilities: CapabilitiesSection {
+            required: vec!["agent_memory_storage".to_owned()],
+        },
+    };
+
+    match SidecarHostAdapter::spawn(manifest, make_deps(InMemoryFs::new()), TEST_TIMEOUT, None) {
+        Err(ExtensionFault::ProtocolError { message }) => {
+            assert_eq!(message, "agent memory capability denied")
+        }
+        Err(other) => panic!("unexpected admission fault: {other:?}"),
+        Ok(mut instance) => {
+            instance.shutdown();
+            panic!("untrusted self-declared storage capability was admitted")
+        }
+    }
+    assert!(
+        !started.exists(),
+        "admission denial must happen before cmd.spawn()"
+    );
+}
+
+#[test]
+fn agent_memory_storage_errors_are_sanitized_and_structured() {
+    let storage = Arc::new(AgentMemoryStorageSpy::new(AgentMemorySpyBehavior::Errors));
+    let (deps, _) = agent_memory_deps(Arc::clone(&storage));
+
+    let malformed = dispatch_agent_memory(
+        "agent_memory/storage/get",
+        json!({"type":"AgentMemoryStorageGet","request":"not an agent memory request"}),
+        &deps,
+    );
+    assert_eq!(malformed["error"]["code"], -32602);
+    assert_eq!(
+        malformed["error"]["message"],
+        "invalid agent memory storage request"
+    );
+    assert!(storage.calls().is_empty());
+
+    let mut missing_storage = deps.clone();
+    missing_storage.agent_memory_storage = None;
+    let missing_storage_response = dispatch_agent_memory(
+        "agent_memory/storage/get",
+        json!({"type":"AgentMemoryStorageGet","request":{"key":[1]}}),
+        &missing_storage,
+    );
+    assert_eq!(missing_storage_response["error"]["code"], -32603);
+    assert_eq!(
+        missing_storage_response["error"]["message"],
+        "agent memory storage unavailable"
+    );
+    assert!(storage.calls().is_empty());
+
+    let mut missing_namespace = deps.clone();
+    missing_namespace.agent_memory_namespace = None;
+    let missing_namespace_response = dispatch_agent_memory(
+        "agent_memory/storage/get",
+        json!({"type":"AgentMemoryStorageGet","request":{"key":[1]}}),
+        &missing_namespace,
+    );
+    assert_eq!(missing_namespace_response["error"]["code"], -32603);
+    assert_eq!(
+        missing_namespace_response["error"]["message"],
+        "agent memory storage unavailable"
+    );
+    assert!(storage.calls().is_empty());
+
+    let bounds = dispatch_agent_memory(
+        "agent_memory/storage/get",
+        json!({"type":"AgentMemoryStorageGet","request":{"key":[115,101,99,114,101,116]}}),
+        &deps,
+    );
+    let unavailable = dispatch_agent_memory(
+        "agent_memory/storage/scan",
+        json!({"type":"AgentMemoryStorageScan","request":{"prefix":[47,112,114,105,118,97,116,101],"cursor":null,"limit":1}}),
+        &deps,
+    );
+    let unknown = dispatch_agent_memory(
+        "agent_memory/storage/transact",
+        json!({"type":"AgentMemoryStorageTransact","request":{"conditions":[],"mutations":[{"type":"Put","key":[1],"value":[99]}]}}),
+        &deps,
+    );
+
+    assert_eq!(bounds["error"]["code"], -32603);
+    assert_eq!(
+        bounds["error"]["message"],
+        "agent memory storage bounds exceeded"
+    );
+    assert_eq!(bounds["error"]["data"], json!({"type":"BoundsExceeded"}));
+    assert_eq!(unavailable["error"]["code"], -32603);
+    assert_eq!(
+        unavailable["error"]["message"],
+        "agent memory storage unavailable"
+    );
+    assert_eq!(unavailable["error"]["data"], json!({"type":"Unavailable"}));
+    assert_eq!(
+        unknown["result"],
+        json!({"type":"Failure","failure":{"type":"CommitOutcomeUnknown"}})
+    );
+    let public = serde_json::to_string(&[bounds, unavailable, unknown]).unwrap();
+    assert!(!public.contains("secret"));
+    assert!(!public.contains("/private"));
+    assert!(!public.contains("99"));
+}
+
+#[test]
+fn supervised_storage_host_calls_reject_unauthorized_extensions_before_adapter_access() {
+    let storage = Arc::new(AgentMemoryStorageSpy::new(AgentMemorySpyBehavior::Success));
+    let (deps, _) = agent_memory_deps(Arc::clone(&storage));
+    let calls = [
+        (
+            "agent_memory/storage/get",
+            json!({"type":"AgentMemoryStorageGet","request":{"key":[1]}}),
+        ),
+        (
+            "agent_memory/storage/scan",
+            json!({"type":"AgentMemoryStorageScan","request":{"prefix":[],"cursor":null,"limit":1}}),
+        ),
+        (
+            "agent_memory/storage/transact",
+            json!({"type":"AgentMemoryStorageTransact","request":{"conditions":[],"mutations":[]}}),
+        ),
+    ];
+    for (method, params) in calls {
+        let response: serde_json::Value = serde_json::from_str(
+            &SidecarHostAdapter::dispatch_capability_call(method, json!(71), params, &deps, &[]),
+        )
+        .expect("denial is valid JSON-RPC");
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(
+            response["error"]["message"],
+            "capability 'agent_memory_storage' not declared"
+        );
+    }
+    assert!(storage.calls().is_empty());
+
+    let mut supervisor = ExtensionSupervisor::new(
+        make_manifest(&test_helper_bin(), vec![]),
+        agent_memory_deps(Arc::clone(&storage)).0,
+        TEST_TIMEOUT,
+        None,
+    );
+    let process_result = supervisor
+        .call_tool(
+            "agent_memory_undeclared",
+            json!({}),
+            &crate::domain::NeverCancelled,
+        )
+        .expect("supervised native child returns its denials");
+    assert_eq!(
+        process_result["denials"],
+        json!([
+            {"code":-32603,"message":"capability 'agent_memory_storage' not declared"},
+            {"code":-32603,"message":"capability 'agent_memory_storage' not declared"},
+            {"code":-32603,"message":"capability 'agent_memory_storage' not declared"}
+        ])
+    );
+    assert!(storage.calls().is_empty());
+    supervisor.shutdown();
+    let after_restart = supervisor
+        .call_tool(
+            "agent_memory_undeclared",
+            json!({}),
+            &crate::domain::NeverCancelled,
+        )
+        .expect("supervisor preserves its per-instance dependencies across restart");
+    assert_eq!(after_restart["denials"], process_result["denials"]);
+    assert!(storage.calls().is_empty());
+
+    let positive = dispatch_agent_memory(
+        "agent_memory/storage/get",
+        json!({"type":"AgentMemoryStorageGet","request":{"key":[1]}}),
+        &deps,
+    );
+    assert_eq!(positive["result"], json!({"value":[4],"generation":7}));
+    assert_eq!(storage.calls().len(), 1);
+
+    let mut fs = InMemoryFs::new();
+    fs.write(RelativePath::new("ordinary.txt"), b"still live".to_vec())
+        .expect("seed unrelated read");
+    let mut unrelated = make_deps(fs);
+    unrelated.agent_memory_storage = None;
+    unrelated.agent_memory_namespace = None;
+    let read: serde_json::Value =
+        serde_json::from_str(&SidecarHostAdapter::dispatch_capability_call(
+            "workspace/readFile",
+            json!(72),
+            json!({"type":"ReadFile","path":"ordinary.txt"}),
+            &unrelated,
+            &[Capability::ReadFile],
+        ))
+        .expect("unrelated read response");
+    assert!(read.get("result").is_some(), "{read}");
 }
 
 #[derive(Debug)]
@@ -1118,6 +1531,8 @@ fn read_file_capability_rejects_a_symlink_escape_at_the_host_boundary() {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
 
     let mut instance =

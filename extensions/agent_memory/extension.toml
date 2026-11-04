@@ -1,0 +1,42 @@
+name = "agent_memory"
+version = "0.1.0"
+command = ["agent_memory_extension"]
+activation = "lazy"
+
+[capabilities]
+required = ["agent_memory_storage"]
+
+[[tools]]
+name = "memory_remember"
+description = "Store one durable memory record. Returns code, id, revision, persistence_mode, durable_data_unavailable, and durable; durable is true only after durable acknowledgement. Privacy-rule changes are non-retroactive and external backups/providers may retain prior data."
+schema_json = '''{"type":"object","properties":{"record":{"type":"object","properties":{"record_type":{"enum":["observation","decision","bugfix","review_rule","task_note","session_summary"]},"title":{"type":"string"},"body":{"type":"string"},"provenance":{"type":"object","properties":{"branch":{"type":["string","null"]},"paths":{"type":"array","items":{"type":"string"},"default":[]},"symbols":{"type":"array","items":{"type":"string"},"default":[]},"tags":{"type":"array","items":{"type":"string"},"default":[]},"source_agent":{"type":["string","null"]},"source_client":{"type":["string","null"]},"commit":{"type":["string","null"]},"pull_request":{"type":["string","null"]},"issue":{"type":["string","null"]}},"additionalProperties":false},"confidence":{"type":["number","null"],"minimum":0,"maximum":1}},"required":["record_type","title","body","provenance"],"additionalProperties":false},"idempotency_key":{"type":"string"}},"required":["record","idempotency_key"],"additionalProperties":false}'''
+
+[[tools]]
+name = "memory_update"
+description = "Update memory records independently. Returns ordered item outcomes plus persistence_mode, durable_data_unavailable, and durable; durable is true only after every successful item is durably acknowledged."
+schema_json = '''{"type":"object","properties":{"items":{"type":"array","minItems":1,"items":{"type":"object","properties":{"id":{"type":"string"},"expected_revision":{"type":"string"},"record":{"type":"object","properties":{"record_type":{"enum":["observation","decision","bugfix","review_rule","task_note","session_summary"]},"title":{"type":"string"},"body":{"type":"string"},"provenance":{"type":"object","properties":{"branch":{"type":["string","null"]},"paths":{"type":"array","items":{"type":"string"},"default":[]},"symbols":{"type":"array","items":{"type":"string"},"default":[]},"tags":{"type":"array","items":{"type":"string"},"default":[]},"source_agent":{"type":["string","null"]},"source_client":{"type":["string","null"]},"commit":{"type":["string","null"]},"pull_request":{"type":["string","null"]},"issue":{"type":["string","null"]}},"additionalProperties":false},"confidence":{"type":["number","null"],"minimum":0,"maximum":1}},"required":["record_type","title","body","provenance"],"additionalProperties":false}},"required":["id","expected_revision","record"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}'''
+
+[[tools]]
+name = "memory_forget"
+description = "Logically delete memory records; deletion is not forensic erasure and external backups/providers may retain data. Returns ordered item outcomes and durability metadata."
+schema_json = '''{"type":"object","properties":{"items":{"type":"array","minItems":1,"items":{"type":"object","properties":{"id":{"type":"string"},"expected_revision":{"type":"string"}},"required":["id","expected_revision"],"additionalProperties":false}}},"required":["items"],"additionalProperties":false}'''
+
+[[tools]]
+name = "memory_search"
+description = "Search compact hits, then use memory_get for batched full-record retrieval. Compact hits omit bodies. Returns hits, next_cursor, persistence_mode, and durable_data_unavailable."
+schema_json = '''{"type":"object","properties":{"query":{"type":"string"},"filters":{"type":"object","properties":{"record_types":{"type":"array","items":{"enum":["observation","decision","bugfix","review_rule","task_note","session_summary"]},"default":[]},"branches":{"type":"array","items":{"type":"string"},"default":[]},"paths":{"type":"array","items":{"type":"string"},"default":[]},"symbols":{"type":"array","items":{"type":"string"},"default":[]},"tags":{"type":"array","items":{"type":"string"},"default":[]},"source_agent":{"type":["string","null"]},"source_client":{"type":["string","null"]},"created_from":{"type":["string","null"],"format":"date-time"},"created_to":{"type":["string","null"],"format":"date-time"}},"additionalProperties":false},"page":{"type":"object","properties":{"limit":{"type":["integer","null"],"minimum":1},"response_bytes":{"type":["integer","null"],"minimum":1},"cursor":{"type":["string","null"]}},"additionalProperties":false}},"required":["query"],"additionalProperties":false}'''
+
+[[tools]]
+name = "memory_timeline"
+description = "Read a bounded half-open memory timeline. Returns compact events, next_cursor, persistence_mode, and durable_data_unavailable."
+schema_json = '''{"type":"object","properties":{"anchor":{"oneOf":[{"type":"object","properties":{"kind":{"const":"record"},"id":{"type":"string"},"before":{"type":"integer","minimum":0},"after":{"type":"integer","minimum":0}},"required":["kind","id","before","after"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"query"},"query":{"type":"string"}},"required":["kind","query"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"window"},"from":{"type":"string","format":"date-time"},"to":{"type":"string","format":"date-time"}},"required":["kind","from","to"],"additionalProperties":false}]},"filters":{"type":"object","properties":{"record_types":{"type":"array","items":{"enum":["observation","decision","bugfix","review_rule","task_note","session_summary"]},"default":[]},"branches":{"type":"array","items":{"type":"string"},"default":[]},"paths":{"type":"array","items":{"type":"string"},"default":[]},"symbols":{"type":"array","items":{"type":"string"},"default":[]},"tags":{"type":"array","items":{"type":"string"},"default":[]},"source_agent":{"type":["string","null"]},"source_client":{"type":["string","null"]},"created_from":{"type":["string","null"],"format":"date-time"},"created_to":{"type":["string","null"],"format":"date-time"}},"additionalProperties":false},"page":{"type":"object","properties":{"limit":{"type":["integer","null"],"minimum":1},"response_bytes":{"type":["integer","null"],"minimum":1},"cursor":{"type":["string","null"]}},"additionalProperties":false}},"required":["anchor"],"additionalProperties":false}'''
+
+[[tools]]
+name = "memory_get"
+description = "Batch-retrieve full records by ID after compact search. Returns ordered item outcomes, persistence_mode, and durable_data_unavailable."
+schema_json = '''{"type":"object","properties":{"ids":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["ids"],"additionalProperties":false}'''
+
+[[tools]]
+name = "memory_context_for_task"
+description = "Search compact task context without unrelated budget fillers. Returns hits, applied_filters, next_cursor, persistence_mode, and durable_data_unavailable; provider retention limits and non-retroactive privacy changes apply."
+schema_json = '''{"type":"object","properties":{"query":{"type":"string"},"filters":{"type":"object","properties":{"record_types":{"type":"array","items":{"enum":["observation","decision","bugfix","review_rule","task_note","session_summary"]},"default":[]},"branches":{"type":"array","items":{"type":"string"},"default":[]},"paths":{"type":"array","items":{"type":"string"},"default":[]},"symbols":{"type":"array","items":{"type":"string"},"default":[]},"tags":{"type":"array","items":{"type":"string"},"default":[]},"source_agent":{"type":["string","null"]},"source_client":{"type":["string","null"]},"created_from":{"type":["string","null"],"format":"date-time"},"created_to":{"type":["string","null"],"format":"date-time"}},"additionalProperties":false},"page":{"type":"object","properties":{"limit":{"type":["integer","null"],"minimum":1},"response_bytes":{"type":["integer","null"],"minimum":1},"cursor":{"type":["string","null"]}},"additionalProperties":false}},"required":["query"],"additionalProperties":false}'''

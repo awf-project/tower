@@ -259,6 +259,8 @@ pub fn host_deps(fs: RealFs) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(FixtureApplyEditsHost { fs }),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -278,6 +280,8 @@ fn recording_host_deps(fs: RealFs, log: HostCallLog) -> HostDeps {
             log,
         }),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 

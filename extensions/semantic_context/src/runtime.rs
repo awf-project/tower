@@ -60,13 +60,11 @@ struct Store {
     path: String,
 }
 struct Clock {
-    origin: Instant,
     control: Option<PathBuf>,
 }
 impl Clock {
     fn production() -> Self {
         Self {
-            origin: Instant::now(),
             control: std::env::var_os("TOWER_SEMANTIC_TEST_CLOCK").map(PathBuf::from),
         }
     }
@@ -79,12 +77,16 @@ impl SemanticClock for Clock {
                     .ok()
                     .and_then(|value| value.trim().parse::<u64>().ok())
                     .unwrap_or(0);
-                self.origin + Duration::from_millis(offset_ms)
+                // HTTP deadlines use real Instants too. Advance that clock
+                // rather than freezing it at startup: otherwise short provider
+                // budgets expire before a request even starts on a busy host.
+                Instant::now() + Duration::from_millis(offset_ms)
             }
             None => Instant::now(),
         }
     }
 }
+
 struct Cancellation;
 impl SemanticCancellation for Cancellation {
     fn is_cancelled(&self) -> bool {
@@ -686,4 +688,29 @@ fn public_error(error: SemanticApplicationError) -> Value {
         value["timeout"] = json!({"operation":operation,"layer":match timeout.layer { DeadlineLayer::Semantic => "semantic", DeadlineLayer::Provider => "provider" },"budget_ms":timeout.budget_ms});
     }
     value
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_clock_tracks_real_time_and_applies_the_requested_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clock-ms");
+        std::fs::write(&path, "0").unwrap();
+        let clock = Clock {
+            control: Some(path.clone()),
+        };
+        let first = clock.now();
+        std::thread::sleep(Duration::from_millis(20));
+        let real_now = Instant::now();
+        let later = clock.now();
+        assert!(later >= real_now);
+        assert!(later > first);
+
+        std::fs::write(&path, "101").unwrap();
+        let real_now = Instant::now();
+        assert!(clock.now() >= real_now + Duration::from_millis(101));
+    }
 }

@@ -4,6 +4,7 @@
 //! macros). Real infrastructure adapters (sled, std::fs, notify)
 //! land in specs 04 / 05 and are conditionally compiled.
 
+pub mod agent_memory_storage;
 /// XDG-backed AST index adapter and workspace path helpers (Stage 3a).
 ///
 /// Outbound port: [`crate::ports::AstIndexPort`].
@@ -47,6 +48,7 @@ pub mod shell;
 pub mod storage;
 pub mod watcher;
 
+pub use agent_memory_storage::{InMemoryAgentMemoryStorage, SledAgentMemoryStorage};
 pub use ast_index::XdgAstIndexAdapter;
 pub use extension::{HostDeps as ExtensionHostDeps, SidecarHostAdapter};
 pub use fs::RealFs;

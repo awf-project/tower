@@ -99,6 +99,9 @@ fn invalid_gate_control_dir() -> ProtocolError {
 }
 
 fn main() {
+    if let Some(marker) = env::var_os("TOWER_TEST_HELPER_STARTED") {
+        fs::write(marker, std::process::id().to_string()).expect("write fixture startup marker");
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -182,6 +185,13 @@ fn main() {
                             description: "Attempt to read a bad path (for denial tests)".to_owned(),
                             schema_json: "{}".to_owned(),
                         },
+                        ToolDecl {
+                            name: "agent_memory_undeclared".to_owned(),
+                            description:
+                                "Issue every storage HostCall without declaring capability"
+                                    .to_owned(),
+                            schema_json: "{}".to_owned(),
+                        },
                     ],
                     events: vec![
                         "event/fileIndexed".to_owned(),
@@ -240,10 +250,10 @@ fn main() {
                                 let resp = Response::ToolResult(result_val);
                                 send_response(&mut out, &id, &resp);
                             }
-                            Err(err_msg) => {
+                            Err(error) => {
                                 let resp = Response::Error(ProtocolError {
                                     code: -32000,
-                                    message: err_msg,
+                                    message: error.message,
                                     data: None,
                                 });
                                 send_response(&mut out, &id, &resp);
@@ -273,10 +283,10 @@ fn main() {
 
                         match read_host_response(&mut lines, &mut queued, &put_id) {
                             Ok(_) => {}
-                            Err(err_msg) => {
+                            Err(error) => {
                                 let resp = Response::Error(ProtocolError {
                                     code: -32000,
-                                    message: format!("index/put failed: {err_msg}"),
+                                    message: format!("index/put failed: {}", error.message),
                                     data: None,
                                 });
                                 send_response(&mut out, &id, &resp);
@@ -295,10 +305,10 @@ fn main() {
                                 let resp = Response::ToolResult(result_val);
                                 send_response(&mut out, &id, &resp);
                             }
-                            Err(err_msg) => {
+                            Err(error) => {
                                 let resp = Response::Error(ProtocolError {
                                     code: -32000,
-                                    message: format!("index/get failed: {err_msg}"),
+                                    message: format!("index/get failed: {}", error.message),
                                     data: None,
                                 });
                                 send_response(&mut out, &id, &resp);
@@ -324,15 +334,56 @@ fn main() {
                                 let resp = Response::ToolResult(v);
                                 send_response(&mut out, &id, &resp);
                             }
-                            Err(err_msg) => {
+                            Err(error) => {
                                 // Return the denial message so tests can assert on it
                                 let resp = Response::Error(ProtocolError {
                                     code: -32000,
-                                    message: err_msg,
+                                    message: error.message,
                                     data: None,
                                 });
                                 send_response(&mut out, &id, &resp);
                             }
+                        }
+                    }
+                    "agent_memory_undeclared" => {
+                        let calls = [
+                            ("agent_memory/storage/get", HostCall::AgentMemoryStorageGet {
+                                request: extension_protocol::messages::AgentMemoryGetRequest { key: vec![1] },
+                            }),
+                            ("agent_memory/storage/scan", HostCall::AgentMemoryStorageScan {
+                                request: extension_protocol::messages::AgentMemoryScanRequest {
+                                    prefix: vec![], cursor: None, limit: 1,
+                                },
+                            }),
+                            ("agent_memory/storage/transact", HostCall::AgentMemoryStorageTransact {
+                                request: extension_protocol::messages::AgentMemoryTransactionRequest {
+                                    conditions: vec![], mutations: vec![],
+                                },
+                            }),
+                        ];
+                        let mut denials = Vec::new();
+                        for (offset, (method, call)) in calls.into_iter().enumerate() {
+                            let call_id = serde_json::json!(9100_u64 + offset as u64);
+                            send_host_call(&mut out, &call_id, method, &call);
+                            out.flush().unwrap();
+                            match read_host_response(&mut lines, &mut queued, &call_id) {
+                                Ok(value) => denials.push(value),
+                                Err(error) => denials.push(serde_json::json!({
+                                    "code": error.code,
+                                    "message": error.message,
+                                })),
+                            }
+                        }
+                        send_response(
+                            &mut out,
+                            &id,
+                            &Response::ToolResult(
+                                serde_json::json!({"denials": denials, "pid": std::process::id()}),
+                            ),
+                        );
+                        if tool_params["exit_after_probe"] == true {
+                            out.flush().unwrap();
+                            break;
                         }
                     }
                     other => {
@@ -442,17 +493,33 @@ fn send_host_call(out: &mut impl Write, id: &serde_json::Value, method: &str, ca
     writeln!(out, "{s}").unwrap();
 }
 
+/// A host response error preserved for test scenarios that need its JSON-RPC code.
+struct HostResponseError {
+    code: Option<i64>,
+    message: String,
+}
+
 /// Read the next non-blank line from stdin and parse it as a host response matching `expected_id`.
 fn read_host_response(
     lines: &mut impl Iterator<Item = Result<String, io::Error>>,
     queued: &mut VecDeque<serde_json::Value>,
     expected_id: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, HostResponseError> {
     loop {
         let line = match lines.next() {
             Some(Ok(l)) => l,
-            Some(Err(e)) => return Err(format!("stdin error: {e}")),
-            None => return Err("stdin closed while waiting for host response".to_owned()),
+            Some(Err(e)) => {
+                return Err(HostResponseError {
+                    code: None,
+                    message: format!("stdin error: {e}"),
+                });
+            }
+            None => {
+                return Err(HostResponseError {
+                    code: None,
+                    message: "stdin closed while waiting for host response".to_owned(),
+                });
+            }
         };
         let line = line.trim().to_owned();
         if line.is_empty() {
@@ -460,7 +527,10 @@ fn read_host_response(
         }
 
         let envelope: serde_json::Value =
-            serde_json::from_str(&line).map_err(|e| format!("parse error: {e}"))?;
+            serde_json::from_str(&line).map_err(|e| HostResponseError {
+                code: None,
+                message: format!("parse error: {e}"),
+            })?;
 
         // Request and response IDs are independent in each direction. Always
         // preserve inbound requests, even when the host happens to reuse the
@@ -480,14 +550,19 @@ fn read_host_response(
         let error = envelope.get("error");
         return match (result, error) {
             (Some(result), None) => Ok(result.clone()),
-            (None, Some(error)) => Err(error
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-                .to_owned()),
-            _ => {
-                Err("malformed host response (expected exactly one of result or error)".to_owned())
-            }
+            (None, Some(error)) => Err(HostResponseError {
+                code: error.get("code").and_then(|value| value.as_i64()),
+                message: error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error")
+                    .to_owned(),
+            }),
+            _ => Err(HostResponseError {
+                code: None,
+                message: "malformed host response (expected exactly one of result or error)"
+                    .to_owned(),
+            }),
         };
     }
 }

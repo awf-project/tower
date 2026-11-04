@@ -984,6 +984,8 @@ fn make_deps() -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -3722,6 +3724,8 @@ fn lsp_process_diagnostics_unsupported_when_no_lsp_configured() {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
 
     let mut adapter = SidecarHostAdapter::spawn(

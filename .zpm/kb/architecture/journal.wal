@@ -168,3 +168,38 @@
 {"ts":1793016984,"op":"retractall","clause":"arch_convention('conv_lifecycle_safeguards_separate', _, _, _, _, _, _, _, _)"}
 {"ts":1793016984,"op":"assert","clause":"arch_convention('conv_lifecycle_safeguards_separate', 'process lifecycle', 'keep cancellation, shutdown escalation, crash detection, idle eviction, kill, and reap bounded independently of ordinary operation timeout policy', 'bug_34_b005_remove_default_timeouts_from_all_si')"}
 {"ts":1793790290,"op":"assert","clause":"arch_decision(dec_semantic_context_sidecar_composition, 'semantic context runtime placement', 'compose SemanticApplication inside the semantic sidecar from the OpenAI-compatible provider, HostCall workspace reader, and SQLite derived index', 'preserves the host domain boundary while exercising real provider, workspace, and persistence adapters through the supervised public MCP path', feature_f016_semantic_context)"}
+{"ts":1793826160,"op":"assert","clause":"arch_decision(adr_0011_host_owned_agent_memory_storage, 'agent memory persistence boundary', 'keep memory rules in the first-party sidecar while physical persistence uses a trusted capability-gated host-owned namespaced transactional port', 'preserves capability isolation, domain separation, and shared adapter contracts at the cost of a versioned protocol and host wiring', feature_f017)"}
+{"ts":1793972270,"op":"assert","clause":"arch_decision('dec_agent_memory_trusted_namespaces', 'agent memory storage authorization', 'authorize storage HostCalls by declared capability and trusted first-party extension identity, with namespaces derived by the host from project and extension identity', 'prevents extensions from self-authorizing or selecting and inspecting another extension or project namespace', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972270,"op":"assert","clause":"arch_decision('dec_agent_memory_durable_ack', 'agent memory durability semantics', 'acknowledge durable mutations only after a conditional transaction has been synchronously flushed and report conflicts or uncertain commits as typed outcomes', 'gives callers an exact durable-success guarantee without exposing backend-specific failures', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972270,"op":"assert","clause":"arch_convention('conv_agent_memory_adapter_contract', 'agent memory persistence adapters', 'keep Sled-backed and in-memory implementations behind the same bounded transactional storage contract and contract-test suite', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972270,"op":"assert","clause":"arch_convention('conv_agent_memory_privacy_boundary', 'agent memory data handling', 'apply privacy rules before persistence, indexing, logging, and optional provider requests; treat rule changes as prospective', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972273,"op":"retractall","clause":"arch_component(_,_,_,'feature_f017_agent_memory_extension')"}
+{"ts":1793972273,"op":"retractall","clause":"arch_port(_,_,'feature_f017_agent_memory_extension')"}
+{"ts":1793972274,"op":"retractall","clause":"arch_decision(_,_,_,_,'feature_f017_agent_memory_extension')"}
+{"ts":1793972275,"op":"retractall","clause":"arch_convention(_,_,_,'feature_f017_agent_memory_extension')"}
+{"ts":1793972275,"op":"retractall","clause":"arch_adr(_,_,'feature_f017_agent_memory_extension')"}
+{"ts":1793972276,"op":"retractall","clause":"arch_feature('feature_f017_agent_memory_extension',_,_)"}
+{"ts":1793972276,"op":"retractall","clause":"arch_component('agent_memory_storage', _, _, _)"}
+{"ts":1793972276,"op":"assert","clause":"arch_component('agent_memory_storage', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972277,"op":"retractall","clause":"arch_component('config', _, _, _)"}
+{"ts":1793972277,"op":"assert","clause":"arch_component('config', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972278,"op":"retractall","clause":"arch_component('daemon', _, _, _)"}
+{"ts":1793972278,"op":"assert","clause":"arch_component('daemon', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972278,"op":"retractall","clause":"arch_component('extension', _, _, _)"}
+{"ts":1793972278,"op":"assert","clause":"arch_component('extension', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972279,"op":"retractall","clause":"arch_component('mcp', _, _, _)"}
+{"ts":1793972279,"op":"assert","clause":"arch_component('mcp', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972279,"op":"retractall","clause":"arch_component('adapters', _, _, _)"}
+{"ts":1793972279,"op":"assert","clause":"arch_component('adapters', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972280,"op":"retractall","clause":"arch_component('storage', _, _, _)"}
+{"ts":1793972280,"op":"assert","clause":"arch_component('storage', infrastructure, '', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972281,"op":"retractall","clause":"arch_decision('dec_agent_memory_host_owned_storage', _, _, _, _)"}
+{"ts":1793972281,"op":"assert","clause":"arch_decision('dec_agent_memory_host_owned_storage', 'agent memory persistence boundary', 'keep memory business rules in the sidecar and place physical persistence behind a host-owned capability-gated namespaced port', 'prevents direct sidecar filesystem or database access while retaining private transactional durable storage without coupling memory semantics to the VFS storage contract', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972281,"op":"retractall","clause":"arch_decision('dec_agent_memory_trusted_namespaces', _, _, _, _, _)"}
+{"ts":1793972281,"op":"assert","clause":"arch_decision('dec_agent_memory_trusted_namespaces', 'agent memory storage authorization', 'authorize storage HostCalls by declared capability and trusted first-party extension identity, with namespaces derived by the host from project and extension identity', 'prevents extensions from self-authorizing or selecting and inspecting another extension or project namespace', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972282,"op":"retractall","clause":"arch_decision('dec_agent_memory_durable_ack', _, _, _, _)"}
+{"ts":1793972282,"op":"assert","clause":"arch_decision('dec_agent_memory_durable_ack', 'agent memory durability semantics', 'acknowledge durable mutations only after a conditional transaction has been synchronously flushed and report conflicts or uncertain commits as typed outcomes', 'gives callers an exact durable-success guarantee without exposing backend-specific failures', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972283,"op":"retractall","clause":"arch_convention('conv_agent_memory_adapter_contract', _, _, _)"}
+{"ts":1793972283,"op":"assert","clause":"arch_convention('conv_agent_memory_adapter_contract', 'agent memory persistence adapters', 'keep Sled-backed and in-memory implementations behind the same bounded transactional storage contract and contract-test suite', 'feature_f017_agent_memory_extension')"}
+{"ts":1793972283,"op":"retractall","clause":"arch_convention('conv_agent_memory_privacy_boundary', _, _, _, _, _, _)"}
+{"ts":1793972283,"op":"assert","clause":"arch_convention('conv_agent_memory_privacy_boundary', 'agent memory data handling', 'apply privacy rules before persistence, indexing, logging, and optional provider requests; treat rule changes as prospective', 'feature_f017_agent_memory_extension')"}

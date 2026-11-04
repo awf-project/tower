@@ -32,6 +32,7 @@
 //! through its constructor (or method parameters), ensuring that `domain/` stays
 //! free of `sled`, `std::fs`, and `notify` (AC4).
 
+pub mod agent_memory_storage;
 pub mod ast_index;
 pub mod code_intel;
 pub mod dependency_source;
@@ -46,6 +47,11 @@ pub mod storage;
 // Inbound ports — use-case contracts called by external drivers.
 pub mod inbound;
 
+pub use agent_memory_storage::{
+    AgentMemoryGetRequest, AgentMemoryGetResult, AgentMemoryNamespace, AgentMemoryScanRequest,
+    AgentMemoryScanResult, AgentMemoryStorageBounds, AgentMemoryStorageError,
+    AgentMemoryStoragePort, AgentMemoryTransactionOutcome, AgentMemoryTransactionRequest,
+};
 pub use ast_index::{AstIndexPort, validate_key as validate_ast_index_key};
 pub use code_intel::{CodeIntelError, CodeIntelligencePort};
 pub use dependency_source::{

@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -61,11 +62,18 @@ use crate::domain::extension_host::{ExtensionRegistry, InvokeError};
 const CATCH_UP_FENCE_TOOL: &str = "_tower_catch_up_fence";
 
 fn public_extension_tool_name(extension: &str, tool: &str) -> String {
-    if extension == "semantic_context" && tool.starts_with("semantic_") {
+    if (extension == "semantic_context" && tool.starts_with("semantic_"))
+        || (extension == "agent_memory" && tool.starts_with("memory_"))
+    {
         format!("tower_{tool}")
     } else {
         format!("tower_{extension}_{tool}")
     }
+}
+
+fn owns_shortened_public_name(extension: &str, tool: &str) -> bool {
+    (extension == "semantic_context" && tool.starts_with("semantic_"))
+        || (extension == "agent_memory" && tool.starts_with("memory_"))
 }
 
 // ── ExtensionMergedRegistry ───────────────────────────────────────────────────
@@ -291,7 +299,11 @@ impl ExtensionMergedRegistry {
             .iter()
             .find(|candidate| &candidate.extension_id == extension_id)
         else {
-            return false;
+            // Agent memory owns host storage startup and has no AST/LSP-style
+            // catch-up phase. Its successfully registered public tools are
+            // therefore immediately available without an unrelated readiness
+            // family. Preserve the existing gate for other extensions.
+            return extension_id.as_str() == "agent_memory";
         };
         gate.dependency_policy
             .is_readiness_control(extension_id, tool_name)
@@ -332,6 +344,10 @@ impl ToolRegistry for ExtensionMergedRegistry {
     /// extensions is reflected immediately in the next `list()` call.
     fn list(&self) -> Vec<ToolDesc> {
         let mut tools = self.native.list();
+        let mut published_names = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<HashSet<_>>();
         let readiness_snapshot = self
             .readiness
             .as_ref()
@@ -343,7 +359,10 @@ impl ToolRegistry for ExtensionMergedRegistry {
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        for (ext_id, tool_decl) in host_guard.declared_tools() {
+        let mut declarations = host_guard.declared_tools();
+        declarations
+            .sort_by_key(|(ext_id, tool)| !owns_shortened_public_name(ext_id.as_str(), &tool.name));
+        for (ext_id, tool_decl) in declarations {
             if tool_decl.name == CATCH_UP_FENCE_TOOL {
                 continue;
             }
@@ -353,6 +372,9 @@ impl ToolRegistry for ExtensionMergedRegistry {
                 continue;
             }
             let namespaced_name = public_extension_tool_name(ext_id.as_str(), &tool_decl.name);
+            if !published_names.insert(namespaced_name.clone()) {
+                continue;
+            }
             let input_schema = serde_json::from_str::<JsonValue>(&tool_decl.schema_json)
                 .unwrap_or_else(|_| serde_json::json!({}));
             tools.push(ToolDesc {
@@ -403,11 +425,13 @@ impl ToolRegistry for ExtensionMergedRegistry {
             return self.native.call(name, args, cancellation);
         }
 
-        let declarations = self
+        let mut declarations = self
             .extension_host
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .declared_tools();
+        declarations
+            .sort_by_key(|(ext_id, tool)| !owns_shortened_public_name(ext_id.as_str(), &tool.name));
         for (ext_id, tool_decl) in declarations {
             if tool_decl.name == CATCH_UP_FENCE_TOOL {
                 continue;
@@ -836,6 +860,8 @@ mod tests {
             format_queue: Arc::new(NoOpFormatQueue),
             apply_edits: Arc::new(UnsupportedApplyEditsHost),
             push_tx: None,
+            agent_memory_storage: None,
+            agent_memory_namespace: None,
         }
     }
 
@@ -1990,6 +2016,92 @@ mod tests {
             .expect("tower_lint_check");
 
         assert_eq!(result, JsonValue::String("lint".to_owned()));
+    }
+
+    #[test]
+    fn agent_memory_public_names_route_and_reject_collisions() {
+        let memory_tools = [
+            "memory_remember",
+            "memory_update",
+            "memory_forget",
+            "memory_search",
+            "memory_timeline",
+            "memory_get",
+            "memory_context_for_task",
+        ];
+        let ext_registry = Arc::new(RwLock::new(ExtensionRegistry::new()));
+        {
+            let mut extensions = ext_registry.write().unwrap();
+            extensions
+                .register(Box::new(TestExtension::identity(
+                    "memory",
+                    vec![make_tool("search")],
+                )))
+                .expect("register colliding extension first");
+            extensions
+                .register(Box::new(TestExtension::new(
+                    "agent_memory",
+                    memory_tools.into_iter().map(make_tool).collect(),
+                    |tool, params| {
+                        Ok(json!({"extension":"agent_memory","tool":tool,"params":params}))
+                    },
+                )))
+                .expect("register agent-memory extension");
+            extensions
+                .register(Box::new(TestExtension::identity(
+                    "find",
+                    vec![make_tool("file")],
+                )))
+                .expect("register native-name collision");
+            extensions
+                .register(Box::new(TestExtension::identity(
+                    "unrelated",
+                    vec![make_tool("memory_search")],
+                )))
+                .expect("register unrelated extension");
+        }
+        let mut merged = ExtensionMergedRegistry::new(empty_engine_state(), ext_registry);
+
+        let listed = merged
+            .list()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        for local_name in memory_tools {
+            assert!(
+                listed.contains(&format!("tower_{local_name}")),
+                "agent-memory declaration {local_name} must use its public name"
+            );
+        }
+        assert!(listed.contains(&"tower_unrelated_memory_search".to_owned()));
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|name| name.as_str() == "tower_memory_search")
+                .count(),
+            1,
+            "colliding extension declarations must not publish duplicate public names"
+        );
+
+        let args = json!({"query":"ownership"});
+        assert_eq!(
+            merged
+                .call(
+                    "tower_memory_search",
+                    args.clone(),
+                    &crate::domain::NeverCancelled,
+                )
+                .expect("route public memory tool"),
+            json!({"extension":"agent_memory","tool":"memory_search","params":args})
+        );
+        assert!(matches!(
+            merged.call(
+                "tower_find_file",
+                JsonValue::Null,
+                &crate::domain::NeverCancelled,
+            ),
+            Err(ToolError::InvalidArgs(_))
+        ));
     }
 
     /// UN1: When no extensions are registered, only native tools are served.

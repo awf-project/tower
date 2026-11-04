@@ -15,7 +15,7 @@ use crate::adapters::formatter::FormatQueuePort;
 use crate::adapters::mcp::PushEvent;
 use crate::domain::DomainError;
 use crate::ports::inbound::{WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult};
-use crate::ports::{AstIndexPort, FileSystemPort};
+use crate::ports::{AgentMemoryNamespace, AgentMemoryStoragePort, AstIndexPort, FileSystemPort};
 use extension_protocol::WorkspaceReadFailure;
 
 /// Capability dependencies required by [`SidecarHostAdapter`].
@@ -37,6 +37,8 @@ use extension_protocol::WorkspaceReadFailure;
 ///     format_queue: Arc::new(NoOpFormatQueue),
 ///     apply_edits: Arc::new(core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost),
 ///     push_tx: None,
+///     agent_memory_storage: None,
+///     agent_memory_namespace: None,
 /// };
 /// ```
 #[derive(Clone)]
@@ -64,6 +66,10 @@ pub struct HostDeps {
     /// subscribed MCP clients receive `notifications/resources/updated`.
     /// `None` means push is disabled (e.g. in unit tests or non-LSP setups).
     pub push_tx: Option<std::sync::mpsc::Sender<PushEvent>>,
+
+    pub agent_memory_storage: Option<Arc<dyn AgentMemoryStoragePort>>,
+
+    pub agent_memory_namespace: Option<AgentMemoryNamespace>,
 }
 
 /// Apply-edits dependency required by `workspace/applyEdits`.

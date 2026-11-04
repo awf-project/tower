@@ -200,6 +200,8 @@ fn host_reader() -> HostCallWorkspaceReadAdapter {
             core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost,
         ),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
     let capabilities = vec![Capability::ReadFile, Capability::ListFiles];
     let transport = move |method: &str, params: Value| {
@@ -259,6 +261,8 @@ fn host_call_workspace_reader_satisfies_shared_contract() {
             core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost,
         ),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
     let legacy = serde_json::to_value(HostCall::ReadFile {
         path: VALID_PATH.to_owned(),
@@ -302,6 +306,8 @@ fn assert_symlink_swap_is_confined() {
             core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost,
         ),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
     let frame = SidecarHostAdapter::dispatch_capability_call(
         "workspace/readFile",

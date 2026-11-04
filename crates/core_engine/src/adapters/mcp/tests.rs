@@ -171,6 +171,8 @@ fi
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
     let supervisor = ExtensionSupervisor::new(manifest, deps, None, None);
     let mut extensions = crate::domain::extension_host::ExtensionRegistry::new();

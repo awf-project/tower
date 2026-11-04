@@ -164,6 +164,7 @@ pub enum Capability {
     /// `workspace/requestFormat` — enqueue a file for formatting.
     RequestFormat,
     RequestApplyEdits,
+    AgentMemoryStorage,
     /// `log` — emit a log message through the host's logging subsystem.
     Log,
     /// `notify/resourceUpdated` — push a `notifications/resources/updated` event

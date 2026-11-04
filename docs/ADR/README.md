@@ -42,10 +42,11 @@ Numbers are never reused. If a decision is reversed, the original ADR is marked 
 | [0008](0008-mcp-mutations-real-extension-host.md)             | Notify the Real Extension Host After MCP Mutations      | Proposed |
 | [0009](0009-defer-apply-edits-extension-callbacks.md)         | Defer Extension Callbacks After Workspace Apply-Edits   | Proposed |
 | [0010](0010-stage-daemon-startup-and-capability-readiness.md) | Stage Daemon Startup and Capability Readiness           | Proposed |
+| [0011](0011-host-owned-agent-memory-storage.md)               | Use Host-Owned Namespaced Storage for Agent Memory      | Proposed |
 
 <!--
   Update this table as ADRs are added. Format:
-  | [0001](0001-short-name.md) | Decision Title | Accepted |
+  | [0001](.template.md) | Decision Title | Accepted |
 -->
 
 ## Creating a New ADR

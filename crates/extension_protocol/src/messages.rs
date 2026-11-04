@@ -2015,7 +2015,128 @@ pub struct SymbolCandidate {
 /// let back: HostCall = serde_json::from_str(&json).unwrap();
 /// assert!(matches!(back, HostCall::Log { .. }));
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryGetRequest {
+    pub key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryGetResult {
+    pub value: Option<Vec<u8>>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryScanRequest {
+    pub prefix: Vec<u8>,
+    pub cursor: Option<Vec<u8>>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryScanResult {
+    pub entries: Vec<AgentMemoryKeyValue>,
+    pub next_cursor: Option<Vec<u8>>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryKeyValue {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum AgentMemoryCondition {
+    KeyAbsent { key: Vec<u8> },
+    ValueEquals { key: Vec<u8>, value: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum AgentMemoryMutation {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryTransactionRequest {
+    pub conditions: Vec<AgentMemoryCondition>,
+    pub mutations: Vec<AgentMemoryMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+pub enum AgentMemoryTransactionOutcome {
+    Committed { generation: u64, durable: bool },
+    Conflict,
+    Failure { failure: AgentMemoryStorageFailure },
+}
+
+impl<'de> Deserialize<'de> for AgentMemoryTransactionOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", deny_unknown_fields)]
+        enum StrictOutcome {
+            Committed { generation: u64, durable: bool },
+            Conflict {},
+            Failure { failure: AgentMemoryStorageFailure },
+        }
+
+        Ok(match StrictOutcome::deserialize(deserializer)? {
+            StrictOutcome::Committed {
+                generation,
+                durable,
+            } => Self::Committed {
+                generation,
+                durable,
+            },
+            StrictOutcome::Conflict {} => Self::Conflict,
+            StrictOutcome::Failure { failure } => Self::Failure { failure },
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+pub enum AgentMemoryStorageFailure {
+    BoundsExceeded,
+    Unavailable,
+    CommitOutcomeUnknown,
+}
+
+impl<'de> Deserialize<'de> for AgentMemoryStorageFailure {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", deny_unknown_fields)]
+        enum StrictFailure {
+            BoundsExceeded {},
+            Unavailable {},
+            CommitOutcomeUnknown {},
+        }
+
+        Ok(match StrictFailure::deserialize(deserializer)? {
+            StrictFailure::BoundsExceeded {} => Self::BoundsExceeded,
+            StrictFailure::Unavailable {} => Self::Unavailable,
+            StrictFailure::CommitOutcomeUnknown {} => Self::CommitOutcomeUnknown,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum HostCall {
     /// Read file contents from the workspace (`workspace/readFile`).
@@ -2068,6 +2189,112 @@ pub enum HostCall {
         /// The resource URI that was updated (e.g. a `file://…` diagnostics URI).
         uri: String,
     },
+    AgentMemoryStorageGet {
+        request: AgentMemoryGetRequest,
+    },
+    AgentMemoryStorageScan {
+        request: AgentMemoryScanRequest,
+    },
+    AgentMemoryStorageTransact {
+        request: AgentMemoryTransactionRequest,
+    },
+}
+
+impl<'de> Deserialize<'de> for HostCall {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum LegacyHostCall {
+            ReadFile {
+                path: String,
+                #[serde(default)]
+                strict: Option<bool>,
+            },
+            ListFiles,
+            IndexGet {
+                key: String,
+            },
+            IndexPut {
+                key: String,
+                bytes: Vec<u8>,
+            },
+            RequestFormat {
+                path: String,
+            },
+            RequestApplyEdits {
+                path: String,
+                expected_version: String,
+                edits: Vec<ApplyEditsHostCallTextEdit>,
+                dry_run: bool,
+            },
+            Log {
+                level: String,
+                msg: String,
+            },
+            NotifyResourceUpdated {
+                uri: String,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type", deny_unknown_fields)]
+        enum StrictAgentMemoryHostCall {
+            #[serde(rename = "AgentMemoryStorageGet")]
+            Get { request: AgentMemoryGetRequest },
+            #[serde(rename = "AgentMemoryStorageScan")]
+            Scan { request: AgentMemoryScanRequest },
+            #[serde(rename = "AgentMemoryStorageTransact")]
+            Transact {
+                request: AgentMemoryTransactionRequest,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum HostCallWire {
+            AgentMemory(StrictAgentMemoryHostCall),
+            Legacy(LegacyHostCall),
+        }
+
+        Ok(match HostCallWire::deserialize(deserializer)? {
+            HostCallWire::AgentMemory(call) => match call {
+                StrictAgentMemoryHostCall::Get { request } => {
+                    Self::AgentMemoryStorageGet { request }
+                }
+                StrictAgentMemoryHostCall::Scan { request } => {
+                    Self::AgentMemoryStorageScan { request }
+                }
+                StrictAgentMemoryHostCall::Transact { request } => {
+                    Self::AgentMemoryStorageTransact { request }
+                }
+            },
+            HostCallWire::Legacy(call) => match call {
+                LegacyHostCall::ReadFile { path, strict } => Self::ReadFile { path, strict },
+                LegacyHostCall::ListFiles => Self::ListFiles,
+                LegacyHostCall::IndexGet { key } => Self::IndexGet { key },
+                LegacyHostCall::IndexPut { key, bytes } => Self::IndexPut { key, bytes },
+                LegacyHostCall::RequestFormat { path } => Self::RequestFormat { path },
+                LegacyHostCall::RequestApplyEdits {
+                    path,
+                    expected_version,
+                    edits,
+                    dry_run,
+                } => Self::RequestApplyEdits {
+                    path,
+                    expected_version,
+                    edits,
+                    dry_run,
+                },
+                LegacyHostCall::Log { level, msg } => Self::Log { level, msg },
+                LegacyHostCall::NotifyResourceUpdated { uri } => {
+                    Self::NotifyResourceUpdated { uri }
+                }
+            },
+        })
+    }
 }
 
 /// Stable failure vocabulary for strict workspace reads.

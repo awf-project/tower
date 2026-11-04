@@ -1875,13 +1875,14 @@ mod tests {
         let executable = workspace.path().join("server with spaces.sh");
         let args_file = workspace.path().join("received-args");
         let cwd_file = workspace.path().join("received-cwd");
-        let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#;
+        // Use a real protocol peer: an eager canned response can arrive before
+        // the client registers initialize and be discarded as unsolicited.
+        let fixture = fixture_lsp_server::binary_path();
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\npwd > '{}'\nprintf 'Content-Length: %s\\r\\n\\r\\n%s' '{}' '{}'\nexec sleep 60\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\npwd > '{}'\nexec '{}' dispatch_unavailable\n",
             args_file.display(),
             cwd_file.display(),
-            initialize.len(),
-            initialize,
+            fixture.display(),
         );
         std::fs::write(&executable, script).expect("write fake language server");
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();

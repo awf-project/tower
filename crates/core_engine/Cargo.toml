@@ -38,6 +38,7 @@ core_engine = { path = ".", features = ["testing"] }
 # rmcp client feature used in mcp handler unit tests (in-process duplex transport).
 rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
 extension_sidecar_harness = { path = "../extension_sidecar_harness" }
+agent_memory_extension = { path = "../../extensions/agent_memory" }
 
 [dependencies]
 tokio-util = { version = "0.7.18", features = ["codec"] }
@@ -88,6 +89,7 @@ sled = "0.34"
 # Trade-off: adds ~200 KB to binary vs. staying on postcard alone; unavoidable for
 # JSON-RPC compliance (spec U1). Scoped to the adapters/mcp layer — domain/ is untouched.
 serde_json = "1"
+regex = "1"
 url = "2.5.8"
 
 # Decision: directories for XDG-compliant global extension scope resolution.
