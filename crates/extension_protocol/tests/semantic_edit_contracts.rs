@@ -620,6 +620,7 @@ fn protocol_tests_assert_representative_json_for_semantic_edit_contracts_and_all
 fn existing_host_call_and_manifest_serialization_tests_continue_to_pass_unchanged() {
     let read_file = serde_json::to_value(HostCall::ReadFile {
         path: "src/lib.rs".to_owned(),
+        strict: None,
     })
     .expect("serialize read file");
     assert_eq!(read_file, json!({"type": "ReadFile", "path": "src/lib.rs"}));

@@ -46,6 +46,7 @@ pub enum CapabilityDependency {
     Workspace,
     Ast,
     Lsp,
+    SemanticContext,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,6 +109,7 @@ pub struct ReadinessSnapshot {
     pub workspace: CapabilityReadiness,
     pub ast: CapabilityReadiness,
     pub lsp: CapabilityReadiness,
+    pub semantic_context: CapabilityReadiness,
     pub extensions: Vec<ExtensionReadiness>,
 }
 
@@ -196,6 +198,7 @@ impl ReadinessController {
                         workspace: CapabilityReadiness::Preparing { phase: initial },
                         ast: CapabilityReadiness::Preparing { phase: initial },
                         lsp: CapabilityReadiness::Preparing { phase: initial },
+                        semantic_context: CapabilityReadiness::Preparing { phase: initial },
                         extensions: Vec::new(),
                     },
                     discovery_closed: false,
@@ -253,7 +256,11 @@ impl ReadinessController {
         let mut state = lock_state(&self.shared.state);
         if !state.discovery_closed {
             state.discovery_closed = true;
-            for dependency in [CapabilityDependency::Ast, CapabilityDependency::Lsp] {
+            for dependency in [
+                CapabilityDependency::Ast,
+                CapabilityDependency::Lsp,
+                CapabilityDependency::SemanticContext,
+            ] {
                 if !has_members(&state.snapshot, dependency) {
                     let readiness = capability_mut(&mut state.snapshot, dependency);
                     if matches!(readiness, CapabilityReadiness::Preparing { .. }) {
@@ -263,8 +270,13 @@ impl ReadinessController {
             }
             recompute_daemon(&mut state);
             self.shared.changed.notify_all();
+            self.shared.async_changed.send_replace(());
         }
         Ok(state.snapshot.clone())
+    }
+
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.shared.async_changed.subscribe()
     }
 
     /// Sticky observation: a failure published before subscription is still visible.
@@ -304,6 +316,7 @@ impl ReadinessController {
             state.snapshot.workspace = CapabilityReadiness::Stopping;
             state.snapshot.ast = CapabilityReadiness::Stopping;
             state.snapshot.lsp = CapabilityReadiness::Stopping;
+            state.snapshot.semantic_context = CapabilityReadiness::Stopping;
             for extension in &mut state.snapshot.extensions {
                 extension.readiness = CapabilityReadiness::Stopping;
             }
@@ -545,6 +558,7 @@ fn capability(
         CapabilityDependency::Workspace => &snapshot.workspace,
         CapabilityDependency::Ast => &snapshot.ast,
         CapabilityDependency::Lsp => &snapshot.lsp,
+        CapabilityDependency::SemanticContext => &snapshot.semantic_context,
     }
 }
 
@@ -556,6 +570,7 @@ fn capability_mut(
         CapabilityDependency::Workspace => &mut snapshot.workspace,
         CapabilityDependency::Ast => &mut snapshot.ast,
         CapabilityDependency::Lsp => &mut snapshot.lsp,
+        CapabilityDependency::SemanticContext => &mut snapshot.semantic_context,
     }
 }
 
@@ -862,6 +877,7 @@ mod tests {
         assert_eq!(snapshot.workspace, preparing(INITIAL_PHASE));
         assert_eq!(snapshot.ast, preparing(INITIAL_PHASE));
         assert_eq!(snapshot.lsp, preparing(INITIAL_PHASE));
+        assert_eq!(snapshot.semantic_context, preparing(INITIAL_PHASE));
         assert!(snapshot.extensions.is_empty());
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap(),
@@ -871,6 +887,7 @@ mod tests {
                 "workspace": {"state": "preparing", "phase": "ownership_acquired"},
                 "ast": {"state": "preparing", "phase": "ownership_acquired"},
                 "lsp": {"state": "preparing", "phase": "ownership_acquired"},
+                "semantic_context": {"state": "preparing", "phase": "ownership_acquired"},
                 "extensions": [],
             })
         );
@@ -1048,6 +1065,7 @@ mod tests {
             CapabilityDependency::Workspace,
             CapabilityDependency::Ast,
             CapabilityDependency::Lsp,
+            CapabilityDependency::SemanticContext,
         ] {
             for phase in [
                 StartupPhase::TransportBound,
@@ -1066,6 +1084,7 @@ mod tests {
                         CapabilityDependency::Workspace => snapshot.workspace,
                         CapabilityDependency::Ast => snapshot.ast,
                         CapabilityDependency::Lsp => snapshot.lsp,
+                        CapabilityDependency::SemanticContext => snapshot.semantic_context,
                     },
                     state
                 );

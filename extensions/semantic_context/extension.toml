@@ -1,0 +1,35 @@
+name = "semantic_context"
+version = "0.1.0"
+command = ["semantic_context_extension"]
+activation = "eager"
+
+[events]
+subscribe = ["event/fileIndexed", "event/fileChanged", "event/fileDeleted"]
+
+[capabilities]
+required = ["read_file", "list_files", "index_get", "log"]
+
+[[tools]]
+name = "semantic_reindex"
+description = "Rebuild the semantic index from the host-provided workspace snapshot."
+schema_json = '{"type":"object","properties":{},"additionalProperties":false}'
+
+[[tools]]
+name = "semantic_search"
+description = "Search indexed semantic context."
+schema_json = '{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":0},"path_prefixes":{"type":"array","items":{"type":"string"}},"languages":{"type":"array","items":{"type":"string"}},"lexical_rerank":{"type":"boolean"}},"required":["query","limit"],"additionalProperties":false}'
+
+[[tools]]
+name = "semantic_related_files"
+description = "Find files related to a workspace path."
+schema_json = '{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer","minimum":0},"path_prefixes":{"type":"array","items":{"type":"string"}},"languages":{"type":"array","items":{"type":"string"}}},"required":["path","limit"],"additionalProperties":false}'
+
+[[tools]]
+name = "semantic_context_for_task"
+description = "Collect a bounded semantic context for a task."
+schema_json = '{"type":"object","properties":{"task":{"type":"string"},"token_budget":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":0},"path_prefixes":{"type":"array","items":{"type":"string"}},"languages":{"type":"array","items":{"type":"string"}}},"required":["task","token_budget","limit"],"additionalProperties":false}'
+
+[[tools]]
+name = "_tower_catch_up_fence"
+description = "Host-internal catch-up ordering fence."
+schema_json = '{"type":"object","properties":{"epoch":{"type":"integer","minimum":0},"delivered_events":{"type":"integer","minimum":0}},"required":["epoch","delivered_events"],"additionalProperties":false}'

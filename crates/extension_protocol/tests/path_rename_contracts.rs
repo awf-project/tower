@@ -492,6 +492,7 @@ fn existing_rename_host_call_and_manifest_capability_json_remains_compatible() {
     };
     let host_call = HostCall::ReadFile {
         path: "src/lib.rs".into(),
+        strict: None,
     };
     let rename_result = RenameResult {
         applied: true,

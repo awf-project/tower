@@ -16,6 +16,7 @@ use crate::adapters::mcp::PushEvent;
 use crate::domain::DomainError;
 use crate::ports::inbound::{WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult};
 use crate::ports::{AstIndexPort, FileSystemPort};
+use extension_protocol::WorkspaceReadFailure;
 
 /// Capability dependencies required by [`SidecarHostAdapter`].
 ///
@@ -97,6 +98,21 @@ pub trait FsAdapter: Send + Sync {
     /// Returns an error string on any I/O or not-found failure.
     fn read_file(&self, path: &str) -> Result<Vec<u8>, String>;
 
+    /// Read raw bytes while retaining stable failure classification.
+    fn read_file_typed(&self, path: &str) -> Result<Vec<u8>, WorkspaceReadFailure> {
+        self.read_file(path)
+            .map_err(|_| WorkspaceReadFailure::HostUnavailable)
+    }
+
+    /// Read a workspace-relative file without allowing path resolution to
+    /// escape the workspace between validation and the read itself.
+    fn read_file_confined(&self, path: &str) -> Result<Vec<u8>, WorkspaceReadFailure> {
+        match self.workspace_root() {
+            Some(root) => read_workspace_file_confined(&root, path),
+            None => self.read_file_typed(path),
+        }
+    }
+
     /// List all indexed workspace files (relative paths).
     fn list_files(&self) -> Vec<String>;
 
@@ -111,6 +127,79 @@ pub trait FsAdapter: Send + Sync {
     }
 }
 
+#[cfg(unix)]
+fn read_workspace_file_confined(
+    root: &std::path::Path,
+    path: &str,
+) -> Result<Vec<u8>, WorkspaceReadFailure> {
+    use std::fs::File;
+    use std::io::Read;
+    use std::path::{Component, Path};
+
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let components = Path::new(path)
+        .components()
+        .map(|component| match component {
+            Component::Normal(component) => Ok(component),
+            _ => Err(WorkspaceReadFailure::InvalidPath),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (file_name, directories) = components
+        .split_last()
+        .ok_or(WorkspaceReadFailure::InvalidPath)?;
+
+    let mut directory = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| WorkspaceReadFailure::HostUnavailable)?;
+    for component in directories {
+        directory = openat(
+            &directory,
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(classify_confined_open_error)?;
+    }
+    let file = openat(
+        &directory,
+        *file_name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(classify_confined_open_error)?;
+    let mut bytes = Vec::new();
+    File::from(file)
+        .read_to_end(&mut bytes)
+        .map_err(|_| WorkspaceReadFailure::HostUnavailable)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn classify_confined_open_error(error: rustix::io::Errno) -> WorkspaceReadFailure {
+    match error {
+        rustix::io::Errno::NOENT => WorkspaceReadFailure::NotFound,
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::XDEV => {
+            WorkspaceReadFailure::InvalidPath
+        }
+        _ => WorkspaceReadFailure::HostUnavailable,
+    }
+}
+
+#[cfg(not(unix))]
+fn read_workspace_file_confined(
+    _root: &std::path::Path,
+    _path: &str,
+) -> Result<Vec<u8>, WorkspaceReadFailure> {
+    // A handle-relative, no-follow implementation is not available through the
+    // standard library on this target. Fail closed instead of reintroducing a
+    // check-then-open race at the capability boundary.
+    Err(WorkspaceReadFailure::HostUnavailable)
+}
+
 /// Adapt a `Mutex<F: FileSystemPort>` to `FsAdapter`.
 ///
 /// The mutex is needed because `FileSystemPort` methods are on `&mut self` for
@@ -123,6 +212,20 @@ impl<F: FileSystemPort + Send + 'static> FsAdapter for std::sync::Mutex<F> {
         guard
             .read(&rel)
             .map_err(|e| format!("readFile({path:?}) failed: {e}"))
+    }
+
+    fn read_file_typed(&self, path: &str) -> Result<Vec<u8>, WorkspaceReadFailure> {
+        let guard = self
+            .lock()
+            .map_err(|_| WorkspaceReadFailure::HostUnavailable)?;
+        let rel = crate::domain::RelativePath::new(path);
+        guard.read(&rel).map_err(|error| match error {
+            crate::ports::PortError::NotFound => WorkspaceReadFailure::NotFound,
+            crate::ports::PortError::InvalidArgs(_) => WorkspaceReadFailure::InvalidPath,
+            crate::ports::PortError::ReconciliationFailed { .. }
+            | crate::ports::PortError::WriteFailed(_)
+            | crate::ports::PortError::ReadFailed(_) => WorkspaceReadFailure::HostUnavailable,
+        })
     }
 
     fn list_files(&self) -> Vec<String> {

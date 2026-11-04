@@ -156,7 +156,7 @@ async fn serve_connection(stream: UnixStream, ctx: Arc<DaemonCtx>) {
             let (handler, sub) = build_handler(&ctx);
             ctx.registry.register_initializing();
             let initialized = tokio::select! {
-                result = serve_server(handler, (read_half, write_half)) => result,
+                result = serve_server(handler, crate::adapters::mcp::transport::McpTransport::new(read_half, write_half)) => result,
                 () = connection_shutdown(&ctx) => { ctx.registry.unregister_initializing(); return; },
             };
             let running = match initialized {

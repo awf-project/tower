@@ -57,6 +57,8 @@ use mcp_server::start_server;
 #[path = "support/dependency_search.rs"]
 mod dependency_search;
 use dependency_search::dependency_search_state_with_storage;
+#[path = "support/mod.rs"]
+mod semantic_support;
 #[path = "support/shell_command.rs"]
 mod shell_command;
 
@@ -94,6 +96,46 @@ shell_scenario!(shell_failures_and_logs_do_not_disclose_private_inputs);
 shell_scenario!(unsuccessful_shell_command_preserves_exit_status_and_output);
 #[cfg(unix)]
 shell_scenario!(malformed_shell_arguments_are_rejected_before_spawn);
+
+#[test]
+#[cfg(unix)]
+fn semantic_tools_report_unsupported_without_provider() {
+    let mut harness = semantic_support::SemanticMcpHarness::start(false, None, None);
+    let listed = harness.await_semantic_tools();
+    let names: Vec<_> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    let calls = [
+        ("tower_semantic_reindex", json!({})),
+        (
+            "tower_semantic_search",
+            json!({"query":"anything","limit":1}),
+        ),
+        (
+            "tower_semantic_related_files",
+            json!({"path":"src.rs","limit":1}),
+        ),
+        (
+            "tower_semantic_context_for_task",
+            json!({"task":"anything","token_budget":16,"limit":1}),
+        ),
+    ];
+    assert_eq!(
+        calls.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        semantic_support::SEMANTIC_TOOLS.to_vec()
+    );
+    for (name, arguments) in calls {
+        assert!(names.contains(&name), "missing public semantic tool {name}");
+        assert_eq!(
+            harness.call(name, arguments),
+            json!({"status":"unsupported","reason":"provider_not_configured"})
+        );
+    }
+    assert!(harness.list_tools()["result"]["tools"].is_array());
+}
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 

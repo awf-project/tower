@@ -58,7 +58,7 @@ pub use messages::{
     SymbolCandidate, TypeHierarchyDirection, TypeHierarchyItem, TypeHierarchyQuery,
     TypeHierarchyRange, TypeHierarchyResult, WorkspaceApplyEditsError,
     WorkspaceApplyEditsErrorCode, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
-    WorkspaceEditSpan,
+    WorkspaceEditSpan, WorkspaceReadFailure, WorkspaceReadResult,
 };
 
 /// The current protocol version carried in every [`InitParams`].

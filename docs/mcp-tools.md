@@ -57,15 +57,21 @@ extension catch-up. Consequently, MCP `initialize` can complete while preparatio
 progress, and a client-side connection timeout does not release ownership or cause a competing
 daemon to open the same Sled database.
 
-Readiness is tracked independently for the workspace, AST, and LSP families. `tower status` reports
+Readiness is tracked independently for the workspace, AST, LSP, and semantic-context families. `tower status` reports
 the daemon generation, lifecycle, each family’s state, and completed startup instrumentation. The
 possible lifecycle states are `starting`, `ready`, `degraded`, `failed`, and `stopping`; a capability
 can additionally be `preparing`, `ready`, `degraded`, `failed`, `unavailable`, or `stopping`.
 
 Native control and tool-description requests remain available during preparation. Workspace, AST,
-and LSP operations are admitted only when their dependencies are ready, or return a bounded
+LSP, and semantic-context operations are admitted only when their dependencies are ready, or return a bounded
 wait/structured readiness result. Clients must not interpret a tool inventory during catch-up as
 proof that every extension result is exhaustive.
+
+Tower advertises `capabilities.tools.listChanged = true`. Each connected session receives
+`notifications/tools/list_changed` when readiness changes its visible tool inventory, including
+when extensions become ready after the initial `tools/list`. Clients should refresh `tools/list`
+on that notification. Readiness progress that leaves the inventory unchanged produces no notification.
+Incoming partial frames remain buffered when an outgoing notification interrupts the receive wait.
 
 ### 1. initialize
 
@@ -103,7 +109,8 @@ Enumerate every available tool. The response lists the native `tower_*` tools
 plus any namespaced tools contributed by discovered extensions (e.g.
 `"tower_ast_get_outline"` from the `ast` extension, `"tower_lsp_diagnostics"` from
 the `lsp` extension, `"tower_debug_launch"` from the `debug` extension, or
-`"tower_lint_check"` from the `lint` extension).
+`"tower_lint_check"` from the `lint` extension, or `"tower_semantic_search"` from the
+`semantic_context` extension).
 
 **Request**
 
@@ -1982,6 +1989,39 @@ the extension identity and requiring the tool to be declared by that extension. 
 the host process or the MCP link. (Previously these were WASM plugin tools dispatched
 to an in-process sandbox; they are now out-of-process native sidecars — see
 [extensions.md](extensions.md). The tool names and wire shape are unchanged.)
+
+---
+
+## Semantic context extension tools
+
+The first-party `semantic_context` sidecar contributes four public tools. Their `tower_semantic_*`
+names are the public aliases for the manifest's `semantic_*` declarations. Install the sidecar to
+make them available. With `[semantic_context]` absent or disabled, calls return
+`{"status":"unsupported","reason":"provider_not_configured"}`. With a configured provider,
+the sidecar uses an extension-owned SQLite index; source reads go through read-only host capabilities.
+
+| Tool                              | Required arguments                                           | Optional arguments                                                                     | Successful result                                                              |
+| --------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `tower_semantic_reindex`          | none (`{}`)                                                  | none                                                                                   | `status: "ok"`, `indexed_files`, `indexed_chunks`, `generation`                |
+| `tower_semantic_search`           | `query` (string), `limit` (integer)                          | `path_prefixes` (string array), `languages` (string array), `lexical_rerank` (boolean) | `status: "ok"`, `hits`, `truncated`                                            |
+| `tower_semantic_related_files`    | `path` (workspace-relative string), `limit` (integer)        | `path_prefixes`, `languages`                                                           | `status: "ok"`, `files`, `truncated`                                           |
+| `tower_semantic_context_for_task` | `task` (string), `token_budget` (integer), `limit` (integer) | `path_prefixes`, `languages`                                                           | `status: "ok"`, `chunks`, `estimated_tokens`, `truncated`, `eligible_unfitted` |
+
+Limits are integers from 0 through 1,000; `token_budget` is from 0 through 1,000,000. Unknown
+arguments, invalid paths, and out-of-range values return `InvalidParams`. Filters are optional:
+`path_prefixes` match workspace-relative prefixes and `languages` match language names. Search
+defaults `lexical_rerank` to `false`. A search hit or context chunk has `path`, UTF-8 byte offsets
+`start_byte` and `end_byte`, `score`, `language`, `snippet`, and `reason`. A related-file entry has
+`path`, `score`, and `reason`.
+
+Operational failures are structured tool payloads. `status: "reindex_required"` with a `reason`
+such as `incompatible_index` asks the caller to run `tower_semantic_reindex`. Provider or storage
+failures return `status: "error"` with a stable `code`, such as `provider_unavailable`,
+`provider_timeout`, `provider_invalid_response`, `provider_dimension_mismatch`, `operation_timeout`,
+or `storage_error`. Timeout payloads also include `timeout.operation`, `timeout.layer`, and
+`timeout.budget_ms`. Semantic readiness can instead produce the MCP readiness error codes above.
+
+See [retrieve semantic code context](user-guide/semantic-retrieval.md) for setup and examples.
 
 ---
 

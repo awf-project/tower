@@ -159,6 +159,7 @@ pub fn host_call_read_file(
 ) -> Result<Vec<u8>, String> {
     let call = HostCall::ReadFile {
         path: path.to_owned(),
+        strict: None,
     };
     host_call::<String>(out, lines, next_id, "workspace/readFile", &call).map(String::into_bytes)
 }

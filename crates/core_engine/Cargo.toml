@@ -40,6 +40,8 @@ rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
 extension_sidecar_harness = { path = "../extension_sidecar_harness" }
 
 [dependencies]
+tokio-util = { version = "0.7.18", features = ["codec"] }
+
 # Decision: extension_protocol provides the ExtensionManifest, ExtensionFault,
 # ToolDecl, EventKind, and Event types used by the domain extension host (spec 22).
 # It is pure (no process/fs/transport), so importing it here does NOT cross the
@@ -86,6 +88,7 @@ sled = "0.34"
 # Trade-off: adds ~200 KB to binary vs. staying on postcard alone; unavoidable for
 # JSON-RPC compliance (spec U1). Scoped to the adapters/mcp layer — domain/ is untouched.
 serde_json = "1"
+url = "2.5.8"
 
 # Decision: directories for XDG-compliant global extension scope resolution.
 # Why: resolves $XDG_DATA_HOME / ~/.local/share (and the spec's "ignore relative

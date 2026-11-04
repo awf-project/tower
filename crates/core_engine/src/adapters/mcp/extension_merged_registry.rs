@@ -8,7 +8,7 @@
 //!    native:    NativeToolRegistry              (spec 10b)
 //!    extension: Arc<RwLock<ExtensionRegistry>>  (declared_tools(), spec 22)
 //!
-//!  list()  → native.list() ++ extension tools (namespaced tower_<ext>_<tool>)
+//!  list()  → native.list() ++ manifest-declared extension tools
 //!  call(name, args):
 //!    native name?    → native.call(name, args, cancellation)
 //!    extension name? → extension_registry.invoke(bare_tool_name, args, cancellation)
@@ -17,9 +17,10 @@
 //!
 //! # Namespace (EV1 / U2)
 //!
-//! Extension tools are namespaced exactly as WASM plugin tools were:
-//! `"tower_<extension_name>_<tool_name>"`. The `tower_` prefix reserves the host
-//! namespace; no extension may be named `"tower"`.
+//! Extension tools normally use `"tower_<extension_name>_<tool_name>"`. The
+//! semantic-context extension retains manifest ownership while exposing its
+//! established `tower_semantic_*` public names. The `tower_` prefix reserves the
+//! host namespace; no extension may be named `"tower"`.
 //!
 //! # Fault mapping
 //!
@@ -58,6 +59,14 @@ use crate::adapters::watcher::RenameCoordinator;
 use crate::domain::extension_host::{ExtensionRegistry, InvokeError};
 
 const CATCH_UP_FENCE_TOOL: &str = "_tower_catch_up_fence";
+
+fn public_extension_tool_name(extension: &str, tool: &str) -> String {
+    if extension == "semantic_context" && tool.starts_with("semantic_") {
+        format!("tower_{tool}")
+    } else {
+        format!("tower_{extension}_{tool}")
+    }
+}
 
 // ── ExtensionMergedRegistry ───────────────────────────────────────────────────
 
@@ -115,6 +124,10 @@ fn remaining_preparation_budget(budget: Option<Duration>, elapsed: Duration) -> 
 }
 
 impl ToolRegistry for ReadinessAwareRegistry {
+    fn tool_list_changes(&self) -> Vec<tokio::sync::watch::Receiver<()>> {
+        vec![self.context.readiness().subscribe_changes()]
+    }
+
     fn list(&self) -> Vec<ToolDesc> {
         let Some(prepared) = self.context.prepared_if_available() else {
             return NativeToolRegistry::descriptions();
@@ -165,7 +178,7 @@ impl ToolRegistry for ReadinessAwareRegistry {
                         .iter()
                         .any(|(id, tool)| {
                             tool.name != CATCH_UP_FENCE_TOOL
-                                && format!("tower_{}_{}", id.as_str(), tool.name) == name
+                                && public_extension_tool_name(id.as_str(), &tool.name) == name
                         })
                 });
             if !known {
@@ -305,6 +318,14 @@ impl ExtensionMergedRegistry {
 }
 
 impl ToolRegistry for ExtensionMergedRegistry {
+    fn tool_list_changes(&self) -> Vec<tokio::sync::watch::Receiver<()>> {
+        self.readiness
+            .as_ref()
+            .map(|gate| gate.controller.subscribe_changes())
+            .into_iter()
+            .collect()
+    }
+
     /// Return all tools: native `tower_*` tools plus namespaced extension tools.
     ///
     /// Called once per `tools/list` request; no caching. Adding or removing
@@ -331,7 +352,7 @@ impl ToolRegistry for ExtensionMergedRegistry {
             {
                 continue;
             }
-            let namespaced_name = format!("tower_{}_{}", ext_id.as_str(), tool_decl.name);
+            let namespaced_name = public_extension_tool_name(ext_id.as_str(), &tool_decl.name);
             let input_schema = serde_json::from_str::<JsonValue>(&tool_decl.schema_json)
                 .unwrap_or_else(|_| serde_json::json!({}));
             tools.push(ToolDesc {
@@ -391,7 +412,7 @@ impl ToolRegistry for ExtensionMergedRegistry {
             if tool_decl.name == CATCH_UP_FENCE_TOOL {
                 continue;
             }
-            if format!("tower_{}_{}", ext_id.as_str(), tool_decl.name) == name {
+            if public_extension_tool_name(ext_id.as_str(), &tool_decl.name) == name {
                 let _permit = if let Some(gate) = &self.readiness {
                     let dependencies = if gate
                         .dependency_policy
@@ -480,6 +501,121 @@ fn invoke_error_to_tool_error_for_extension(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn mcp_notifies_when_semantic_tools_become_ready() {
+        use crate::adapters::mcp::{
+            diagnostics::NoOpDiagnosticsReader, lsp_tools::SubscriptionRegistry,
+            rmcp_server::TowerMcpHandler,
+        };
+        use rmcp::{ClientHandler, ServiceExt};
+
+        struct Client(tokio::sync::mpsc::UnboundedSender<()>);
+        impl ClientHandler for Client {
+            async fn on_tool_list_changed(
+                &self,
+                _: rmcp::service::NotificationContext<rmcp::RoleClient>,
+            ) {
+                let _ = self.0.send(());
+            }
+        }
+
+        for ready_before_initialize in [false, true] {
+            let (registry, readiness, _) = readiness_registry(
+                "semantic_context",
+                vec![make_tool("semantic_search")],
+                CapabilityDependency::SemanticContext,
+                &[],
+                None,
+            );
+            let handler = TowerMcpHandler::new(
+                crate::adapters::mcp::chain_registry::ChainRegistry::new(vec![Box::new(registry)]),
+                Arc::new(NoOpDiagnosticsReader),
+                Arc::new(Mutex::new(SubscriptionRegistry::new())),
+                vec![],
+            );
+            let extension = crate::domain::extension_host::ExtensionId::new("semantic_context");
+            if ready_before_initialize {
+                readiness
+                    .transition_extension(&extension, CapabilityReadiness::Ready)
+                    .unwrap();
+            }
+            let (server_io, client_io) = tokio::io::duplex(65_536);
+            let server_task = tokio::spawn(async move {
+                let server = handler.serve(server_io).await.unwrap();
+                server.waiting().await.unwrap();
+            });
+            let (tx, mut notifications) = tokio::sync::mpsc::unbounded_channel();
+            let client = Client(tx).serve(client_io).await.unwrap();
+            assert_eq!(
+                client
+                    .peer_info()
+                    .unwrap()
+                    .capabilities
+                    .tools
+                    .as_ref()
+                    .unwrap()
+                    .list_changed,
+                Some(true),
+            );
+            if !ready_before_initialize {
+                let initial = client.list_tools(None).await.unwrap();
+                assert!(
+                    !initial
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "tower_semantic_search")
+                );
+                readiness
+                    .transition_extension(&extension, CapabilityReadiness::Ready)
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+                .await
+                .expect("client must learn the tool inventory changed")
+                .unwrap();
+            let tools = client.list_tools(None).await.unwrap();
+            assert!(
+                tools
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "tower_semantic_search")
+            );
+            // An unrelated lifecycle change must not repeat the notification.
+            readiness
+                .transition_capability(CapabilityDependency::Workspace, CapabilityReadiness::Ready)
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), notifications.recv())
+                    .await
+                    .is_err()
+            );
+            // A failure hides the tool again and must refresh the client too.
+            readiness
+                .transition_extension(
+                    &extension,
+                    CapabilityReadiness::Failed {
+                        failure_class: StartupFailureClass::ExtensionProtocol,
+                    },
+                )
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+                .await
+                .expect("tool removal must notify the client")
+                .unwrap();
+            assert!(
+                !client
+                    .list_tools(None)
+                    .await
+                    .unwrap()
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "tower_semantic_search")
+            );
+            client.cancel().await.unwrap();
+            server_task.await.unwrap();
+        }
+    }
+
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -497,11 +633,14 @@ mod tests {
         CapabilityDependency, CapabilityReadiness, DaemonLifecycle, ExtensionDependencyPolicy,
         ReadinessController, StartupFailureClass,
     };
+    use crate::adapters::extension::host_deps::{FsAdapter, HostDeps, UnsupportedApplyEditsHost};
+    use crate::adapters::extension::sidecar::SidecarHostAdapter;
+    use crate::adapters::formatter::NoOpFormatQueue;
     use crate::adapters::mcp::native_tools::{
         EXPECTED_NATIVE_TOOL_NAMES, EngineState, NativeToolRegistry,
     };
     use crate::adapters::mcp::registry::ToolRegistry;
-    use crate::adapters::{InMemoryFs, InMemoryStorage};
+    use crate::adapters::{InMemoryAstIndex, InMemoryFs, InMemoryStorage};
     use crate::domain::extension_host::{
         ExtensionApplicationError, ExtensionCallError, ExtensionRegistry, InvokeError,
     };
@@ -674,6 +813,30 @@ mod tests {
 
     fn empty_ext_registry() -> Arc<RwLock<ExtensionRegistry>> {
         Arc::new(RwLock::new(ExtensionRegistry::new()))
+    }
+
+    struct CountingHostCallFs(Arc<AtomicUsize>);
+
+    impl FsAdapter for CountingHostCallFs {
+        fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("unexpected HostCall filesystem access".to_owned())
+        }
+
+        fn list_files(&self) -> Vec<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    fn host_call_deps(calls: Arc<AtomicUsize>) -> HostDeps {
+        HostDeps {
+            fs: Arc::new(CountingHostCallFs(calls)),
+            ast_index: Arc::new(InMemoryAstIndex::new()),
+            format_queue: Arc::new(NoOpFormatQueue),
+            apply_edits: Arc::new(UnsupportedApplyEditsHost),
+            push_tx: None,
+        }
     }
 
     fn merged_with_echo_extension(ext_name: &str, tool_name: &str) -> ExtensionMergedRegistry {
@@ -1304,6 +1467,135 @@ mod tests {
             json!({"dependency":"ast","phase":"ownership_acquired","wait_expired":true}),
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn semantic_context_tools_preserve_manifest_schemas_when_merged() {
+        let manifest: ExtensionManifest = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../extensions/semantic_context/extension.toml"
+        )))
+        .expect("parse shipped semantic manifest");
+        let public_tools: Vec<_> = manifest
+            .tools
+            .iter()
+            .filter(|tool| tool.name != CATCH_UP_FENCE_TOOL)
+            .cloned()
+            .collect();
+        let extension_host = empty_ext_registry();
+        extension_host
+            .write()
+            .unwrap()
+            .register(Box::new(TestExtension::echo(
+                "semantic_context",
+                manifest.tools.clone(),
+            )))
+            .expect("register semantic manifest");
+        let merged = ExtensionMergedRegistry::new(empty_engine_state(), extension_host);
+        let semantic: Vec<_> = merged
+            .list()
+            .into_iter()
+            .filter(|tool| tool.name.starts_with("tower_semantic_"))
+            .collect();
+        let expected_public_names = [
+            "tower_semantic_reindex",
+            "tower_semantic_search",
+            "tower_semantic_related_files",
+            "tower_semantic_context_for_task",
+        ];
+
+        let host_call_dependencies = Arc::new(AtomicUsize::new(0));
+        let deps = host_call_deps(Arc::clone(&host_call_dependencies));
+        for public_name in expected_public_names {
+            let response: JsonValue =
+                serde_json::from_str(&SidecarHostAdapter::dispatch_capability_call(
+                    public_name,
+                    json!(17),
+                    json!({}),
+                    &deps,
+                    &[],
+                ))
+                .expect("HostCall response is JSON-RPC");
+            assert_eq!(response["error"]["code"], -32601);
+            assert_eq!(
+                response["error"]["message"],
+                format!("unknown host capability method: {public_name}"),
+                "public MCP tool must not be a HostCall capability"
+            );
+        }
+        assert_eq!(
+            host_call_dependencies.load(Ordering::SeqCst),
+            0,
+            "rejected public MCP tool names must not invoke HostCall dependencies"
+        );
+
+        assert_eq!(
+            semantic
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_public_names
+        );
+        for (actual, declared) in semantic.iter().zip(public_tools) {
+            assert_eq!(actual.description, declared.description);
+            assert_eq!(
+                actual.input_schema,
+                serde_json::from_str::<JsonValue>(&declared.schema_json)
+                    .expect("semantic schema is valid JSON")
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_context_tools_are_admitted_only_after_readiness() {
+        let tools = vec![
+            make_tool("semantic_reindex"),
+            make_tool("semantic_search"),
+            make_tool("semantic_related_files"),
+            make_tool("semantic_context_for_task"),
+        ];
+        let (mut registry, readiness, calls) = readiness_registry(
+            "semantic_context",
+            tools,
+            CapabilityDependency::SemanticContext,
+            &[],
+            Some(Duration::ZERO),
+        );
+        let name = "tower_semantic_search";
+
+        assert!(!registry.list().iter().any(|tool| tool.name == name));
+        assert_application_error(
+            registry
+                .call(
+                    name,
+                    json!({"query":"ownership","limit":3}),
+                    &crate::domain::NeverCancelled,
+                )
+                .expect_err("preparing semantic tool is not admitted"),
+            -32_004,
+            "capability initialization is still in progress",
+            json!({"dependency":"semantic_context","phase":"ownership_acquired","wait_expired":true}),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        readiness
+            .transition_extension(
+                &crate::domain::extension_host::ExtensionId::new("semantic_context"),
+                CapabilityReadiness::Ready,
+            )
+            .expect("semantic catch-up completed");
+        assert!(registry.list().iter().any(|tool| tool.name == name));
+        assert_eq!(
+            registry
+                .call(
+                    name,
+                    json!({"query":"ownership","limit":3}),
+                    &crate::domain::NeverCancelled
+                )
+                .expect("ready semantic tool is admitted"),
+            json!({"tool":"semantic_search","params":{"query":"ownership","limit":3}})
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
