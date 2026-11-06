@@ -1992,6 +1992,56 @@ to an in-process sandbox; they are now out-of-process native sidecars — see
 
 ---
 
+## Agent memory extension tools
+
+The first-party `agent_memory` sidecar contributes seven tools. Install it with the other extensions
+to expose them through `tools/list`. Storage is project scoped and host owned under
+`.tower/agent_memory/`; baseline lexical search works without a provider. See the
+[agent memory guide](user-guide/agent-memory.md) for a compact-search-then-batched-get workflow.
+
+| Tool                            | Required arguments                           | Optional arguments | Successful payload                               |
+| ------------------------------- | -------------------------------------------- | ------------------ | ------------------------------------------------ |
+| `tower_memory_remember`         | `record`, `idempotency_key`                  | none               | `id`, `revision`                                 |
+| `tower_memory_update`           | `items` of `{id, expected_revision, record}` | none               | ordered item outcomes                            |
+| `tower_memory_forget`           | `items` of `{id, expected_revision}`         | none               | ordered item outcomes                            |
+| `tower_memory_get`              | `ids`                                        | none               | ordered item outcomes with full records          |
+| `tower_memory_search`           | `query`                                      | `filters`, `page`  | compact `hits`, `next_cursor`                    |
+| `tower_memory_timeline`         | `anchor`                                     | `filters`, `page`  | compact `events`, `next_cursor`                  |
+| `tower_memory_context_for_task` | `query`                                      | `filters`, `page`  | compact `hits`, `applied_filters`, `next_cursor` |
+
+`record` requires `record_type`, `title`, `body`, and `provenance`; optional `confidence` is a
+finite number from 0 to 1. Types are `observation`, `decision`, `bugfix`, `review_rule`,
+`task_note`, and `session_summary`. Provenance accepts `branch`, `paths`, `symbols`, `tags`,
+`source_agent`, `source_client`, `commit`, `pull_request`, and `issue`. Paths are normalized
+workspace-relative paths. IDs and revisions are opaque; update and forget use optimistic
+`expected_revision` checks. Get preserves requested order, including repeated IDs; batch mutations
+report independent per-item outcomes.
+
+`filters` supports `record_types`, `branches`, `paths`, `symbols`, `tags`, `source_agent`,
+`source_client`, `created_from` (inclusive), and `created_to` (exclusive). Within one array, values
+are ORed; filter fields are ANDed. `page` accepts `limit`, `response_bytes`, and `cursor`. Defaults
+are 20 results and 32,768 response bytes; maxima are 100 results and 131,072 bytes, configurable
+under `[agent_memory.limits]`. Hits include `id`, `revision`, `record_type`, `title`, `paths`,
+`timestamp`, `score`, `reasons`, and `truncated_fields`; they never include bodies. Use get for full
+records. A cursor is bound to the request and store generation; `cursor_expired` requires a fresh
+query.
+
+Timeline `anchor` is exactly one of `{kind:"record",id,before,after}`,
+`{kind:"query",query}`, or `{kind:"window",from,to}`. Record counts are required and bounded by
+`max_results`; window endpoints are RFC3339 UTC, inclusive at `from` and exclusive at `to`.
+Events are ordered by creation time then ID.
+
+Every payload includes `code`, `persistence_mode` (`durable`, `read_only`, or `in_memory`), and
+`durable_data_unavailable`. Mutations also include `durable`; it is true only after durable
+acknowledgement. Expected outcomes use tool payload codes, including `not_found`,
+`revision_conflict`, `idempotency_conflict`, `read_only`, `storage_unavailable`,
+`commit_outcome_unknown`, `privacy_rejected`, `cursor_expired`, and
+`response_budget_too_small`. Malformed shape, unknown fields, or invalid bounds return JSON-RPC
+`InvalidParams` (`-32602`). Privacy rejection never returns matched sensitive text. A forgotten
+record is logically deleted; this does not erase external backups or provider-held data.
+
+---
+
 ## Semantic context extension tools
 
 The first-party `semantic_context` sidecar contributes four public tools. Their `tower_semantic_*`

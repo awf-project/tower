@@ -501,7 +501,8 @@ impl SemanticMcpHarness {
             }
             assert!(
                 Instant::now() < deadline,
-                "semantic tools not published: {response}"
+                "semantic tools not published: {response}\ndaemon stderr: {}",
+                self.stderr()
             );
             thread::yield_now();
         }
@@ -570,7 +571,9 @@ impl SemanticMcpHarness {
     }
 
     pub fn advance_clock_ms(&self, offset_ms: u64) {
-        fs::write(&self.clock_path, offset_ms.to_string()).unwrap();
+        let staged = self.clock_path.with_extension("tmp");
+        fs::write(&staged, offset_ms.to_string()).unwrap();
+        fs::rename(staged, &self.clock_path).unwrap();
     }
 
     pub fn stderr(&self) -> String {

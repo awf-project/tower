@@ -126,6 +126,8 @@ fn make_deps_with_recording(fq: RecordingFormatQueue) -> HostDeps {
         format_queue: Arc::new(fq),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -136,6 +138,8 @@ fn make_deps_with_fs_and_recording(fs: InMemoryFs, fq: RecordingFormatQueue) -> 
         format_queue: Arc::new(fq),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -146,6 +150,8 @@ fn make_deps() -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 

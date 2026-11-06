@@ -18,6 +18,7 @@ use extension_protocol::ExtensionFault;
 
 use super::catch_up::{CatchUpError, CatchUpFailure};
 use crate::adapters::SledStorageAdapter;
+use crate::adapters::agent_memory_storage::{InMemoryAgentMemoryStorage, SledAgentMemoryStorage};
 use crate::adapters::ast_index::{
     XdgAstIndexAdapter, compute_workspace_key, global_ast_workspace_dir, workspace_ast_dir,
 };
@@ -25,7 +26,11 @@ use crate::adapters::cli::{GlobalOpts, resolve_extensions_dir_arg, resolve_works
 use crate::adapters::config::lsp::{
     lsp_initialize_payload_with_diagnostics_timeout, validate_lsp_commands,
 };
-use crate::adapters::config::{QueryableProjects, ShellConfig, TowerConfig};
+use crate::adapters::config::{
+    AgentMemoryConfig, AgentMemoryConfigurationReason, AgentMemoryInitConfig,
+    AgentMemoryPersistenceMode, AgentMemoryStartupPolicy, ConfigError, QueryableProjects,
+    ShellConfig, TowerConfig,
+};
 use crate::adapters::daemon::instrumentation::StartupInstrumentation;
 use crate::adapters::daemon::lifecycle::{
     CapabilityDependency, CapabilityReadiness, DaemonLifecycle, ReadinessController,
@@ -63,12 +68,213 @@ use crate::ports::PortError;
 use crate::ports::inbound::{
     FileMutationUseCase, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult,
 };
-use crate::ports::{AstIndexPort, ExtensionHostPort, NoOpDocumentSync};
+use crate::ports::{
+    AgentMemoryGetRequest, AgentMemoryGetResult, AgentMemoryNamespace, AgentMemoryScanRequest,
+    AgentMemoryScanResult, AgentMemoryStorageBounds, AgentMemoryStorageError,
+    AgentMemoryStoragePort, AgentMemoryTransactionOutcome, AgentMemoryTransactionRequest,
+    AstIndexPort, ExtensionHostPort, NoOpDocumentSync,
+};
 use extension_protocol::ExtensionManifest;
 
 type SharedFormatQueue = Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>;
 type FormatterEchoSet = Arc<Mutex<HashMap<String, ()>>>;
 const BUNDLED_DEBUG_MANIFEST: &str = include_str!("../../../../../extensions/debug/extension.toml");
+
+pub fn host_memory_configuration(
+    workspace_root: &Path,
+    config: &AgentMemoryConfig,
+) -> Result<(Arc<dyn AgentMemoryStoragePort>, AgentMemoryInitConfig), ConfigError> {
+    let incompatible_startup = || ConfigError::InvalidAgentMemoryConfiguration {
+        field: "agent_memory.storage.startup_policy",
+        reason: AgentMemoryConfigurationReason::IncompatibleStartupPolicy,
+    };
+    let bounds = AgentMemoryStorageBounds::try_new(
+        config.limits.max_query_bytes as usize,
+        config.limits.max_body_bytes as usize,
+        config.limits.max_results,
+        config.limits.max_batch_items as usize,
+        config.limits.max_batch_items as usize,
+        config.limits.max_response_bytes as usize,
+        64,
+    )
+    .map_err(|_| incompatible_startup())?;
+    let project_key = compute_workspace_key(workspace_root);
+    let root = workspace_root.join(".tower/agent_memory");
+    let schema = root.join("schema");
+    let existing_schema = std::fs::read(&schema).ok();
+    let compatible = existing_schema.as_deref() == Some(b"1");
+    let new_store = !root.exists();
+
+    let durable = || -> Result<Arc<dyn AgentMemoryStoragePort>, ConfigError> {
+        if root.exists() && !compatible {
+            return Err(incompatible_startup());
+        }
+        let storage =
+            SledAgentMemoryStorage::open(&root, bounds).map_err(|_| incompatible_startup())?;
+        if new_store {
+            std::fs::write(&schema, b"1").map_err(|_| incompatible_startup())?;
+        }
+        Ok(Arc::new(storage))
+    };
+
+    let (storage, persistence_mode, durable_data_unavailable) = match config.storage.startup_policy
+    {
+        AgentMemoryStartupPolicy::Fail => (durable()?, AgentMemoryPersistenceMode::Durable, false),
+        AgentMemoryStartupPolicy::ReadOnly => {
+            if !compatible {
+                return Err(incompatible_startup());
+            }
+            (
+                Arc::new(ReadOnlyAgentMemoryStorage(durable()?)) as Arc<dyn AgentMemoryStoragePort>,
+                AgentMemoryPersistenceMode::ReadOnly,
+                false,
+            )
+        }
+        AgentMemoryStartupPolicy::InMemory => match durable() {
+            Ok(storage) => (storage, AgentMemoryPersistenceMode::Durable, false),
+            Err(_) => (
+                Arc::new(InMemoryAgentMemoryStorage::new(bounds))
+                    as Arc<dyn AgentMemoryStoragePort>,
+                AgentMemoryPersistenceMode::InMemory,
+                true,
+            ),
+        },
+    };
+    #[cfg(debug_assertions)]
+    let storage = crate::adapters::agent_memory_storage::ProcessStorageSpy::wrap(storage);
+    Ok((
+        storage,
+        AgentMemoryInitConfig {
+            project_key,
+            persistence_mode,
+            durable_data_unavailable,
+            limits: config.limits.clone(),
+            privacy: config.privacy.clone(),
+            provider: config.provider.clone(),
+        },
+    ))
+}
+
+pub(crate) fn install_agent_memory_init(
+    config: &mut TowerConfig,
+    init: &AgentMemoryInitConfig,
+) -> Result<(), String> {
+    let payload = serde_json::to_value(init)
+        .map_err(|_| "agent memory initialization configuration is invalid".to_owned())?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "agent memory initialization configuration is invalid".to_owned())?;
+    config
+        .extensions
+        .initialize
+        .insert("agent_memory".to_owned(), payload);
+    Ok(())
+}
+
+/// Host-owned resources selected once during agent-memory startup.
+///
+/// Storage errors are returned to the caller without changing the selected
+/// persistence mode. Provider work receives one absolute deadline for all
+/// attempts, so retries cannot refresh the configured budget.
+pub struct AgentMemoryRuntime {
+    storage: Arc<dyn AgentMemoryStoragePort>,
+    init: AgentMemoryInitConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentMemoryProviderStep<T, E> {
+    Complete(Result<T, E>),
+    Retry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentMemoryProviderOutcome<T, E> {
+    NotConfigured,
+    Complete(Result<T, E>),
+    TimedOut,
+}
+
+impl AgentMemoryRuntime {
+    pub(crate) fn new(
+        storage: Arc<dyn AgentMemoryStoragePort>,
+        init: AgentMemoryInitConfig,
+    ) -> Self {
+        Self { storage, init }
+    }
+
+    pub fn initialization(&self) -> &AgentMemoryInitConfig {
+        &self.init
+    }
+
+    fn storage(&self) -> Arc<dyn AgentMemoryStoragePort> {
+        Arc::clone(&self.storage)
+    }
+
+    pub fn get(
+        &self,
+        namespace: &AgentMemoryNamespace,
+        request: AgentMemoryGetRequest,
+    ) -> Result<AgentMemoryGetResult, AgentMemoryStorageError> {
+        self.storage.get(namespace, request)
+    }
+
+    pub fn run_provider_operation<T, E>(
+        &self,
+        mut operation: impl FnMut(Instant) -> AgentMemoryProviderStep<T, E>,
+    ) -> AgentMemoryProviderOutcome<T, E> {
+        self.run_provider_operation_with_clock(Instant::now, &mut operation)
+    }
+
+    pub(crate) fn run_provider_operation_with_clock<T, E>(
+        &self,
+        mut now: impl FnMut() -> Instant,
+        operation: &mut impl FnMut(Instant) -> AgentMemoryProviderStep<T, E>,
+    ) -> AgentMemoryProviderOutcome<T, E> {
+        let Some(provider) = &self.init.provider else {
+            return AgentMemoryProviderOutcome::NotConfigured;
+        };
+        let deadline = now() + Duration::from_millis(provider.timeout_ms);
+        loop {
+            if now() >= deadline {
+                return AgentMemoryProviderOutcome::TimedOut;
+            }
+            match operation(deadline) {
+                AgentMemoryProviderStep::Complete(result) => {
+                    return AgentMemoryProviderOutcome::Complete(result);
+                }
+                AgentMemoryProviderStep::Retry => {}
+            }
+        }
+    }
+}
+
+struct ReadOnlyAgentMemoryStorage(Arc<dyn AgentMemoryStoragePort>);
+
+impl AgentMemoryStoragePort for ReadOnlyAgentMemoryStorage {
+    fn get(
+        &self,
+        namespace: &AgentMemoryNamespace,
+        request: AgentMemoryGetRequest,
+    ) -> Result<AgentMemoryGetResult, AgentMemoryStorageError> {
+        self.0.get(namespace, request)
+    }
+
+    fn scan(
+        &self,
+        namespace: &AgentMemoryNamespace,
+        request: AgentMemoryScanRequest,
+    ) -> Result<AgentMemoryScanResult, AgentMemoryStorageError> {
+        self.0.scan(namespace, request)
+    }
+
+    fn transact(
+        &self,
+        _namespace: &AgentMemoryNamespace,
+        _request: AgentMemoryTransactionRequest,
+    ) -> Result<AgentMemoryTransactionOutcome, AgentMemoryStorageError> {
+        Err(AgentMemoryStorageError::Unavailable)
+    }
+}
 #[derive(Debug)]
 pub enum PreparationError {
     Cancelled,
@@ -657,6 +863,10 @@ fn prepare_workspace_resources(
         .map_err(|_| PreparationError::Storage)?;
     let phase_started = Instant::now();
     let workspace_root = resolve_workspace_root(opts);
+    let (agent_memory_storage, agent_memory_init) =
+        host_memory_configuration(&workspace_root, &config.agent_memory)
+            .map_err(|_| PreparationError::Storage)?;
+    let agent_memory = AgentMemoryRuntime::new(agent_memory_storage, agent_memory_init);
     #[cfg(feature = "startup-test-hooks")]
     let startup_test_hooks = StartupTestHooks::for_workspace(&workspace_root);
     let storage_result = SledStorageAdapter::open_cancellable(
@@ -800,6 +1010,7 @@ fn prepare_workspace_resources(
         push_rx: None,
         diag_reader: Arc::new(NoOpDiagnosticsReader),
         rename_coordinator,
+        agent_memory,
         _watcher: watcher,
     };
     Ok(WorkspacePreparation {
@@ -811,7 +1022,7 @@ fn prepare_workspace_resources(
 
 fn run_workspace_preparation(
     opts: &GlobalOpts,
-    config: TowerConfig,
+    mut config: TowerConfig,
     readiness: &Arc<ReadinessController>,
     shared: &Arc<PreparationShared>,
     cancellation: &PreparationCancellation,
@@ -846,6 +1057,9 @@ fn run_workspace_preparation(
         instrumentation,
         Arc::clone(&publisher),
     )?;
+    install_agent_memory_init(&mut config, handle.agent_memory.initialization())
+        .map_err(|_| PreparationError::ExtensionDiscovery)?;
+    let agent_memory_storage = handle.agent_memory.storage();
     let workspace_root = resolve_workspace_root(opts);
     let state = Arc::clone(&handle.state);
     let ext_registry = Arc::clone(&handle.ext_registry);
@@ -878,6 +1092,7 @@ fn run_workspace_preparation(
         &ext_registry,
         ext_ast_index,
         format_queue,
+        agent_memory_storage,
         Some(&cancellation.cancelled),
     )
     .map_err(|_| PreparationError::ExtensionDiscovery)?;
@@ -1494,6 +1709,8 @@ pub struct EngineHandle {
     pub diag_reader: Arc<dyn DiagnosticsReader>,
     /// Shared ordering boundary for native renames and filesystem events.
     pub rename_coordinator: Arc<RenameCoordinator>,
+    /// Host-owned agent-memory storage and immutable startup mode.
+    pub agent_memory: AgentMemoryRuntime,
     /// Kept alive: dropping the watcher stops live sync.
     pub _watcher: NotifyWatcherAdapter,
 }
@@ -1692,6 +1909,7 @@ fn load_extension_registry(
     ext_registry: &Arc<RwLock<ExtensionRegistry>>,
     ext_ast_index: Arc<dyn AstIndexPort + Send + Sync>,
     format_queue: Arc<dyn crate::adapters::formatter::FormatQueuePort + Send + Sync>,
+    agent_memory_storage: Arc<dyn AgentMemoryStoragePort>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<mpsc::Receiver<PushEvent>, String> {
     let (push_tx, push_rx) = mpsc::channel::<PushEvent>();
@@ -1713,6 +1931,8 @@ fn load_extension_registry(
         format_queue: format_queue as Arc<dyn crate::adapters::formatter::FormatQueuePort>,
         apply_edits: Arc::new(EngineApplyEditsHost::new(Arc::clone(state))),
         push_tx: Some(push_tx),
+        agent_memory_storage: Some(agent_memory_storage),
+        agent_memory_namespace: None,
     };
 
     let init_configs = extension_init_configs(tower_config).map_err(|error| error.to_string())?;
@@ -2074,8 +2294,16 @@ fn replay_initial_index_to_extensions(
 ///
 /// The `tower_config` is passed in ready-to-use; callers are responsible for
 /// loading it via `config::load` before calling this function.
-pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<EngineHandle, String> {
+pub fn build_engine(
+    opts: &GlobalOpts,
+    mut tower_config: TowerConfig,
+) -> Result<EngineHandle, String> {
     let workspace_root = resolve_workspace_root(opts);
+    let (agent_memory_storage, agent_memory_init) =
+        host_memory_configuration(&workspace_root, &tower_config.agent_memory)
+            .map_err(|error| error.to_string())?;
+    let agent_memory = AgentMemoryRuntime::new(agent_memory_storage, agent_memory_init.clone());
+    install_agent_memory_init(&mut tower_config, &agent_memory_init)?;
     if tower_config.lsp_budget_required() {
         tower_config
             .extensions
@@ -2176,6 +2404,7 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         &ext_registry,
         ext_ast_index,
         format_queue,
+        agent_memory.storage(),
         None,
     )?;
     replay_initial_index_to_extensions(&state, &ext_registry)?;
@@ -2187,6 +2416,7 @@ pub fn build_engine(opts: &GlobalOpts, tower_config: TowerConfig) -> Result<Engi
         push_rx: Some(push_rx),
         diag_reader,
         rename_coordinator,
+        agent_memory,
         _watcher,
     })
 }
@@ -2255,6 +2485,8 @@ mod tests {
             format_queue: Arc::new(NoOpFormatQueue),
             apply_edits: Arc::new(UnsupportedApplyEditsHost),
             push_tx: None,
+            agent_memory_storage: None,
+            agent_memory_namespace: None,
         }
     }
 

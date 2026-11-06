@@ -2375,20 +2375,34 @@ async fn cold_start_initializes_before_extension_catch_up() {
         h.await.unwrap().expect("client joins starting daemon");
     }
 
-    let snap = core_engine::adapters::daemon::client::send_control_async(
-        &GlobalOpts {
-            workspace_dir: Some(dir.path().to_path_buf()),
-            extensions_dir: None,
-        },
-        ControlRequest::Status,
-    )
+    // Transport readiness precedes engine initialization and opening Sled.
+    // Observe workspace readiness before probing the daemon's database lock.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snap = core_engine::adapters::daemon::client::send_control_async(
+                &GlobalOpts {
+                    workspace_dir: Some(dir.path().to_path_buf()),
+                    extensions_dir: None,
+                },
+                ControlRequest::Status,
+            )
+            .await
+            .expect("status");
+            let ControlResponse::Status(snapshot) = snap else {
+                panic!("expected status snapshot");
+            };
+            assert!(snapshot.generation > 0);
+            match snapshot.workspace {
+                CapabilityReadiness::Ready => break,
+                CapabilityReadiness::Preparing { .. } => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                state => panic!("workspace preparation failed: {state:?}"),
+            }
+        }
+    })
     .await
-    .expect("status");
-    if let ControlResponse::Status(s) = snap {
-        assert!(s.generation > 0);
-    } else {
-        panic!("expected status snapshot");
-    }
+    .expect("workspace becomes ready before checking Sled ownership");
     assert!(
         sled::open(dir.path().join(".tower/db")).is_err(),
         "the running daemon must be the sole Sled opener"
@@ -3657,14 +3671,52 @@ async fn slow_extension_rejects_invalid_initialization_modes() {
             .expect("tools/list response"),
     )
     .expect("parse tools/list response");
-    assert!(
-        !tools["result"]["tools"]
+    assert!(tools["result"]["tools"].is_array(), "{tools}");
+    let discovery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        write_line(
+            &mut connection,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#,
+        )
+        .await
+        .expect("list contracts during discovery");
+        let discovered: Value = serde_json::from_str(
+            &read_line_capped(&mut connection, 1 << 20)
+                .await
+                .expect("read contracts")
+                .expect("contracts response"),
+        )
+        .expect("parse contracts");
+        if discovered["result"]["tools"]
             .as_array()
             .expect("tools array")
             .iter()
-            .any(|tool| { tool["name"] == "tower_slow_start_probe_catch_up" }),
-        "an extension rejected during manifest discovery cannot publish its control: {tools}"
-    );
+            .any(|tool| tool["name"] == "tower_slow_start_probe_catch_up")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < discovery_deadline,
+            "discovery did not publish failed extension contract: {discovered}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Discovery retains failed eager contracts so calls report the extension
+    // fault rather than silently turning a declared tool into an unknown tool.
+    write_line(
+        &mut connection,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tower_slow_start_probe_catch_up","arguments":{}}}"#,
+    )
+    .await
+    .expect("invoke rejected extension control");
+    let rejected: Value = serde_json::from_str(
+        &read_line_capped(&mut connection, 1 << 20)
+            .await
+            .expect("read rejected control")
+            .expect("rejected control response"),
+    )
+    .expect("parse rejected control response");
+    assert_eq!(rejected["result"]["isError"], true, "{rejected}");
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.path().to_path_buf()),
         extensions_dir: None,

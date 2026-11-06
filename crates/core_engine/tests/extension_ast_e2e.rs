@@ -410,6 +410,8 @@ fn make_deps(fs: InMemoryFs) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -429,6 +431,8 @@ fn make_deps_with_apply_edits(fs: Arc<Mutex<InMemoryFs>>) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(InMemoryApplyEditsHost { fs }),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 
@@ -473,6 +477,8 @@ fn safe_delete_planner(
             calls: apply_calls.clone(),
         }),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
     let mut adapter =
         SidecarHostAdapter::spawn(ast_manifest(&ast_extension_bin()), deps, TEST_TIMEOUT, None)
@@ -682,6 +688,8 @@ fn make_deps_with_index(fs: InMemoryFs, index: InMemoryAstIndex) -> HostDeps {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     }
 }
 

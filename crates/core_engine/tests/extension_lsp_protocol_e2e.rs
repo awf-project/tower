@@ -92,6 +92,8 @@ fn spawn_initialized_lsp(mut manifest: ExtensionManifest) -> Box<dyn ExtensionIn
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: None,
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
 
     SidecarHostAdapter::spawn(
@@ -259,6 +261,8 @@ fn spec27_notify_resource_updated_reaches_push_channel() {
         format_queue: Arc::new(NoOpFormatQueue),
         apply_edits: Arc::new(UnsupportedApplyEditsHost),
         push_tx: Some(tx),
+        agent_memory_storage: None,
+        agent_memory_namespace: None,
     };
 
     // Manually build the JSON-RPC request frame the extension would send.

@@ -59,6 +59,13 @@ is the kernel extension point.
 
 ## The golden rule
 
+The `agent_memory` sidecar owns record validation, privacy, and retrieval rules. Physical storage
+stays in the host behind a dedicated `AgentMemoryStoragePort`, separate from the VFS `StoragePort`.
+The host derives a project-and-extension-private namespace and gates storage HostCalls to the
+trusted first-party sidecar. The durable adapter commits canonical records and baseline lexical
+projections atomically under `.tower/agent_memory/`; the in-memory adapter follows the same port
+contract. See [ADR 0011](ADR/0011-host-owned-agent-memory-storage.md) for the storage decision.
+
 The `domain/` module contains `#![forbid(unsafe_code)]` and imports **zero** infrastructure
 crates. There is no `sled`, `std::process`, `notify`, or `std::fs` anywhere under `domain/`.
 Domain services receive port trait objects through their constructors and talk exclusively

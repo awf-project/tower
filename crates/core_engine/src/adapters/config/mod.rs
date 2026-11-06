@@ -8,6 +8,9 @@
 //! Absent file → `TowerConfig::default()` (silent). Present but unreadable or
 //! invalid (bad TOML / unknown key) → `Err` → the binary fails fast (exit 1).
 
+#[cfg(test)]
+#[path = "tests.rs"]
+mod agent_memory_tests;
 pub mod debug;
 pub mod lint;
 pub mod lsp;
@@ -53,6 +56,172 @@ pub enum SemanticContextConfigurationReason {
     SymlinkEscape,
     InvalidEndpoint,
     InvalidEnvironmentVariable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMemoryConfigurationReason {
+    Zero,
+    OutOfRange,
+    InconsistentBounds,
+    InvalidPrivacyRule,
+    InvalidProviderTimeout,
+    IncompatibleStartupPolicy,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryConfig {
+    #[serde(default)]
+    pub storage: AgentMemoryStorageConfig,
+    #[serde(default)]
+    pub limits: AgentMemoryLimitsConfig,
+    #[serde(default)]
+    pub privacy: AgentMemoryPrivacyConfig,
+    #[serde(default)]
+    pub provider: Option<AgentMemoryProviderConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryStorageConfig {
+    #[serde(default)]
+    pub startup_policy: AgentMemoryStartupPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMemoryStartupPolicy {
+    #[default]
+    Fail,
+    ReadOnly,
+    InMemory,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryLimitsConfig {
+    #[serde(default = "agent_memory_default_max_title_bytes")]
+    pub max_title_bytes: u32,
+    #[serde(default = "agent_memory_default_max_body_bytes")]
+    pub max_body_bytes: u32,
+    #[serde(default = "agent_memory_default_max_metadata_items")]
+    pub max_metadata_items: u32,
+    #[serde(default = "agent_memory_default_max_metadata_string_bytes")]
+    pub max_metadata_string_bytes: u32,
+    #[serde(default = "agent_memory_default_max_batch_items")]
+    pub max_batch_items: u32,
+    #[serde(default = "agent_memory_default_results")]
+    pub default_results: u32,
+    #[serde(default = "agent_memory_default_max_results")]
+    pub max_results: u32,
+    #[serde(default = "agent_memory_default_response_bytes")]
+    pub default_response_bytes: u32,
+    #[serde(default = "agent_memory_default_max_response_bytes")]
+    pub max_response_bytes: u32,
+    #[serde(default = "agent_memory_default_max_query_bytes")]
+    pub max_query_bytes: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryPrivacyConfig {
+    #[serde(default)]
+    pub rules: Vec<AgentMemoryPrivacyRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryPrivacyRuleConfig {
+    pub id: String,
+    pub pattern: String,
+    pub action: AgentMemoryPrivacyAction,
+    #[serde(default)]
+    pub replacement: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMemoryPrivacyAction {
+    Reject,
+    Redact,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryProviderConfig {
+    pub name: String,
+    #[serde(default = "agent_memory_default_provider_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMemoryPersistenceMode {
+    Durable,
+    ReadOnly,
+    InMemory,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentMemoryInitConfig {
+    pub project_key: String,
+    pub persistence_mode: AgentMemoryPersistenceMode,
+    pub durable_data_unavailable: bool,
+    pub limits: AgentMemoryLimitsConfig,
+    pub privacy: AgentMemoryPrivacyConfig,
+    pub provider: Option<AgentMemoryProviderConfig>,
+}
+
+impl Default for AgentMemoryLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_title_bytes: agent_memory_default_max_title_bytes(),
+            max_body_bytes: agent_memory_default_max_body_bytes(),
+            max_metadata_items: agent_memory_default_max_metadata_items(),
+            max_metadata_string_bytes: agent_memory_default_max_metadata_string_bytes(),
+            max_batch_items: agent_memory_default_max_batch_items(),
+            default_results: agent_memory_default_results(),
+            max_results: agent_memory_default_max_results(),
+            default_response_bytes: agent_memory_default_response_bytes(),
+            max_response_bytes: agent_memory_default_max_response_bytes(),
+            max_query_bytes: agent_memory_default_max_query_bytes(),
+        }
+    }
+}
+
+const fn agent_memory_default_max_title_bytes() -> u32 {
+    1_024
+}
+const fn agent_memory_default_max_body_bytes() -> u32 {
+    65_536
+}
+const fn agent_memory_default_max_metadata_items() -> u32 {
+    100
+}
+const fn agent_memory_default_max_metadata_string_bytes() -> u32 {
+    1_024
+}
+const fn agent_memory_default_max_batch_items() -> u32 {
+    100
+}
+const fn agent_memory_default_results() -> u32 {
+    20
+}
+const fn agent_memory_default_max_results() -> u32 {
+    100
+}
+const fn agent_memory_default_response_bytes() -> u32 {
+    32_768
+}
+const fn agent_memory_default_max_response_bytes() -> u32 {
+    131_072
+}
+const fn agent_memory_default_max_query_bytes() -> u32 {
+    4_096
+}
+const fn agent_memory_default_provider_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -405,6 +574,7 @@ pub struct TowerConfig {
     pub lint: LintConfig,
     pub debug: DebugConfig,
     pub semantic_context: SemanticContextConfig,
+    pub agent_memory: AgentMemoryConfig,
     /// `[extensions]` section — sidecar extension runtime settings (spec 24).
     ///
     /// Absent → `ExtensionConfig::default()` (no request timeout).
@@ -432,6 +602,8 @@ struct RawTowerConfig {
     #[serde(default)]
     semantic_context: SemanticContextConfig,
     #[serde(default)]
+    agent_memory: AgentMemoryConfig,
+    #[serde(default)]
     extensions: ExtensionConfig,
     #[serde(default)]
     daemon: DaemonConfig,
@@ -457,6 +629,7 @@ impl<'de> Deserialize<'de> for TowerConfig {
             lint: raw.lint,
             debug: raw.debug,
             semantic_context: raw.semantic_context,
+            agent_memory: raw.agent_memory,
             extensions: raw.extensions,
             daemon: raw.daemon,
             projects: ProjectsConfig::default(),
@@ -716,6 +889,10 @@ pub enum ConfigError {
         field: &'static str,
         reason: SemanticContextConfigurationReason,
     },
+    InvalidAgentMemoryConfiguration {
+        field: &'static str,
+        reason: AgentMemoryConfigurationReason,
+    },
     LegacySection {
         path: PathBuf,
         section: &'static str,
@@ -792,6 +969,9 @@ impl std::fmt::Display for ConfigError {
                     f,
                     "invalid semantic context configuration {field}: {reason:?}"
                 )
+            }
+            ConfigError::InvalidAgentMemoryConfiguration { field, reason } => {
+                write!(f, "invalid agent memory configuration {field}: {reason:?}")
             }
             ConfigError::LegacySection {
                 path,
@@ -875,6 +1055,16 @@ fn load_with_path_canonicalizer(
         Err(source) => return Err(ConfigError::Io { path, source }),
     };
 
+    // TOML has no null value, but this field has a stricter public error
+    // contract than a generic syntax failure. Classify the assignment before
+    // parsing while accepting TOML-equivalent quoted keys and comments.
+    if agent_memory_provider_timeout_is_null(&contents) {
+        return Err(invalid_agent_memory(
+            "agent_memory.provider.timeout_ms",
+            AgentMemoryConfigurationReason::InvalidProviderTimeout,
+        ));
+    }
+
     let raw: toml::Value = toml::from_str(&contents).map_err(|source| {
         shell_parse_error(&contents, &source).unwrap_or_else(|| ConfigError::Parse {
             path: path.clone(),
@@ -938,6 +1128,7 @@ fn load_with_path_canonicalizer(
         })?;
     validate_daemon_deadlines(&config.daemon)?;
     validate_extension_configuration(&config.extensions)?;
+    validate_agent_memory_configuration(&config.agent_memory)?;
     validate_semantic_context_configuration(
         &config.semantic_context,
         workspace_root,
@@ -949,6 +1140,161 @@ fn load_with_path_canonicalizer(
         config.extensions.lsp_diagnostics_timeout()?;
     }
     Ok(config)
+}
+
+fn agent_memory_provider_timeout_is_null(contents: &str) -> bool {
+    let mut in_provider = false;
+    for line in contents.lines() {
+        let statement = line.split('#').next().unwrap_or_default().trim();
+        if statement.starts_with('[') {
+            in_provider = statement == "[agent_memory.provider]";
+            continue;
+        }
+        if !in_provider {
+            continue;
+        }
+        let Some((key, value)) = statement.split_once('=') else {
+            continue;
+        };
+        let key = key
+            .trim()
+            .trim_matches(|character| character == '"' || character == '\'');
+        if key == "timeout_ms" && value.trim() == "null" {
+            return true;
+        }
+    }
+    false
+}
+
+fn invalid_agent_memory(
+    field: &'static str,
+    reason: AgentMemoryConfigurationReason,
+) -> ConfigError {
+    ConfigError::InvalidAgentMemoryConfiguration { field, reason }
+}
+
+fn validate_agent_memory_configuration(config: &AgentMemoryConfig) -> Result<(), ConfigError> {
+    const MAX_LIMIT: u32 = 16_777_216;
+    let limits = &config.limits;
+    for (field, value) in [
+        (
+            "agent_memory.limits.max_title_bytes",
+            limits.max_title_bytes,
+        ),
+        ("agent_memory.limits.max_body_bytes", limits.max_body_bytes),
+        (
+            "agent_memory.limits.max_metadata_items",
+            limits.max_metadata_items,
+        ),
+        (
+            "agent_memory.limits.max_metadata_string_bytes",
+            limits.max_metadata_string_bytes,
+        ),
+        (
+            "agent_memory.limits.max_batch_items",
+            limits.max_batch_items,
+        ),
+        (
+            "agent_memory.limits.default_results",
+            limits.default_results,
+        ),
+        ("agent_memory.limits.max_results", limits.max_results),
+        (
+            "agent_memory.limits.default_response_bytes",
+            limits.default_response_bytes,
+        ),
+        (
+            "agent_memory.limits.max_response_bytes",
+            limits.max_response_bytes,
+        ),
+        (
+            "agent_memory.limits.max_query_bytes",
+            limits.max_query_bytes,
+        ),
+    ] {
+        if value == 0 {
+            return Err(invalid_agent_memory(
+                field,
+                AgentMemoryConfigurationReason::Zero,
+            ));
+        }
+        if value > MAX_LIMIT {
+            return Err(invalid_agent_memory(
+                field,
+                AgentMemoryConfigurationReason::OutOfRange,
+            ));
+        }
+    }
+    if limits.default_results > limits.max_results {
+        return Err(invalid_agent_memory(
+            "agent_memory.limits.default_results",
+            AgentMemoryConfigurationReason::InconsistentBounds,
+        ));
+    }
+    if limits.max_results > limits.max_batch_items {
+        return Err(invalid_agent_memory(
+            "agent_memory.limits.max_results",
+            AgentMemoryConfigurationReason::InconsistentBounds,
+        ));
+    }
+    if limits.default_response_bytes > limits.max_response_bytes {
+        return Err(invalid_agent_memory(
+            "agent_memory.limits.default_response_bytes",
+            AgentMemoryConfigurationReason::InconsistentBounds,
+        ));
+    }
+
+    let mut rule_ids = std::collections::HashSet::new();
+    for (index, rule) in config.privacy.rules.iter().enumerate() {
+        let id_field = match index {
+            0 => "agent_memory.privacy.rules[0].id",
+            1 => "agent_memory.privacy.rules[1].id",
+            _ => "agent_memory.privacy.rules[].id",
+        };
+        if rule.id.is_empty() || rule.id.len() > 128 || !rule_ids.insert(rule.id.as_str()) {
+            return Err(invalid_agent_memory(
+                id_field,
+                AgentMemoryConfigurationReason::InvalidPrivacyRule,
+            ));
+        }
+        if regex::Regex::new(&rule.pattern).is_err() {
+            return Err(invalid_agent_memory(
+                match index {
+                    0 => "agent_memory.privacy.rules[0].pattern",
+                    _ => "agent_memory.privacy.rules[].pattern",
+                },
+                AgentMemoryConfigurationReason::InvalidPrivacyRule,
+            ));
+        }
+        let replacement_valid = match rule.action {
+            AgentMemoryPrivacyAction::Reject => rule.replacement.is_none(),
+            AgentMemoryPrivacyAction::Redact => rule.replacement.is_some(),
+        };
+        if !replacement_valid {
+            return Err(invalid_agent_memory(
+                match index {
+                    0 => "agent_memory.privacy.rules[0].replacement",
+                    _ => "agent_memory.privacy.rules[].replacement",
+                },
+                AgentMemoryConfigurationReason::InvalidPrivacyRule,
+            ));
+        }
+    }
+    if let Some(provider) = &config.provider {
+        if provider.name.is_empty() || provider.name.len() > 128 {
+            return Err(invalid_agent_memory(
+                "agent_memory.provider.name",
+                AgentMemoryConfigurationReason::InvalidProviderTimeout,
+            ));
+        }
+        if !(1..=86_400_000).contains(&provider.timeout_ms) {
+            return Err(invalid_agent_memory(
+                "agent_memory.provider.timeout_ms",
+                AgentMemoryConfigurationReason::InvalidProviderTimeout,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_semantic(

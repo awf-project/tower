@@ -119,6 +119,8 @@ enum RespawnState {
 ///     format_queue: Arc::new(NoOpFormatQueue),
 ///     apply_edits: Arc::new(core_engine::adapters::extension::host_deps::UnsupportedApplyEditsHost),
 ///     push_tx: None,
+///     agent_memory_storage: None,
+///     agent_memory_namespace: None,
 /// };
 /// let _supervisor = ExtensionSupervisor::new(manifest, deps, Duration::from_secs(30), None);
 /// ```
@@ -223,7 +225,8 @@ impl ExtensionSupervisor {
 
     /// Record a fault, drop the instance, and schedule the next backoff window.
     fn record_fault(&mut self) {
-        self.instance = None;
+        // Dropping Child alone does not reap it or join the protocol reader.
+        self.shutdown();
         self.consecutive_faults = self.consecutive_faults.saturating_add(1);
         let delay = backoff_for_attempt(self.consecutive_faults.saturating_sub(1));
         self.respawn_state = RespawnState::Backoff {
@@ -245,6 +248,8 @@ impl ExtensionSupervisor {
             format_queue: std::sync::Arc::clone(&self.deps.format_queue),
             apply_edits: std::sync::Arc::clone(&self.deps.apply_edits),
             push_tx: self.deps.push_tx.clone(),
+            agent_memory_storage: self.deps.agent_memory_storage.clone(),
+            agent_memory_namespace: self.deps.agent_memory_namespace.clone(),
         }
     }
 }

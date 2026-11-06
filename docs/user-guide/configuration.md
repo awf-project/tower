@@ -18,6 +18,28 @@ leaves the config unchanged.
 
 ## Canonical sections
 
+Agent memory uses the first-party `agent_memory` sidecar. With the sidecar installed, the omitted
+`[agent_memory]` section uses durable storage and lexical retrieval. To set a startup fallback or
+filter sensitive text before it is stored, add:
+
+```toml
+[agent_memory.storage]
+startup_policy = "fail" # fail, read_only, or in_memory
+
+[[agent_memory.privacy.rules]]
+id = "credential"
+pattern = "(?i)api[_-]?key\\s*[:=]\\s*\\S+"
+action = "reject" # or redact, with a required replacement string
+```
+
+The default `fail` policy does not silently switch stores. `read_only` requires a compatible,
+consistent existing store; `in_memory` permits volatile operation and reports when durable data is
+unavailable. Responses identify the selected `persistence_mode`; mutations report `durable` only
+after a durable commit. Privacy rules are prospective: changing a rule does not scrub existing
+records or external backups. The host owns `.tower/agent_memory/` and chooses its storage namespace.
+See [agent memory](agent-memory.md) for the tool workflow and
+[the MCP reference](../mcp-tools.md#agent-memory-extension-tools) for limits and result codes.
+
 Cross-project read-only queries use the strict `[projects]` section. Each
 `[[projects.queryable]]` entry must declare a unique stable `id`, display `name`,
 and configured workspace `path`. Tower never discovers additional projects.

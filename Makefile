@@ -18,7 +18,7 @@ INSTALL_DIR  ?= $(HOME)/.local/bin
 #   EXT_DEST    — discovery scope to install into. Default: local project scope.
 #                 GLOBAL=1 selects the XDG global scope unless EXT_DEST is explicit.
 #   EXT_PROFILE — release (default, deployable) or debug (fast, reuses dev build).
-EXTENSIONS   ?= ast debug fmt lint lsp semantic_context
+EXTENSIONS   ?= ast debug fmt lint lsp semantic_context agent_memory
 ifeq ($(GLOBAL),1)
 ifneq ($(strip $(XDG_DATA_HOME)),)
 EXT_DEST     ?= $(XDG_DATA_HOME)/tower/extensions

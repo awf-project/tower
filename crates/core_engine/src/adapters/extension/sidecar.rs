@@ -181,6 +181,15 @@ fn encode_response_ok(id: Value, result: Value) -> String {
 
 /// Serialize a JSON-RPC error response to a newline-terminated JSON frame.
 fn encode_response_err(id: Value, code: i32, message: String) -> String {
+    encode_response_err_with_data(id, code, message, None)
+}
+
+fn encode_response_err_with_data(
+    id: Value,
+    code: i32,
+    message: String,
+    data: Option<Value>,
+) -> String {
     let envelope = JsonRpcResponse {
         jsonrpc: "2.0".to_owned(),
         id,
@@ -188,7 +197,7 @@ fn encode_response_err(id: Value, code: i32, message: String) -> String {
         error: Some(JsonRpcError {
             code,
             message,
-            data: None,
+            data,
         }),
     };
     let mut s = serde_json::to_string(&envelope).expect("serialize JsonRpcResponse error");
@@ -363,7 +372,7 @@ impl SidecarHostAdapter {
     /// Spawn the extension and include host-provided extension configuration in
     /// the `initialize` request.
     pub fn spawn_with_config<T>(
-        manifest: ExtensionManifest,
+        mut manifest: ExtensionManifest,
         deps: HostDeps,
         request_timeout: T,
         extension_config: Option<Value>,
@@ -378,13 +387,30 @@ impl SidecarHostAdapter {
             .and_then(|config| config.pointer("/record/backend"))
             .and_then(Value::as_str)
             == Some("rr");
-        let argv = &manifest.command;
-        if argv.is_empty() {
+        if manifest.command.is_empty() {
             return Err(ExtensionFault::ProtocolError {
                 message: "manifest.command is empty".to_owned(),
             });
         }
+        if manifest
+            .capabilities
+            .required
+            .iter()
+            .any(|capability| capability == "agent_memory_storage")
+        {
+            let host = std::env::current_exe().map_err(|_| ExtensionFault::ProtocolError {
+                message: "agent memory capability denied".to_owned(),
+            })?;
+            let selected =
+                select_trusted_agent_memory_executable(&manifest, &host).ok_or_else(|| {
+                    ExtensionFault::ProtocolError {
+                        message: "agent memory capability denied".to_owned(),
+                    }
+                })?;
+            manifest.command[0] = selected.to_string_lossy().into_owned();
+        }
 
+        let argv = &manifest.command;
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .stdin(Stdio::piped())
@@ -458,7 +484,14 @@ impl SidecarHostAdapter {
                 required: init_result
                     .capabilities
                     .iter()
-                    .filter(|capability| capability_allowed_for_manifest(&manifest, capability))
+                    .filter(|capability| {
+                        manifest
+                            .capabilities
+                            .required
+                            .iter()
+                            .any(|declared| declared == capability_to_str(capability))
+                            && capability_allowed_for_manifest(&manifest, capability)
+                    })
                     .map(capability_to_str)
                     .map(str::to_owned)
                     .collect(),
@@ -1319,6 +1352,11 @@ fn dispatch_host_call(
     allowed_caps: &[Capability],
 ) -> String {
     match method {
+        "agent_memory/storage/get"
+        | "agent_memory/storage/scan"
+        | "agent_memory/storage/transact" => {
+            dispatch_agent_memory_storage(method, call_id, params, deps, allowed_caps)
+        }
         "workspace/readFile" => {
             if !allowed_caps.contains(&Capability::ReadFile) {
                 return encode_response_err(
@@ -1516,6 +1554,17 @@ fn dispatch_host_call(
                 .as_str()
                 .or_else(|| params["msg"].as_str())
                 .unwrap_or("");
+            #[cfg(debug_assertions)]
+            if let Some(path) = std::env::var_os("TOWER_TEST_HOST_LOG_CAPTURE") {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(file, "{params}");
+                }
+            }
             eprintln!("[tower/ext] [{level}] {msg}");
             encode_response_ok(call_id, Value::Bool(true))
         }
@@ -1542,6 +1591,105 @@ fn dispatch_host_call(
             -32601,
             format!("unknown host capability method: {other}"),
         ),
+    }
+}
+
+fn dispatch_agent_memory_storage(
+    method: &str,
+    call_id: Value,
+    params: Value,
+    deps: &HostDeps,
+    allowed_caps: &[Capability],
+) -> String {
+    use crate::ports::AgentMemoryStorageError;
+    use extension_protocol::HostCall;
+
+    if !allowed_caps.contains(&Capability::AgentMemoryStorage) {
+        return encode_response_err(
+            call_id,
+            -32603,
+            "capability 'agent_memory_storage' not declared".to_owned(),
+        );
+    }
+
+    let call: HostCall = match serde_json::from_value(params) {
+        Ok(call) => call,
+        Err(_) => {
+            return encode_response_err(
+                call_id,
+                -32602,
+                "invalid agent memory storage request".to_owned(),
+            );
+        }
+    };
+    let (Some(storage), Some(namespace)) = (
+        deps.agent_memory_storage.as_ref(),
+        deps.agent_memory_namespace.as_ref(),
+    ) else {
+        return encode_response_err(
+            call_id,
+            -32603,
+            "agent memory storage unavailable".to_owned(),
+        );
+    };
+
+    let result = match (method, call) {
+        ("agent_memory/storage/get", HostCall::AgentMemoryStorageGet { request }) => {
+            storage.get(namespace, request).and_then(|result| {
+                serde_json::to_value(result).map_err(|_| AgentMemoryStorageError::Unavailable)
+            })
+        }
+        ("agent_memory/storage/scan", HostCall::AgentMemoryStorageScan { request }) => {
+            storage.scan(namespace, request).and_then(|result| {
+                serde_json::to_value(result).map_err(|_| AgentMemoryStorageError::Unavailable)
+            })
+        }
+        ("agent_memory/storage/transact", HostCall::AgentMemoryStorageTransact { request }) => {
+            match storage.transact(namespace, request) {
+                Ok(result) => {
+                    serde_json::to_value(result).map_err(|_| AgentMemoryStorageError::Unavailable)
+                }
+                Err(error) => serde_json::to_value(
+                    extension_protocol::messages::AgentMemoryTransactionOutcome::Failure {
+                        failure: storage_failure(error),
+                    },
+                )
+                .map_err(|_| AgentMemoryStorageError::Unavailable),
+            }
+        }
+        _ => {
+            return encode_response_err(
+                call_id,
+                -32602,
+                "invalid agent memory storage request".to_owned(),
+            );
+        }
+    };
+
+    match result {
+        Ok(value) => encode_response_ok(call_id, value),
+        Err(error) => encode_response_err_with_data(
+            call_id,
+            -32603,
+            error.to_string(),
+            serde_json::to_value(storage_failure(error)).ok(),
+        ),
+    }
+}
+
+fn storage_failure(
+    error: crate::ports::AgentMemoryStorageError,
+) -> extension_protocol::messages::AgentMemoryStorageFailure {
+    match error {
+        crate::ports::AgentMemoryStorageError::BoundsExceeded => {
+            extension_protocol::messages::AgentMemoryStorageFailure::BoundsExceeded
+        }
+        crate::ports::AgentMemoryStorageError::Unavailable => {
+            extension_protocol::messages::AgentMemoryStorageFailure::Unavailable
+        }
+        crate::ports::AgentMemoryStorageError::CommitOutcomeUnknown => {
+            extension_protocol::messages::AgentMemoryStorageFailure::CommitOutcomeUnknown
+        }
     }
 }
 
@@ -1797,6 +1945,7 @@ fn capability_to_str(cap: &Capability) -> &'static str {
         Capability::IndexPut => "index_put",
         Capability::RequestFormat => "request_format",
         Capability::RequestApplyEdits => "request_apply_edits",
+        Capability::AgentMemoryStorage => "agent_memory_storage",
         Capability::Log => "log",
         Capability::Notify => "notify",
     }
@@ -1810,6 +1959,7 @@ fn str_to_capability(s: &str) -> Option<Capability> {
         "index_put" => Some(Capability::IndexPut),
         "request_format" => Some(Capability::RequestFormat),
         "request_apply_edits" => Some(Capability::RequestApplyEdits),
+        "agent_memory_storage" => Some(Capability::AgentMemoryStorage),
         "log" => Some(Capability::Log),
         "notify" => Some(Capability::Notify),
         _ => None,
@@ -1827,8 +1977,36 @@ fn allowed_capabilities_for_manifest(manifest: &ExtensionManifest) -> Vec<Capabi
 }
 
 fn capability_allowed_for_manifest(manifest: &ExtensionManifest, capability: &Capability) -> bool {
-    !matches!(capability, Capability::RequestApplyEdits)
-        || is_trusted_apply_edits_extension(manifest)
+    match capability {
+        Capability::RequestApplyEdits => is_trusted_apply_edits_extension(manifest),
+        Capability::AgentMemoryStorage => is_trusted_agent_memory_extension(manifest),
+        _ => true,
+    }
+}
+
+fn is_trusted_agent_memory_extension(manifest: &ExtensionManifest) -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|host| select_trusted_agent_memory_executable(manifest, &host))
+        .is_some()
+}
+
+pub(crate) fn select_trusted_agent_memory_executable(
+    manifest: &ExtensionManifest,
+    host_executable: &Path,
+) -> Option<std::path::PathBuf> {
+    if manifest.name != "agent_memory" {
+        return None;
+    }
+    let command = manifest.command.first()?;
+    let command = Path::new(command).canonicalize().ok()?;
+    let host = host_executable.canonicalize().ok()?;
+    let expected = host
+        .parent()?
+        .join("agent_memory_extension")
+        .canonicalize()
+        .ok()?;
+    (command == expected).then_some(expected)
 }
 
 fn is_trusted_apply_edits_extension(manifest: &ExtensionManifest) -> bool {
@@ -1866,8 +2044,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FormatPathError, HostDeps, dispatch_host_call, operation_request_timeout_for,
-        semantic_operation_timeout, validate_workspace_format_path,
+        FormatPathError, HostDeps, SidecarHostAdapter, capability_to_str, dispatch_host_call,
+        operation_request_timeout_for, select_trusted_agent_memory_executable,
+        semantic_operation_timeout, str_to_capability, validate_workspace_format_path,
     };
     #[cfg(target_os = "linux")]
     use super::{LinuxProcessIdentity, parse_linux_process_stat};
@@ -1879,7 +2058,92 @@ mod tests {
     use crate::ports::inbound::{
         PerFileEditResult, WorkspaceApplyEditsRequest, WorkspaceApplyEditsResult, WorkspaceEditSpan,
     };
-    use extension_protocol::Capability;
+    use extension_protocol::manifest::{Activation, CapabilitiesSection, EventsSection};
+    use extension_protocol::{Capability, ExtensionManifest};
+
+    #[test]
+    fn agent_memory_storage_capability_uses_literal_wire_mapping_in_both_directions() {
+        assert_eq!(
+            capability_to_str(&Capability::AgentMemoryStorage),
+            "agent_memory_storage"
+        );
+        assert_eq!(
+            str_to_capability("agent_memory_storage"),
+            Some(Capability::AgentMemoryStorage)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_memory_admission_pins_the_verified_executable_across_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let install = tempfile::tempdir().expect("temporary installation");
+        let host = install.path().join("tower");
+        let trusted = install.path().join("trusted-agent-memory");
+        let attacker = install.path().join("attacker");
+        let bundled = install.path().join("agent_memory_extension");
+        let manifest_command = install.path().join("manifest-command");
+        std::fs::write(&host, b"host").expect("write host fixture");
+        std::fs::write(&trusted, b"trusted").expect("write trusted fixture");
+        std::fs::write(&attacker, b"attacker").expect("write attacker fixture");
+        symlink(&trusted, &bundled).expect("link bundled executable");
+        symlink(&bundled, &manifest_command).expect("link manifest command");
+        let manifest = ExtensionManifest {
+            name: "agent_memory".to_owned(),
+            version: "0.1.0".to_owned(),
+            command: vec![manifest_command.to_string_lossy().into_owned()],
+            activation: Activation::Eager,
+            tools: vec![],
+            events: EventsSection::default(),
+            capabilities: CapabilitiesSection {
+                required: vec!["agent_memory_storage".to_owned()],
+            },
+        };
+
+        let selected = select_trusted_agent_memory_executable(&manifest, &host)
+            .expect("trusted adjacent executable is admitted");
+        std::fs::remove_file(&manifest_command).expect("remove original manifest link");
+        symlink(&attacker, &manifest_command).expect("swap manifest link");
+
+        assert_eq!(
+            selected,
+            trusted.canonicalize().expect("canonical trusted path")
+        );
+        assert_ne!(
+            selected,
+            manifest_command
+                .canonicalize()
+                .expect("canonical attacker path")
+        );
+    }
+
+    #[test]
+    fn agent_memory_storage_stays_fail_closed_before_sidecar_initialization() {
+        let manifest = ExtensionManifest {
+            name: "untrusted_agent_memory_fixture".to_owned(),
+            version: "0.1.0".to_owned(),
+            command: vec!["sh".to_owned()],
+            activation: Activation::Eager,
+            tools: vec![],
+            events: EventsSection::default(),
+            capabilities: CapabilitiesSection {
+                required: vec!["agent_memory_storage".to_owned()],
+            },
+        };
+
+        let result = SidecarHostAdapter::spawn(
+            manifest,
+            make_deps_no_push(),
+            std::time::Duration::from_secs(1),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(extension_protocol::ExtensionFault::ProtocolError { message })
+                if message == "agent memory capability denied"
+        ));
+    }
 
     #[test]
     fn semantic_host_supervision_uses_operation_scope_without_embedding_budget_leakage() {
@@ -2031,6 +2295,8 @@ mod tests {
             format_queue: Arc::new(NoOpFormatQueue),
             apply_edits: Arc::new(RecordingApplyEditsHost::default()),
             push_tx: Some(push_tx),
+            agent_memory_storage: None,
+            agent_memory_namespace: None,
         }
     }
 
@@ -2045,6 +2311,8 @@ mod tests {
             format_queue: Arc::new(NoOpFormatQueue),
             apply_edits,
             push_tx: None,
+            agent_memory_storage: None,
+            agent_memory_namespace: None,
         }
     }
 
@@ -2059,6 +2327,8 @@ mod tests {
             format_queue: queue,
             apply_edits: Arc::new(RecordingApplyEditsHost::default()),
             push_tx: None,
+            agent_memory_storage: None,
+            agent_memory_namespace: None,
         };
         parse_response(&dispatch_host_call(
             "workspace/requestFormat",
