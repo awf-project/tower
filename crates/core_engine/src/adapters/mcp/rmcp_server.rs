@@ -1,5 +1,5 @@
 //! rmcp [`ServerHandler`] implementation — replaces the hand-rolled JSON-RPC
-//! transport loop (spec 10a migration to rmcp 1.7).
+//! transport loop (spec 10a migration to rmcp).
 //!
 //! # Design
 //!
@@ -30,11 +30,11 @@ use std::sync::{Arc, Mutex};
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ResourcesCapability, ServerCapabilities, ServerInfo, SubscribeRequestParams, Tool,
-    UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, SubscribeRequestParams,
+    Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::{Peer, ServerHandler};
@@ -185,15 +185,13 @@ impl ServerHandler for TowerMcpHandler {
     ///
     /// Tools and resources (with subscribe enabled) are advertised. rmcp
     /// handles protocol-version negotiation — we never need to echo it back.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
-                .enable_resources_with(ResourcesCapability {
-                    subscribe: Some(true),
-                    list_changed: Some(false),
-                })
+                .enable_resources()
+                .enable_resources_subscribe()
                 .build(),
         )
         .with_server_info(Implementation::new("tower", env!("CARGO_PKG_VERSION")))
@@ -216,6 +214,7 @@ impl ServerHandler for TowerMcpHandler {
             meta: None,
             next_cursor: None,
             tools: rmcp_tools,
+            ..Default::default()
         })
     }
 
@@ -232,7 +231,7 @@ impl ServerHandler for TowerMcpHandler {
         &self,
         req: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let name = req.name.as_ref().to_owned();
         // arguments may be absent; default to empty object per MCP spec.
         let args: Value = req
@@ -261,11 +260,9 @@ impl ServerHandler for TowerMcpHandler {
                 // Preserve the existing wire shape: text content wrapping the
                 // serialised JSON value (matches the pre-migration behaviour
                 // and what Codex and other clients expect).
-                Ok(CallToolResult::success(vec![Content::text(
-                    value.to_string(),
-                )]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(value.to_string())]).into())
             }
-            Err(error) => tool_error_to_rmcp(error),
+            Err(error) => tool_error_to_rmcp(error).map(Into::into),
         }
     }
 
@@ -278,17 +275,13 @@ impl ServerHandler for TowerMcpHandler {
         let resources: Vec<Resource> = self
             .resource_uris
             .iter()
-            .map(|uri| {
-                Resource::new(
-                    RawResource::new(uri.clone(), uri.clone()).with_mime_type("application/json"),
-                    None,
-                )
-            })
+            .map(|uri| Resource::new(uri.clone(), uri.clone()).with_mime_type("application/json"))
             .collect();
         Ok(ListResourcesResult {
             meta: None,
             next_cursor: None,
             resources,
+            ..Default::default()
         })
     }
 
@@ -301,7 +294,7 @@ impl ServerHandler for TowerMcpHandler {
         &self,
         req: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         let uri = req.uri.clone();
         let diags = self.diag_reader.diagnostics_for(&uri);
         let diagnostics: Vec<DiagnosticJson<'_>> = diags
@@ -315,10 +308,7 @@ impl ServerHandler for TowerMcpHandler {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("uri".to_owned(), Value::String(uri.clone()));
         }
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            payload.to_string(),
-            uri,
-        )]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(payload.to_string(), uri)]).into())
     }
 
     /// `resources/subscribe` — record the URI in the subscription registry.
@@ -370,7 +360,7 @@ pub(super) fn tool_error_to_rmcp(error: ToolError) -> Result<CallToolResult, Mcp
         ToolError::NotFound(msg) => {
             // Application-level "tool not found". Encode as is_error:true
             // per MCP spec (tool-level error, not a protocol error).
-            Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "tool not found: {msg}"
             ))]))
         }
@@ -378,10 +368,10 @@ pub(super) fn tool_error_to_rmcp(error: ToolError) -> Result<CallToolResult, Mcp
             // Bad request structure — map to protocol-level invalid params.
             Err(McpError::invalid_params(msg, None))
         }
-        ToolError::ExecutionFailed(msg) => Ok(CallToolResult::error(vec![Content::text(format!(
-            "execution failed: {msg}"
-        ))])),
-        ToolError::Cancelled => Ok(CallToolResult::error(vec![Content::text(
+        ToolError::ExecutionFailed(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(
+            format!("execution failed: {msg}"),
+        )])),
+        ToolError::Cancelled => Ok(CallToolResult::error(vec![ContentBlock::text(
             "tool invocation cancelled",
         )])),
         ToolError::Application {
@@ -389,14 +379,14 @@ pub(super) fn tool_error_to_rmcp(error: ToolError) -> Result<CallToolResult, Mcp
             message,
             data,
         } => {
-            let mut result = CallToolResult::error(vec![Content::text(message)]);
+            let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
             result.structured_content = data;
             Ok(result)
         }
-        ToolError::ResourceNotFound(msg) => Ok(CallToolResult::error(vec![Content::text(
+        ToolError::ResourceNotFound(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(
             format!("resource not found: {msg}"),
         )])),
-        ToolError::PreconditionFailed(msg) => Ok(CallToolResult::error(vec![Content::text(
+        ToolError::PreconditionFailed(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(
             format!("precondition failed: {msg}"),
         )])),
     }

@@ -312,7 +312,7 @@ fn decode_external_result(
     let text = result
         .content
         .first()
-        .and_then(|content| content.raw.as_text())
+        .and_then(|content| content.as_text())
         .map(|content| content.text.as_str())
         .ok_or_else(|| ExternalDaemonError::Decode {
             project: project.clone(),

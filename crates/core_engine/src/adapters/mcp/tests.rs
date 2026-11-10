@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rmcp::model::Content;
+use rmcp::model::ContentBlock as Content;
 use rmcp::service::PeerRequestOptions;
 use rmcp::{RoleClient, ServerHandler, ServiceExt};
 use serde_json::json;
@@ -753,6 +753,8 @@ fn ac5_list_resources_returns_configured_uris() {
     });
 }
 
+// Exercise the legacy subscription contract still supported by Tower.
+#[allow(deprecated)]
 #[test]
 fn ac5_subscribe_unsubscribe_round_trip() {
     block_on(async {
@@ -875,8 +877,8 @@ fn subscription_registry_clear() {
 fn extract_first_text(content: &[Content]) -> String {
     content
         .first()
-        .and_then(|c| match &c.raw {
-            rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+        .and_then(|c| match c {
+            rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
             _ => None,
         })
         .unwrap_or_default()

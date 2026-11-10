@@ -1958,7 +1958,6 @@ fn tower_debug_cancel_reaps_fixture_process_tree_and_next_launch_recovers() {
         assert_eq!(launch.is_error, Some(false), "launch result: {launch:?}");
         let launch: Value = serde_json::from_str(
             launch.content[0]
-                .raw
                 .as_text()
                 .expect("launch must return text JSON")
                 .text
@@ -1989,10 +1988,10 @@ fn tower_debug_cancel_reaps_fixture_process_tree_and_next_launch_recovers() {
         })
         .await
         .expect("fixture must be alive before cancellation");
-        let cancellation = CancelledNotification::new(CancelledNotificationParam {
-            request_id: pending.id.clone(),
-            reason: Some("test cancellation".to_owned()),
-        });
+        let cancellation = CancelledNotification::new(CancelledNotificationParam::new(
+            Some(pending.id.clone()),
+            Some("test cancellation".to_owned()),
+        ));
         client
             .peer()
             .send_notification(cancellation.into())

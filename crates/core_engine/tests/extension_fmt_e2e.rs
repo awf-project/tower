@@ -187,8 +187,8 @@ fn first_text(result: &rmcp::model::CallToolResult) -> &str {
     result
         .content
         .first()
-        .and_then(|content| match &content.raw {
-            rmcp::model::RawContent::Text(text) => Some(text.text.as_str()),
+        .and_then(|content| match content {
+            rmcp::model::ContentBlock::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
         .unwrap_or("")

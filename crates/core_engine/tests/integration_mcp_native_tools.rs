@@ -221,8 +221,8 @@ fn first_text(result: &rmcp::model::CallToolResult) -> &str {
     result
         .content
         .first()
-        .and_then(|c| match &c.raw {
-            rmcp::model::RawContent::Text(t) => Some(t.text.as_str()),
+        .and_then(|c| match c {
+            rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .unwrap_or("")

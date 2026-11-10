@@ -203,3 +203,9 @@
 {"ts":1793972283,"op":"assert","clause":"arch_convention('conv_agent_memory_adapter_contract', 'agent memory persistence adapters', 'keep Sled-backed and in-memory implementations behind the same bounded transactional storage contract and contract-test suite', 'feature_f017_agent_memory_extension')"}
 {"ts":1793972283,"op":"retractall","clause":"arch_convention('conv_agent_memory_privacy_boundary', _, _, _, _, _, _)"}
 {"ts":1793972283,"op":"assert","clause":"arch_convention('conv_agent_memory_privacy_boundary', 'agent memory data handling', 'apply privacy rules before persistence, indexing, logging, and optional provider requests; treat rule changes as prospective', 'feature_f017_agent_memory_extension')"}
+{"ts":1794318563,"op":"retractall","clause":"arch_component(_,_,_,'chore_airlock')"}
+{"ts":1794318563,"op":"retractall","clause":"arch_port(_,_,'chore_airlock')"}
+{"ts":1794318563,"op":"retractall","clause":"arch_decision(_,_,_,_,'chore_airlock')"}
+{"ts":1794318564,"op":"retractall","clause":"arch_convention(_,_,_,'chore_airlock')"}
+{"ts":1794318564,"op":"retractall","clause":"arch_adr(_,_,'chore_airlock')"}
+{"ts":1794318564,"op":"retractall","clause":"arch_feature('chore_airlock',_,_)"}
