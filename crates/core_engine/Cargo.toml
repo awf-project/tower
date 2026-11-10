@@ -36,7 +36,7 @@ gag = "1"
 # test-only helpers like `FileId::new_for_testing` (gated on that feature).
 core_engine = { path = ".", features = ["testing"] }
 # rmcp client feature used in mcp handler unit tests (in-process duplex transport).
-rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
+rmcp = { version = "3.9.0", features = ["server", "client", "transport-io"] }
 extension_sidecar_harness = { path = "../extension_sidecar_harness" }
 agent_memory_extension = { path = "../../extensions/agent_memory" }
 
@@ -97,7 +97,7 @@ url = "2.5.8"
 # XDG_DATA_HOME" rule) cross-platform, used only at the binary/adapter edge to
 # locate the global extensions dir. Domain stays untouched.
 directories = "6"
-rmcp = { version = "1.7.0", features = ["server", "client", "transport-io"] }
+rmcp = { version = "3.9.0", features = ["server", "client", "transport-io"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync"] }
 # clap (derive) for the binary CLI surface: subcommands + --version/--help.
 # MIT/Apache-2.0; covered by deny.toml allow-list.

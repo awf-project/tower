@@ -468,3 +468,5 @@
 {"ts":1793937679,"op":"assert","clause":"trigger('agent_memory_storage_namespace_must_be_host_derived','',project)"}
 {"ts":1793937680,"op":"assert","clause":"rule('agent_memory_storage_operations_require_bounds',pitfall,'Require explicit configured bounds on every agent-memory read, scan, and conditional transaction; reject requests that exceed those bounds.',high,'implement')"}
 {"ts":1793937681,"op":"assert","clause":"trigger('agent_memory_storage_operations_require_bounds','',project)"}
+{"ts":1794323568,"op":"assert","clause":"rule(user_owns_git_commits, workflow, 'Do not create git commits on behalf of the user. Authorization was explicitly revoked; prepare changes and run verification, then leave committing to the user unless they explicitly authorize it again.', high, 'Explicit user instruction 2026-11-10')"}
+{"ts":1794323568,"op":"assert","clause":"trigger(user_owns_git_commits, '*', project)"}

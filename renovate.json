@@ -1,0 +1,47 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Europe/Paris",
+  "schedule": ["* 0-7 * * 1"],
+  "automerge": false,
+  "prConcurrentLimit": 5,
+  "osvVulnerabilityAlerts": true,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["* 0-7 * * 1"]
+  },
+  "packageRules": [
+    {
+      "description": "Group compatible Rust dependency updates across the workspace.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Rust dependencies"
+    },
+    {
+      "description": "Group compatible documentation site dependency updates.",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "site dependencies"
+    },
+    {
+      "description": "Group compatible GitHub Actions updates and digest pins.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "GitHub Actions"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/hugo\\.yml$/"],
+      "matchStrings": ["HUGO_VERSION:\\s*\"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "gohugoio/hugo",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver-coerced"
+    }
+  ]
+}

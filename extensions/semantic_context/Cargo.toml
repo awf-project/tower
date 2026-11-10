@@ -14,7 +14,7 @@ path = "src/lib.rs"
 extension_protocol = { path = "../../crates/extension_protocol" }
 extension_sidecar_harness = { path = "../../crates/extension_sidecar_harness" }
 reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"

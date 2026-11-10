@@ -989,33 +989,26 @@ mod tests {
     /// GREEN-4 / AC4: If the file is modified between pre-read and write,
     /// the CAS check aborts and the newer content wins.
     ///
-    /// We test `run_filter_job` by intercepting at the CAS re-read step.
-    /// Since we cannot inject into the method, we verify indirectly:
-    /// write different content during the format, then assert the formatted
-    /// output was NOT applied (the newer content survives).
-    ///
-    /// This test uses a script that sleeps briefly so we can write a new
-    /// version of the file between the tool invocation and the CAS check.
-    /// Due to the sequential nature of the worker, we instead directly test
-    /// the hash logic.
+    /// The formatter consumes the original input, replaces the file on disk,
+    /// then produces different output. This orders the external edit strictly
+    /// between the worker's initial read and its CAS check without sleeps.
     #[test]
     fn cas_aborts_when_file_changed_concurrently() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("concurrent.txt");
-        fs::write(&file_path, b"original\n").unwrap();
+        // Exceed the pipe buffer so the fixture must consume its input before exiting.
+        fs::write(&file_path, vec![b'x'; 256 * 1024]).unwrap();
         let path_str = file_path.to_str().unwrap().to_owned();
 
-        // The script: output formatted text then modify the file on disk
-        // (simulating a concurrent writer), before the worker re-reads it.
-        // We use a tool that writes "newer content\n" to the file (simulating
-        // external write) and then outputs "formatted\n" on stdout.
-        // Because the file now has "newer content\n" but h0 was "original\n",
-        // the CAS check will abort.
-        let script = format!(
-            "printf 'newer content\\n' > '{}'; printf 'formatted\\n'",
-            path_str.replace('\'', "\\'")
-        );
-        let argv = vec!["sh".to_owned(), "-c".to_owned(), script];
+        // Drain stdin before exiting: otherwise the writer can hit a broken pipe
+        // and report a tool failure before the CAS check is reached.
+        let argv = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "cat >/dev/null; printf 'newer content\\n' > \"$1\"; printf 'formatted\\n'".to_owned(),
+            "--".to_owned(),
+            path_str.clone(),
+        ];
 
         let worker = FormatWorker {
             echo_set: noop_echo_set(),

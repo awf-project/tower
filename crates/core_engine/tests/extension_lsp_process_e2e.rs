@@ -1540,7 +1540,9 @@ fn diagnostics_send_did_open_then_did_change_with_current_content() {
         );
         assert_eq!(response["result"]["data"]["diagnostics"], expected);
 
-        let trace = read_trace(&workspace);
+        // The fixture flushes diagnostics before appending its publication trace.
+        // Receiving the response alone does not establish that the log is complete.
+        let trace = wait_for_trace_event(&workspace, "published");
         let new_entries = &trace[trace_before_len..];
         let sync = new_entries
             .iter()

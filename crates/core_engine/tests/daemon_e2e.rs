@@ -1713,6 +1713,7 @@ fn assert_formatter_lifecycle(
         .stderr(Stdio::piped())
         .spawn()
         .expect("start production daemon");
+    let mut daemon = ProductionDaemonGuard::new(daemon, binary, workspace);
 
     wait_until(Duration::from_secs(10), || socket_path(workspace).exists());
     let runtime = tokio::runtime::Runtime::new().expect("formatter status runtime");
@@ -1720,9 +1721,13 @@ fn assert_formatter_lifecycle(
         workspace_dir: Some(workspace.to_path_buf()),
         extensions_dir: None,
     };
+    // Workspace readiness does not wait for non-AST/LSP extensions. Observe the
+    // formatter's published tool before emitting the file-change events it handles.
     wait_until(Duration::from_secs(10), || {
         matches!(runtime.block_on(core_engine::adapters::daemon::client::send_control_async(&opts, ControlRequest::Status)),
-            Ok(ControlResponse::Status(snapshot)) if snapshot.lifecycle == core_engine::adapters::daemon::DaemonLifecycle::Ready)
+            Ok(ControlResponse::Status(snapshot))
+                if snapshot.lifecycle == core_engine::adapters::daemon::DaemonLifecycle::Ready
+                    && snapshot.extensions.iter().any(|tool| tool == "format"))
     });
     for &(path, _) in cases {
         std::fs::write(workspace.join(path), "format me\n").unwrap();
@@ -1736,7 +1741,12 @@ fn assert_formatter_lifecycle(
 
     let shutdown = run_production(binary, workspace, "shutdown");
     assert!(shutdown.status.success(), "shutdown failed: {shutdown:?}");
-    let output = daemon.wait_with_output().expect("wait for daemon shutdown");
+    let output = daemon
+        .child
+        .take()
+        .expect("daemon guard is armed")
+        .wait_with_output()
+        .expect("wait for daemon shutdown");
     assert!(output.status.success(), "daemon failed: {output:?}");
     assert!(output.stdout.is_empty(), "daemon wrote protocol stdout");
     assert!(!local_marker.exists(), "disabled extension was spawned");
