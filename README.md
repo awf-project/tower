@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/awf-project/tower/main/scripts/inst
 To build from source instead:
 
 ```bash
-git clone <repository-url> tower
+git clone https://github.com/awf-project/tower.git
 cd tower
 cargo build --workspace --bins
 ```
@@ -141,6 +141,20 @@ Workspace resolution is consistent across commands:
 | 1        | `--workspace-dir <path>`           |
 | 2        | `TOWER_WORKSPACE=/path/to/project` |
 | 3        | current working directory          |
+
+#### Example: Codex
+
+From the root of the workspace you want Tower to index:
+
+```bash
+codex mcp add tower -- tower --workspace-dir "$PWD" mcp
+codex mcp list
+```
+
+This registers Tower globally in Codex and fixes its workspace to the current directory at
+registration time. Starting Codex in another directory does not change that workspace.
+
+Start a new Codex session and use `/mcp` to verify that Tower is connected.
 
 ## Core Concepts
 
