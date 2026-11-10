@@ -470,3 +470,5 @@
 {"ts":1793937681,"op":"assert","clause":"trigger('agent_memory_storage_operations_require_bounds','',project)"}
 {"ts":1794323568,"op":"assert","clause":"rule(user_owns_git_commits, workflow, 'Do not create git commits on behalf of the user. Authorization was explicitly revoked; prepare changes and run verification, then leave committing to the user unless they explicitly authorize it again.', high, 'Explicit user instruction 2026-11-10')"}
 {"ts":1794323568,"op":"assert","clause":"trigger(user_owns_git_commits, '*', project)"}
+{"ts":1794395189,"op":"assert","clause":"rule(ci_stabilization_case_by_case, review, 'Scope CI stabilization to the reported failing test and its directly responsible code; do not broaden into a pipeline audit unless requested.', high, 'User instruction 2026-11-11')"}
+{"ts":1794395189,"op":"assert","clause":"trigger(ci_stabilization_case_by_case, '*', project)"}
