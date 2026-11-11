@@ -486,8 +486,10 @@ fn supervise(
             )?;
             return Ok(ProcessOutcome {
                 status: termination_status(exit_status),
-                stdout: collected.stdout,
-                stderr: collected.stderr,
+                // Completed readers have already been removed from workers.
+                // Preserve their output when cleanup collects the remaining pipes.
+                stdout: stdout_output.unwrap_or(collected.stdout),
+                stderr: stderr_output.unwrap_or(collected.stderr),
                 timed_out: false,
             });
         }
@@ -504,8 +506,10 @@ fn supervise(
             )?;
             return Ok(ProcessOutcome {
                 status: collected.status,
-                stdout: collected.stdout,
-                stderr: collected.stderr,
+                // Completed readers have already been removed from workers.
+                // Preserve their output when cleanup collects the remaining pipes.
+                stdout: stdout_output.unwrap_or(collected.stdout),
+                stderr: stderr_output.unwrap_or(collected.stderr),
                 timed_out: true,
             });
         }
@@ -1032,6 +1036,93 @@ mod tests {
         );
         assert_recorded_process_exits(&leader_pid_path);
         assert_recorded_process_exits(&descendant_pid_path);
+    }
+
+    #[test]
+    fn already_collected_output_survives_exit_and_timeout_cleanup() {
+        use std::os::unix::process::CommandExt as _;
+        let _fixture_lock = process_fixture_lock();
+        // One reader is complete before the first supervision poll. The waiter
+        // releases the other only after that poll, forcing partial collection.
+        struct ReleaseReader {
+            pending: std::sync::Mutex<Option<mpsc::Sender<Result<BoundedOutput, ProcessError>>>>,
+            timeout: bool,
+        }
+        impl Waiter for ReleaseReader {
+            fn try_wait(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+                if let Some(sender) = self.pending.lock().unwrap().take() {
+                    sender
+                        .send(Ok(BoundedOutput {
+                            bytes: b"late".to_vec(),
+                            truncated: false,
+                        }))
+                        .unwrap();
+                    if self.timeout {
+                        return Ok(None);
+                    }
+                }
+                child.wait().map(Some)
+            }
+        }
+        for timeout in [false, true] {
+            for early_stdout in [false, true] {
+                let child = Command::new("sh")
+                    .args(["-c", "exit 0"])
+                    .process_group(0)
+                    .spawn()
+                    .unwrap();
+                let (early_tx, early_rx) = mpsc::channel();
+                early_tx
+                    .send(Ok(BoundedOutput {
+                        bytes: b"early".to_vec(),
+                        truncated: true,
+                    }))
+                    .unwrap();
+                let early = PipeWorker {
+                    receiver: early_rx,
+                    handle: thread::spawn(|| {}),
+                };
+                let (late_tx, late_rx) = mpsc::channel();
+                let late = PipeWorker {
+                    receiver: late_rx,
+                    handle: thread::spawn(|| {}),
+                };
+                let (stdout, stderr) = if early_stdout {
+                    (early, late)
+                } else {
+                    (late, early)
+                };
+                let outcome = supervise(
+                    child,
+                    timeout.then(Instant::now),
+                    CLEANUP_BUDGET,
+                    &NeverCancelled,
+                    ProcessWorkers {
+                        writer: None,
+                        stdout: Some(stdout),
+                        stderr: Some(stderr),
+                    },
+                    &ReleaseReader {
+                        pending: std::sync::Mutex::new(Some(late_tx)),
+                        timeout,
+                    },
+                )
+                .unwrap();
+                let (early, late) = if early_stdout {
+                    (&outcome.stdout, &outcome.stderr)
+                } else {
+                    (&outcome.stderr, &outcome.stdout)
+                };
+                assert_eq!(
+                    early.bytes, b"early",
+                    "timeout={timeout}, stdout={early_stdout}"
+                );
+                assert!(early.truncated);
+                assert_eq!(late.bytes, b"late");
+                assert!(!late.truncated);
+                assert_eq!(outcome.timed_out, timeout);
+            }
+        }
     }
 
     #[test]

@@ -1691,6 +1691,33 @@ fn configure_formatter_commands(workspace: &Path) -> PathBuf {
     formatter_log
 }
 
+fn wait_for_formatter_condition(
+    daemon: &mut ProductionDaemonGuard,
+    stderr_path: &Path,
+    phase: &str,
+    mut condition: impl FnMut() -> Result<(), String>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let detail = match condition() {
+            Ok(()) => return,
+            Err(detail) => detail,
+        };
+        let exit = daemon
+            .child
+            .as_mut()
+            .expect("formatter daemon guard is armed")
+            .try_wait()
+            .expect("inspect formatter daemon process");
+        assert!(
+            exit.is_none() && Instant::now() < deadline,
+            "formatter phase {phase:?} failed: {detail}; daemon exit: {exit:?}\nstderr:\n{}",
+            fs::read_to_string(stderr_path).unwrap_or_default(),
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn assert_formatter_lifecycle(
     binary: &Path,
     workspace: &Path,
@@ -1702,6 +1729,8 @@ fn assert_formatter_lifecycle(
         std::fs::write(workspace.join(path), "before startup\n").unwrap();
     }
 
+    let stderr_path = workspace.join(".tower/formatter-daemon.stderr");
+    let stderr = fs::File::create(&stderr_path).expect("create formatter daemon log");
     let daemon = Command::new(binary)
         .arg("daemon")
         .arg("--workspace-dir")
@@ -1710,34 +1739,77 @@ fn assert_formatter_lifecycle(
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", workspace)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("start production daemon");
     let mut daemon = ProductionDaemonGuard::new(daemon, binary, workspace);
 
-    wait_until(Duration::from_secs(10), || socket_path(workspace).exists());
-    let runtime = tokio::runtime::Runtime::new().expect("formatter status runtime");
+    // A current-thread client avoids multiplying runtime worker pools when
+    // process tests run concurrently. Keep the MCP session open until shutdown
+    // so daemon idleness cannot race the assertions.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("formatter client runtime");
     let opts = GlobalOpts {
         workspace_dir: Some(workspace.to_path_buf()),
         extensions_dir: None,
     };
-    // Workspace readiness does not wait for non-AST/LSP extensions. Observe the
-    // formatter's published tool before emitting the file-change events it handles.
-    wait_until(Duration::from_secs(10), || {
-        matches!(runtime.block_on(core_engine::adapters::daemon::client::send_control_async(&opts, ControlRequest::Status)),
-            Ok(ControlResponse::Status(snapshot))
+    wait_for_formatter_condition(&mut daemon, &stderr_path, "public socket", || {
+        socket_path(workspace)
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "socket has not appeared".to_owned())
+    });
+    let session = runtime.block_on(RoutedMcpSession::connect(workspace));
+    wait_for_formatter_condition(&mut daemon, &stderr_path, "formatter readiness", || {
+        let response = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                core_engine::adapters::daemon::client::send_control_async(
+                    &opts,
+                    ControlRequest::Status,
+                ),
+            )
+            .await
+        });
+        match response {
+            Ok(Ok(ControlResponse::Status(snapshot)))
                 if snapshot.lifecycle == core_engine::adapters::daemon::DaemonLifecycle::Ready
-                    && snapshot.extensions.iter().any(|tool| tool == "format"))
+                    && snapshot.extensions.iter().any(|tool| tool == "format") =>
+            {
+                Ok(())
+            }
+            other => Err(format!("last status: {other:?}")),
+        }
     });
     for &(path, _) in cases {
         std::fs::write(workspace.join(path), "format me\n").unwrap();
     }
-    wait_until(Duration::from_secs(10), || {
-        cases.iter().all(|(path, expected)| {
-            std::fs::read_to_string(workspace.join(path))
-                .is_ok_and(|contents| contents == *expected)
-        })
+    wait_for_formatter_condition(&mut daemon, &stderr_path, "formatted files", || {
+        let pending: Vec<_> = cases
+            .iter()
+            .filter_map(|(path, expected)| {
+                let observed = fs::read_to_string(workspace.join(path));
+                if observed
+                    .as_deref()
+                    .is_ok_and(|contents| contents == *expected)
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "{path}: expected {expected:?}, observed {observed:?}"
+                    ))
+                }
+            })
+            .collect();
+        if pending.is_empty() {
+            Ok(())
+        } else {
+            Err(pending.join("\n"))
+        }
     });
+    drop(session);
 
     let shutdown = run_production(binary, workspace, "shutdown");
     assert!(shutdown.status.success(), "shutdown failed: {shutdown:?}");
