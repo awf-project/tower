@@ -63,14 +63,17 @@ async fn read_raw_control_status(workspace: &Path) -> String {
 }
 
 /// Spawn `run_daemon` on a blocking thread against a tempdir workspace.
-fn spawn_daemon_thread(root: std::path::PathBuf, cfg: TowerConfig) {
+fn spawn_daemon_thread(
+    root: PathBuf,
+    cfg: TowerConfig,
+) -> std::thread::JoinHandle<Result<(), String>> {
     std::thread::spawn(move || {
         let opts = GlobalOpts {
             workspace_dir: Some(root),
             extensions_dir: None,
         };
-        let _ = run_daemon(&opts, cfg, false);
-    });
+        run_daemon(&opts, cfg, false)
+    })
 }
 
 fn selected_production_binary() -> PathBuf {
@@ -2213,16 +2216,20 @@ async fn control_status_reports_a_snapshot() {
 async fn daemon_self_terminates_after_idle() {
     let dir = tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".tower")).unwrap();
-    spawn_daemon_thread(dir.path().to_path_buf(), config_with_idle(1)); // 1s idle
+    let daemon = spawn_daemon_thread(dir.path().to_path_buf(), config_with_idle(1));
 
     let sock = socket_path(dir.path());
     // Daemon is up.
-    let _ = wait_for_socket(&sock, Duration::from_secs(5))
-        .await
-        .unwrap();
-    // With no keep-alive clients connected, it should exit after the idle timeout and the
-    // socket should stop accepting.
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    drop(
+        wait_for_socket(&sock, Duration::from_secs(5))
+            .await
+            .unwrap(),
+    );
+    wait_until(Duration::from_secs(10), || daemon.is_finished());
+    daemon
+        .join()
+        .expect("daemon thread")
+        .expect("idle shutdown");
     assert!(
         core_engine::adapters::daemon::socket::try_connect(&sock)
             .await
@@ -2709,11 +2716,7 @@ async fn malformed_tool_parameters_remain_invalid_params() {
     )
     .await
     .unwrap();
-    let response = read_line_capped(&mut connection, 1 << 20)
-        .await
-        .unwrap()
-        .unwrap();
-    let response: Value = serde_json::from_str(&response).unwrap();
+    let response = read_mcp_response(&mut connection, 2, Duration::from_secs(5)).await;
 
     assert_eq!(response["error"]["code"], -32602);
     assert_ne!(response["error"]["code"], -32004);
@@ -4861,6 +4864,7 @@ async fn slow_extension_pending_fence_expires_as_extension_timeout() {
         ReconciliationProcessHarness, SlowStartInitializeConfiguration, StartupMilestone,
     };
     let mut harness = ReconciliationProcessHarness::new(SlowStartInitializeConfiguration::Block);
+    harness.request_timeout_secs = 1;
     harness.start_generation().await;
     let deadline = Instant::now() + Duration::from_secs(5);
     harness
@@ -4896,48 +4900,41 @@ async fn slow_extension_pending_fence_expires_as_extension_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_failure_is_observable_and_restartable() {
+    use core_engine::adapters::daemon::{DaemonLifecycle, StartupFailureClass};
+
     let workspace = tempdir().unwrap();
     fs::create_dir_all(workspace.path().join(".tower")).unwrap();
     // Deterministic storage failure without hooks or permissions assumptions.
     fs::write(workspace.path().join(".tower/db"), "not a directory").unwrap();
     let root = workspace.path().to_path_buf();
     let mut config = config_with_idle(300);
-    config.daemon.connection_timeout_secs = Some(1);
-    let daemon = tokio::task::spawn_blocking(move || {
-        run_daemon(
-            &GlobalOpts {
-                workspace_dir: Some(root),
-                extensions_dir: None,
-            },
-            config,
-            false,
-        )
-    });
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let raw = loop {
-        let raw = read_raw_control_status(workspace.path()).await;
-        if raw.contains("failed") {
-            break raw;
-        }
-        assert!(Instant::now() < deadline, "{raw}");
-        tokio::task::yield_now().await;
-    };
+    config.daemon.connection_timeout_secs = Some(3);
+    let daemon = spawn_daemon_thread(root, config);
     // Even an open control connection cannot retain fatal resources forever.
-    let mut control = UnixStream::connect(socket_path(workspace.path()))
+    let mut control = wait_for_socket(&socket_path(workspace.path()), Duration::from_secs(5))
         .await
         .unwrap();
     control
         .write_all(Handshake::new(ClientRole::Control).to_line().as_bytes())
         .await
         .unwrap();
-    assert!(raw.contains("failed"), "{raw}");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(3), daemon)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_err()
-    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let raw = read_raw_control_status(workspace.path()).await;
+            let ControlResponse::Status(snapshot) = serde_json::from_str(&raw).unwrap() else {
+                panic!("expected control status: {raw}");
+            };
+            if let DaemonLifecycle::Failed { failure_class } = snapshot.lifecycle {
+                assert_eq!(failure_class, StartupFailureClass::Storage);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("storage failure becomes observable");
+    wait_until(Duration::from_secs(10), || daemon.is_finished());
+    assert!(daemon.join().expect("daemon thread").is_err());
     assert!(!socket_path(workspace.path()).exists());
     let owner = WorkspaceDaemonOwner::acquire(workspace.path())
         .expect("failure released lifetime ownership");
@@ -4945,7 +4942,7 @@ async fn startup_failure_is_observable_and_restartable() {
     drop(control);
     fs::remove_file(workspace.path().join(".tower/db")).unwrap();
     let root = workspace.path().to_path_buf();
-    spawn_daemon_thread(root, config_with_idle(1));
+    spawn_daemon_thread(root, config_with_idle(300));
     let status = read_raw_control_status(workspace.path()).await;
     assert!(!status.is_empty(), "fresh generation serves control");
     // Explicit shutdown avoids a detached daemon outliving its test workspace.

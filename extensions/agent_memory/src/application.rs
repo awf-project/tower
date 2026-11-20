@@ -5,7 +5,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, SecondsFormat, Utc};
 use extension_protocol::messages::{
     AgentMemoryCondition as Condition, AgentMemoryGetRequest, AgentMemoryMutation as Mutation,
     AgentMemoryScanRequest, AgentMemoryStorageFailure, AgentMemoryTransactionOutcome,
@@ -20,6 +19,7 @@ use crate::{
     MatchReasonField, MatchReasonKind, MemoryFilters, MemoryId, MemoryRecord, MemoryStore,
     MemoryType, PersistenceMode, PrivacyError, PrivacyFilter, Provenance, RankingMode, Revision,
     ValidationError,
+    domain::{ParsedTimestamp, timestamp_cmp},
 };
 
 const SCHEMA: u32 = 1;
@@ -671,11 +671,12 @@ impl<S: MemoryStore, C: Clock, I: IdGenerator, P: EnrichmentProvider>
                     .map_err(map_privacy)?,
             },
         };
-        let query = TimelineQuery::try_new(
+        let query = TimelineQuery::with_timestamp_parser(
             anchor,
             self.privacy_filters(query.filters)?,
             query.page,
             &self.limits,
+            ParsedTimestamp::parse_normalized_or_input,
         )?;
         let (records, generation) = self.retrieval_snapshot()?;
         let anchor_key = timeline_anchor_key(&query.anchor);
@@ -1612,6 +1613,16 @@ impl TimelineQuery {
         page: Page,
         limits: &AgentMemoryLimitsConfig,
     ) -> Result<Self, MemoryApplicationError> {
+        Self::with_timestamp_parser(anchor, filters, page, limits, ParsedTimestamp::parse)
+    }
+
+    fn with_timestamp_parser(
+        anchor: TimelineAnchor,
+        filters: MemoryFilters,
+        page: Page,
+        limits: &AgentMemoryLimitsConfig,
+        parse: fn(&str) -> Option<ParsedTimestamp>,
+    ) -> Result<Self, MemoryApplicationError> {
         let anchor = match anchor {
             TimelineAnchor::Record { id, before, after } => {
                 if before >= limits.max_results {
@@ -1633,8 +1644,12 @@ impl TimelineQuery {
                 query: normalize_query(query, limits)?,
             },
             TimelineAnchor::Window { from, to } => {
-                let from = normalize_timestamp_arg("from", from)?;
-                let to = normalize_timestamp_arg("to", to)?;
+                let from = parse(&from)
+                    .ok_or_else(|| invalid("from", "invalid"))?
+                    .format_utc();
+                let to = parse(&to)
+                    .ok_or_else(|| invalid("to", "invalid"))?
+                    .format_utc();
                 if timestamp_cmp(&to, &from).is_lt() {
                     return Err(invalid("to", "before_from"));
                 }
@@ -2027,16 +2042,6 @@ fn normalize_query(
     Ok(value)
 }
 
-fn normalize_timestamp_arg(
-    field: &'static str,
-    value: String,
-) -> Result<String, MemoryApplicationError> {
-    let parsed = DateTime::parse_from_rfc3339(&value).map_err(|_| invalid(field, "invalid"))?;
-    Ok(parsed
-        .with_timezone(&Utc)
-        .to_rfc3339_opts(SecondsFormat::AutoSi, true))
-}
-
 fn request_digest(
     tool: &str,
     query: &str,
@@ -2337,16 +2342,6 @@ fn timeline_record_order(left: &StoredRecord, right: &StoredRecord) -> std::cmp:
     timestamp_cmp(&left.created_at, &right.created_at).then_with(|| left.id.cmp(&right.id))
 }
 
-fn timestamp_cmp(left: &str, right: &str) -> std::cmp::Ordering {
-    match (
-        DateTime::parse_from_rfc3339(left),
-        DateTime::parse_from_rfc3339(right),
-    ) {
-        (Ok(left), Ok(right)) => left.cmp(&right),
-        _ => left.cmp(right),
-    }
-}
-
 fn timeline_anchor_key(anchor: &TimelineAnchor) -> String {
     format!("{anchor:?}")
 }
@@ -2422,10 +2417,10 @@ fn serialized_retrieval_len(
         "next_cursor": cursor,
     });
     if let Some(filters) = envelope.applied_filters {
-        value
-            .as_object_mut()
-            .expect("retrieval envelope is an object")
-            .insert("applied_filters".to_owned(), filters_payload(filters));
+        let Some(object) = value.as_object_mut() else {
+            return Err(MemoryApplicationError::StorageUnavailable);
+        };
+        object.insert("applied_filters".to_owned(), filters_payload(filters));
     }
     serde_json::to_vec(&value)
         .map(|bytes| bytes.len())
@@ -2732,13 +2727,11 @@ fn privacy_all(
         .collect()
 }
 fn timestamp(x: SystemTime) -> Result<String, MemoryApplicationError> {
-    let d = x
-        .duration_since(SystemTime::UNIX_EPOCH)
+    x.duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| invalid("timestamp", "out_of_range"))?;
-    let s = i64::try_from(d.as_secs()).map_err(|_| invalid("timestamp", "out_of_range"))?;
-    Ok(DateTime::<Utc>::from_timestamp(s, d.subsec_nanos())
-        .ok_or_else(|| invalid("timestamp", "out_of_range"))?
-        .to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    let timestamp =
+        jiff::Timestamp::try_from(x).map_err(|_| invalid("timestamp", "out_of_range"))?;
+    Ok(ParsedTimestamp::from_timestamp(timestamp).format_utc())
 }
 fn next_revision(x: &Revision) -> Result<Revision, MemoryApplicationError> {
     let n = x

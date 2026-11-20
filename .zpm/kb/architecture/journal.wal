@@ -209,3 +209,28 @@
 {"ts":1794318564,"op":"retractall","clause":"arch_convention(_,_,_,'chore_airlock')"}
 {"ts":1794318564,"op":"retractall","clause":"arch_adr(_,_,'chore_airlock')"}
 {"ts":1794318564,"op":"retractall","clause":"arch_feature('chore_airlock',_,_)"}
+{"ts":1795171277,"op":"assert","clause":"arch_decision('dec_agent_memory_jiff_compatibility_layer', 'agent memory time implementation', 'keep Jiff behind a private ParsedTimestamp compatibility layer', 'removes the direct unmaintained Chrono dependency without changing String-backed persisted records, protocol DTOs, JSON, or MCP timestamp behavior', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171277,"op":"assert","clause":"arch_decision('dec_agent_memory_leap_second_compatibility', 'agent memory leap-second handling', 'preserve leap seconds with an explicit compatibility marker and ordering key', 'Jiff normalizes seconds value 60, while the existing public contract keeps its spelling and orders it after the preceding second and before the next minute', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171277,"op":"assert","clause":"arch_convention('conv_agent_memory_timestamp_contract', 'extensions/agent_memory', 'canonical stored timestamps use UTC Z text with insignificant fractional zeros omitted; retrieval and timeline inputs retain their distinct normalization rules', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171277,"op":"assert","clause":"arch_convention('conv_agent_memory_timestamp_comparison', 'extensions/agent_memory', 'compare parseable timestamps by instant and use lexical ordering when an internal timestamp is unparseable', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171277,"op":"assert","clause":"arch_convention('conv_agent_memory_clock_boundaries', 'extensions/agent_memory', 'convert injected SystemTime through checked bounds and return timestamp/out_of_range before a storage mutation for pre-epoch or unsupported values', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171279,"op":"retractall","clause":"arch_component(_,_,_,'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171279,"op":"retractall","clause":"arch_port(_,_,'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171279,"op":"retractall","clause":"arch_decision(_,_,_,_,'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171279,"op":"retractall","clause":"arch_convention(_,_,_,'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171279,"op":"retractall","clause":"arch_adr(_,_,'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171280,"op":"retractall","clause":"arch_feature('feature_f018_replace_chrono_with_jiff_for_agent_me',_,_)"}
+{"ts":1795171280,"op":"retractall","clause":"arch_component('extension', _, _, _)"}
+{"ts":1795171280,"op":"assert","clause":"arch_component('extension', infrastructure, '', 'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171280,"op":"retractall","clause":"arch_component('formatter', _, _, _)"}
+{"ts":1795171280,"op":"assert","clause":"arch_component('formatter', infrastructure, '', 'feature_f018_replace_chrono_with_jiff_for_agent_me')"}
+{"ts":1795171280,"op":"retractall","clause":"arch_decision('dec_agent_memory_jiff_compatibility_layer', _, _, _, _, _, _, _)"}
+{"ts":1795171280,"op":"assert","clause":"arch_decision('dec_agent_memory_jiff_compatibility_layer', 'agent memory time implementation', 'keep Jiff behind a private ParsedTimestamp compatibility layer', 'removes the direct unmaintained Chrono dependency without changing String-backed persisted records, protocol DTOs, JSON, or MCP timestamp behavior', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171280,"op":"retractall","clause":"arch_decision('dec_agent_memory_leap_second_compatibility', _, _, _, _, _)"}
+{"ts":1795171280,"op":"assert","clause":"arch_decision('dec_agent_memory_leap_second_compatibility', 'agent memory leap-second handling', 'preserve leap seconds with an explicit compatibility marker and ordering key', 'Jiff normalizes seconds value 60, while the existing public contract keeps its spelling and orders it after the preceding second and before the next minute', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171281,"op":"retractall","clause":"arch_convention('conv_agent_memory_timestamp_contract', _, _, _)"}
+{"ts":1795171281,"op":"assert","clause":"arch_convention('conv_agent_memory_timestamp_contract', 'extensions/agent_memory', 'canonical stored timestamps use UTC Z text with insignificant fractional zeros omitted; retrieval and timeline inputs retain their distinct normalization rules', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171281,"op":"retractall","clause":"arch_convention('conv_agent_memory_timestamp_comparison', _, _, _)"}
+{"ts":1795171281,"op":"assert","clause":"arch_convention('conv_agent_memory_timestamp_comparison', 'extensions/agent_memory', 'compare parseable timestamps by instant and use lexical ordering when an internal timestamp is unparseable', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795171281,"op":"retractall","clause":"arch_convention('conv_agent_memory_clock_boundaries', _, _, _)"}
+{"ts":1795171281,"op":"assert","clause":"arch_convention('conv_agent_memory_clock_boundaries', 'extensions/agent_memory', 'convert injected SystemTime through checked bounds and return timestamp/out_of_range before a storage mutation for pre-epoch or unsupported values', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}

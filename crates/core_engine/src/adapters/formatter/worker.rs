@@ -569,9 +569,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn formatter_without_configured_timeout_completes_after_release() {
+        // This is a hang guard for a real subprocess and a durable file write.
+        // The formatter itself has no deadline.
+        let watchdog = Duration::from_secs(10);
         let dir = tempdir().unwrap();
         let marker = dir.path().join("started");
-        let release = dir.path().join("release");
         let source = dir.path().join("source.txt");
         fs::write(&source, b"unformatted\n").unwrap();
         let script = dir.path().join("formatter.sh");
@@ -579,7 +581,7 @@ mod tests {
         // which can fail with ETXTBSY. No executable permission is required.
         fs::write(
             &script,
-            "#!/bin/sh\nprintf started > \"$1\"\nwhile [ ! -e \"$2\" ]; do :; done\ncat >/dev/null\nprintf 'formatted\\n'\n",
+            "#!/bin/sh\nprintf started > \"$1\" || exit 1\nwhile [ -e \"$1\" ]; do sleep 0.05; done\ncat >/dev/null\nprintf 'formatted\\n'\n",
         ).unwrap();
         let mut tools = BTreeMap::new();
         tools.insert(
@@ -590,7 +592,6 @@ mod tests {
                     "sh".to_owned(),
                     script.to_string_lossy().into_owned(),
                     marker.to_string_lossy().into_owned(),
-                    release.to_string_lossy().into_owned(),
                 ],
                 extensions: vec!["txt".to_owned()],
                 timeout_secs: None,
@@ -611,17 +612,21 @@ mod tests {
                 .unwrap();
         });
 
-        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        let marker_deadline = Instant::now() + watchdog;
         while !marker.exists() && Instant::now() < marker_deadline {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(10));
         }
         assert!(marker.exists(), "formatter did not reach its release gate");
         assert!(matches!(
             result_rx.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
-        fs::write(&release, b"release").unwrap();
-        assert!(result_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        fs::remove_file(&marker).expect("release the waiting formatter");
+        assert!(
+            result_rx
+                .recv_timeout(watchdog)
+                .expect("formatter must commit its output after release")
+        );
         assert_eq!(fs::read(&source).unwrap(), b"formatted\n");
     }
 

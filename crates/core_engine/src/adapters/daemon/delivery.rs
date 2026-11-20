@@ -50,7 +50,7 @@ impl ExtensionDelivery {
         let event_count = batch.events.len();
         if self
             .queued_events
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count
                     .checked_add(event_count)
                     .filter(|count| *count <= MAX_PENDING_EVENTS)

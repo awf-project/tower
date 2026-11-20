@@ -526,6 +526,21 @@ impl Clock for FixedClock {
         Duration::ZERO
     }
 }
+
+#[derive(Clone)]
+struct ElapsedClock {
+    wall: Arc<AtomicU64>,
+    started: Arc<Instant>,
+}
+impl Clock for ElapsedClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(self.wall.fetch_add(1, Ordering::SeqCst))
+    }
+    fn monotonic_now(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 #[derive(Clone)]
 struct FixedId(Arc<Mutex<u64>>);
 impl IdGenerator for FixedId {
@@ -1168,10 +1183,14 @@ fn host_frames_are_preserved_while_memory_host_calls_are_pending() {
 fn provider_timeout_preserves_baseline_tool_availability() {
     // Exercise the production runtime adapter so the configured finite budget,
     // cancellation publication, and sanitized failure are observable.
+    let monotonic_started = Arc::new(Instant::now());
     let provider = RuntimeProvider::new();
     let app = Arc::new(MemoryApplication::new_configured(
         TestStore::default(),
-        FixedClock(Arc::new(AtomicU64::new(1_767_225_600))),
+        ElapsedClock {
+            wall: Arc::new(AtomicU64::new(1_767_225_600)),
+            started: monotonic_started,
+        },
         FixedId(Arc::new(Mutex::new(0))),
         Some(provider),
         PrivacyFilter::default(),
@@ -1210,10 +1229,18 @@ fn provider_timeout_preserves_baseline_tool_availability() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let application = app.clone();
     let cancellation = cancelled.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (begin_tx, begin_rx) = mpsc::sync_channel(0);
     let enrichment = std::thread::spawn(move || {
+        ready_tx
+            .send(())
+            .expect("provider worker must become ready");
+        begin_rx.recv().expect("provider worker must be released");
         application.run_enrichment(EnrichmentRequest { record }, cancellation.as_ref())
     });
+    ready_rx.recv().expect("provider worker must report ready");
     let started = Instant::now();
+    begin_tx.send(()).expect("provider worker must start");
     assert_eq!(
         enrichment.join().expect("provider worker must join"),
         Err(agent_memory_extension::MemoryApplicationError::ProviderTimeout)

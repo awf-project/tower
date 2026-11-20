@@ -71,7 +71,14 @@ clippy: ## Lint, warnings as errors (CI step 2)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: test
+# Parallel fixtures copy native sidecars. Prefer disk-backed scratch outside
+# the checkout so fixture workspaces don't inherit the project's .towerignore.
+ifndef TMPDIR
+TEST_TMPDIR_ROOT := $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)
+export TMPDIR := $(TEST_TMPDIR_ROOT)/tower/test-tmp
+endif
 test: ## Run the workspace test suite (compiles native extensions first)
+	mkdir -p "$(TMPDIR)"
 	cargo build --workspace --bins
 	cargo test --workspace
 

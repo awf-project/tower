@@ -583,7 +583,7 @@ fn runtime_test_proves_apply_edits_writes_are_visible_through_an_indexed_read_se
     write_apply_edits_extension(&workspace, &expected_version);
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = Some(1);
+    config.extensions.request_timeout_secs = Some(TEST_TIMEOUT.as_secs());
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.root().to_path_buf()),
@@ -1442,31 +1442,25 @@ printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy"
 
 #[test]
 fn lint_fix_follow_up_timeout_reports_applied_changes() {
+    // Preparation, the real edit, and follow-up startup share the lint budget.
+    const FIX_TIMEOUT_SECS: u64 = 5;
     let workspace = TestWorkspace::new();
-    let counter = workspace.root().join("post-edit-tool-failure-count.txt");
-    let counter_path = counter.to_string_lossy().replace('\\', "\\\\");
     let descendant_pid = workspace.root().join(".tower/follow-up-descendant.pid");
-    let descendant_pid_path = descendant_pid.to_string_lossy().replace('\\', "\\\\");
     let script = workspace.script(
         "post-edit-tool-failure.sh",
-        &format!(
-            r#"#!/bin/sh
-count=0
-if [ -f "{counter_path}" ]; then count=$(cat "{counter_path}"); fi
-count=$((count + 1))
-printf '%s' "$count" > "{counter_path}"
-if [ "$count" = 1 ]; then
-  printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope","level":"warning","code":{{"code":"fixture::replace"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}}]}}}}'
+        r#"#!/bin/sh
+IFS= read -r line < "$1" || exit 1
+if [ "$line" = nope ]; then
+  printf '%s\n' '{"reason":"compiler-message","message":{"message":"replace nope","level":"warning","code":{"code":"fixture::replace"},"spans":[{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}]}}'
   exit 0
 fi
-sh -c 'trap "" TERM; echo $$ > "{descendant_pid_path}"; while :; do sleep 1; done' &
-while [ ! -f "{descendant_pid_path}" ]; do :; done
-wait
-"#
-        ),
+[ "$line" = yep ] || exit 1
+sh -c 'trap "" TERM; echo $$ > .tower/follow-up-descendant.pid; exec sleep 60' &
+wait "$!"
+"#,
     );
     workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
-    set_lint_timeout(&workspace, 1);
+    set_lint_timeout(&workspace, FIX_TIMEOUT_SECS);
     workspace.write_file("src/main.rs", "nope\n");
 
     let mut adapter = ShutdownGuard::new(spawn_lint_fix_adapter(&workspace));
@@ -1483,7 +1477,7 @@ wait
         json!({
             "code": "lint_timeout",
             "message": "lint command timed out",
-            "detail": { "operation": "fix", "layer": "subprocess", "budget_ms": 1000 }
+            "detail": { "operation": "fix", "layer": "subprocess", "budget_ms": FIX_TIMEOUT_SECS * 1000 }
         })
     );
     assert_eq!(

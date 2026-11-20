@@ -163,18 +163,13 @@ pub fn run() -> Result<(), RuntimeError> {
             "initialize" => {
                 let params =
                     serde_json::from_value::<InitParams>(params).map_err(|_| RuntimeError)?;
-                match MemoryRuntime::compose(params, transport.clone()) {
-                    Ok(value) => {
-                        runtime = Some(value);
-                        send_response(
-                            &transport.output,
-                            &id,
-                            &Response::Initialized(protocol::initialize_result()),
-                        )
-                        .map_err(|_| RuntimeError)?;
-                    }
-                    Err(error) => return Err(error),
-                }
+                runtime = Some(MemoryRuntime::compose(params, transport.clone())?);
+                send_response(
+                    &transport.output,
+                    &id,
+                    &Response::Initialized(protocol::initialize_result()),
+                )
+                .map_err(|_| RuntimeError)?;
             }
             "invokeTool" => handle_tool(&transport, &runtime, &id, params)?,
             "deliverEvent" => {

@@ -1,15 +1,13 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Read as _;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use core_engine::adapters::daemon::socket::socket_path;
+use core_engine::adapters::daemon::socket::{socket_path, try_connect};
 use core_engine::adapters::daemon::wire::{ClientRole, Handshake, read_line_capped, write_line};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -114,7 +112,7 @@ fn main() {
 struct Daemon {
     workspace: TempDir,
     child: Child,
-    stderr: Option<thread::JoinHandle<String>>,
+    stderr: PathBuf,
 }
 impl Daemon {
     async fn start(shell: Option<&str>) -> (Self, Session) {
@@ -125,34 +123,49 @@ impl Daemon {
             format!("[daemon]\nidle_timeout_secs = 300\n{}", shell.unwrap_or("")),
         )
         .unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tower"))
+        let stderr = workspace.path().join(".tower/daemon.stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_tower"))
             .args(["daemon", "--workspace-dir"])
             .arg(workspace.path())
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", workspace.path())
+            .env("TOKIO_WORKER_THREADS", "2")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
-        let mut pipe = child.stderr.take().unwrap();
-        let stderr = thread::spawn(move || {
-            let mut s = String::new();
-            pipe.read_to_string(&mut s).unwrap();
-            s
-        });
-        let session = Session::connect(workspace.path()).await;
-        (
-            Self {
-                workspace,
-                child,
-                stderr: Some(stderr),
-            },
-            session,
-        )
+        let mut daemon = Self {
+            workspace,
+            child,
+            stderr,
+        };
+        let socket = socket_path(daemon.path());
+        let startup = async {
+            loop {
+                if let Some(status) = daemon.child.try_wait().unwrap() {
+                    panic!(
+                        "daemon exited during startup ({status}): {}",
+                        daemon.stderr()
+                    );
+                }
+                match try_connect(&socket).await {
+                    Ok(Some(stream)) => break Session::initialize(stream).await,
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(e) => panic!("connect to {}: {e}: {}", socket.display(), daemon.stderr()),
+                }
+            }
+        };
+        let session = tokio::time::timeout(Duration::from_secs(15), startup)
+            .await
+            .unwrap_or_else(|_| panic!("daemon startup timed out: {}", daemon.stderr()));
+        (daemon, session)
     }
     fn path(&self) -> &Path {
         self.workspace.path()
+    }
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr).expect("read fixture daemon stderr")
     }
     fn stop(&mut self) {
         if self.child.try_wait().unwrap().is_none() {
@@ -168,12 +181,18 @@ impl Daemon {
     }
     fn captured_stderr(mut self) -> String {
         self.stop();
-        self.stderr.take().unwrap().join().unwrap()
+        self.stderr()
     }
 }
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.stop();
+        if std::thread::panicking() {
+            // A failed startup may never have published a socket for shutdown.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        } else {
+            self.stop();
+        }
     }
 }
 
@@ -182,17 +201,7 @@ struct Session {
     id: u64,
 }
 impl Session {
-    async fn connect(workspace: &Path) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut stream = loop {
-            match UnixStream::connect(socket_path(workspace)).await {
-                Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(10)).await
-                }
-                Err(e) => panic!("connect daemon: {e}"),
-            }
-        };
+    async fn initialize(mut stream: UnixStream) -> Self {
         stream
             .write_all(Handshake::new(ClientRole::Mcp).to_line().as_bytes())
             .await
@@ -324,8 +333,6 @@ fn assert_output_only_in_stdout_response(response: &Value, sentinel: &str) {
 }
 
 pub(crate) async fn disabled_shell_tool_is_absent_from_discovery() {
-    let (_a, mut s) = Daemon::start(None).await;
-    assert_eq!(tool_count(&s.list().await), 0);
     let c = shell(
         false,
         &[fixture_binary().to_str().unwrap(), "argv"],
@@ -333,8 +340,10 @@ pub(crate) async fn disabled_shell_tool_is_absent_from_discovery() {
         64,
         64,
     );
-    let (_d, mut s) = Daemon::start(Some(&c)).await;
-    assert_eq!(tool_count(&s.list().await), 0)
+    for config in [None, Some(c.as_str())] {
+        let (_daemon, mut session) = Daemon::start(config).await;
+        assert_eq!(tool_count(&session.list().await), 0);
+    }
 }
 pub(crate) async fn enabled_shell_tool_executes_allowed_command() {
     let c = shell(

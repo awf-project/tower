@@ -2182,6 +2182,12 @@ fn register_bundled_debug_extension(
 
 fn debug_extension_binary_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
+    // In-process integration tests run from Cargo's private build directory.
+    // Cargo exposes the actual host binary, beside the prebuilt sidecar.
+    #[cfg(feature = "testing")]
+    let exe = std::env::var_os("CARGO_BIN_EXE_tower")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(exe);
     let exe_dir = exe.parent()?;
     let bin_dir = if exe_dir.file_name().is_some_and(|name| name == "deps") {
         exe_dir.parent()?

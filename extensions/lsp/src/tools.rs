@@ -1061,7 +1061,7 @@ fn optional_combined_preview(result: &WorkspaceApplyEditsResult) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::{BufRead, Write as _};
+    use std::io::BufRead;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 

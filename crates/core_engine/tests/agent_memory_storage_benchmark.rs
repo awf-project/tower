@@ -425,7 +425,7 @@ fn verify_current_release_binary(
     if !clean.success() {
         return Err(BinaryProvenanceError::RebuildFailed);
     }
-    let status = Command::new(env!("CARGO"))
+    let output = Command::new(env!("CARGO"))
         .current_dir(checkout)
         .args([
             "test",
@@ -435,24 +435,18 @@ fn verify_current_release_binary(
             "agent_memory_storage_benchmark",
             "--release",
             "--no-run",
+            "--locked",
+            "--message-format=json",
         ])
-        .status()
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .map_err(|_| BinaryProvenanceError::RebuildFailed)?;
-    if !status.success() {
+    if !output.status.success() {
         return Err(BinaryProvenanceError::RebuildFailed);
     }
-    let rebuilt_path = std::fs::read_dir(checkout.join("target/release/deps"))
-        .map_err(|_| BinaryProvenanceError::RebuiltExecutableMissing)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.is_file()
-                && path.file_name().is_some_and(|name| {
-                    name.to_string_lossy()
-                        .starts_with("agent_memory_storage_benchmark-")
-                })
-                && is_executable(path)
-        })
+    let rebuilt_path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(benchmark_artifact)
         .ok_or(BinaryProvenanceError::RebuiltExecutableMissing)?;
     let rebuilt_sha256 = sha256(&rebuilt_path).map_err(|_| BinaryProvenanceError::RebuildFailed)?;
     validate_binary_provenance(
@@ -473,14 +467,16 @@ fn sha256(path: &Path) -> std::io::Result<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect())
 }
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-}
-#[cfg(not(unix))]
-fn is_executable(_: &Path) -> bool {
-    true
+fn benchmark_artifact(line: &str) -> Option<PathBuf> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    if message["reason"] == "compiler-artifact"
+        && message["target"]["name"] == "agent_memory_storage_benchmark"
+        && message["target"]["kind"] == serde_json::json!(["test"])
+    {
+        message["executable"].as_str().map(PathBuf::from)
+    } else {
+        None
+    }
 }
 fn git(checkout: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -527,6 +523,19 @@ fn filesystem_provenance_validation_rejects_unresolved_and_ambiguous_findmnt_out
         ))
     );
 }
+#[test]
+fn benchmark_artifact_selects_the_executable_reported_for_the_test_target() {
+    let path = "/checkout/target/release/build/core_engine/hash/out/agent_memory_storage_benchmark";
+    let mut artifact = serde_json::json!({
+        "reason": "compiler-artifact",
+        "target": { "name": "agent_memory_storage_benchmark", "kind": ["bin"] },
+        "executable": path
+    });
+    assert_eq!(benchmark_artifact(&artifact.to_string()), None);
+    artifact["target"]["kind"] = serde_json::json!(["test"]);
+    assert_eq!(benchmark_artifact(&artifact.to_string()), Some(path.into()));
+}
+
 #[test]
 fn executable_provenance_validation_rejects_non_release_or_digest_mismatch() {
     let checkout = Path::new("/checkout");

@@ -205,6 +205,9 @@ fn lint_fix_non_timeout_errors_map_to_null_timeout_detail() {
 #[test]
 fn tower_lint_fix_uses_one_explicit_timeout_for_fix_and_verification() {
     const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(14);
+    // Either three-second invocation fits alone, with two seconds of headroom
+    // for launching verification under load. Both exceed the shared deadline.
+    const LINT_TIMEOUT_SECS: u64 = 5;
 
     let workspace = TestWorkspace::new();
     let counter = workspace.root().join("configured-fix-count.txt");
@@ -217,19 +220,18 @@ count=0
 if [ -f "{counter_path}" ]; then count=$(cat "{counter_path}"); fi
 count=$((count + 1))
 printf '%s' "$count" > "{counter_path}"
+sleep 3
 if [ "$count" = 1 ]; then
-  sleep 0.7
   printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"replace nope","level":"warning","code":{{"code":"fixture::replace"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":5,"byte_start":0,"byte_end":4,"suggested_replacement":"yep","applicability":"MachineApplicable"}}]}}}}'
 else
-  sleep 0.7
   printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"still noisy","level":"warning","code":{{"code":"fixture::remaining"}},"spans":[{{"file_name":"src/main.rs","is_primary":true,"line_start":1,"column_start":1,"line_end":1,"column_end":4}}]}}}}'
 fi
 "#
         ),
     );
     workspace.write_lint_config_with_format(&script, &["rs"], "rustc-json", "append", None);
-    let host_timeout = configure_lint_timeout_and_host_budget(&workspace, Some(1));
-    assert_eq!(host_timeout, Duration::from_secs(3));
+    let host_timeout = configure_lint_timeout_and_host_budget(&workspace, Some(LINT_TIMEOUT_SECS));
+    assert_eq!(host_timeout, Duration::from_secs(11));
     workspace.write_file("src/main.rs", "nope\n");
 
     let payload = block_on(async {
@@ -256,7 +258,7 @@ fi
             "error": {
                 "code": "lint_timeout",
                 "message": "lint command timed out",
-                "detail": {"operation": "fix", "layer": "subprocess", "budget_ms": 1000}
+                "detail": {"operation": "fix", "layer": "subprocess", "budget_ms": LINT_TIMEOUT_SECS * 1000}
             }
         }),
         "verification must consume only the deadline remaining after extraction"

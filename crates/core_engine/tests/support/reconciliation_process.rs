@@ -6,6 +6,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use core_engine::adapters::cli::GlobalOpts;
+use core_engine::adapters::daemon::CapabilityReadiness;
 use core_engine::adapters::daemon::client::send_control_async;
 use core_engine::adapters::daemon::socket::{
     OwnerLiveness, probe_owner, socket_path, wait_for_socket,
@@ -259,6 +260,7 @@ pub(crate) struct ReconciliationProcessHarness {
     committed_events: u64,
     resources_released: bool,
     seed_ready_fixture: bool,
+    pub(crate) request_timeout_secs: u64,
     process_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
     evidence_binaries: Option<BinaryProvenance>,
     watcher_thread: Option<(u32, u32)>,
@@ -438,6 +440,7 @@ impl ReconciliationProcessHarness {
             committed_events: 0,
             resources_released: false,
             seed_ready_fixture: false,
+            request_timeout_secs: 30,
             process_guard: None,
             evidence_binaries: Some(binaries),
             watcher_thread: None,
@@ -552,6 +555,7 @@ impl ReconciliationProcessHarness {
             committed_events: 0,
             resources_released: false,
             seed_ready_fixture: true,
+            request_timeout_secs: 30,
             process_guard: None,
             evidence_binaries: None,
             watcher_thread: None,
@@ -667,7 +671,7 @@ impl ReconciliationProcessHarness {
                  [extensions.readiness_controls]\nslow_start = [\"probe_catch_up\"]\n\
                  [extensions.initialize.slow_start]\nmode = \"{}\"\n",
                 if self.seed_ready_fixture { 1 } else { 30 },
-                if self.seed_ready_fixture { 1 } else { 30 },
+                self.request_timeout_secs,
                 self.configuration.as_str(),
             ),
         )
@@ -1176,7 +1180,8 @@ impl Drop for ReconciliationProcessHarness {
 #[derive(Debug, PartialEq, Eq)]
 struct PersistedState(BTreeMap<String, PersistedEntries>);
 
-fn run_bounded_daemon(binary: &Path, workspace: &Path, env: &[(&str, &str)]) -> Output {
+#[tokio::main(flavor = "current_thread")]
+async fn run_bounded_daemon(binary: &Path, workspace: &Path, env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(binary);
     command
         .arg("daemon")
@@ -1184,18 +1189,63 @@ fn run_bounded_daemon(binary: &Path, workspace: &Path, env: &[(&str, &str)]) -> 
         .arg(workspace)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", std::env::var_os("HOME").unwrap_or_default());
+        .env("HOME", workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, value) in env {
         command.env(key, value);
     }
-    command.output().expect("run selected tower daemon")
+    let mut child = command.spawn().expect("run selected tower daemon");
+    let opts = GlobalOpts {
+        workspace_dir: Some(workspace.to_owned()),
+        extensions_dir: None,
+    };
+    // The injected failure exits on its own. For a healthy generation,
+    // reconciliation and its metrics are published before workspace readiness.
+    let mut shutdown_requested = false;
+    let finished = tokio::time::timeout(Duration::from_secs(30), async {
+        while child
+            .try_wait()
+            .expect("poll reconciliation daemon")
+            .is_none()
+        {
+            if !shutdown_requested
+                && let Ok(ControlResponse::Status(status)) =
+                    send_control_async(&opts, ControlRequest::Status).await
+                && status.workspace == CapabilityReadiness::Ready
+            {
+                shutdown_requested = matches!(
+                    send_control_async(&opts, ControlRequest::Shutdown).await,
+                    Ok(ControlResponse::Ok)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if finished.is_err() {
+        let _ = child.kill();
+    }
+    let output = child
+        .wait_with_output()
+        .expect("reap reconciliation daemon");
+    assert!(
+        finished.is_ok(),
+        "timed out waiting for reconciliation daemon"
+    );
+    assert!(
+        !output.status.success() || shutdown_requested,
+        "reconciliation daemon exited successfully before reporting workspace readiness"
+    );
+    output
 }
 
-fn write_idle_config(workspace: &Path, secret: &str) {
+fn write_reconciliation_config(workspace: &Path, secret: &str) {
     std::fs::create_dir_all(workspace.join(".tower")).unwrap();
     std::fs::write(
         workspace.join(".tower/config.toml"),
-        format!("# {secret}\n[daemon]\nidle_timeout_secs = 1\n"),
+        format!("# {secret}\n[daemon]\nidle_timeout_secs = 300\n"),
     )
     .unwrap();
 }
@@ -1311,8 +1361,8 @@ impl<'a> ReconciliationProcessFixture<'a> {
         let workspace = tempdir().unwrap();
         let unrelated = tempdir().unwrap();
         let extensions = tempdir().unwrap();
-        write_idle_config(workspace.path(), Self::SECRET);
-        write_idle_config(unrelated.path(), Self::SECRET);
+        write_reconciliation_config(workspace.path(), Self::SECRET);
+        write_reconciliation_config(unrelated.path(), Self::SECRET);
         std::fs::write(
             workspace.path().join("baseline.rs"),
             "pub fn baseline() {}\n",

@@ -611,13 +611,11 @@ fn read_chunks(
             _ => return Err(SemanticIndexError::Corrupt),
         };
         let embedding: Vec<u8> = row.get(13).map_err(|_| SemanticIndexError::Corrupt)?;
-        if embedding.is_empty() || !embedding.len().is_multiple_of(4) {
+        let (floats, remainder) = embedding.as_chunks::<4>();
+        if floats.is_empty() || !remainder.is_empty() {
             return Err(SemanticIndexError::Corrupt);
         }
-        let values = embedding
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact embedding width")))
-            .collect();
+        let values = floats.iter().copied().map(f32::from_le_bytes).collect();
         result.push(IndexedChunk {
             chunk: SemanticChunk {
                 path: WorkspacePath::new(row.get(0).map_err(|_| SemanticIndexError::Corrupt)?)

@@ -446,7 +446,7 @@ impl SledAgentMemoryStorage {
 
     fn acquire_request(&self) -> Result<RequestPermit<'_>, AgentMemoryStorageError> {
         self.outstanding_requests
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Acquire, Ordering::Relaxed, |current| {
                 (current < self.bounds.max_outstanding_requests).then_some(current + 1)
             })
             .map_err(|_| AgentMemoryStorageError::BoundsExceeded)?;
@@ -588,7 +588,7 @@ impl InMemoryAgentMemoryStorage {
 
     fn acquire_request(&self) -> Result<RequestPermit<'_>, AgentMemoryStorageError> {
         self.outstanding_requests
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Acquire, Ordering::Relaxed, |current| {
                 (current < self.bounds.max_outstanding_requests).then_some(current + 1)
             })
             .map_err(|_| AgentMemoryStorageError::BoundsExceeded)?;

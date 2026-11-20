@@ -977,20 +977,105 @@ fn supervised_storage_host_calls_reject_unauthorized_extensions_before_adapter_a
     }
 }
 
-#[test]
-fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
-    let mut harness = MemoryMcpHarness::start();
-    let first = harness.call(
-        "tower_memory_remember",
-        json!({"record":record_with("observation", "café alpha", "body must not be returned", provenance("branch-a", "src/a.rs", "alpha", "tag-a", "agent-a", "client-a")), "idempotency_key":"retrieval-a"}),
+fn assert_canonical_utc_timestamp(timestamp: &str) {
+    let bytes = timestamp.as_bytes();
+    assert!(
+        matches!(bytes.len(), 20 | 24 | 27 | 30),
+        "timestamp must use AutoSi-compatible precision: {timestamp}"
     );
-    let second = harness.call(
-        "tower_memory_remember",
-        json!({"record":record_with("decision", "café beta", "another private body", provenance("branch-b", "src/b.rs", "beta", "tag-b", "agent-b", "client-b")), "idempotency_key":"retrieval-b"}),
+    assert_eq!(bytes[4], b'-', "{timestamp}");
+    assert_eq!(bytes[7], b'-', "{timestamp}");
+    assert_eq!(bytes[10], b'T', "{timestamp}");
+    assert_eq!(bytes[13], b':', "{timestamp}");
+    assert_eq!(bytes[16], b':', "{timestamp}");
+    assert_eq!(bytes.last(), Some(&b'Z'), "{timestamp}");
+    if bytes.len() > 20 {
+        assert_eq!(bytes[19], b'.', "{timestamp}");
+    }
+    assert!(
+        bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16)
+                || (index == 19 && bytes.len() > 20)
+                || index + 1 == bytes.len()
+                || byte.is_ascii_digit()),
+        "timestamp contains a noncanonical component: {timestamp}"
     );
-    assert_eq!(first["code"], "ok");
-    assert_eq!(second["code"], "ok");
+}
 
+fn creation_order_key(timestamp: &str) -> (&str, u32) {
+    assert_canonical_utc_timestamp(timestamp);
+    let (seconds, fraction) = timestamp
+        .strip_suffix('Z')
+        .unwrap()
+        .split_once('.')
+        .unwrap_or((&timestamp[..19], ""));
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u32>().unwrap() * 10_u32.pow(9 - fraction.len() as u32)
+    };
+    (seconds, nanos)
+}
+
+fn equivalent_offset(timestamp: &str) -> String {
+    assert_canonical_utc_timestamp(timestamp);
+    let minute: u8 = timestamp[14..16].parse().unwrap();
+    // Keep the local date and hour even at midnight on New Year's Day.
+    let (local_minute, offset) = if minute == 59 {
+        (58, "-00:01")
+    } else {
+        (minute + 1, "+00:01")
+    };
+    format!(
+        "{}{local_minute:02}{}{offset}",
+        &timestamp[..14],
+        &timestamp[16..timestamp.len() - 1]
+    )
+}
+
+fn remember_retrieval_pair() -> (MemoryMcpHarness, Value, Value) {
+    // Retry on a coarse wall clock with a fresh workspace and just two records.
+    for _ in 0..3 {
+        let mut harness = MemoryMcpHarness::start();
+        let first = harness.call(
+            "tower_memory_remember",
+            json!({"record":record_with("observation", "café alpha", "body must not be returned", provenance("branch-a", "src/a.rs", "alpha", "tag-a", "agent-a", "client-a")), "idempotency_key":"retrieval-a"}),
+        );
+        let second = harness.call(
+            "tower_memory_remember",
+            json!({"record":record_with("decision", "café beta", "another private body", provenance("branch-b", "src/b.rs", "beta", "tag-b", "agent-b", "client-b")), "idempotency_key":"retrieval-b"}),
+        );
+        assert_eq!(first["code"], "ok");
+        assert_eq!(second["code"], "ok");
+        let batch = harness.call(
+            "tower_memory_get",
+            json!({"ids":[second["id"].clone(), "missing", first["id"].clone()]}),
+        );
+        let alpha = &batch["items"][2]["record"];
+        let beta = &batch["items"][0]["record"];
+        assert_eq!(batch["items"][1]["code"], "not_found");
+        assert_eq!(alpha["title"], "café alpha");
+        assert_eq!(beta["title"], "café beta");
+        for (fetched, remembered) in [(alpha, &first), (beta, &second)] {
+            assert_eq!(fetched["id"], remembered["id"]);
+            assert_eq!(fetched["revision"], remembered["revision"]);
+            assert_canonical_utc_timestamp(fetched["created_at"].as_str().unwrap());
+            assert_eq!(fetched["created_at"], fetched["updated_at"]);
+        }
+        if alpha["created_at"] != beta["created_at"] {
+            return (harness, alpha.clone(), beta.clone());
+        }
+    }
+    panic!("production clock did not yield distinct creation instants after three attempts");
+}
+
+fn assert_filtered_and_ranked_search(
+    harness: &mut MemoryMcpHarness,
+    first: &Value,
+    second: &Value,
+) {
     let search = harness.call(
         "tower_memory_search",
         json!({
@@ -1006,6 +1091,7 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
     assert!(hits.iter().all(|hit| hit.get("body").is_none()), "{search}");
     assert_eq!(hits[0]["id"], first["id"]);
     assert_eq!(hits[0]["title"], "café alpha");
+    assert_eq!(hits[0]["timestamp"], first["created_at"]);
     assert_eq!(
         hits[0].as_object().unwrap().keys().collect::<Vec<_>>(),
         vec![
@@ -1049,6 +1135,39 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
             "{filtered}"
         );
     }
+    let scored = harness.search("café alpha", json!({"limit":10,"response_bytes":4096}));
+    assert_eq!(scored["code"], "ok", "{scored}");
+    assert_eq!(scored["hits"][0]["id"], first["id"]);
+    assert_eq!(scored["hits"][1]["id"], second["id"]);
+    assert!(
+        scored["hits"][0]["score"].as_f64().unwrap() > scored["hits"][1]["score"].as_f64().unwrap(),
+        "search must order higher scores before creation time: {scored}"
+    );
+}
+
+fn assert_search_timestamp_order(harness: &mut MemoryMcpHarness, older: &Value, newer: &Value) {
+    let zero_offset_window = harness.call(
+        "tower_memory_search",
+        json!({
+            "query":"café",
+            "filters":{
+                "created_from":format!("{}+00:00", older["created_at"].as_str().unwrap().strip_suffix('Z').unwrap()),
+                "created_to":format!("{}-00:00", newer["created_at"].as_str().unwrap().strip_suffix('Z').unwrap())
+            },
+            "page":{"limit":10,"response_bytes":4096}
+        }),
+    );
+    assert_eq!(zero_offset_window["code"], "ok", "{zero_offset_window}");
+    assert_eq!(
+        zero_offset_window["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![older["id"].clone()],
+        "retrieval bounds must include from and exclude to: {zero_offset_window}"
+    );
     let tie_one = harness.search("café", json!({"limit":10,"response_bytes":4096}));
     let tie_two = harness.search("café", json!({"limit":10,"response_bytes":4096}));
     assert_eq!(tie_one["hits"], tie_two["hits"], "search tie order changed");
@@ -1059,30 +1178,49 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
             .iter()
             .map(|hit| hit["id"].clone())
             .collect::<Vec<_>>(),
-        vec![second["id"].clone(), first["id"].clone()],
+        vec![newer["id"].clone(), older["id"].clone()],
         "equal-score hits must use newest timestamp, then ascending id"
     );
-
-    let batch = harness.call(
-        "tower_memory_get",
-        json!({"ids":[second["id"].clone(), "missing", first["id"].clone()]}),
+    assert_eq!(tie_one["hits"][0]["score"], tie_one["hits"][1]["score"]);
+    assert_eq!(
+        tie_one["hits"][0]["timestamp"].as_str(),
+        newer["created_at"].as_str()
     );
-    assert_eq!(batch["items"][0]["record"]["title"], "café beta");
-    assert_eq!(batch["items"][1]["code"], "not_found");
-    assert_eq!(batch["items"][2]["record"]["title"], "café alpha");
-
-    let context = harness.call("tower_memory_context_for_task", json!({"query":"unmatched task", "filters":{"paths":["src/b.rs"]}, "page":{"limit":10,"response_bytes":4096}}));
-    assert_eq!(context["code"], "ok", "{context}");
-    assert_eq!(context["hits"][0]["id"], second["id"]);
-    assert!(
-        context["hits"][0]["reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason == &json!({"kind":"metadata","field":"path"})),
-        "{context}"
+    assert_eq!(
+        tie_one["hits"][1]["timestamp"].as_str(),
+        older["created_at"].as_str()
     );
+}
 
+fn assert_context_by_path(harness: &mut MemoryMcpHarness, first: &Value, second: &Value) {
+    for (path, id, timestamp) in [
+        (
+            "src/a.rs",
+            &first["id"],
+            first["created_at"].as_str().unwrap(),
+        ),
+        (
+            "src/b.rs",
+            &second["id"],
+            second["created_at"].as_str().unwrap(),
+        ),
+    ] {
+        let context = harness.call("tower_memory_context_for_task", json!({"query":"unmatched task", "filters":{"paths":[path]}, "page":{"limit":10,"response_bytes":4096}}));
+        assert_eq!(context["code"], "ok", "{context}");
+        assert_eq!(context["hits"][0]["id"], *id);
+        assert_eq!(context["hits"][0]["timestamp"], timestamp);
+        assert!(
+            context["hits"][0]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == &json!({"kind":"metadata","field":"path"})),
+            "{context}"
+        );
+    }
+}
+
+fn assert_timeline_anchors(harness: &mut MemoryMcpHarness, first: &Value) {
     let empty = harness.search("absent-token", json!({"limit":10,"response_bytes":4096}));
     assert_eq!(empty["hits"], json!([]), "{empty}");
     let missing_anchor = harness.call(
@@ -1100,6 +1238,9 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
         );
         assert_eq!(timeline["code"], "ok", "{timeline}");
     }
+}
+
+fn assert_timeline_windows(harness: &mut MemoryMcpHarness, older: &Value, newer: &Value) {
     let timeline = harness.call(
         "tower_memory_timeline",
         json!({
@@ -1115,8 +1256,16 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
             .iter()
             .map(|event| event["id"].clone())
             .collect::<Vec<_>>(),
-        vec![first["id"].clone(), second["id"].clone()],
+        vec![older["id"].clone(), newer["id"].clone()],
         "timeline events must remain in chronological creation order"
+    );
+    assert_eq!(
+        timeline["events"][0]["timestamp"].as_str(),
+        older["created_at"].as_str()
+    );
+    assert_eq!(
+        timeline["events"][1]["timestamp"].as_str(),
+        newer["created_at"].as_str()
     );
     assert!(
         timeline["events"]
@@ -1126,6 +1275,75 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
             .all(|event| event.get("body").is_none()),
         "timeline events must remain compact: {timeline}"
     );
+
+    let canonical_window = harness.call(
+        "tower_memory_timeline",
+        json!({
+            "anchor":{"kind":"window","from":older["created_at"],"to":newer["created_at"]},
+            "page":{"limit":10,"response_bytes":4096}
+        }),
+    );
+    let offset_window = harness.call(
+        "tower_memory_timeline",
+        json!({
+            "anchor":{
+                "kind":"window",
+                "from":equivalent_offset(older["created_at"].as_str().unwrap()),
+                "to":equivalent_offset(newer["created_at"].as_str().unwrap())
+            },
+            "page":{"limit":10,"response_bytes":4096}
+        }),
+    );
+    assert_eq!(canonical_window["code"], "ok", "{canonical_window}");
+    assert_eq!(offset_window["code"], "ok", "{offset_window}");
+    assert_eq!(
+        canonical_window["events"], offset_window["events"],
+        "equivalent nonzero-offset bounds must normalize to the same instants"
+    );
+    assert_eq!(
+        canonical_window["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![older["id"].clone()],
+        "timeline windows must include from and exclude to: {canonical_window}"
+    );
+}
+
+fn assert_invalid_retrieval_requests(
+    harness: &mut MemoryMcpHarness,
+    first: &Value,
+    second: &Value,
+) {
+    for (name, arguments) in [
+        (
+            "tower_memory_search",
+            json!({
+                "query":"café",
+                "filters":{"created_from":equivalent_offset(first["created_at"].as_str().unwrap())}
+            }),
+        ),
+        (
+            "tower_memory_timeline",
+            json!({
+                "anchor":{"kind":"window","from":"not-a-timestamp","to":second["created_at"]}
+            }),
+        ),
+    ] {
+        let invalid_timestamp =
+            harness.raw_call("tools/call", json!({"name":name,"arguments":arguments}));
+        assert_eq!(
+            invalid_timestamp["result"]["isError"], true,
+            "timestamp validation must remain a typed MCP parameter error: {invalid_timestamp}"
+        );
+        assert_eq!(
+            invalid_timestamp["result"]["content"][0]["text"], "Invalid params",
+            "{invalid_timestamp}"
+        );
+    }
+
     let too_small = harness.search("café", json!({"limit":1,"response_bytes":1}));
     assert_eq!(
         too_small["code"], "response_budget_too_small",
@@ -1137,6 +1355,48 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
     );
     assert_eq!(malformed["result"]["isError"], true, "{malformed}");
     assert_eq!(malformed["result"]["content"][0]["text"], "Invalid params");
+}
+
+fn assert_update_and_truncation_after_restart(harness: &mut MemoryMcpHarness, first: &Value) {
+    let updated = harness.call(
+        "tower_memory_update",
+        json!({
+            "items":[{
+                "id":first["id"].clone(),
+                "expected_revision":first["revision"].clone(),
+                "record":record_with(
+                    "observation",
+                    "café alpha",
+                    "updated body",
+                    provenance(
+                        "branch-a",
+                        "src/a.rs",
+                        "alpha",
+                        "tag-a",
+                        "agent-a",
+                        "client-a"
+                    )
+                )
+            }]
+        }),
+    );
+    assert_eq!(updated["items"][0]["code"], "ok", "{updated}");
+    let updated_record = harness.call("tower_memory_get", json!({"ids":[first["id"].clone()]}));
+    assert_eq!(updated_record["items"][0]["code"], "ok", "{updated_record}");
+    assert_eq!(
+        updated_record["items"][0]["record"]["created_at"],
+        first["created_at"]
+    );
+    let updated_timestamp = updated_record["items"][0]["record"]["updated_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_canonical_utc_timestamp(&updated_timestamp);
+    assert!(
+        creation_order_key(&updated_timestamp)
+            >= creation_order_key(first["created_at"].as_str().unwrap()),
+        "updates must not move a record timestamp before its creation: {updated_record}"
+    );
 
     // Reopen the same durable records under a smaller compact-field limit.
     // The four two-byte code points force truncation between UTF-8 boundaries.
@@ -1147,6 +1407,15 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
     )
     .unwrap();
     harness.restart();
+    let persisted_update = harness.call("tower_memory_get", json!({"ids":[first["id"].clone()]}));
+    assert_eq!(
+        persisted_update["items"][0]["record"]["created_at"],
+        first["created_at"]
+    );
+    assert_eq!(
+        persisted_update["items"][0]["record"]["updated_at"],
+        updated_timestamp
+    );
     let truncated = harness.search("utf8 boundary", json!({"limit":10,"response_bytes":4096}));
     let hit = truncated["hits"]
         .as_array()
@@ -1157,6 +1426,25 @@ fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
     assert_eq!(hit["title"], "ééé");
     assert_eq!(hit["truncated_fields"], json!(["title"]));
     assert!(serde_json::to_vec(&truncated).unwrap().len() <= 4096);
+}
+
+#[test]
+fn public_retrieval_is_compact_filtered_bounded_and_provider_independent() {
+    let (mut harness, first, second) = remember_retrieval_pair();
+    let (older, newer) = if creation_order_key(first["created_at"].as_str().unwrap())
+        < creation_order_key(second["created_at"].as_str().unwrap())
+    {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    assert_filtered_and_ranked_search(&mut harness, &first, &second);
+    assert_search_timestamp_order(&mut harness, older, newer);
+    assert_context_by_path(&mut harness, &first, &second);
+    assert_timeline_anchors(&mut harness, &first);
+    assert_timeline_windows(&mut harness, older, newer);
+    assert_invalid_retrieval_requests(&mut harness, &first, &second);
+    assert_update_and_truncation_after_restart(&mut harness, &first);
 }
 
 #[test]

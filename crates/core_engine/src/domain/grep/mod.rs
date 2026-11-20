@@ -185,7 +185,7 @@ impl<'a> TextSearch<'a> {
                     }
                     if line.contains(pattern) {
                         if counter
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                                 (current < effective_cap).then_some(current + 1)
                             })
                             .is_err()

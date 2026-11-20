@@ -437,7 +437,7 @@ fn input_with(title: &str, body: &str, branch: &str, path: &str) -> RecordInput 
 #[test]
 fn search_filters_compact_hits_and_breaks_ties_deterministically() {
     let store = MemoryStoreDouble::durable();
-    let application = app(store.clone(), &["b", "a", "filtered"]);
+    let application = app(store.clone(), &["b", "a", "higher-score", "filtered"]);
     application
         .remember(remember(
             input_with("needle beta", "unrelated", "main", "src/b.rs"),
@@ -452,10 +452,32 @@ fn search_filters_compact_hits_and_breaks_ties_deterministically() {
         .unwrap();
     application
         .remember(remember(
+            input_with("needle priority", "needle", "main", "src/priority.rs"),
+            "higher-score-key",
+        ))
+        .unwrap();
+    application
+        .remember(remember(
             input_with("needle filtered", "unrelated", "other", "src/x.rs"),
             "filtered-key",
         ))
         .unwrap();
+    MemoryApplication::new(
+        store.clone(),
+        FixedClock {
+            wall: SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_800_000_000)
+                + Duration::from_millis(900),
+            monotonic: Duration::from_secs(10),
+        },
+        SequenceIds::new(&["newer"]),
+        None::<ProviderDouble>,
+    )
+    .remember(remember(
+        input_with("needle newer", "unrelated", "main", "src/newer.rs"),
+        "newer-key",
+    ))
+    .unwrap();
     let filters = MemoryFilters::try_new(
         vec![],
         vec!["main".into()],
@@ -483,9 +505,12 @@ fn search_filters_compact_hits_and_breaks_ties_deterministically() {
         )
         .unwrap();
 
-    assert_eq!(result.hits.len(), 2);
-    assert!(format!("{:?}", result.hits[0]).contains("MemoryId(\"a\")"));
-    assert!(format!("{:?}", result.hits[1]).contains("MemoryId(\"b\")"));
+    assert_eq!(result.hits.len(), 4);
+    assert_eq!(result.hits[0].score(), 2.0);
+    assert!(format!("{:?}", result.hits[0]).contains("MemoryId(\"higher-score\")"));
+    assert!(format!("{:?}", result.hits[1]).contains("MemoryId(\"newer\")"));
+    assert!(format!("{:?}", result.hits[2]).contains("MemoryId(\"a\")"));
+    assert!(format!("{:?}", result.hits[3]).contains("MemoryId(\"b\")"));
     let compact = format!("{result:?}");
     assert!(!compact.contains("unrelated"));
     assert!(!compact.contains("body for"));
@@ -657,6 +682,107 @@ fn timeline_orders_creation_events_for_anchor_query_and_window_modes() {
     assert!(
         matches!(window, TimelineResult::Found { ref events, .. } if events.len() == 2 && format!("{:?}", events[0]).contains("MemoryId(\"a\")") && format!("{:?}", events[1]).contains("MemoryId(\"b\")"))
     );
+    let normalized_offset_window = app(store.clone(), &[])
+        .timeline(
+            TimelineQuery::try_new(
+                TimelineAnchor::Window {
+                    from: "2027-01-15T09:00:00+01:00".into(),
+                    to: "2027-01-15T09:00:01+01:00".into(),
+                },
+                empty_filters(),
+                page(10),
+                &limits(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(
+        matches!(normalized_offset_window, TimelineResult::Found { ref events, .. } if events.len() == 2 && format!("{:?}", events[0]).contains("MemoryId(\"a\")") && format!("{:?}", events[1]).contains("MemoryId(\"b\")"))
+    );
+    for (input, expected) in [
+        ("2020-01-01T00:00:00+23:59", "2019-12-31T00:01:00Z"),
+        ("2027-01-15T09:00:60+01:00", "2027-01-15T08:00:60Z"),
+        ("9999-12-31T23:59:59-00:01", "+10000-01-01T00:00:59Z"),
+    ] {
+        let query = TimelineQuery::try_new(
+            TimelineAnchor::Window {
+                from: input.into(),
+                to: input.into(),
+            },
+            empty_filters(),
+            page(10),
+            &limits(),
+        )
+        .expect("supported timeline timestamp");
+        assert_eq!(
+            query.anchor,
+            TimelineAnchor::Window {
+                from: expected.into(),
+                to: expected.into(),
+            }
+        );
+    }
+    let leap_window = app(store.clone(), &[])
+        .timeline(
+            TimelineQuery::try_new(
+                TimelineAnchor::Window {
+                    from: "2027-01-15T08:00:60Z".into(),
+                    to: "2027-01-15T08:01:00Z".into(),
+                },
+                empty_filters(),
+                page(10),
+                &limits(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(leap_window, TimelineResult::Found { ref events, .. } if events.is_empty()));
+
+    // Dispatch validates wire arguments, then the service revalidates the
+    // normalized window after applying privacy rules.
+    let application = app(store.clone(), &[]);
+    for (from, to, ids) in [
+        ("9999-12-31T23:58:00Z", "9999-12-31T23:59:59-00:01", vec![]),
+        (
+            "2027-01-15T08:00:02Z",
+            "9999-12-31T23:59:59-00:01",
+            vec!["d"],
+        ),
+        (
+            "0000-01-01T00:00:00+00:01",
+            "2027-01-15T08:00:01Z",
+            vec!["a", "b"],
+        ),
+    ] {
+        let result = application
+            .dispatch_retrieval(
+                "memory_timeline",
+                json!({
+                    "anchor": {"kind": "window", "from": from, "to": to},
+                    "page": {"limit": 10, "response_bytes": 4096}
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["code"], "ok", "{from}..{to}: {result}");
+        let actual: Vec<_> = result["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, ids, "{from}..{to}");
+    }
+    for endpoint in ["+10000-01-01T00:00:59Z", "-0001-12-31T23:59:00Z"] {
+        assert_eq!(
+            application.dispatch_retrieval(
+                "memory_timeline",
+                json!({
+                    "anchor": {"kind": "window", "from": endpoint, "to": endpoint}
+                })
+            ),
+            Err(RetrievalDispatchError::InvalidParams)
+        );
+    }
 
     let fractional_store = MemoryStoreDouble::durable();
     for (id, offset) in [
@@ -742,6 +868,7 @@ fn timeline_orders_creation_events_for_anchor_query_and_window_modes() {
         .unwrap();
     assert!(matches!(equal, TimelineResult::Found { ref events, .. } if events.is_empty()));
     let before = store.snapshot();
+    let requests_before = store.transaction_requests();
     assert_eq!(
         TimelineQuery::try_new(
             TimelineAnchor::Window {
@@ -758,6 +885,32 @@ fn timeline_orders_creation_events_for_anchor_query_and_window_modes() {
         })
     );
     assert_eq!(store.snapshot(), before);
+    assert_eq!(store.transaction_requests(), requests_before);
+    for (field, from, to, reason) in [
+        ("from", "not-a-timestamp", "2027-01-15T08:00:01Z", "invalid"),
+        ("to", "2027-01-15T08:00:00Z", "not-a-timestamp", "invalid"),
+        (
+            "to",
+            "2027-01-15T09:00:01+01:00",
+            "2027-01-15T08:00:00Z",
+            "before_from",
+        ),
+    ] {
+        assert_eq!(
+            TimelineQuery::try_new(
+                TimelineAnchor::Window {
+                    from: from.into(),
+                    to: to.into(),
+                },
+                empty_filters(),
+                page(10),
+                &limits(),
+            ),
+            Err(MemoryApplicationError::InvalidArgument { field, reason })
+        );
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(store.transaction_requests(), requests_before);
+    }
     for (anchor, field) in [
         (
             TimelineAnchor::Record {
@@ -2227,6 +2380,62 @@ fn application_clock_and_id_ports_are_deterministic() {
     assert!(
         matches!(&fetched.items[0], GetItemResult::Found { record, .. } if record.created_at() == "2027-01-15T08:00:00Z")
     );
+
+    let maximum_clock = MemoryApplication::new(
+        MemoryStoreDouble::durable(),
+        FixedClock {
+            wall: SystemTime::UNIX_EPOCH + Duration::new(253_402_207_200, 999_999_999),
+            monotonic: Duration::ZERO,
+        },
+        SequenceIds::new(&["maximum-time"]),
+        None::<ProviderDouble>,
+    );
+    let maximum = maximum_clock
+        .remember(remember(input("maximum"), "maximum-time-key"))
+        .unwrap();
+    let maximum_record = maximum_clock
+        .get(GetQuery::try_new(vec![maximum.id], &limits()).unwrap())
+        .unwrap();
+    assert!(matches!(
+        &maximum_record.items[0],
+        GetItemResult::Found { record, .. }
+            if record.created_at() == "9999-12-30T22:00:00.999999999Z"
+    ));
+
+    for (wall, id, key) in [
+        (
+            SystemTime::UNIX_EPOCH + Duration::new(253_402_207_201, 0),
+            "after-maximum",
+            "after-maximum-key",
+        ),
+        (
+            SystemTime::UNIX_EPOCH - Duration::from_nanos(1),
+            "before-epoch",
+            "before-epoch-key",
+        ),
+    ] {
+        let store = MemoryStoreDouble::durable();
+        let invalid_clock = MemoryApplication::new(
+            store.clone(),
+            FixedClock {
+                wall,
+                monotonic: Duration::ZERO,
+            },
+            SequenceIds::new(&[id]),
+            None::<ProviderDouble>,
+        );
+        let snapshot_before = store.snapshot();
+        let requests_before = store.transaction_requests();
+        assert_eq!(
+            invalid_clock.remember(remember(input("invalid"), key)),
+            Err(MemoryApplicationError::InvalidArgument {
+                field: "timestamp",
+                reason: "out_of_range"
+            })
+        );
+        assert_eq!(store.snapshot(), snapshot_before);
+        assert_eq!(store.transaction_requests(), requests_before);
+    }
 
     let invalid_clock = MemoryApplication::new(
         MemoryStoreDouble::durable(),

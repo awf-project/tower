@@ -65,15 +65,19 @@ mod shell_command;
 #[cfg(unix)]
 static SHELL_SCENARIO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// gag redirects process-wide stderr for the two dependency privacy checks.
+static STDERR_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(unix)]
 macro_rules! shell_scenario {
     ($name:ident) => {
         #[test]
         fn $name() {
-            let _guard = SHELL_SCENARIO_LOCK.lock().unwrap();
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(shell_command::$name());
+            // The lock limits simultaneous processes. Each scenario owns its own workspace.
+            let _guard = SHELL_SCENARIO_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            block_on(shell_command::$name());
         }
     };
 }
@@ -2176,6 +2180,9 @@ fn search_does_not_discover_unconfigured_dependency_roots() {
 
 #[test]
 fn dependency_scan_failure_preserves_workspace_results() {
+    let _guard = STDERR_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     block_on(async {
         let fixture = tempfile::tempdir().unwrap();
         let workspace = fixture.path().join("workspace");
@@ -2349,6 +2356,9 @@ fn dependency_changes_require_reindex_and_publish_current_complete_snapshot() {
 
 #[test]
 fn mutating_tools_reject_dependency_paths() {
+    let _guard = STDERR_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     block_on(async {
         let fixture = tempfile::tempdir().unwrap();
         let workspace = fixture.path().join("workspace");

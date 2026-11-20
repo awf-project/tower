@@ -1865,34 +1865,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn f008_spawn_real_spawner_resolves_from_workspace_and_preserves_ordered_args() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let workspace = tempfile::tempdir().expect("temporary workspace");
         let project_root = workspace.path().join("crates/app");
         std::fs::create_dir_all(project_root.join("src")).expect("create project source directory");
         std::fs::write(project_root.join("Cargo.toml"), "").expect("write project manifest");
 
-        let executable = workspace.path().join("server with spaces.sh");
-        let args_file = workspace.path().join("received-args");
-        let cwd_file = workspace.path().join("received-cwd");
-        // Use a real protocol peer: an eager canned response can arrive before
-        // the client registers initialize and be discarded as unsolicited.
-        let fixture = fixture_lsp_server::binary_path();
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\npwd > '{}'\nexec '{}' dispatch_unavailable\n",
-            args_file.display(),
-            cwd_file.display(),
-            fixture.display(),
-        );
-        std::fs::write(&executable, script).expect("write fake language server");
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-
+        symlink("/bin/sh", workspace.path().join("server with spaces")).expect("link test server");
         let mut config = rust_config();
         let server = config.servers.get_mut("rust").unwrap();
-        server.command = "./server with spaces.sh".to_owned();
-        server.args = vec!["first argument".to_owned(), "--second=value".to_owned()];
+        server.command = "./server with spaces".to_owned();
+        // sh -c binds the fixture path to $0 and the arguments under test to "$@".
+        // The relative output path also records which working directory the pool chose.
+        server.args = vec![
+            "-c".to_owned(),
+            r#"printf '%s\n' "$@" > received-args && exec "$0" dispatch_unavailable"#.to_owned(),
+            fixture_lsp_server::binary_path()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            "first argument".to_owned(),
+            "--second=value".to_owned(),
+        ];
         let pool = SessionPool::new(
             config,
             workspace.path().to_path_buf(),
@@ -1903,12 +1898,8 @@ mod tests {
             .expect("resolved language server should spawn");
 
         assert_eq!(
-            std::fs::read_to_string(args_file).unwrap(),
+            std::fs::read_to_string(project_root.join("received-args")).unwrap(),
             "first argument\n--second=value\n"
-        );
-        assert_eq!(
-            PathBuf::from(std::fs::read_to_string(cwd_file).unwrap().trim()),
-            project_root
         );
     }
 

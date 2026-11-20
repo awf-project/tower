@@ -1,11 +1,197 @@
 use std::cmp::Ordering;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, SecondsFormat};
+use jiff::{fmt::temporal::DateTimeParser, tz::Offset};
 use serde::{Deserialize, Serialize};
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 const MAX_OPAQUE_ID_BYTES: usize = 1024;
+
+pub(crate) struct ParsedTimestamp {
+    base: jiff::Timestamp,
+    offset: jiff::tz::Offset,
+    leap_second: bool,
+    year_shift: i16,
+}
+
+impl ParsedTimestamp {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let (year, rest) = value.split_at_checked(4)?;
+        if !year.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Self::parse_with_year(year, rest)
+    }
+
+    fn parse_with_year(year: &str, rest: &str) -> Option<Self> {
+        let (local, suffix) = rest.split_at_checked(15)?;
+        let (fraction, offset) = parse_fraction_and_offset(suffix)?;
+        let (datetime, leap_second) = parse_civil_time(year, local, fraction)?;
+        let (base, year_shift) = match offset.to_timestamp(datetime) {
+            Ok(base) => (base, 0),
+            Err(_) if datetime.year() == 9999 => {
+                let shifted = datetime.with().year(9599).build().ok()?;
+                (offset.to_timestamp(shifted).ok()?, 400)
+            }
+            Err(_) => return None,
+        };
+        Some(Self {
+            base,
+            offset,
+            leap_second,
+            year_shift,
+        })
+    }
+
+    pub(crate) fn parse_normalized_or_input(value: &str) -> Option<Self> {
+        // A four-digit input year can cross either boundary during UTC
+        // normalization. Accept only the formatter's exact expanded spelling.
+        let parsed = if let Some(rest) = value.strip_prefix("+10000") {
+            let mut parsed = Self::parse_with_year("9600", rest)?;
+            parsed.year_shift = 400;
+            parsed
+        } else if let Some(rest) = value.strip_prefix("-0001") {
+            Self::parse_with_year("-000001", rest)?
+        } else {
+            return Self::parse(value);
+        };
+        (parsed.format_utc() == value).then_some(parsed)
+    }
+
+    pub(crate) fn from_timestamp(timestamp: jiff::Timestamp) -> Self {
+        Self {
+            base: timestamp,
+            offset: Offset::UTC,
+            leap_second: false,
+            year_shift: 0,
+        }
+    }
+
+    pub(crate) fn is_utc(&self) -> bool {
+        self.offset == Offset::UTC
+    }
+
+    pub(crate) fn format_utc(&self) -> String {
+        let datetime = Offset::UTC.to_datetime(self.base);
+        let year = i32::from(datetime.year()) + i32::from(self.year_shift);
+        let mut formatted = if (0..=9999).contains(&year) {
+            format!("{year:04}")
+        } else if year > 9999 {
+            format!("+{year:05}")
+        } else {
+            format!("-{magnitude:04}", magnitude = year.unsigned_abs())
+        };
+        let second = if self.leap_second {
+            60
+        } else {
+            datetime.second()
+        };
+        formatted.push_str(&format!(
+            "-{:02}-{:02}T{:02}:{:02}:{second:02}",
+            datetime.month(),
+            datetime.day(),
+            datetime.hour(),
+            datetime.minute(),
+        ));
+        let nanosecond = datetime.subsec_nanosecond();
+        if nanosecond != 0 {
+            if nanosecond % 1_000_000 == 0 {
+                formatted.push_str(&format!(".{:03}", nanosecond / 1_000_000));
+            } else if nanosecond % 1_000 == 0 {
+                formatted.push_str(&format!(".{:06}", nanosecond / 1_000));
+            } else {
+                formatted.push_str(&format!(".{nanosecond:09}"));
+            }
+        }
+        formatted.push('Z');
+        formatted
+    }
+
+    fn comparison_key(&self) -> (i128, i128) {
+        const NANOS_PER_SECOND: i128 = 1_000_000_000;
+        const GREGORIAN_CYCLE_SECONDS: i128 = 146_097 * 86_400;
+
+        let nanoseconds = self.base.as_nanosecond();
+        let seconds = nanoseconds.div_euclid(NANOS_PER_SECOND)
+            + i128::from(self.year_shift) * GREGORIAN_CYCLE_SECONDS / 400;
+        let subsecond = nanoseconds.rem_euclid(NANOS_PER_SECOND)
+            + if self.leap_second {
+                NANOS_PER_SECOND
+            } else {
+                0
+            };
+        (seconds, subsecond)
+    }
+}
+
+pub(crate) fn timestamp_cmp(left: &str, right: &str) -> Ordering {
+    match (
+        ParsedTimestamp::parse_normalized_or_input(left),
+        ParsedTimestamp::parse_normalized_or_input(right),
+    ) {
+        (Some(left), Some(right)) => left.comparison_key().cmp(&right.comparison_key()),
+        _ => left.cmp(right),
+    }
+}
+
+fn parse_civil_time(
+    year: &str,
+    local: &str,
+    fraction: &str,
+) -> Option<(jiff::civil::DateTime, bool)> {
+    // local is the fixed-width "-MM-DDTHH:MM:SS" part. Check the legacy
+    // grammar before passing calendar and time range validation to Jiff.
+    if !local.bytes().enumerate().all(|(i, byte)| match i {
+        0 | 3 => byte == b'-',
+        6 => matches!(byte, b'T' | b't' | b' '),
+        9 | 12 => byte == b':',
+        _ => byte.is_ascii_digit(),
+    }) {
+        return None;
+    }
+    let leap_second = &local[13..] == "60";
+    let seconds = if leap_second { "59" } else { &local[13..] };
+    let civil = format!("{year}{}T{}{seconds}{fraction}", &local[..6], &local[7..13]);
+    let pieces = DateTimeParser::new().parse_pieces(&civil).ok()?;
+    Some((pieces.date().to_datetime(pieces.time()?), leap_second))
+}
+
+fn parse_fraction_and_offset(suffix: &str) -> Option<(&str, Offset)> {
+    let Some(digits_and_offset) = suffix.strip_prefix('.') else {
+        return Some(("", parse_offset(suffix)?));
+    };
+    let offset = digits_and_offset.trim_start_matches(|c: char| c.is_ascii_digit());
+    let digits = digits_and_offset.len() - offset.len();
+    if digits == 0 {
+        return None;
+    }
+    Some((&suffix[..1 + digits.min(9)], parse_offset(offset)?))
+}
+
+fn parse_offset(value: &str) -> Option<Offset> {
+    if matches!(value, "Z" | "z") {
+        return Some(Offset::UTC);
+    }
+    let sign = value.chars().next()?;
+    let magnitude = value.strip_prefix(sign)?;
+    let [h1, h2, b':', m1, m2] = *magnitude.as_bytes() else {
+        return None;
+    };
+    if ![h1, h2, m1, m2].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let hours: i32 = magnitude[..2].parse().ok()?;
+    let minutes: i32 = magnitude[3..].parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3600 + minutes * 60;
+    match sign {
+        '+' => Offset::from_seconds(seconds).ok(),
+        '-' | '−' => Offset::from_seconds(-seconds).ok(),
+        _ => None,
+    }
+}
 
 /// Converts a required parsed input field into its strongly typed value.
 ///
@@ -203,7 +389,7 @@ impl MemoryRecord {
 
         let created = parse_canonical_timestamp("created_at", &created_at)?;
         let updated = parse_canonical_timestamp("updated_at", &updated_at)?;
-        if updated < created {
+        if updated.comparison_key() < created.comparison_key() {
             return Err(ValidationError::InvalidTimestamp {
                 field: "updated_at",
             });
@@ -346,12 +532,10 @@ fn validate_paths(
 fn parse_canonical_timestamp(
     field: &'static str,
     value: &str,
-) -> Result<DateTime<chrono::FixedOffset>, ValidationError> {
-    let parsed = DateTime::parse_from_rfc3339(value)
-        .map_err(|_| ValidationError::InvalidTimestamp { field })?;
-    if parsed.offset().local_minus_utc() != 0
-        || parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true) != value
-    {
+) -> Result<ParsedTimestamp, ValidationError> {
+    let parsed =
+        ParsedTimestamp::parse(value).ok_or(ValidationError::InvalidTimestamp { field })?;
+    if parsed.format_utc() != value {
         return Err(ValidationError::InvalidTimestamp { field });
     }
     Ok(parsed)
@@ -422,8 +606,7 @@ impl MemoryFilters {
             .map(|value| normalize_retrieval_timestamp("created_to", value))
             .transpose()?;
         if let (Some(from), Some(to)) = (&created_from, &created_to)
-            && parse_retrieval_timestamp("created_from", from)?
-                > parse_retrieval_timestamp("created_to", to)?
+            && timestamp_cmp(from, to).is_gt()
         {
             return Err(invalid("created_to", "before_created_from"));
         }
@@ -515,10 +698,7 @@ impl Ord for SearchOrderKey {
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| {
-                parse_valid_timestamp(&other.created_at)
-                    .cmp(&parse_valid_timestamp(&self.created_at))
-            })
+            .then_with(|| timestamp_cmp(&other.created_at, &self.created_at))
             .then_with(|| self.id.cmp(&other.id))
     }
 }
@@ -537,9 +717,7 @@ pub struct TimelineOrderKey {
 
 impl Ord for TimelineOrderKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        parse_valid_timestamp(&self.created_at)
-            .cmp(&parse_valid_timestamp(&other.created_at))
-            .then_with(|| self.id.cmp(&other.id))
+        timestamp_cmp(&self.created_at, &other.created_at).then_with(|| self.id.cmp(&other.id))
     }
 }
 
@@ -898,12 +1076,8 @@ fn validate_score(score: f64) -> Result<(), RetrievalError> {
 fn parse_retrieval_timestamp(
     field: &'static str,
     value: &str,
-) -> Result<DateTime<chrono::FixedOffset>, RetrievalError> {
-    DateTime::parse_from_rfc3339(value).map_err(|_| invalid(field, "invalid_timestamp"))
-}
-
-fn parse_valid_timestamp(value: &str) -> DateTime<chrono::FixedOffset> {
-    DateTime::parse_from_rfc3339(value).expect("validated timestamp")
+) -> Result<ParsedTimestamp, RetrievalError> {
+    ParsedTimestamp::parse(value).ok_or_else(|| invalid(field, "invalid_timestamp"))
 }
 
 fn normalize_retrieval_timestamp(
@@ -911,10 +1085,10 @@ fn normalize_retrieval_timestamp(
     value: String,
 ) -> Result<String, RetrievalError> {
     let parsed = parse_retrieval_timestamp(field, &value)?;
-    if parsed.offset().local_minus_utc() != 0 {
+    if !parsed.is_utc() {
         return Err(invalid(field, "not_utc"));
     }
-    Ok(parsed.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    Ok(parsed.format_utc())
 }
 
 fn validate_filter_values(
@@ -1075,5 +1249,57 @@ fn reason_field_name(field: &MatchReasonField) -> &'static str {
         MatchReasonField::Tag => "tag",
         MatchReasonField::SourceAgent => "source_agent",
         MatchReasonField::SourceClient => "source_client",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use super::timestamp_cmp;
+
+    #[test]
+    fn timestamp_comparison_falls_back_lexically_for_unparseable_internal_values() {
+        for (left, right, expected) in [
+            (
+                "2020-01-01T00:00:00+01:00",
+                "2019-12-31T23:30:00Z",
+                Ordering::Less,
+            ),
+            (
+                "2020-01-01T00:00:59.999999999Z",
+                "2020-01-01T00:00:60Z",
+                Ordering::Less,
+            ),
+            (
+                "2020-01-01T00:00:60Z",
+                "2020-01-01T00:01:00Z",
+                Ordering::Less,
+            ),
+            (
+                "1969-12-31T23:59:59.999999998Z",
+                "1969-12-31T23:59:59.999999999Z",
+                Ordering::Less,
+            ),
+            (
+                "9999-12-30T22:00:00.999999999Z",
+                "9999-12-30T22:00:01Z",
+                Ordering::Less,
+            ),
+            ("not-a-timestamp", "2020-01-01T00:00:00Z", Ordering::Greater),
+            (
+                "+10000-01-01T00:00:60.500Z",
+                "9999-12-31T23:59:60.5-00:01",
+                Ordering::Equal,
+            ),
+            (
+                "-0001-12-31T23:59:00Z",
+                "0000-01-01T00:00:00+00:01",
+                Ordering::Equal,
+            ),
+            ("2020-01-01T00:00:00Z", "not-a-timestamp", Ordering::Less),
+        ] {
+            assert_eq!(timestamp_cmp(left, right), expected, "{left} vs {right}");
+        }
     }
 }

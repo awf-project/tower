@@ -84,7 +84,7 @@ The toolchain is pinned in `rust-toolchain.toml` at the workspace root:
 
 ```toml
 [toolchain]
-channel = "1.96.0"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
 ```

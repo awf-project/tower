@@ -2021,7 +2021,7 @@ fn engine_apply_edits_host_returns_one_per_file_result_for_every_targeted_file()
     write_batch_apply_edits_extension(&extensions_dir, &first_file_version);
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = Some(2);
+    config.extensions.request_timeout_secs = Some(TEST_TIMEOUT.as_secs());
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.path().to_path_buf()),
@@ -2131,7 +2131,7 @@ fn successful_file_mutations_fan_out_filechanged_callbacks_only_after_locks_are_
     );
 
     let mut config = TowerConfig::default();
-    config.extensions.request_timeout_secs = Some(2);
+    config.extensions.request_timeout_secs = Some(TEST_TIMEOUT.as_secs());
     let handle = build_engine(
         &GlobalOpts {
             workspace_dir: Some(workspace.path().to_path_buf()),

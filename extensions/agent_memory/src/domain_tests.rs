@@ -176,19 +176,48 @@ fn literal_empty_envelope() -> &'static str {
 fn compact_results_order_deterministically_for_equal_scores_and_timestamps() {
     let context = TaskContext::try_new(
         vec![
-            compact_hit("memory-c", "older", "2026-11-05T09:00:00Z", 4.0),
             compact_hit("memory-b", "same time", "2026-11-05T10:00:00Z", 4.0),
             compact_hit("memory-a", "same time", "2026-11-05T10:00:00Z", 4.0),
+            compact_hit(
+                "memory-fractional",
+                "ordinary fraction",
+                "2026-11-05T10:00:00.1Z",
+                4.0,
+            ),
+            compact_hit(
+                "memory-leap-before",
+                "before leap second",
+                "2026-11-05T10:00:59.999999999Z",
+                4.0,
+            ),
+            compact_hit("memory-leap", "leap second", "2026-11-05T10:00:60Z", 4.0),
+            compact_hit("memory-next", "next minute", "2026-11-05T10:01:00Z", 4.0),
+            compact_hit(
+                "memory-maximum",
+                "supported maximum",
+                "9999-12-30T22:00:01Z",
+                4.0,
+            ),
             compact_hit("memory-z", "higher score", "2026-11-05T08:00:00Z", 5.0),
         ],
         empty_filters(),
         None,
-        ResponseBudget::try_new(4, 4096, &retrieval_limits()).expect("valid response budget"),
+        ResponseBudget::try_new(8, 4096, &retrieval_limits()).expect("valid response budget"),
     )
     .expect("hits fit in the response budget");
 
     let rendered = format!("{context:?}");
-    let positions = ["memory-z", "memory-a", "memory-b", "memory-c"].map(|id| {
+    let positions = [
+        "memory-z",
+        "memory-maximum",
+        "memory-next",
+        "memory-leap",
+        "memory-leap-before",
+        "memory-fractional",
+        "memory-a",
+        "memory-b",
+    ]
+    .map(|id| {
         rendered
             .find(id)
             .unwrap_or_else(|| panic!("ordered context must contain {id}: {rendered}"))
@@ -209,6 +238,48 @@ fn timeline_events_order_by_creation_without_update_reordering() {
                 "memory-b",
                 "updated later",
                 "2026-11-05T10:00:00Z",
+                1.0,
+            ))
+            .expect("valid timeline event"),
+        ),
+        (
+            TimelineOrderKey::try_new(
+                "2026-11-05T10:00:59.999999999Z".into(),
+                MemoryId::try_from("memory-leap-before".to_owned()).expect("valid memory id"),
+            )
+            .expect("valid timeline key"),
+            TimelineEvent::try_new(compact_hit(
+                "memory-leap-before",
+                "before leap second",
+                "2026-11-05T10:00:59.999999999Z",
+                1.0,
+            ))
+            .expect("valid timeline event"),
+        ),
+        (
+            TimelineOrderKey::try_new(
+                "2026-11-05T10:00:60Z".into(),
+                MemoryId::try_from("memory-leap".to_owned()).expect("valid memory id"),
+            )
+            .expect("valid timeline key"),
+            TimelineEvent::try_new(compact_hit(
+                "memory-leap",
+                "leap second",
+                "2026-11-05T10:00:60Z",
+                1.0,
+            ))
+            .expect("valid timeline event"),
+        ),
+        (
+            TimelineOrderKey::try_new(
+                "2026-11-05T10:01:00Z".into(),
+                MemoryId::try_from("memory-next".to_owned()).expect("valid memory id"),
+            )
+            .expect("valid timeline key"),
+            TimelineEvent::try_new(compact_hit(
+                "memory-next",
+                "next minute",
+                "2026-11-05T10:01:00Z",
                 1.0,
             ))
             .expect("valid timeline event"),
@@ -269,6 +340,9 @@ fn timeline_events_order_by_creation_without_update_reordering() {
             "TimelineOrderKey { created_at: \"2026-11-05T10:00:00Z\", id: MemoryId(\"memory-a\") }",
             "TimelineOrderKey { created_at: \"2026-11-05T10:00:00Z\", id: MemoryId(\"memory-b\") }",
             "TimelineOrderKey { created_at: \"2026-11-05T10:00:00.100Z\", id: MemoryId(\"memory-fractional\") }",
+            "TimelineOrderKey { created_at: \"2026-11-05T10:00:59.999999999Z\", id: MemoryId(\"memory-leap-before\") }",
+            "TimelineOrderKey { created_at: \"2026-11-05T10:00:60Z\", id: MemoryId(\"memory-leap\") }",
+            "TimelineOrderKey { created_at: \"2026-11-05T10:01:00Z\", id: MemoryId(\"memory-next\") }",
         ]
     );
 }
@@ -374,6 +448,26 @@ fn retrieval_values_store_normalized_timestamps_and_paths() {
     let rendered = format!("{hit:?}");
     assert!(rendered.contains("paths: [\"src/lib.rs\"]"));
     assert!(rendered.contains("timestamp: \"2026-11-05T10:00:00Z\""));
+
+    for (input, expected) in [
+        ("2026-11-05T10:00:00+00:00", "2026-11-05T10:00:00Z"),
+        ("2026-11-05T10:00:00-00:00", "2026-11-05T10:00:00Z"),
+    ] {
+        let filters = MemoryFilters::try_new(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(input.into()),
+            None,
+            &retrieval_limits(),
+        )
+        .expect("zero-offset retrieval timestamp is accepted");
+        assert_eq!(filters.created_from(), Some(expected));
+    }
 }
 
 #[test]
@@ -476,6 +570,71 @@ fn retrieval_constructors_reject_invalid_values_with_exact_errors() {
             reason: "not_utc",
         })
     );
+    for (value, reason) in [
+        ("not-a-timestamp", "invalid_timestamp"),
+        ("2026-11-05T11:00:00+01:00", "not_utc"),
+    ] {
+        let expected = RetrievalError::InvalidArgument {
+            field: "created_at",
+            reason,
+        };
+        assert_eq!(
+            SearchOrderKey::try_new(1.0, value.into(), valid_id()).map(|_| ()),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            TimelineOrderKey::try_new(value.into(), valid_id()).map(|_| ()),
+            Err(expected)
+        );
+    }
+    for (field, created_from, created_to, reason) in [
+        (
+            "created_from",
+            Some("not-a-timestamp"),
+            None,
+            "invalid_timestamp",
+        ),
+        (
+            "created_to",
+            None,
+            Some("not-a-timestamp"),
+            "invalid_timestamp",
+        ),
+        (
+            "created_from",
+            Some("2026-11-05T11:00:00+01:00"),
+            None,
+            "not_utc",
+        ),
+        (
+            "created_to",
+            None,
+            Some("2026-11-05T11:00:00+01:00"),
+            "not_utc",
+        ),
+        (
+            "created_to",
+            Some("2026-11-05T10:00:01Z"),
+            Some("2026-11-05T10:00:00Z"),
+            "before_created_from",
+        ),
+    ] {
+        assert_eq!(
+            MemoryFilters::try_new(
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                created_from.map(str::to_owned),
+                created_to.map(str::to_owned),
+                &retrieval_limits(),
+            ),
+            Err(RetrievalError::InvalidArgument { field, reason })
+        );
+    }
     assert_eq!(
         ResponseBudget::try_new(0, 128, &retrieval_limits()),
         Err(RetrievalError::InvalidArgument {
@@ -554,6 +713,29 @@ fn retrieval_constructors_reject_invalid_values_with_exact_errors() {
             reason: "negative",
         })
     );
+    for (timestamp, reason) in [
+        ("not-a-timestamp", "invalid_timestamp"),
+        ("2026-11-05T10:00:00+01:00", "not_utc"),
+    ] {
+        assert_eq!(
+            CompactHit::try_new(
+                valid_id(),
+                valid_revision(),
+                MemoryType::Observation,
+                "title".into(),
+                vec![],
+                timestamp.into(),
+                1.0,
+                vec![],
+                vec![],
+                &retrieval_limits(),
+            ),
+            Err(RetrievalError::InvalidArgument {
+                field: "timestamp",
+                reason,
+            })
+        );
+    }
     assert_eq!(
         CompactHit::try_new(
             valid_id(),
@@ -604,6 +786,72 @@ fn records_validate_required_fields_and_metadata_bounds() {
         )
         .is_ok()
     );
+    for timestamp in [
+        "2026-11-05T10:00:00.123Z",
+        "2026-11-05T10:00:00.123456Z",
+        "2026-11-05T10:00:00.123456789Z",
+    ] {
+        assert!(record("title", "body", None, timestamp, timestamp).is_ok());
+    }
+    assert!(
+        record(
+            "title",
+            "body",
+            None,
+            "9999-12-30T22:00:01Z",
+            "9999-12-30T22:00:01.123456789Z",
+        )
+        .is_ok()
+    );
+    for (field, created_at, updated_at) in [
+        ("created_at", "not-a-timestamp", "2026-11-05T10:00:01Z"),
+        ("updated_at", "2026-11-05T10:00:00Z", "not-a-timestamp"),
+        (
+            "created_at",
+            "2026-11-05T10:00:00+00:00",
+            "2026-11-05T10:00:01Z",
+        ),
+        (
+            "updated_at",
+            "2026-11-05T10:00:00Z",
+            "2026-11-05T10:00:01+00:00",
+        ),
+        (
+            "created_at",
+            "2026-11-05T10:00:00-00:00",
+            "2026-11-05T10:00:01Z",
+        ),
+        (
+            "updated_at",
+            "2026-11-05T10:00:00Z",
+            "2026-11-05T10:00:01-00:00",
+        ),
+        (
+            "created_at",
+            "2026-11-05T10:00:00+01:00",
+            "2026-11-05T10:00:01Z",
+        ),
+        (
+            "updated_at",
+            "2026-11-05T10:00:00Z",
+            "2026-11-05T10:00:01+01:00",
+        ),
+        (
+            "created_at",
+            "2026-11-05T10:00:00.1230Z",
+            "2026-11-05T10:00:01Z",
+        ),
+        (
+            "updated_at",
+            "2026-11-05T10:00:00Z",
+            "2026-11-05T10:00:01.1230Z",
+        ),
+    ] {
+        assert_eq!(
+            record("title", "body", None, created_at, updated_at),
+            Err(ValidationError::InvalidTimestamp { field })
+        );
+    }
 
     assert_eq!(
         crate::require_field::<String>("title", None),
@@ -767,6 +1015,87 @@ fn records_validate_required_fields_and_metadata_bounds() {
             limit: limits().max_metadata_string_bytes,
         })
     );
+}
+
+#[test]
+fn timestamps_preserve_supported_rfc3339_syntax_and_errors() {
+    for (input, expected) in [
+        ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z"),
+        ("2020-01-01t00:00:00z", "2020-01-01T00:00:00Z"),
+        ("2020-01-01 00:00:00Z", "2020-01-01T00:00:00Z"),
+        ("2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00Z"),
+        ("2020-01-01T00:00:00-00:00", "2020-01-01T00:00:00Z"),
+        ("2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00Z"),
+        ("2020-01-01T00:00:00.123Z", "2020-01-01T00:00:00.123Z"),
+        ("2020-01-01T00:00:00.123456Z", "2020-01-01T00:00:00.123456Z"),
+        (
+            "2020-01-01T00:00:00.123456789Z",
+            "2020-01-01T00:00:00.123456789Z",
+        ),
+        (
+            "2020-01-01T00:00:00.1234567899−00:00",
+            "2020-01-01T00:00:00.123456789Z",
+        ),
+        ("2020-01-01T00:00:60Z", "2020-01-01T00:00:60Z"),
+        (
+            "2020-01-01T00:00:60.123456789Z",
+            "2020-01-01T00:00:60.123456789Z",
+        ),
+        ("9999-12-30T22:00:01Z", "9999-12-30T22:00:01Z"),
+    ] {
+        let filters = MemoryFilters::try_new(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(input.into()),
+            None,
+            &retrieval_limits(),
+        )
+        .expect("supported retrieval timestamp");
+        assert_eq!(filters.created_from(), Some(expected));
+    }
+
+    for (input, reason) in [
+        ("not-a-timestamp", "invalid_timestamp"),
+        ("2020-01-01T00:00:00+24:00", "invalid_timestamp"),
+        ("2020-01-01T00:00:00[UTC]", "invalid_timestamp"),
+        ("2020-01-01T00:00:00.123456789xZ", "invalid_timestamp"),
+        ("2020-01-01T00:00:00+23:59", "not_utc"),
+        ("2020-01-01T01:00:00+01:00", "not_utc"),
+    ] {
+        assert_eq!(
+            MemoryFilters::try_new(
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                None,
+                Some(input.into()),
+                None,
+                &retrieval_limits(),
+            ),
+            Err(RetrievalError::InvalidArgument {
+                field: "created_from",
+                reason,
+            })
+        );
+    }
+
+    let record = record(
+        "title",
+        "body",
+        None,
+        "2020-01-01T00:00:60.123456789Z",
+        "2020-01-01T00:00:60.123456789Z",
+    )
+    .expect("canonical leap-second record timestamp");
+    assert!(format!("{record:?}").contains("2020-01-01T00:00:60.123456789Z"));
 }
 
 #[test]
