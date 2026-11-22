@@ -130,6 +130,11 @@ install: release ## Build release and install tower to $(INSTALL_DIR)
 	@mkdir -p "$(INSTALL_DIR)"
 	install -m 0755 target/release/$(BIN) "$(INSTALL_DIR)/$(BIN)"
 	@echo "installed $(BIN) -> $(INSTALL_DIR)/$(BIN)"
+	# The agent_memory extension gets storage access only when its binary sits
+	# next to the tower binary, so install it here as well.
+	cargo build --release -p agent_memory_extension
+	install -m 0755 target/release/agent_memory_extension "$(INSTALL_DIR)/agent_memory_extension"
+	@echo "installed agent_memory_extension -> $(INSTALL_DIR)/agent_memory_extension"
 
 # Reference extensions are discovered, not bundled: each must live in a scope as
 # <scope>/<name>/extension.toml alongside its native binary (the manifest's
