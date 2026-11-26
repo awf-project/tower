@@ -56,7 +56,7 @@
 //! `get` and `get_blob` call `sled::Tree::get` directly with `&self`, acquiring
 //! no application-level lock.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
@@ -161,10 +161,10 @@ fn read_reconciliation_allocator(
 fn apply_reconciliation_removals(
     tx_files: &TransactionalTree,
     tx_paths: &TransactionalTree,
-    tx_index: &TransactionalTree,
     removals: &[FileId],
     free_slots: &mut Vec<u32>,
     record_rewrite: &dyn Fn(FileId),
+    postings: &mut PostingEdits<'_>,
 ) -> ReconciliationTxResult<()> {
     for id in removals {
         record_rewrite(*id);
@@ -175,7 +175,8 @@ fn apply_reconciliation_removals(
                 .map_err(ConflictableTransactionError::Abort)?;
             tx_paths.remove(path_key(&file.path))?;
             for token in tokenize(file.path.as_str()) {
-                update_posting(tx_index, token.as_str().as_bytes(), *id, false)
+                postings
+                    .update(token.as_str().as_bytes(), *id, false)
                     .map_err(lift_index_codec)?;
             }
             if !free_slots.contains(&id.index()) {
@@ -189,11 +190,11 @@ fn apply_reconciliation_removals(
 fn apply_reconciliation_additions(
     tx_files: &TransactionalTree,
     tx_paths: &TransactionalTree,
-    tx_index: &TransactionalTree,
     additions: &[PreparedReconciliationAddition],
     slot_generations: &mut Vec<u32>,
     free_slots: &mut Vec<u32>,
     record_rewrite: &dyn Fn(FileId),
+    postings: &mut PostingEdits<'_>,
 ) -> ReconciliationTxResult<()> {
     for addition in additions {
         let old_tokens: HashSet<String> = match tx_files.get(addition.key.as_ref())? {
@@ -224,11 +225,13 @@ fn apply_reconciliation_additions(
         free_slots.retain(|index| *index != addition.id.index());
 
         for token in addition.tokens.difference(&old_tokens) {
-            update_posting(tx_index, token.as_bytes(), addition.id, true)
+            postings
+                .update(token.as_bytes(), addition.id, true)
                 .map_err(lift_index_codec)?;
         }
         for token in old_tokens.difference(&addition.tokens) {
-            update_posting(tx_index, token.as_bytes(), addition.id, false)
+            postings
+                .update(token.as_bytes(), addition.id, false)
                 .map_err(lift_index_codec)?;
         }
     }
@@ -731,23 +734,25 @@ impl StoragePort for SledStorageAdapter {
             |(tx_files, tx_paths, tx_meta, tx_index)| {
                 let (mut slot_generations, mut free_slots) =
                     read_reconciliation_allocator(tx_meta)?;
+                let mut postings = PostingEdits::new(tx_index);
                 apply_reconciliation_removals(
                     tx_files,
                     tx_paths,
-                    tx_index,
                     &delta.removals,
                     &mut free_slots,
                     &record_rewrite,
+                    &mut postings,
                 )?;
                 apply_reconciliation_additions(
                     tx_files,
                     tx_paths,
-                    tx_index,
                     &additions,
                     &mut slot_generations,
                     &mut free_slots,
                     &record_rewrite,
+                    &mut postings,
                 )?;
+                postings.write().map_err(lift_index_codec)?;
                 write_reconciliation_allocator(tx_meta, &slot_generations, &free_slots)?;
 
                 #[cfg(any(test, feature = "testing"))]
@@ -985,6 +990,7 @@ impl StoragePort for SledStorageAdapter {
                         .map_err(ConflictableTransactionError::Abort)?,
                 };
 
+                let mut postings = PostingEdits::new(tx_index);
                 for rec in &records {
                     // ── Compute old token set (for delta) ───────────────────
                     let old_token_set: HashSet<String> = match tx_files.get(rec.key.as_ref())? {
@@ -1022,17 +1028,20 @@ impl StoragePort for SledStorageAdapter {
                     // ── Update index ─────────────────────────────────────────
                     for token_str in &rec.new_token_set {
                         if !old_token_set.contains(token_str) {
-                            update_posting(tx_index, token_str.as_bytes(), rec.file_id, true)
+                            postings
+                                .update(token_str.as_bytes(), rec.file_id, true)
                                 .map_err(lift_index_codec)?;
                         }
                     }
                     for token_str in &old_token_set {
                         if !rec.new_token_set.contains(token_str) {
-                            update_posting(tx_index, token_str.as_bytes(), rec.file_id, false)
+                            postings
+                                .update(token_str.as_bytes(), rec.file_id, false)
                                 .map_err(lift_index_codec)?;
                         }
                     }
                 }
+                postings.write().map_err(lift_index_codec)?;
 
                 // Persist updated allocator state once for the whole batch.
                 let gens_bytes = postcard::to_allocvec(&slot_gens)
@@ -1232,6 +1241,88 @@ fn update_posting(
     Ok(())
 }
 
+/// The posting-list edits of one transaction. Each list is read once,
+/// edited in memory in call order and written once, where calling
+/// [`update_posting`] per file reads and rewrites a common token's whole list
+/// for every file of a batch (quadratic in a workspace-wide reconciliation).
+/// The written lists are those the per-call updates would leave, in the same
+/// order.
+struct PostingEdits<'tx> {
+    tx: &'tx TransactionalTree,
+    lists: HashMap<Vec<u8>, PostingList>,
+}
+
+struct PostingList {
+    ids: Vec<FileId>,
+    /// The ids the list holds once `removed` is dropped from `ids`.
+    members: HashSet<FileId>,
+    /// Ids still in `ids` but removed; dropped from it in one pass on write.
+    removed: HashSet<FileId>,
+}
+
+impl<'tx> PostingEdits<'tx> {
+    fn new(tx: &'tx TransactionalTree) -> Self {
+        Self {
+            tx,
+            lists: HashMap::new(),
+        }
+    }
+
+    fn update(
+        &mut self,
+        token_key: &[u8],
+        file_id: FileId,
+        add: bool,
+    ) -> Result<(), ConflictableTransactionError<postcard::Error>> {
+        let list = match self.lists.entry(token_key.to_vec()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let ids: Vec<FileId> = match self.tx.get(token_key)? {
+                    Some(bytes) => postcard::from_bytes(bytes.as_ref())
+                        .map_err(ConflictableTransactionError::Abort)?,
+                    None => Vec::new(),
+                };
+                let members = ids.iter().copied().collect();
+                entry.insert(PostingList {
+                    ids,
+                    members,
+                    removed: HashSet::new(),
+                })
+            }
+        };
+        if add {
+            if list.members.insert(file_id) {
+                // Re-added after a removal: it goes to the end, as a removal
+                // followed by a push would leave it.
+                if list.removed.remove(&file_id) {
+                    list.ids.retain(|&id| id != file_id);
+                }
+                list.ids.push(file_id);
+            }
+        } else if list.members.remove(&file_id) {
+            list.removed.insert(file_id);
+        }
+        Ok(())
+    }
+
+    fn write(self) -> Result<(), ConflictableTransactionError<postcard::Error>> {
+        let tx = self.tx;
+        for (token_key, mut list) in self.lists {
+            if !list.removed.is_empty() {
+                list.ids.retain(|id| !list.removed.contains(id));
+            }
+            if list.ids.is_empty() {
+                tx.remove(token_key.as_slice())?;
+            } else {
+                let bytes = postcard::to_allocvec(&list.ids)
+                    .map_err(ConflictableTransactionError::Abort)?;
+                tx.insert(token_key.as_slice(), bytes.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── Utility ───────────────────────────────────────────────────────────────────
 
 /// Convert a `ConflictableTransactionError<postcard::Error>` (returned by
@@ -1311,5 +1402,66 @@ mod cancellation_tests {
         assert_eq!(steps.load(std::sync::atomic::Ordering::SeqCst), 8);
         let (_, workspace, _) = SledStorageAdapter::open(root.path()).unwrap();
         assert_eq!(workspace.snapshot().files.len(), 30);
+    }
+}
+
+#[cfg(test)]
+mod posting_edits_tests {
+    use super::*;
+
+    /// Batched posting edits leave every list exactly as per-call updates
+    /// would, byte for byte: same members, same order, same pruning.
+    #[test]
+    fn posting_edits_write_what_per_call_updates_write() {
+        let db = sled::Config::new().temporary(true).open().unwrap();
+        let per_call = db.open_tree("per_call").unwrap();
+        let batched = db.open_tree("batched").unwrap();
+        let tokens: [&[u8]; 4] = [b"src", b"http", b"client", b"lone"];
+        for tree in [&per_call, &batched] {
+            tree.insert(
+                b"src",
+                postcard::to_allocvec(&vec![FileId::new_for_testing(7, 0)]).unwrap(),
+            )
+            .unwrap();
+        }
+        // A fixed pseudo-random walk: adds, removes, removes of absent ids
+        // and re-adds after a removal, over a few tokens and ids.
+        let mut state = 0x2545_f491_u32;
+        let mut ops = Vec::new();
+        for _ in 0..2_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let token = tokens[(state % 4) as usize];
+            let id = FileId::new_for_testing((state >> 3) % 12, (state >> 8) % 2);
+            ops.push((token, id, !(state >> 12).is_multiple_of(3)));
+        }
+        per_call
+            .transaction(|tx| {
+                for &(token, id, add) in &ops {
+                    update_posting(tx, token, id, add)?;
+                }
+                Ok::<(), ConflictableTransactionError<postcard::Error>>(())
+            })
+            .unwrap();
+        batched
+            .transaction(|tx| {
+                let mut edits = PostingEdits::new(tx);
+                for &(token, id, add) in &ops {
+                    edits.update(token, id, add)?;
+                }
+                edits.write()
+            })
+            .unwrap();
+        let dump = |tree: &sled::Tree| -> Vec<(Vec<u8>, Vec<u8>)> {
+            tree.iter()
+                .map(|entry| {
+                    let (key, value) = entry.unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect()
+        };
+        assert_eq!(dump(&batched), dump(&per_call));
+        assert!(!dump(&per_call).is_empty());
     }
 }
