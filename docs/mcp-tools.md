@@ -1021,7 +1021,7 @@ is described in [workspace configuration](user-guide/configuration.md).
 
 ### tower_lsp_definition
 
-Resolve the definition site(s) of the symbol at a position.
+Resolve the definition sites of the symbol at a position. Returned paths are relative to the Tower workspace. Navigation applies the workspace and nested `.towerignore` rules at each result path. If these rules cannot be read or parsed, navigation returns the structured error `workspace_policy_error`.
 
 | Field       | Type    | Required | Description                         |
 | ----------- | ------- | -------- | ----------------------------------- |
@@ -1594,7 +1594,7 @@ protocol-level invalid-params errors.
 
 ### tower_debug_launch
 
-Launch a configured adapter session.
+Launch a configured adapter session. GDB stops at entry by default. With `launch_overrides.stopOnEntry` set to `false`, a running program returns `state: "running"` and `stop: null`. Calling `tower_debug_continue` on a running session waits for its next stop or exit, including after a previous call timed out while the program was running.
 
 | Field              | Type           | Required | Description                                                                                            |
 | ------------------ | -------------- | -------- | ------------------------------------------------------------------------------------------------------ |
@@ -1632,6 +1632,9 @@ Launch a configured adapter session.
 ### tower_debug_set_breakpoints
 
 Replace the session's breakpoints for one source file.
+The returned path and line reflect the position reported by the adapter, which can
+move a breakpoint to an executable line. If the adapter omits either field, Tower
+returns the corresponding requested value.
 
 | Field         | Type   | Required | Description                                                             |
 | ------------- | ------ | -------- | ----------------------------------------------------------------------- |
@@ -1728,6 +1731,11 @@ Run a stateless one-shot debug probe. The tool launches a configured program, se
 breakpoint, continues until stop, exit, timeout, termination, or adapter exit, captures requested
 evidence, and always tears down the internal session before returning. It does not expose a
 `session_id`.
+
+When a breakpoint is supplied, the probe captures a hit only at that breakpoint.
+It matches the adapter's breakpoint ID when available and otherwise checks the
+stopped frame's source path and line. An unrelated stop at the entry to `main`
+therefore leaves the probe waiting for its target.
 
 | Field          | Type                 | Required | Description                                                                       |
 | -------------- | -------------------- | -------- | --------------------------------------------------------------------------------- |
@@ -1827,7 +1835,7 @@ stdout and stderr; `output_truncated:true` signals that the cap was reached.
 
 ### tower_debug_replay
 
-Open a replay-backed debug session for a recorded trace. Replay sessions reuse the normal session
+Open a replay-backed debug session for a recorded trace. With GDB, rr starts the configured debugger and connects it to the recorded process. The launch result includes the observed stop. Replay sessions reuse the normal session
 tools (`tower_debug_continue`, `tower_debug_step`, `tower_debug_threads`, `tower_debug_stack`,
 `tower_debug_variables`, `tower_debug_evaluate`, `tower_debug_terminate`, and
 `tower_debug_disconnect`) and advertise reverse execution support.

@@ -1289,28 +1289,27 @@ fn assert_reconciliation_metrics_absent(output: &Output) {
     );
 }
 
-/// Read the `paths` projection itself rather than rebuilding an in-memory
-/// workspace. This makes the process fixture detect a partially-published
-/// reconciliation transaction.
-fn persisted_path_inventory(workspace: &Path) -> BTreeMap<String, (u32, u32)> {
-    let db = sled::open(workspace.join(".tower/db")).expect("open persisted Sled database");
-    let paths = db.open_tree("paths").expect("open persisted paths tree");
-    paths
-        .iter()
-        .map(|entry| {
-            let (path, encoded_id) = entry.expect("read persisted path entry");
-            let encoded_id: [u8; 8] = encoded_id
-                .as_ref()
-                .try_into()
-                .expect("persisted FileId must have eight bytes");
-            let index = u32::from_be_bytes(encoded_id[..4].try_into().unwrap());
-            let generation = u32::from_be_bytes(encoded_id[4..].try_into().unwrap());
-            (
-                String::from_utf8(path.to_vec()).expect("persisted path must be UTF-8"),
-                (index, generation),
-            )
-        })
-        .collect()
+impl PersistedState {
+    /// Decode the persisted paths from the same snapshot used to verify rollback.
+    fn path_inventory(&self) -> BTreeMap<String, (u32, u32)> {
+        self.0["paths"]
+            .iter()
+            .map(|(path, encoded_id)| {
+                let encoded_id: &[u8; 8] = encoded_id
+                    .as_slice()
+                    .try_into()
+                    .expect("persisted FileId must have eight bytes");
+                let index = u32::from_be_bytes(encoded_id[..4].try_into().unwrap());
+                let generation = u32::from_be_bytes(encoded_id[4..].try_into().unwrap());
+                (
+                    std::str::from_utf8(path)
+                        .expect("persisted path must be UTF-8")
+                        .to_owned(),
+                    (index, generation),
+                )
+            })
+            .collect()
+    }
 }
 
 fn persisted_state(workspace: &Path) -> PersistedState {
@@ -1403,13 +1402,14 @@ impl<'a> ReconciliationProcessFixture<'a> {
     fn establish_baseline(&self) -> PersistedState {
         let baseline = run_bounded_daemon(self.production, self.workspace.path(), &[]);
         assert!(baseline.status.success(), "baseline failed: {baseline:?}");
+        let baseline_state = persisted_state(self.workspace.path());
         let prior_good_inventory = BTreeMap::from([("baseline.rs".to_owned(), (0, 0))]);
         assert_eq!(
-            persisted_path_inventory(self.workspace.path()),
+            baseline_state.path_inventory(),
             prior_good_inventory,
             "baseline must establish the exact persisted inventory used for rollback"
         );
-        persisted_state(self.workspace.path())
+        baseline_state
     }
 
     fn assert_invalid_selector_is_inert(&self) {
@@ -1492,15 +1492,15 @@ impl<'a> ReconciliationProcessFixture<'a> {
                 .count(),
             1
         );
+        let repaired_state = persisted_state(self.workspace.path());
         assert_eq!(
-            persisted_path_inventory(self.workspace.path()),
+            repaired_state.path_inventory(),
             BTreeMap::from([
                 ("baseline.rs".to_owned(), (0, 0)),
                 ("repaired.rs".to_owned(), (1, 0)),
             ]),
             "first clean retry must publish the exact repaired persisted inventory"
         );
-        let repaired_state = persisted_state(self.workspace.path());
         assert_repaired_projections(&repaired_state, prior_good_state);
     }
 

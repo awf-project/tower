@@ -31,20 +31,23 @@ Architecture: **Domain-Driven Design + Hexagonal Architecture + Microkernel**.
 
 ### Install
 
-Download a prebuilt binary from GitHub Releases:
+Install the latest stable release on Linux (x86_64 or ARM64) or macOS (Apple Silicon).
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh | sh
+tower --version
 ```
 
-The installer writes `tower` to `$HOME/.local/bin` by default. You can override the release or
-install directory:
+The installer writes `tower` to `$HOME/.local/bin` and installs the bundled extensions.
+To pin a release, pass its tag to the installer.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh \
-  | TOWER_VERSION=dev TOWER_INSTALL_DIR="$HOME/bin" sh
+  | TOWER_VERSION=v0.1.0 sh
 ```
+
+Use `TOWER_VERSION=dev` for the latest development build or `TOWER_INSTALL_DIR` to choose
+the binary directory.
 
 To build from source instead:
 

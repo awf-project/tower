@@ -299,11 +299,12 @@ impl ExtensionMergedRegistry {
             .iter()
             .find(|candidate| &candidate.extension_id == extension_id)
         else {
-            // Agent memory owns host storage startup and has no AST/LSP-style
-            // catch-up phase. Its successfully registered public tools are
-            // therefore immediately available without an unrelated readiness
-            // family. Preserve the existing gate for other extensions.
-            return extension_id.as_str() == "agent_memory";
+            // Registration suffices for extensions with no catch-up dependency.
+            // A bound extension can briefly lack a snapshot during discovery.
+            return gate
+                .dependency_policy
+                .dependency_for(extension_id)
+                .is_none();
         };
         gate.dependency_policy
             .is_readiness_control(extension_id, tool_name)
@@ -970,6 +971,36 @@ mod tests {
             }
             other => panic!("expected application error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inventory_lists_registered_extensions_without_a_readiness_dependency() {
+        let (registry, _, _) = readiness_registry(
+            "ast",
+            vec![make_tool("outline")],
+            CapabilityDependency::Ast,
+            &[],
+            None,
+        );
+        let mut host = registry.extension_host.write().unwrap();
+        for (extension, tool) in [("fmt", "format"), ("lint", "check"), ("debug", "sessions")] {
+            host.register(Box::new(TestExtension::echo(
+                extension,
+                vec![make_tool(tool)],
+            )))
+            .expect("register extension");
+        }
+        drop(host);
+
+        let names: HashSet<_> = registry.list().into_iter().map(|tool| tool.name).collect();
+        for name in [
+            "tower_fmt_format",
+            "tower_lint_check",
+            "tower_debug_sessions",
+        ] {
+            assert!(names.contains(name), "missing {name}");
+        }
+        assert!(!names.contains("tower_ast_outline"));
     }
 
     #[test]

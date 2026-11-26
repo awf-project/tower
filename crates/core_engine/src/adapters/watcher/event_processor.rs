@@ -245,6 +245,30 @@ impl EventProcessor {
         let Some(publisher) = self.publication.clone() else {
             return self.apply_event(event);
         };
+        // The OS watches build and database directories too. Staging a full
+        // index for every ignored write can starve subsequent source events.
+        let untracked_and_excluded = |path: &Path| {
+            self.to_relative(path).is_some_and(|rel| {
+                self.is_excluded(&rel)
+                    && self
+                        .workspace
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_by_path(&rel)
+                        .is_none()
+            })
+        };
+        let ignored = match &event {
+            WatchEvent::Create(path) | WatchEvent::Modify(path) | WatchEvent::Delete(path) => {
+                untracked_and_excluded(path)
+            }
+            WatchEvent::Rename { from, to } => {
+                untracked_and_excluded(from) && untracked_and_excluded(to)
+            }
+        };
+        if ignored {
+            return Ok(());
+        }
         loop {
             if self
                 .watcher_cancelled
@@ -3428,6 +3452,29 @@ mod tests {
             0,
             "a.rs now matching ignore must be removed on Modify"
         );
+    }
+
+    #[test]
+    fn untracked_excluded_events_do_not_acquire_the_publication_gate() {
+        let root = tempfile::tempdir().unwrap();
+        write_towerignore(root.path(), "target/\n");
+        let (processor, workspace, _) = make_processor(root.path().to_path_buf());
+        let publisher = Arc::new(crate::adapters::daemon::CommittedEventPublisher::new(1));
+        let mut processor = processor.with_publication(Some(Arc::clone(&publisher)));
+        let file = root.path().join("target/output");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "generated").unwrap();
+        processor.process_event(WatchEvent::Modify(file)).unwrap();
+        assert_eq!(publisher.metrics().acquisitions, 0);
+        let source = root.path().join("main.rs");
+        std::fs::write(&source, "fn main() {}").unwrap();
+        processor
+            .process_event(WatchEvent::Create(source.clone()))
+            .unwrap();
+        write_towerignore(root.path(), "main.rs\n");
+        processor.process_event(WatchEvent::Modify(source)).unwrap();
+        assert!(workspace.read().unwrap().snapshot().files.is_empty());
+        assert_eq!(publisher.metrics().acquisitions, 2);
     }
 
     /// Matcher rebuild: after a Modify on the root `.towerignore` adds `build/`,

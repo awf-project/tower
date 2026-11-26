@@ -1534,13 +1534,7 @@ async fn tower_fmt_format_without_configured_timeout_completes_real_formatter_an
     )
     .await
     .expect("enqueue formatting through public MCP");
-    let acknowledgement: Value = serde_json::from_str(
-        &read_line_capped(&mut connection, 1 << 20)
-            .await
-            .expect("read formatter acknowledgement")
-            .expect("formatter acknowledgement frame"),
-    )
-    .expect("parse formatter acknowledgement");
+    let acknowledgement = read_mcp_response(&mut connection, 2, Duration::from_secs(5)).await;
     assert!(acknowledgement["result"].is_object());
 
     let marker_deadline = Instant::now() + Duration::from_secs(2);
@@ -1565,13 +1559,7 @@ async fn tower_fmt_format_without_configured_timeout_completes_real_formatter_an
         )
         .await
         .expect("poll formatted bytes through public MCP");
-        let response: Value = serde_json::from_str(
-            &read_line_capped(&mut connection, 1 << 20)
-                .await
-                .expect("read tower_read_file response")
-                .expect("tower_read_file response frame"),
-        )
-        .expect("parse tower_read_file response");
+        let response = read_mcp_response(&mut connection, request_id, Duration::from_secs(5)).await;
         let payload = response["result"]["content"][0]["text"]
             .as_str()
             .and_then(|text| serde_json::from_str::<Value>(text).ok());

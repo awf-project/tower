@@ -66,15 +66,13 @@ pub use pool::SessionPool;
 
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ignore::Match;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde_json::{Value, json};
 
 use crate::lsp_adapter::decode::{
@@ -82,15 +80,15 @@ use crate::lsp_adapter::decode::{
     decode_workspace_edit as decode_workspace_edit_spans,
 };
 use crate::lsp_adapter::documents::{DocSync, DocumentTracker};
-use core_engine::adapters::fs::scan::TOWERIGNORE_FILE_NAME;
+use core_engine::adapters::fs::WorkspacePathExclusion;
 use core_engine::domain::RelativePath;
 use core_engine::domain::code_intel::{
     Diagnostic, Hover, Location, Position, Range, Severity, Symbol,
 };
 use core_engine::domain::mutation::compute_content_version;
 use core_engine::ports::{
-    CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PrepareRenameResult,
-    RenameNavigationError,
+    CodeIntelError, CodeIntelligencePort, DocumentSyncPort, NavigationPort, PathExclusionDecision,
+    PathExclusionError, PathExclusionPort, PrepareRenameResult, RenameNavigationError,
 };
 use extension_protocol::messages::{
     CleanupCoverage, LspOutcomeCode, PathMoveKind, PathRenameError, PathRenameErrorCode,
@@ -117,6 +115,9 @@ impl core::fmt::Display for LspSessionError {
             Self::CapabilityUnavailable => "language server capability is unavailable",
             Self::NotRenameable => "symbol is not renameable",
             Self::WorkspaceExternal => "workspace path is external",
+            Self::Backend(LspOutcomeCode::WorkspacePolicyError) => {
+                "could not evaluate workspace path exclusions (.towerignore)"
+            }
             Self::Backend(_) => "language server request failed",
         };
         f.write_str(description)
@@ -904,8 +905,8 @@ pub struct LspClientAdapter {
     /// Semantic provider capabilities reported by the initialized server.
     semantic_capabilities: Mutex<SemanticCapabilities>,
     operation_timeout: Option<Duration>,
-    /// Root `.towerignore` policy applied to navigation results.
-    ignore: Gitignore,
+    /// Workspace policy shared with indexing, including nested ignore rules.
+    exclusions: Box<dyn PathExclusionPort + std::panic::RefUnwindSafe>,
     next_id: AtomicI64,
     /// Set to `true` by the reader thread on stdout EOF (server died or exited).
     /// The pool checks this on every request to detect crashes. Relaxed ordering
@@ -975,6 +976,11 @@ fn is_bad_executable_format(error: &std::io::Error) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn is_bad_executable_format(_error: &std::io::Error) -> bool {
     false
+}
+
+pub(crate) struct SessionRoots<'a> {
+    project: &'a Path,
+    workspace: &'a Path,
 }
 
 impl LspClientAdapter {
@@ -1056,7 +1062,10 @@ impl LspClientAdapter {
             args,
             extensions,
             language_id,
-            workspace_root,
+            SessionRoots {
+                project: &workspace_root,
+                workspace: &workspace_root,
+            },
             push_tx,
             operation_timeout,
         )
@@ -1068,24 +1077,26 @@ impl LspClientAdapter {
         args: &[String],
         extensions: Vec<String>,
         language_id: String,
-        root: PathBuf,
+        roots: SessionRoots<'_>,
         push_tx: Option<DiagnosticsSender>,
         operation_timeout: Option<Duration>,
     ) -> Result<Self, LspSessionError> {
-        if !root.is_dir() {
+        if !roots.project.is_dir() {
             return Err(LspSessionError::Backend(
                 extension_protocol::LspOutcomeCode::ServerLaunchFailed,
             ));
         }
 
+        let exclusions = WorkspacePathExclusion::new(roots.workspace.to_owned())
+            .map_err(|_| LspSessionError::Backend(LspOutcomeCode::ServerLaunchFailed))?;
         let mut child = Command::new(executable)
             .args(args)
-            .current_dir(&root)
+            .current_dir(roots.project)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| classify_spawn_error(error, executable, &root))?;
+            .map_err(|error| classify_spawn_error(error, executable, roots.project))?;
 
         let stdin = child.stdin.take().ok_or(LspSessionError::Backend(
             extension_protocol::LspOutcomeCode::ServerLaunchFailed,
@@ -1137,9 +1148,8 @@ impl LspClientAdapter {
             responses_clone.1.notify_all();
         });
 
-        let ignore = build_ignore_matcher(&root);
         let adapter = Self {
-            workspace_root: root,
+            workspace_root: roots.workspace.to_path_buf(),
             extensions,
             language_id,
             inner: Mutex::new(Session {
@@ -1161,12 +1171,12 @@ impl LspClientAdapter {
                 diagnostics: DiagnosticsCapability::Push,
             }),
             operation_timeout,
-            ignore,
+            exclusions: Box::new(exclusions),
             next_id: AtomicI64::new(1),
             dead_flag,
             reader_exit,
         };
-        adapter.handshake()?;
+        adapter.handshake(roots.project)?;
         Ok(adapter)
     }
 
@@ -1177,9 +1187,9 @@ impl LspClientAdapter {
         Arc::clone(&self.state)
     }
 
-    fn handshake(&self) -> Result<(), LspSessionError> {
+    fn handshake(&self, project_root: &Path) -> Result<(), LspSessionError> {
         let deadline = self.operation_deadline()?;
-        let root_uri = path_to_uri(&self.workspace_root);
+        let root_uri = path_to_uri(project_root);
         let initialize_params = initialize_params(std::process::id(), &root_uri);
         let initialized = json!({
             "jsonrpc": "2.0",
@@ -1708,11 +1718,7 @@ impl LspClientAdapter {
         let result = self.send_request_until(method, params, deadline);
         self.release_doc(&uri);
         let raws = decode_locations_typed(&result?)?;
-        Ok(workspace_locations(
-            raws,
-            &self.workspace_root,
-            &self.ignore,
-        ))
+        workspace_locations(raws, &self.workspace_root, self.exclusions.as_ref())
     }
 
     fn prepare_rename_query(
@@ -2158,10 +2164,9 @@ impl pool::PooledSession for LspClientAdapter {
         let deadline = self.operation_deadline()?;
         let emitted_sync = self.acquire_doc_with_sync_until(&uri, text, deadline)?;
         let result = (|| {
-            // Readiness notifications are optional in LSP. Only servers that
-            // actually signal readiness can participate in this extra gate;
-            // otherwise the semantic response itself establishes completion.
-            if emitted_sync && (pre_open_ready_gen > 0 || is_server_status_active(&self.state)) {
+            // A completed background-index progress token (e.g. from clangd)
+            // does not promise another notification when a document reopens.
+            if emitted_sync && is_server_status_active(&self.state) {
                 self.await_index_settled(pre_open_ready_gen, deadline)?;
             }
             self.send_request_until(
@@ -2176,11 +2181,7 @@ impl pool::PooledSession for LspClientAdapter {
         })();
         self.release_doc(&uri);
         let raws = decode_locations_typed(&result?)?;
-        Ok(workspace_locations(
-            raws,
-            &self.workspace_root,
-            &self.ignore,
-        ))
+        workspace_locations(raws, &self.workspace_root, self.exclusions.as_ref())
     }
 
     fn implementations_lsp(
@@ -2690,15 +2691,6 @@ fn path_to_uri(path: &std::path::Path) -> String {
     format!("file://{}", encode_uri_path(&path.display().to_string()))
 }
 
-/// Build the root `.towerignore` matcher used to filter navigation results.
-/// Falls back to an empty matcher when the file is absent or malformed (same
-/// policy as the watcher's `EventProcessor`).
-fn build_ignore_matcher(root: &Path) -> Gitignore {
-    let mut builder = GitignoreBuilder::new(root);
-    let _ = builder.add(root.join(TOWERIGNORE_FILE_NAME));
-    builder.build().unwrap_or_else(|_| Gitignore::empty())
-}
-
 /// Serialise a [`DocSync`] action to the matching LSP notification and write it
 /// through the shared writer.
 fn write_doc_sync(writer: &Writer, uri: &str, sync: &DocSync) -> std::io::Result<()> {
@@ -2754,26 +2746,40 @@ fn write_doc_sync_message(
 /// Normalize decoded raw locations to workspace-relative domain [`Location`]s,
 /// dropping any outside `root` or matched by the `.towerignore` policy
 /// (spec 14b: result filtering to workspace root / `.towerignore`).
-fn workspace_locations(raws: Vec<RawLocation>, root: &Path, ignore: &Gitignore) -> Vec<Location> {
-    raws.into_iter()
-        .filter_map(|raw| {
-            let UriClassification::WorkspacePath(rel_str) =
-                decode::classify_uri(&raw.uri, root, UriAccessPolicy::Writable)?
-            else {
-                return None;
-            };
-            if matches!(
-                ignore.matched_path_or_any_parents(&rel_str, false),
-                Match::Ignore(_)
-            ) {
-                return None;
-            }
-            Some(Location {
-                path: RelativePath::new(rel_str),
+fn workspace_locations(
+    raws: Vec<RawLocation>,
+    root: &Path,
+    exclusions: &dyn PathExclusionPort,
+) -> Result<Vec<Location>, LspSessionError> {
+    let mut locations = Vec::new();
+    // References often share a file. Re-evaluate its policy on the next query
+    // so edits to nested .towerignore files take effect in a resident session.
+    let mut decisions = HashMap::new();
+    for raw in raws {
+        let Some(UriClassification::WorkspacePath(relative)) =
+            decode::classify_uri(&raw.uri, root, UriAccessPolicy::Writable)
+        else {
+            continue;
+        };
+        let path = RelativePath::new(relative);
+        let decision = decisions
+            .entry(path.clone())
+            .or_insert_with_key(|path| exclusions.classify(path));
+        match decision {
+            Ok(PathExclusionDecision::Allowed) => locations.push(Location {
+                path,
                 range: raw.range,
-            })
-        })
-        .collect()
+            }),
+            Ok(PathExclusionDecision::Excluded(_))
+            | Err(PathExclusionError::OutsideWorkspace | PathExclusionError::SymlinkEscape) => {}
+            Err(PathExclusionError::PolicyEvaluation) => {
+                return Err(LspSessionError::Backend(
+                    LspOutcomeCode::WorkspacePolicyError,
+                ));
+            }
+        }
+    }
+    Ok(locations)
 }
 
 fn type_hierarchy_range(range: lsp_types::Range) -> extension_protocol::TypeHierarchyRange {
@@ -3045,14 +3051,15 @@ mod tests {
         }
     }
 
-    fn empty_ignore() -> ignore::gitignore::Gitignore {
-        ignore::gitignore::Gitignore::empty()
+    fn empty_ignore() -> core_engine::test_support::InMemoryPathExclusion {
+        core_engine::test_support::InMemoryPathExclusion::new(Default::default())
     }
 
     #[test]
     fn in_root_location_becomes_relative() {
         let root = std::path::Path::new("/w");
-        let out = workspace_locations(vec![raw("file:///w/src/a.rs")], root, &empty_ignore());
+        let out =
+            workspace_locations(vec![raw("file:///w/src/a.rs")], root, &empty_ignore()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path.as_str(), "src/a.rs");
     }
@@ -3064,7 +3071,8 @@ mod tests {
             vec![raw("file:///w/src/a.rs"), raw("file:///elsewhere/b.rs")],
             root,
             &empty_ignore(),
-        );
+        )
+        .unwrap();
         let paths: Vec<&str> = out.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["src/a.rs"]);
     }
@@ -3072,9 +3080,12 @@ mod tests {
     #[test]
     fn ignored_location_is_dropped() {
         let root = std::path::Path::new("/w");
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-        builder.add_line(None, "*.gen.rs").unwrap();
-        let ignore = builder.build().unwrap();
+        let ignore = core_engine::test_support::InMemoryPathExclusion::new(
+            core_engine::test_support::PathExclusionFixture {
+                files: vec![(RelativePath::new(".towerignore"), b"*.gen.rs".to_vec())],
+                ..Default::default()
+            },
+        );
 
         let out = workspace_locations(
             vec![
@@ -3083,9 +3094,50 @@ mod tests {
             ],
             root,
             &ignore,
-        );
+        )
+        .unwrap();
         let paths: Vec<&str> = out.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["src/real.rs"]);
+    }
+
+    #[test]
+    fn workspace_locations_classifies_each_path_once_and_preserves_interleaved_ranges() {
+        use core_engine::ports::{PathExclusionDecision, PathExclusionError, PathExclusionPort};
+
+        #[derive(Default)]
+        struct CountingExclusions(Mutex<Vec<String>>);
+
+        impl PathExclusionPort for CountingExclusions {
+            fn classify(
+                &self,
+                path: &RelativePath,
+            ) -> Result<PathExclusionDecision, PathExclusionError> {
+                self.0.lock().unwrap().push(path.as_str().to_owned());
+                empty_ignore().classify(path)
+            }
+        }
+
+        let exclusions = CountingExclusions::default();
+        let mut locations = Vec::new();
+        for (line, file) in ["a.rs", ".hidden.rs", "b.rs", "%61.rs", ".hidden.rs"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut location = raw(&format!("file:///w/{file}"));
+            location.range.start.line = line as u32;
+            location.range.end.line = line as u32;
+            locations.push(location);
+        }
+        let expected = [(0, "a.rs"), (2, "b.rs"), (3, "a.rs")].map(|(index, file)| Location {
+            path: RelativePath::new(file),
+            range: locations[index].range,
+        });
+        let actual = workspace_locations(locations, Path::new("/w"), &exclusions).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            *exclusions.0.lock().unwrap(),
+            ["a.rs", ".hidden.rs", "b.rs"]
+        );
     }
 
     #[test]
@@ -3270,7 +3322,7 @@ mod tests {
                 diagnostics: DiagnosticsCapability::Push,
             }),
             operation_timeout: Some(TEST_OPERATION_TIMEOUT),
-            ignore: empty_ignore(),
+            exclusions: Box::new(empty_ignore()),
             next_id: AtomicI64::new(1),
             dead_flag: Arc::new(AtomicBool::new(false)),
             reader_exit: Arc::new(AtomicU8::new(ReaderExit::Crashed as u8)),
@@ -4507,8 +4559,9 @@ mod tests {
                 adapter
                     .acquire_doc_until(&adapter.uri_for(&path), "fn main() {}", None)
                     .unwrap();
-                mark_ready(&adapter.state);
             }
+            // Generic background work finished before this query.
+            mark_ready(&adapter.state);
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
                 let worker = scope.spawn(|| {
@@ -4603,6 +4656,7 @@ mod tests {
     fn references_without_configured_timeout_wait_for_fresh_readiness() {
         let (mut adapter, sink, responses) = test_adapter();
         adapter.operation_timeout = None;
+        super::note_server_status_active(&adapter.state);
         mark_ready(&adapter.state);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
@@ -4708,6 +4762,7 @@ mod tests {
     fn references_readiness_timeout_releases_document_hold() {
         let (mut adapter, sink, _responses) = test_adapter();
         adapter.operation_timeout = Some(Duration::from_millis(20));
+        super::note_server_status_active(&adapter.state);
         mark_ready(&adapter.state);
         let path = RelativePath::new("src/main.rs");
 
@@ -4776,7 +4831,10 @@ mod tests {
             &[],
             vec!["rs".to_owned()],
             "rust".to_owned(),
-            workspace.path().to_path_buf(),
+            super::SessionRoots {
+                project: workspace.path(),
+                workspace: workspace.path(),
+            },
             None,
             Some(TEST_OPERATION_TIMEOUT),
         ) {
@@ -4797,7 +4855,10 @@ mod tests {
             &[],
             vec!["rs".to_owned()],
             "rust".to_owned(),
-            workspace.path().to_path_buf(),
+            super::SessionRoots {
+                project: workspace.path(),
+                workspace: workspace.path(),
+            },
             None,
             Some(TEST_OPERATION_TIMEOUT),
         ) {
@@ -4825,7 +4886,10 @@ mod tests {
             &[],
             vec!["rs".to_owned()],
             "rust".to_owned(),
-            removed_root,
+            super::SessionRoots {
+                project: &removed_root,
+                workspace: workspace.path(),
+            },
             None,
             Some(TEST_OPERATION_TIMEOUT),
         ) {

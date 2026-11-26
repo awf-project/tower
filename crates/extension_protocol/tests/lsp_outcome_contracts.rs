@@ -322,7 +322,7 @@ fn exports_lsp_outcome_family_with_required_fields_variants_and_wire_spellings()
 }
 
 #[test]
-fn covers_eleven_outcome_codes_six_operations_required_fields_and_explicit_nulls() {
+fn covers_outcome_codes_operations_required_fields_and_explicit_nulls() {
     let codes = [
         (
             LspOutcomeCode::LanguageNotConfigured,
@@ -345,6 +345,10 @@ fn covers_eleven_outcome_codes_six_operations_required_fields_and_explicit_nulls
         (
             LspOutcomeCode::ServerMalformedResponse,
             "server_malformed_response",
+        ),
+        (
+            LspOutcomeCode::WorkspacePolicyError,
+            "workspace_policy_error",
         ),
         (LspOutcomeCode::ServerError, "server_error"),
     ];

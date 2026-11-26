@@ -15,12 +15,11 @@ construct tower.
 
 ## Spec-driven workflow
 
-All features were built from a backlog of single-responsibility specifications
-in `.agent/todo/` (git-ignored; local working artifacts only). Each spec is
-written in **EARS + Given/When/Then** format and includes an explicit TDD
-sequence. The ordering follows a dependency DAG documented in
-`.agent/todo/README.md`, which also holds the authoritative ASCII architecture
-wireframe.
+The feature backlog lives in the `tower` Airlock project configured in
+[.airlock.toml](../.airlock.toml). Each spec covers one responsibility and uses
+**EARS + Given/When/Then** with an explicit TDD sequence. The **Core Engine —
+Spec Roadmap** note records the dependency order and holds the authoritative
+ASCII architecture wireframe.
 
 The contract for merging any spec:
 
@@ -280,7 +279,6 @@ Tower was constructed through an orchestrated TDD workflow applied spec by spec:
 No spec left the tree in a broken state: the full quality gate
 (`fmt + clippy + test + deny`) was green at every step.
 
-The dependency order of the specs is preserved in `.agent/todo/README.md`.
 The hexagonal architecture ensured that specs could be developed in isolation:
 domain specs never touched adapters, and adapter specs never touched domain logic
 beyond port traits. The most recent slice (specs 20–29) replaced the embedded WASM

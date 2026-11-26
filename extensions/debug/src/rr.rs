@@ -109,6 +109,24 @@ impl RealRrRecorder {
     }
 }
 
+fn rr_command(request: &RrRecordRequest) -> Command {
+    let mut command = Command::new("rr");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_request_env(&mut command, &request.env);
+    if let Some(cwd) = &request.cwd {
+        command.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
 impl RrRecorder for RealRrRecorder {
     fn record_with_deadline(
         &self,
@@ -131,27 +149,26 @@ impl RrRecorder for RealRrRecorder {
             Err(_) => return record_failed("trace_register", "trace allocation failed"),
         };
 
-        let mut command = Command::new("rr");
+        // rr creates its own output directory.
+        // Keep the store's reservation until we can atomically replace it with the trace.
+        let staging =
+            match std::path::absolute(&store.policy().trace_root).and_then(tempfile::tempdir_in) {
+                Ok(directory) => directory,
+                Err(_) => {
+                    let _ = store.abort_trace(&allocation);
+                    return record_failed("trace_register", "could not stage the rr recording");
+                }
+            };
+        let recording = staging.path().join("trace");
+
+        let mut command = rr_command(&request);
         command
             .arg("record")
             .arg("-o")
-            .arg(&allocation.path)
+            .arg(&recording)
             .arg("--")
             .arg(&request.program)
-            .args(&request.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        apply_request_env(&mut command, &request.env);
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+            .args(&request.args);
 
         let child = match command.spawn() {
             Ok(child) => child,
@@ -181,12 +198,37 @@ impl RrRecorder for RealRrRecorder {
             let _ = store.abort_trace(&allocation);
             return record_failed("wait", "rr record exited without a process status code");
         }
-        if looks_like_rr_output_failure(&chunks, status.code()) {
-            let _ = store.abort_trace(&allocation);
-            return record_failed("output", "rr record output was malformed");
-        }
-
         let (output, output_truncated) = bounded_output_events(chunks, readers_truncated);
+        // Even a failed exec can leave a finalized version file. Ask rr to
+        // decode the recorded process table before advertising a replay.
+        let validation = rr_command(&request).arg("ps").arg(&recording).spawn();
+        let valid = match validation {
+            Ok(child) => match capture_recording_process(
+                child,
+                deadline.as_ref(),
+                store,
+                &allocation,
+                "rr ps",
+            ) {
+                Ok(captured) => captured.status.success(),
+                Err(error) => return *error,
+            },
+            Err(_) => false,
+        };
+        if !valid {
+            let _ = store.abort_trace(&allocation);
+            let mut failure = record_failed(
+                "output",
+                "rr could not read a recorded process from the trace",
+            );
+            failure.output = output;
+            failure.output_truncated = output_truncated;
+            return failure;
+        }
+        if std::fs::rename(&recording, &allocation.path).is_err() {
+            let _ = store.abort_trace(&allocation);
+            return record_failed("trace_register", "could not publish the rr recording");
+        }
         let output_summary = output
             .iter()
             .map(|output| output.text.clone())
@@ -981,25 +1023,6 @@ fn truncate_string_to_bytes(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
 }
 
-fn looks_like_rr_output_failure(chunks: &[CapturedChunk], exit_code: Option<i32>) -> bool {
-    let stdout_is_empty = chunks
-        .iter()
-        .filter(|chunk| chunk.category == "stdout")
-        .all(|chunk| chunk.bytes.is_empty());
-    if exit_code != Some(2) || !stdout_is_empty {
-        return false;
-    }
-    let stderr_text = chunks
-        .iter()
-        .filter(|chunk| chunk.category == "stderr")
-        .flat_map(|chunk| chunk.bytes.iter().copied())
-        .collect::<Vec<_>>();
-    let stderr_text = String::from_utf8_lossy(&stderr_text).to_lowercase();
-    stderr_text.contains("syntax error")
-        || stderr_text.contains("unterminated")
-        || stderr_text.contains("unexpected eof")
-}
-
 #[cfg(unix)]
 fn terminate_child(child: &mut Child) {
     let process_group_id = format!("-{}", child.id());
@@ -1161,7 +1184,12 @@ mod tests {
     fn fake_rr_bin(name: &str, script: &str) -> (PathBuf, PathBuf) {
         let bin_dir = temp_trace_root(name).join("bin");
         fs::create_dir_all(&bin_dir).expect("create fake rr bin dir");
-        let rr_path = write_executable(bin_dir.join("rr"), script);
+        let script = script.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ \"$1\" = ps ]; then test -f \"$2/tasks\"; exit $?; fi\n",
+            1,
+        );
+        let rr_path = write_executable(bin_dir.join("rr"), &script);
         (bin_dir, rr_path)
     }
 
@@ -1540,6 +1568,8 @@ mod tests {
         let timeout_probe = temp_trace_root("timeout-reaping").join("child.pid");
         let script = format!(
             "#!/bin/sh\n\
+             /bin/mkdir \"$3\" || exit 1\n\
+             : > \"$3/tasks\"\n\
              shift 4\n\
              \"$@\" &\n\
              echo \"$!\" > {}\n\
@@ -1743,8 +1773,10 @@ mod tests {
             (
                 "trace_register",
                 {
-                    let (fake_rr_dir, _rr_path) =
-                        fake_rr_bin("trace-register-failure", "#!/bin/sh\nshift 4\n\"$@\"\n");
+                    let (fake_rr_dir, _rr_path) = fake_rr_bin(
+                        "trace-register-failure",
+                        "#!/bin/sh\n/bin/mkdir \"$3\" || exit 1\n: > \"$3/tasks\"\nshift 4\n\"$@\"\n",
+                    );
                     let trace_root_file = temp_trace_root("trace-register-root").join("file");
                     fs::write(&trace_root_file, "not a directory").expect("write trace root file");
                     RrRecordRequest {
@@ -1811,8 +1843,37 @@ mod tests {
     }
 
     #[test]
+    fn rr_failure_without_a_finalized_trace_preserves_stderr_and_releases_reservation() {
+        let (bin, _) = fake_rr_bin(
+            "incomplete-trace",
+            "#!/bin/sh\n/bin/mkdir \"$3\" || exit 2\n: > \"$3/version\"\necho recording-failed >&2\nexit 1\n",
+        );
+        let mut request = request("incomplete-trace");
+        request.env.insert("PATH".into(), bin.display().to_string());
+        let mut store = TraceStore::new(request.trace_policy.clone());
+        let result = RealRrRecorder::new().record(request, &mut store);
+        assert!(!result.recordable);
+        assert!(result.trace_id.is_none());
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|chunk| chunk.text.contains("recording-failed"))
+        );
+        assert_eq!(
+            std::fs::read_dir(&store.policy().trace_root)
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn rr_target_nonzero_exit_is_preserved_as_exit_code_and_not_infrastructure_failure() {
-        let (fake_rr_dir, _rr_path) = fake_rr_bin("target-nonzero", "#!/bin/sh\nshift 4\n\"$@\"\n");
+        let (fake_rr_dir, _rr_path) = fake_rr_bin(
+            "target-nonzero",
+            "#!/bin/sh\n/bin/mkdir \"$3\" || exit 1\n: > \"$3/tasks\"\nshift 4\n\"$@\"\n",
+        );
         let request = RrRecordRequest {
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "echo failed >&2; exit 7".to_owned()],
@@ -1852,8 +1913,10 @@ mod tests {
 
     #[test]
     fn rr_output_capture_preserves_stderr_before_stdout_interleaving() {
-        let (fake_rr_dir, _rr_path) =
-            fake_rr_bin("interleaved-output", "#!/bin/sh\nshift 4\n\"$@\"\n");
+        let (fake_rr_dir, _rr_path) = fake_rr_bin(
+            "interleaved-output",
+            "#!/bin/sh\n/bin/mkdir \"$3\" || exit 1\n: > \"$3/tasks\"\nshift 4\n\"$@\"\n",
+        );
         let request = RrRecordRequest {
             program: "/bin/sh".to_owned(),
             args: vec![
@@ -1921,6 +1984,8 @@ mod tests {
             "successful-command",
             "#!/bin/sh\n\
              printf '%s\\n' \"$@\" > \"$RR_TEST_ARGV_CAPTURE\"\n\
+             /bin/mkdir \"$3\" || exit 1\n\
+             : > \"$3/tasks\"\n\
              shift 4\n\
              \"$@\"\n",
         );

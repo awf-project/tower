@@ -535,6 +535,7 @@ dependencies = [
  "extension_sidecar_harness",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1519,7 +1520,6 @@ dependencies = [
  "extension_protocol",
  "extension_sidecar_harness",
  "fixture_lsp_server",
- "ignore",
  "lsp-types",
  "serde",
  "serde_json",

@@ -24,9 +24,9 @@ serde = { version = "1", features = ["derive"] }
 # does NOT create a circular dependency (extensions/* are not in crates/*).
 core_engine = { path = "../../crates/core_engine" }
 toml = "1.1.2"
-ignore = "0.4.26"
 lsp-types = "0.97.0"
 
 [dev-dependencies]
+core_engine = { path = "../../crates/core_engine", features = ["testing"] }
 fixture_lsp_server = { path = "../fixtures/lsp_server" }
 tempfile = "3"

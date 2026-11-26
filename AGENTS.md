@@ -183,8 +183,8 @@ result rather than a transport error.
 
 ## Working conventions specific to this repo
 
-- Per the global guide: write/update the **ASCII architecture wireframe** in `.agent/todo/README.md`
-  when structure changes — keep it the single source of truth for the hexagon.
+- When the structure changes, update the **ASCII architecture wireframe** in the
+  **Core Engine — Spec Roadmap** note in the `tower` Airlock project.
 - Index source of truth = **Sled** (persisted + reloaded on start); index invalidation is transactional
   and joint with file-record writes (spec 04b).
 - **Local config**: `<workspace>/.tower/config.toml` (TOML) holds per-project settings.

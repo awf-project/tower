@@ -75,7 +75,7 @@ clippy: ## Lint, warnings as errors (CI step 2)
 # the checkout so fixture workspaces don't inherit the project's .towerignore.
 ifndef TMPDIR
 TEST_TMPDIR_ROOT := $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)
-export TMPDIR := $(TEST_TMPDIR_ROOT)/tower/test-tmp
+test: export TMPDIR := $(TEST_TMPDIR_ROOT)/tower/test-tmp
 endif
 test: ## Run the workspace test suite (compiles native extensions first)
 	mkdir -p "$(TMPDIR)"
@@ -111,8 +111,10 @@ gate: fmt-check clippy test deny ## Full quality gate, same sequence as CI
 dist: release ## Package a release tarball (host + reference extensions) + sha256
 	cargo build --release $(addprefix -p ,$(addsuffix _extension,$(EXTENSIONS)))
 	@mkdir -p dist
-	@archive="$(BIN)-$(VERSION)-$(HOST_TARGET).tar.gz"; \
+	@set -eu; \
+	archive="$(BIN)-$(VERSION)-$(HOST_TARGET).tar.gz"; \
 	staging="$$(mktemp -d)"; \
+	trap 'rm -rf "$$staging"' EXIT; \
 	install -m 0755 target/release/$(BIN) "$$staging/$(BIN)"; \
 	for ext in $(EXTENSIONS); do \
 	  mkdir -p "$$staging/extensions/$$ext"; \
@@ -120,7 +122,6 @@ dist: release ## Package a release tarball (host + reference extensions) + sha25
 	  install -m 0755 "target/release/$${ext}_extension" "$$staging/extensions/$$ext/$${ext}_extension"; \
 	done; \
 	tar -czf "dist/$$archive" -C "$$staging" .; \
-	rm -rf "$$staging"; \
 	( cd dist && (sha256sum "$$archive" 2>/dev/null || shasum -a 256 "$$archive") > "$$archive.sha256" ); \
 	echo "dist/$$archive"; \
 	echo "dist/$$archive.sha256"

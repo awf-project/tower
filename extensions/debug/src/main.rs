@@ -27,8 +27,8 @@ use extension_sidecar_harness::{
     HostCallIdAllocator, QueuedFrame, frame_from_envelope, host_call, send_error, send_response,
 };
 use protocol::{
-    DebugAdapterConfig, DebugInitializeConfig, debug_not_initialized_result,
-    debug_tool_declarations, debug_tool_unavailable_result,
+    DebugInitializeConfig, debug_not_initialized_result, debug_tool_declarations,
+    debug_tool_unavailable_result,
 };
 use rr::RrRuntime;
 use serde_json::{Map, Value, json};
@@ -360,6 +360,23 @@ impl DebugAdapterFactory for RealDebugAdapterFactory {
         &self,
         request: &LaunchRequest,
     ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+        self.spawn(request, false)
+    }
+
+    fn start_replay(
+        &self,
+        request: &LaunchRequest,
+    ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+        self.spawn(request, true)
+    }
+}
+
+impl RealDebugAdapterFactory {
+    fn spawn(
+        &self,
+        request: &LaunchRequest,
+        replay: bool,
+    ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
         let adapter_config = self
             .config
             .languages
@@ -370,7 +387,13 @@ impl DebugAdapterFactory for RealDebugAdapterFactory {
                     request.language
                 ))
             })?;
-        let transport = ProcessDapTransport::spawn(adapter_config).map_err(|error| {
+        let rr_gdb = replay && adapter_config.adapter_type == "gdb";
+        let (program, args) = if rr_gdb {
+            (&request.program, &request.args)
+        } else {
+            (&adapter_config.command, &adapter_config.args)
+        };
+        let transport = ProcessDapTransport::spawn(program, args).map_err(|error| {
             DebugRuntimeError::LaunchFailed(format!(
                 "failed to start debug adapter for language {}: {error}",
                 request.language
@@ -380,6 +403,9 @@ impl DebugAdapterFactory for RealDebugAdapterFactory {
             adapter_type: adapter_config.adapter_type.clone(),
             launch_defaults: adapter_config.launch.clone(),
             client: DapClient::new(Box::new(transport)),
+            pending_gdb_launch: None,
+            rr_gdb,
+            stopped_thread_id: Some(1),
             next_output_sequence: 1,
         }))
     }
@@ -392,10 +418,10 @@ struct ProcessDapTransport {
 }
 
 impl ProcessDapTransport {
-    fn spawn(config: &DebugAdapterConfig) -> Result<Self, io::Error> {
-        let mut command = Command::new(&config.command);
+    fn spawn(program: &str, args: &[String]) -> Result<Self, io::Error> {
+        let mut command = Command::new(program);
         command
-            .args(&config.args)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -480,6 +506,9 @@ struct ProcessDebugAdapterSession {
     adapter_type: String,
     launch_defaults: Map<String, Value>,
     client: DapClient,
+    pending_gdb_launch: Option<(u64, bool)>,
+    rr_gdb: bool,
+    stopped_thread_id: Option<u64>,
     next_output_sequence: u64,
 }
 
@@ -503,6 +532,10 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         request: &LaunchRequest,
         timeout: Option<Duration>,
     ) -> Result<(), DebugRuntimeError> {
+        // rr has already connected GDB to its remote target before DAP initialize.
+        if self.rr_gdb {
+            return Ok(());
+        }
         let mut arguments = self.launch_defaults.clone();
         arguments.insert("program".to_owned(), Value::String(request.program.clone()));
         if let Some(cwd) = &request.cwd {
@@ -526,6 +559,19 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         }
         for (key, value) in &request.launch_overrides {
             arguments.insert(key.clone(), value.clone());
+        }
+
+        if self.adapter_type == "gdb" {
+            // GDB acknowledges launch only after configurationDone. Tower opens
+            // interactive sessions stopped, so request an entry stop by default.
+            let stop_on_entry =
+                arguments.entry("stopOnEntry").or_insert(Value::Bool(true)) == &Value::Bool(true);
+            self.wait_for_launch_event(&["initialized"], timeout)?;
+            let seq = self
+                .client
+                .send_request("launch", Value::Object(arguments))?;
+            self.pending_gdb_launch = Some((seq, stop_on_entry));
+            return Ok(());
         }
 
         let response = self
@@ -590,8 +636,15 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
             for (index, breakpoint) in source_breakpoints.into_iter().enumerate() {
                 let response_breakpoint = response_breakpoints.get(index).unwrap_or(&Value::Null);
                 verified.push(DebugBreakpoint {
-                    path: breakpoint.path.clone(),
-                    line: breakpoint.line,
+                    path: response_breakpoint
+                        .pointer("/source/path")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&breakpoint.path)
+                        .to_owned(),
+                    line: response_breakpoint
+                        .get("line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(breakpoint.line),
                     condition: breakpoint.condition.clone(),
                     hit_condition: breakpoint.hit_condition.clone(),
                     verified: response_breakpoint
@@ -605,11 +658,57 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         Ok(verified)
     }
 
+    fn initial_stop(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<DebugStop>, DebugRuntimeError> {
+        let budget = session::OperationBudget::from_remaining(timeout)?;
+        let pending = self.pending_gdb_launch.take();
+        if let Some((seq, _)) = pending {
+            ensure_success(
+                self.client
+                    .finish_request("launch", seq, budget.remaining())?,
+            )?;
+        }
+        let events = ["stopped", "exited", "terminated"];
+        let event = if self.rr_gdb || pending.is_some_and(|(_, stop_on_entry)| stop_on_entry) {
+            Some(self.wait_for_launch_event(&events, budget.remaining())?)
+        } else {
+            self.client.take_pending_event(&events)
+        };
+        if let Some(event) = event {
+            let mut stop = self.decode_stop_event(event);
+            if let Some(thread) = stop.thread_id {
+                match self.stack(thread, budget.remaining()) {
+                    Ok(frames) => stop.top_frame = frames.into_iter().next(),
+                    Err(error @ DebugRuntimeError::DebugTimeout { .. }) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            return Ok(Some(stop));
+        }
+
+        let stop = if pending.is_some() {
+            None
+        } else {
+            session::initial_stack_stop(self, budget.remaining())?
+        };
+        self.stopped_thread_id = stop.as_ref().and_then(|stop| stop.thread_id);
+        Ok(stop)
+    }
+
     fn continue_session(
         &mut self,
         timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
-        self.resume("continue", json!({}), timeout)
+        if let Some(thread_id) = self.stopped_thread_id {
+            self.resume("continue", json!({"threadId": thread_id}), timeout)
+        } else {
+            // GDB was launched running. The next stop or exit can arrive before
+            // the caller issues continue, so consume it without resuming again.
+            let budget = session::OperationBudget::from_remaining(timeout)?;
+            self.wait_after_resume("continue", timeout, &budget)
+        }
     }
 
     fn step(
@@ -619,7 +718,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume(
             "next",
-            json!({ "threadId": thread_id.unwrap_or(1) }),
+            json!({ "threadId": thread_id.or(self.stopped_thread_id).unwrap_or(1) }),
             timeout,
         )
     }
@@ -631,7 +730,7 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     ) -> Result<DebugStop, DebugRuntimeError> {
         self.resume(
             "pause",
-            json!({ "threadId": thread_id.unwrap_or(1) }),
+            json!({ "threadId": thread_id.or(self.stopped_thread_id).unwrap_or(1) }),
             timeout,
         )
     }
@@ -737,11 +836,26 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
             timeout,
         )?;
         ensure_success(response.clone())?;
-        variable_from_value(&response.body).ok_or_else(|| {
-            DebugRuntimeError::LaunchFailed(
-                "debug adapter returned malformed evaluate result".into(),
-            )
-        })
+        let body = &response.body;
+        let evaluated = body
+            .get("result")
+            .and_then(Value::as_str)
+            .map(|value| DebugVariable {
+                name: expression.to_owned(),
+                value: value.to_owned(),
+                r#type: body.get("type").and_then(Value::as_str).map(str::to_owned),
+                variables_reference: body
+                    .get("variablesReference")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+        evaluated
+            .or_else(|| variable_from_value(body))
+            .ok_or_else(|| {
+                DebugRuntimeError::LaunchFailed(
+                    "debug adapter returned malformed evaluate result".into(),
+                )
+            })
     }
 
     fn reverse_continue(
@@ -749,6 +863,9 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         thread_id: Option<u64>,
         timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
+        if self.rr_gdb {
+            return self.reverse_gdb("reverse-continue", "reverse_continue", thread_id, timeout);
+        }
         self.resume(
             "reverseContinue",
             json!({ "threadId": thread_id.unwrap_or(1) }),
@@ -762,6 +879,14 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
         granularity: session::StepBackGranularity,
         timeout: Option<Duration>,
     ) -> Result<DebugStop, DebugRuntimeError> {
+        if self.rr_gdb {
+            let command = match granularity {
+                session::StepBackGranularity::Line => "reverse-step",
+                session::StepBackGranularity::Instruction => "reverse-stepi",
+                session::StepBackGranularity::Over => "reverse-next",
+            };
+            return self.reverse_gdb(command, "step_back", thread_id, timeout);
+        }
         self.resume(
             "stepBack",
             json!({
@@ -827,6 +952,10 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
     }
 
     fn terminate(&mut self, timeout: Duration) -> Result<(), DebugRuntimeError> {
+        if self.adapter_type == "gdb" {
+            // Disconnect also succeeds when the inferior has already exited.
+            return self.disconnect(timeout);
+        }
         let response = self.client.request("terminate", json!({}), timeout)?;
         ensure_success(response)
     }
@@ -838,6 +967,50 @@ impl DebugAdapterSession for ProcessDebugAdapterSession {
 }
 
 impl ProcessDebugAdapterSession {
+    // GDB exposes reverse execution for remote rr targets through the DAP REPL.
+    fn reverse_gdb(
+        &mut self,
+        command: &str,
+        operation: &str,
+        thread_id: Option<u64>,
+        timeout: Option<Duration>,
+    ) -> Result<DebugStop, DebugRuntimeError> {
+        let budget = session::OperationBudget::from_remaining(timeout)?;
+        let mut arguments = json!({"context": "repl", "expression": format!("{command} &")});
+        if let Some(thread) = thread_id {
+            let frame = self
+                .stack(thread, budget.remaining())?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    DebugRuntimeError::NotStopped("no frame for the requested thread".into())
+                })?;
+            arguments["frameId"] = json!(frame.id);
+        }
+        let response = self
+            .client
+            .request("evaluate", arguments, budget.remaining())?;
+        ensure_success(response)?;
+        self.stopped_thread_id = None;
+        self.wait_after_resume(operation, timeout, &budget)
+    }
+
+    fn wait_for_launch_event(
+        &mut self,
+        events: &[&str],
+        timeout: Option<Duration>,
+    ) -> Result<DapEvent, DebugRuntimeError> {
+        self.client.wait_for_event(events, timeout)?.ok_or_else(|| {
+            DapError::Timeout {
+                command: "launch".to_owned(),
+                budget_ms: timeout
+                    .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0),
+            }
+            .into()
+        })
+    }
+
     fn resume(
         &mut self,
         command: &str,
@@ -861,11 +1034,30 @@ impl ProcessDebugAdapterSession {
             result => result?,
         };
         ensure_success(response)?;
+        self.stopped_thread_id = None;
+        self.wait_after_resume(command, timeout, &budget)
+    }
+
+    fn wait_after_resume(
+        &mut self,
+        command: &str,
+        timeout: Option<Duration>,
+        budget: &session::OperationBudget,
+    ) -> Result<DebugStop, DebugRuntimeError> {
         match self
             .client
             .wait_for_event(&["stopped", "exited", "terminated"], budget.remaining())
         {
-            Ok(Some(event)) => Ok(self.stop_from_event(event, budget.remaining())),
+            Ok(Some(event)) => {
+                let mut stop = self.decode_stop_event(event);
+                if let Some(thread) = stop.thread_id {
+                    stop.top_frame = self
+                        .stack(thread, budget.remaining())
+                        .ok()
+                        .and_then(|frames| frames.into_iter().next());
+                }
+                Ok(stop)
+            }
             Ok(None) | Err(DapError::Timeout { .. }) => {
                 Ok(self.timeout_stop(operation_label(command), timeout))
             }
@@ -884,30 +1076,30 @@ impl ProcessDebugAdapterSession {
         }
     }
 
-    fn stop_from_event(&mut self, event: DapEvent, timeout: Option<Duration>) -> DebugStop {
+    fn decode_stop_event(&mut self, event: DapEvent) -> DebugStop {
         let output_since = self.drain_output_events();
         match event.event.as_str() {
             "stopped" => {
-                let thread_id = event
-                    .body
-                    .get("threadId")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1);
+                let thread_id = event.body.get("threadId").and_then(Value::as_u64);
+                self.stopped_thread_id = Some(thread_id.unwrap_or(1));
                 let reason = event
                     .body
                     .get("reason")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let top_frame = self
-                    .stack(thread_id, timeout)
-                    .ok()
-                    .and_then(|mut frames| frames.drain(..).next());
                 DebugStop {
                     state: DebugSessionState::Stopped,
                     reason,
-                    thread_id: Some(thread_id),
-                    top_frame,
-                    hit_breakpoint_ids: Vec::new(),
+                    thread_id,
+                    top_frame: None,
+                    hit_breakpoint_ids: event
+                        .body
+                        .get("hitBreakpointIds")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_u64)
+                        .collect(),
                     timed_out: false,
                     error: None,
                     exit_code: None,
@@ -1169,6 +1361,9 @@ fn process_debug_adapter_session_maps_exited_event_with_exit_code() {
         adapter_type: "fixture".to_owned(),
         launch_defaults: Map::new(),
         client: DapClient::new(Box::new(transport)),
+        pending_gdb_launch: None,
+        rr_gdb: false,
+        stopped_thread_id: Some(1),
         next_output_sequence: 1,
     };
 
@@ -1865,6 +2060,102 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_maps_the_dap_result_to_the_requested_expression() {
+        let transport = ScriptedTransport::new(vec![Ok(Some(json!({
+            "type":"response","request_seq":1,"command":"evaluate","success":true,
+            "body":{"result":"42","type":"u32","variablesReference":0}
+        })))]);
+        let value = process_session(transport)
+            .evaluate(0, "value", None)
+            .unwrap();
+        assert_eq!(value.name, "value");
+        assert_eq!(value.value, "42");
+        assert_eq!(value.r#type.as_deref(), Some("u32"));
+    }
+
+    #[test]
+    fn gdb_configures_before_launch_reply_and_waits_for_entry() {
+        let response = |seq, command| {
+            Ok(Some(json!({
+                "type": "response", "request_seq": seq, "command": command, "success": true
+            })))
+        };
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({"type":"event", "event":"initialized"}))),
+            response(1, "launch"),
+            response(2, "configurationDone"),
+            Ok(Some(
+                json!({"type":"event", "event":"stopped", "body":{"reason":"entry","threadId":7}}),
+            )),
+            response(3, "stackTrace"),
+            response(4, "continue"),
+            Err(DapError::Timeout {
+                command: "recv".into(),
+                budget_ms: 1000,
+            }),
+            Ok(Some(
+                json!({"type":"event", "event":"exited", "body":{"exitCode":0}}),
+            )),
+        ]);
+        let sent = transport.sent_messages();
+        let mut session = process_session(transport);
+        session.adapter_type = "gdb".to_owned();
+        let timeout = Some(Duration::from_secs(1));
+        let launch = serde_json::from_value(json!({"language":"rust","program":"app"})).unwrap();
+        session.launch(&launch, timeout).unwrap();
+        assert_eq!(sent.lock().unwrap()[0]["arguments"]["stopOnEntry"], true);
+        session.set_breakpoints(&[], timeout).unwrap();
+        let stop = session.initial_stop(timeout).unwrap().unwrap();
+        assert_eq!(stop.reason.as_deref(), Some("entry"));
+        assert_eq!(stop.thread_id, Some(7));
+        assert!(stop.hit_breakpoint_ids.is_empty());
+        assert_eq!(sent.lock().unwrap()[2]["arguments"]["threadId"], 7);
+        assert!(session.continue_session(timeout).unwrap().timed_out);
+        assert_eq!(
+            session.continue_session(timeout).unwrap().exit_code,
+            Some(0)
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[3]["arguments"]["threadId"], 7);
+    }
+
+    #[test]
+    fn gdb_running_launch_waits_for_the_next_event_without_sending_continue() {
+        // configurationDone and launch responses can arrive in either order.
+        let transport = ScriptedTransport::new(vec![
+            Ok(Some(json!({"type":"event","event":"initialized"}))),
+            Ok(Some(
+                json!({"type":"response","request_seq":2,"command":"configurationDone","success":true}),
+            )),
+            Ok(Some(
+                json!({"type":"response","request_seq":1,"command":"launch","success":true}),
+            )),
+            Ok(Some(
+                json!({"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":9,"hitBreakpointIds":[31,47]}}),
+            )),
+            Ok(Some(
+                json!({"type":"response","request_seq":3,"command":"stackTrace","success":true}),
+            )),
+        ]);
+        let sent = transport.sent_messages();
+        let mut session = process_session(transport);
+        session.adapter_type = "gdb".to_owned();
+        let launch = serde_json::from_value(json!({"language":"rust","program":"app",
+            "launch_overrides":{"stopOnEntry":false}}))
+        .unwrap();
+        session.launch(&launch, None).unwrap();
+        session.set_breakpoints(&[], None).unwrap();
+        assert!(session.initial_stop(None).unwrap().is_none());
+        let stop = session.continue_session(None).unwrap();
+        assert_eq!(stop.thread_id, Some(9));
+        assert_eq!(stop.hit_breakpoint_ids, vec![31, 47]);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2]["command"], "stackTrace");
+    }
+
+    #[test]
     fn breakpoint_sources_share_one_deadline_and_report_the_original_budget() {
         let mut transport = ScriptedTransport::new(vec![
             Ok(Some(
@@ -1905,7 +2196,7 @@ mod tests {
             "success": true,
             "body": {
                 "breakpoints": [
-                    { "verified": true, "id": 7 },
+                    { "verified": true, "source": { "path": "/workspace/src/main.rs" }, "line": 13 },
                     { "verified": true, "id": 8 }
                 ]
             }
@@ -1939,8 +2230,10 @@ mod tests {
                 .iter()
                 .map(|breakpoint| breakpoint.verified_id)
                 .collect::<Vec<_>>(),
-            vec![Some(7), Some(8)]
+            vec![None, Some(8)]
         );
+        assert_eq!(breakpoints[0].path, "/workspace/src/main.rs");
+        assert_eq!(breakpoints[0].line, 13);
     }
 
     #[test]
@@ -2128,6 +2421,9 @@ mod tests {
             adapter_type: "fixture".to_owned(),
             launch_defaults: serde_json::Map::new(),
             client: DapClient::new(Box::new(transport)),
+            pending_gdb_launch: None,
+            rr_gdb: false,
+            stopped_thread_id: Some(1),
             next_output_sequence: 1,
         }
     }

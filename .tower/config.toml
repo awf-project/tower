@@ -19,11 +19,11 @@ format = "rustc-json"
 target = "none"
 
 [debug.rust]
-command = "target/debug/fixture_debug_adapter"
-args = []
+command = "gdb"
+args = ["-nx", "-q", "-i=dap"]
 extensions = ["rs"]
-adapter_type = "fixture"
-default_timeout_secs = 5
+adapter_type = "gdb"
+default_timeout_secs = 10
 idle_ttl_secs = 300
 
 [debug.record]
