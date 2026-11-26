@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-26
+
 ### Fixed
 
 - Agent memory now works from the normal global, project-local, and explicitly configured extension directories. A local override uses the same project memory as the global extension.
