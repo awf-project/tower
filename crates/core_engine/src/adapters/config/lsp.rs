@@ -262,9 +262,9 @@ fn validate_executable(path: &Path) -> Result<ResolvedLspCommand, LspCommandErro
         Err(_) => return Err(LspCommandError::ServerLaunchFailed),
     }
 
-    let executable = path
-        .canonicalize()
-        .map_err(|_| LspCommandError::ServerLaunchFailed)?;
+    // The server runs from the project root. Keep an absolute path and preserve
+    // its invocation name: rustup selects the tool from argv[0].
+    let executable = std::path::absolute(path).map_err(|_| LspCommandError::ServerLaunchFailed)?;
     Ok(ResolvedLspCommand { executable })
 }
 
@@ -736,6 +736,25 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn resolver_preserves_the_invoked_name_of_a_multicall_language_server() {
+        let workspace = tempfile::tempdir().unwrap();
+        let proxy = workspace.path().join("rustup");
+        write_executable(&proxy);
+        let server = workspace.path().join("rust-analyzer");
+        std::os::unix::fs::symlink(&proxy, &server).unwrap();
+        let search_path = std::env::join_paths([workspace.path()]).unwrap();
+
+        let resolved =
+            resolve_lsp_command("rust-analyzer", workspace.path(), Some(&search_path)).unwrap();
+        assert_eq!(resolved.executable.file_name(), server.file_name());
+        assert_eq!(
+            resolved.executable.canonicalize().unwrap(),
+            proxy.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn f008_resolver_accepts_an_execute_only_native_file() {
         let workspace = tempfile::tempdir().unwrap();
         let executable = workspace.path().join("execute-only-server");
@@ -744,9 +763,7 @@ mod tests {
 
         assert_eq!(
             resolve_lsp_command("./execute-only-server", workspace.path(), None).unwrap(),
-            ResolvedLspCommand {
-                executable: executable.canonicalize().unwrap(),
-            }
+            ResolvedLspCommand { executable }
         );
     }
 
@@ -760,11 +777,11 @@ mod tests {
         std::fs::write(&executable, b"MZ").unwrap();
         let search_path = std::env::join_paths([&bin]).unwrap();
 
+        let resolved =
+            resolve_lsp_command("language-server", workspace.path(), Some(&search_path)).unwrap();
         assert_eq!(
-            resolve_lsp_command("language-server", workspace.path(), Some(&search_path)).unwrap(),
-            ResolvedLspCommand {
-                executable: executable.canonicalize().unwrap(),
-            }
+            resolved.executable.canonicalize().unwrap(),
+            executable.canonicalize().unwrap()
         );
     }
 
@@ -782,7 +799,7 @@ mod tests {
             assert_eq!(
                 resolve_lsp_command(command, workspace.path(), None).unwrap(),
                 ResolvedLspCommand {
-                    executable: executable.canonicalize().unwrap(),
+                    executable: executable.clone(),
                 },
                 "command {command:?}"
             );
@@ -812,7 +829,7 @@ mod tests {
             assert_eq!(
                 resolve_lsp_command(command, workspace.path(), Some(&search_path)).unwrap(),
                 ResolvedLspCommand {
-                    executable: expected.canonicalize().unwrap(),
+                    executable: expected.clone(),
                 },
                 "command {command:?}"
             );

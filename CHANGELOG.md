@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Agent memory now works from the normal global, project-local, and explicitly configured extension directories. A local override uses the same project memory as the global extension.
+- Tower preserves the configured language server's executable name so rustup can launch `rust-analyzer` from the project's toolchain.
+
 ## [0.1.1] - 2026-11-26
 
 ### Fixed

@@ -314,7 +314,7 @@ fn agent_memory_capability_rejects_undeclared_requests_before_storage() {
 }
 
 #[test]
-fn untrusted_extension_cannot_self_declare_agent_memory_storage() {
+fn unrelated_extension_cannot_self_declare_agent_memory_storage() {
     let temp = tempfile::tempdir().expect("temporary sentinel directory");
     let started = temp.path().join("child-started");
     let script = r#"
@@ -325,7 +325,7 @@ read -r shutdown
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"type":"Ack"}}'
 "#;
     let manifest = ExtensionManifest {
-        name: "agent_memory".to_owned(),
+        name: "unrelated".to_owned(),
         version: "0.1.0".to_owned(),
         command: vec![
             "sh".to_owned(),

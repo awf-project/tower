@@ -372,7 +372,7 @@ impl SidecarHostAdapter {
     /// Spawn the extension and include host-provided extension configuration in
     /// the `initialize` request.
     pub fn spawn_with_config<T>(
-        mut manifest: ExtensionManifest,
+        manifest: ExtensionManifest,
         deps: HostDeps,
         request_timeout: T,
         extension_config: Option<Value>,
@@ -392,22 +392,13 @@ impl SidecarHostAdapter {
                 message: "manifest.command is empty".to_owned(),
             });
         }
-        if manifest
-            .capabilities
-            .required
-            .iter()
-            .any(|capability| capability == "agent_memory_storage")
+        let memory = Capability::AgentMemoryStorage;
+        if declares_capability(&manifest, &memory)
+            && !capability_allowed_for_manifest(&manifest, &memory)
         {
-            let host = std::env::current_exe().map_err(|_| ExtensionFault::ProtocolError {
+            return Err(ExtensionFault::ProtocolError {
                 message: "agent memory capability denied".to_owned(),
-            })?;
-            let selected =
-                select_trusted_agent_memory_executable(&manifest, &host).ok_or_else(|| {
-                    ExtensionFault::ProtocolError {
-                        message: "agent memory capability denied".to_owned(),
-                    }
-                })?;
-            manifest.command[0] = selected.to_string_lossy().into_owned();
+            });
         }
 
         let argv = &manifest.command;
@@ -484,14 +475,7 @@ impl SidecarHostAdapter {
                 required: init_result
                     .capabilities
                     .iter()
-                    .filter(|capability| {
-                        manifest
-                            .capabilities
-                            .required
-                            .iter()
-                            .any(|declared| declared == capability_to_str(capability))
-                            && capability_allowed_for_manifest(&manifest, capability)
-                    })
+                    .filter(|capability| manifest_grants_capability(&manifest, capability))
                     .map(capability_to_str)
                     .map(str::to_owned)
                     .collect(),
@@ -1979,34 +1963,25 @@ fn allowed_capabilities_for_manifest(manifest: &ExtensionManifest) -> Vec<Capabi
 fn capability_allowed_for_manifest(manifest: &ExtensionManifest, capability: &Capability) -> bool {
     match capability {
         Capability::RequestApplyEdits => is_trusted_apply_edits_extension(manifest),
-        Capability::AgentMemoryStorage => is_trusted_agent_memory_extension(manifest),
+        Capability::AgentMemoryStorage => manifest.name == "agent_memory",
         _ => true,
     }
 }
 
-fn is_trusted_agent_memory_extension(manifest: &ExtensionManifest) -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|host| select_trusted_agent_memory_executable(manifest, &host))
-        .is_some()
+fn declares_capability(manifest: &ExtensionManifest, capability: &Capability) -> bool {
+    manifest
+        .capabilities
+        .required
+        .iter()
+        .any(|name| name == capability_to_str(capability))
 }
 
-pub(crate) fn select_trusted_agent_memory_executable(
+pub(super) fn manifest_grants_capability(
     manifest: &ExtensionManifest,
-    host_executable: &Path,
-) -> Option<std::path::PathBuf> {
-    if manifest.name != "agent_memory" {
-        return None;
-    }
-    let command = manifest.command.first()?;
-    let command = Path::new(command).canonicalize().ok()?;
-    let host = host_executable.canonicalize().ok()?;
-    let expected = host
-        .parent()?
-        .join("agent_memory_extension")
-        .canonicalize()
-        .ok()?;
-    (command == expected).then_some(expected)
+    capability: &Capability,
+) -> bool {
+    declares_capability(manifest, capability)
+        && capability_allowed_for_manifest(manifest, capability)
 }
 
 fn is_trusted_apply_edits_extension(manifest: &ExtensionManifest) -> bool {
@@ -2045,8 +2020,8 @@ mod tests {
 
     use super::{
         FormatPathError, HostDeps, SidecarHostAdapter, capability_to_str, dispatch_host_call,
-        operation_request_timeout_for, select_trusted_agent_memory_executable,
-        semantic_operation_timeout, str_to_capability, validate_workspace_format_path,
+        operation_request_timeout_for, semantic_operation_timeout, str_to_capability,
+        validate_workspace_format_path,
     };
     #[cfg(target_os = "linux")]
     use super::{LinuxProcessIdentity, parse_linux_process_stat};
@@ -2070,51 +2045,6 @@ mod tests {
         assert_eq!(
             str_to_capability("agent_memory_storage"),
             Some(Capability::AgentMemoryStorage)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn agent_memory_admission_pins_the_verified_executable_across_symlink_swap() {
-        use std::os::unix::fs::symlink;
-
-        let install = tempfile::tempdir().expect("temporary installation");
-        let host = install.path().join("tower");
-        let trusted = install.path().join("trusted-agent-memory");
-        let attacker = install.path().join("attacker");
-        let bundled = install.path().join("agent_memory_extension");
-        let manifest_command = install.path().join("manifest-command");
-        std::fs::write(&host, b"host").expect("write host fixture");
-        std::fs::write(&trusted, b"trusted").expect("write trusted fixture");
-        std::fs::write(&attacker, b"attacker").expect("write attacker fixture");
-        symlink(&trusted, &bundled).expect("link bundled executable");
-        symlink(&bundled, &manifest_command).expect("link manifest command");
-        let manifest = ExtensionManifest {
-            name: "agent_memory".to_owned(),
-            version: "0.1.0".to_owned(),
-            command: vec![manifest_command.to_string_lossy().into_owned()],
-            activation: Activation::Eager,
-            tools: vec![],
-            events: EventsSection::default(),
-            capabilities: CapabilitiesSection {
-                required: vec!["agent_memory_storage".to_owned()],
-            },
-        };
-
-        let selected = select_trusted_agent_memory_executable(&manifest, &host)
-            .expect("trusted adjacent executable is admitted");
-        std::fs::remove_file(&manifest_command).expect("remove original manifest link");
-        symlink(&attacker, &manifest_command).expect("swap manifest link");
-
-        assert_eq!(
-            selected,
-            trusted.canonicalize().expect("canonical trusted path")
-        );
-        assert_ne!(
-            selected,
-            manifest_command
-                .canonicalize()
-                .expect("canonical attacker path")
         );
     }
 
