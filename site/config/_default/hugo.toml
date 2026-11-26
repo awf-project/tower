@@ -1,5 +1,5 @@
 title = "Tower — AI Workflow Framework"
-baseurl = "https://awf-project.github.io/tower/"
+baseurl = "https://docs.awf-project.ai/tower/"
 disableAliases = true
 disableHugoGeneratorInject = true
 # disableKinds = ["taxonomy", "term"]
