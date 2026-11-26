@@ -72,10 +72,16 @@ jobs:
       - name: Verify packaged binary
         env:
           ARCHIVE: tower-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz
+          STABLE_RELEASE: ${{ needs.prepare.outputs.channel == 'prod' && needs.prepare.outputs.prerelease == 'false' }}
         run: |
           staging=$(mktemp -d)
           tar -xzf "dist/$ARCHIVE" -C "$staging"
-          "$staging/tower" --version
+          actual=$("$staging/tower" --version)
+          echo "$actual"
+          if [ "$STABLE_RELEASE" = "true" ] && [ "$actual" != "tower ${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME disagrees with packaged binary '$actual'"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
