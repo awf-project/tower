@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,36 @@ pub struct BreakpointProbe {
     pub path: String,
     pub line: u64,
     pub condition: Option<String>,
+}
+
+impl BreakpointProbe {
+    fn matches_stop(
+        &self,
+        stop: &DebugStop,
+        installed: Option<&DebugBreakpoint>,
+        cwd: &Path,
+    ) -> bool {
+        if let Some(id) = installed.and_then(|bp| bp.verified_id)
+            && !stop.hit_breakpoint_ids.is_empty()
+        {
+            return stop.hit_breakpoint_ids.contains(&id);
+        }
+        // DAP makes breakpoint IDs optional. Use the adapter's resolved source
+        // position when it supplied one, including when it moved the breakpoint.
+        let (path, line) = installed.map_or((self.path.as_str(), self.line), |bp| {
+            (bp.path.as_str(), bp.line)
+        });
+        let Some(frame) = &stop.top_frame else {
+            return false;
+        };
+        (stop.reason.as_deref() == Some("breakpoint") || !stop.hit_breakpoint_ids.is_empty())
+            && frame.line == line
+            && frame.path.as_deref().is_some_and(|source| {
+                Path::new(source) == Path::new(path)
+                    || std::path::absolute(cwd)
+                        .is_ok_and(|base| base.join(source) == base.join(path))
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,35 +200,22 @@ pub fn run_eval_at(
         Err(error) => return Err(runtime_tool_error(error)),
     };
 
+    let condition_unsupported = request.breakpoint.as_ref().and_then(|probe| {
+        (probe.condition.is_some() && configured_breakpoints.iter().any(|bp| !bp.verified))
+            .then_some(true)
+    });
     let session_id = launch.session_id;
-    if let Some(probe) = &request.breakpoint {
-        let condition_unsupported = (probe.condition.is_some()
-            && configured_breakpoints
-                .iter()
-                .any(|breakpoint| !breakpoint.verified))
-        .then_some(true);
-        run_eval_at_loop(
-            request,
-            sessions,
-            session_id,
-            deadline,
-            condition_unsupported,
-        )
-    } else {
-        run_eval_at_loop(request, sessions, session_id, deadline, None)
-    }
-}
-
-fn run_eval_at_loop(
-    request: EvalAtRequest,
-    sessions: &SessionManager,
-    session_id: DebugSessionId,
-    deadline: RecipeDeadline,
-    condition_unsupported: Option<bool>,
-) -> Result<EvalAtResult, DebugToolError> {
+    let mut output = Vec::new();
+    let mut initial_stop = launch.stop.and_then(|mut stop| {
+        output.append(&mut stop.output_since);
+        // An exit or a hit on an installed probe can arrive during launch.
+        // With no probe, continue past the adapter's own startup breakpoint.
+        (stop.state == DebugSessionState::Terminated
+            || (request.breakpoint.is_some() && stop.state == DebugSessionState::Stopped))
+            .then_some(stop)
+    });
     let max_hits = request.max_hits;
     let mut hits = Vec::new();
-    let mut output = Vec::new();
 
     loop {
         let Some(remaining) = deadline.remaining_or_unlimited() else {
@@ -210,7 +228,10 @@ fn run_eval_at_loop(
                 deadline,
             );
         };
-        let stop = match sessions.continue_session(&session_id, remaining) {
+        let next_stop = initial_stop
+            .take()
+            .map_or_else(|| sessions.continue_session(&session_id, remaining), Ok);
+        let stop = match next_stop {
             Ok(stop) => stop,
             Err(DebugRuntimeError::DebugTimeout { .. }) => {
                 return finish_timeout_after_cleanup(
@@ -251,6 +272,15 @@ fn run_eval_at_loop(
 
         match stop.state {
             DebugSessionState::Stopped => {
+                if let Some(probe) = &request.breakpoint
+                    && !probe.matches_stop(
+                        &stop,
+                        configured_breakpoints.first(),
+                        Path::new(request.cwd.as_deref().unwrap_or(".")),
+                    )
+                {
+                    continue;
+                }
                 match capture_hit(&request, sessions, &session_id, &stop, deadline) {
                     Ok(hit) => hits.push(hit),
                     Err(CaptureError::AdapterGone) => {
@@ -1178,7 +1208,10 @@ mod tests {
     #[test]
     fn eval_at_missing_breakpoint_launches_continues_and_returns_exit_evidence_without_setting_breakpoints()
      {
-        let factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario::exited(0)));
+        let factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario {
+            initial_stop: Some(stopped_hit()),
+            ..FakeEvalAtScenario::exited(0)
+        }));
         let sessions = SessionManager::new(debug_config(), factory.clone());
 
         let result = run_eval_at(
@@ -1556,6 +1589,47 @@ mod tests {
     }
 
     #[test]
+    fn eval_at_uses_a_breakpoint_or_exit_observed_during_launch() {
+        for stop in [stopped_hit(), exited(17)] {
+            let factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario {
+                initial_stop: Some(stop.clone()),
+                ..FakeEvalAtScenario::single_hit()
+            }));
+            let sessions = SessionManager::new(debug_config(), factory.clone());
+            let result = run_eval_at(base_request(), &sessions).unwrap();
+            assert_eq!(result.hit, stop.state == DebugSessionState::Stopped);
+            assert_eq!(result.exit_code, stop.exit_code);
+            assert_eq!(result.output, stop.output_since);
+            assert_eq!(factory.continue_count(), 0);
+            assert!(sessions.sessions().is_empty());
+        }
+    }
+
+    #[test]
+    fn eval_at_skips_unrelated_breakpoints_and_matches_source_when_hit_ids_are_absent() {
+        let mut launch_stop = stopped_hit();
+        launch_stop.hit_breakpoint_ids = vec![2];
+        let mut other_file = stopped_hit();
+        other_file.hit_breakpoint_ids.clear();
+        other_file.top_frame.as_mut().unwrap().path = Some("/other/src/main.rs".into());
+        let mut probe_stop = stopped_hit();
+        probe_stop.hit_breakpoint_ids.clear();
+        probe_stop.top_frame.as_mut().unwrap().path = Some("/workspace/src/main.rs".into());
+        let factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario {
+            initial_stop: Some(launch_stop),
+            ..FakeEvalAtScenario::with_stops([Ok(other_file), Ok(probe_stop.clone())])
+        }));
+        let sessions = SessionManager::new(debug_config(), factory.clone());
+
+        let result = run_eval_at(base_request(), &sessions).unwrap();
+        assert_eq!(factory.continue_count(), 2);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].frame, probe_stop.top_frame);
+        assert_eq!(result.output.len(), 3);
+        assert!(sessions.sessions().is_empty());
+    }
+
+    #[test]
     fn eval_at_adapter_exit_returns_successful_evidence_and_attempts_cleanup() {
         let exited_factory = Arc::new(FakeEvalAtFactory::new(FakeEvalAtScenario::adapter_exited()));
         let exited_sessions = SessionManager::new(debug_config(), exited_factory.clone());
@@ -1906,6 +1980,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeEvalAtScenario {
+        initial_stop: Option<DebugStop>,
         stops: Arc<Mutex<VecDeque<Result<DebugStop, DebugRuntimeError>>>>,
         expression_errors: Vec<String>,
         expression_adapter_exits: Vec<String>,
@@ -2052,6 +2127,7 @@ mod tests {
 
         fn with_stops<const N: usize>(stops: [Result<DebugStop, DebugRuntimeError>; N]) -> Self {
             Self {
+                initial_stop: None,
                 stops: Arc::new(Mutex::new(VecDeque::from(stops))),
                 expression_errors: Vec::new(),
                 expression_adapter_exits: Vec::new(),
@@ -2120,6 +2196,16 @@ mod tests {
                     ..breakpoint.clone()
                 })
                 .collect())
+        }
+
+        fn initial_stop(
+            &mut self,
+            timeout: Option<Duration>,
+        ) -> Result<Option<DebugStop>, DebugRuntimeError> {
+            if let Some(stop) = &self.scenario.initial_stop {
+                return Ok(Some(stop.clone()));
+            }
+            crate::session::initial_stack_stop(self, timeout)
         }
 
         fn continue_session(

@@ -81,6 +81,7 @@ pub enum LspOutcomeCode {
     ServerTimeout,
     ServerTransportError,
     ServerMalformedResponse,
+    WorkspacePolicyError,
     ServerError,
 }
 

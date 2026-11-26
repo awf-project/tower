@@ -73,6 +73,11 @@ impl DapClient {
     ) -> Result<DapResponse, DapError> {
         let timeout = timeout.into();
         let deadline = checked_deadline(timeout)?;
+        let request_seq = self.send_request(command, arguments)?;
+        self.receive_response(command, request_seq, timeout, deadline)
+    }
+
+    pub fn send_request(&mut self, command: &str, arguments: Value) -> Result<u64, DapError> {
         let request_seq = self.next_seq;
         self.next_seq += 1;
 
@@ -84,6 +89,25 @@ impl DapClient {
         });
         self.transport.send(&request)?;
 
+        Ok(request_seq)
+    }
+
+    pub fn finish_request(
+        &mut self,
+        command: &str,
+        request_seq: u64,
+        timeout: Option<Duration>,
+    ) -> Result<DapResponse, DapError> {
+        self.receive_response(command, request_seq, timeout, checked_deadline(timeout)?)
+    }
+
+    fn receive_response(
+        &mut self,
+        command: &str,
+        request_seq: u64,
+        timeout: Option<Duration>,
+        deadline: Option<Instant>,
+    ) -> Result<DapResponse, DapError> {
         if let Some(index) = self
             .pending_responses
             .iter()
@@ -139,12 +163,8 @@ impl DapClient {
     ) -> Result<Option<DapEvent>, DapError> {
         let timeout = timeout.into();
         let deadline = checked_deadline(timeout)?;
-        if let Some(index) = self
-            .pending_events
-            .iter()
-            .position(|event| event_names.contains(&event.event.as_str()))
-        {
-            return Ok(Some(self.pending_events.remove(index)));
+        if let Some(event) = self.take_pending_event(event_names) {
+            return Ok(Some(event));
         }
 
         loop {
@@ -174,6 +194,14 @@ impl DapClient {
                 DapMessage::Response(response) => self.pending_responses.push_back(response),
             }
         }
+    }
+
+    pub fn take_pending_event(&mut self, names: &[&str]) -> Option<DapEvent> {
+        let index = self
+            .pending_events
+            .iter()
+            .position(|event| names.contains(&event.event.as_str()))?;
+        Some(self.pending_events.remove(index))
     }
 
     pub fn drain_events(&mut self) -> Vec<DapEvent> {

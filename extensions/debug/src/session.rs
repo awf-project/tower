@@ -185,25 +185,16 @@ impl SessionManager {
             return Err(budget.map_error(error));
         }
 
-        let top_frame = match adapter.stack(1, budget.remaining()) {
-            Ok(frames) => frames.into_iter().next(),
-            Err(error @ DebugRuntimeError::DebugTimeout { .. }) => {
+        let stop = match adapter.initial_stop(budget.remaining()) {
+            Ok(stop) => stop,
+            Err(error) => {
                 let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
                 return Err(budget.map_error(error));
             }
-            Err(_) => None,
         };
-        let stop = DebugStop {
-            state: DebugSessionState::Stopped,
-            reason: Some("breakpoint".to_owned()),
-            thread_id: Some(1),
-            top_frame,
-            hit_breakpoint_ids: vec![1],
-            timed_out: false,
-            error: None,
-            exit_code: None,
-            output_since: Vec::new(),
-        };
+        let launch_state = stop
+            .as_ref()
+            .map_or(DebugSessionState::Running, |stop| stop.state.clone());
 
         let mut state = self.state.lock().unwrap();
         self.cleanup_expired_locked(&mut state);
@@ -217,9 +208,12 @@ impl SessionManager {
             SessionEntry {
                 language: params.language,
                 kind: SessionKind::Live,
-                state: DebugSessionState::Stopped,
-                last_stop: Some(stop.clone()),
-                output: Vec::new(),
+                state: launch_state.clone(),
+                last_stop: stop.clone(),
+                output: stop
+                    .as_ref()
+                    .map(|stop| stop.output_since.clone())
+                    .unwrap_or_default(),
                 adapter,
                 timeout,
                 idle_ttl,
@@ -230,8 +224,8 @@ impl SessionManager {
         Ok((
             LaunchResult {
                 session_id,
-                state: DebugSessionState::Stopped,
-                stop: Some(stop),
+                state: launch_state,
+                stop,
             },
             configured_breakpoints,
         ))
@@ -271,6 +265,16 @@ impl SessionManager {
                 })?;
                 let (program, mut args) = if adapter_config.adapter_type == "fixture" {
                     (adapter_config.command.clone(), adapter_config.args.clone())
+                } else if adapter_config.adapter_type == "gdb" {
+                    (
+                        "rr".to_owned(),
+                        vec![
+                            "replay".into(),
+                            "-q".into(),
+                            "-d".into(),
+                            adapter_config.command.clone(),
+                        ],
+                    )
                 } else {
                     ("rr".to_owned(), vec!["replay".to_owned()])
                 };
@@ -278,6 +282,10 @@ impl SessionManager {
                     args.push(trace_path);
                 }
                 args.extend(request.adapter_args);
+                if adapter_config.adapter_type == "gdb" {
+                    args.push("--".into());
+                    args.extend(adapter_config.args.iter().cloned());
+                }
                 (program, args)
             }
         };
@@ -292,7 +300,7 @@ impl SessionManager {
             launch_overrides,
         };
 
-        let mut adapter = self.adapter_factory.start(&start_request)?;
+        let mut adapter = self.adapter_factory.start_replay(&start_request)?;
         if let Err(error) = adapter.initialize(budget.remaining()) {
             let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
             return Err(budget.map_error(error));
@@ -302,25 +310,20 @@ impl SessionManager {
             return Err(budget.map_error(error));
         }
 
-        let top_frame = match adapter.stack(1, budget.remaining()) {
-            Ok(frames) => frames.into_iter().next(),
-            Err(error @ DebugRuntimeError::DebugTimeout { .. }) => {
+        let mut stop = match adapter.initial_stop(budget.remaining()) {
+            Ok(Some(stop)) if stop.state == DebugSessionState::Stopped => stop,
+            Ok(_) => {
+                let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
+                return Err(DebugRuntimeError::LaunchFailed(
+                    "replay did not report a stopped thread".into(),
+                ));
+            }
+            Err(error) => {
                 let _ = adapter.terminate(LIFECYCLE_TIMEOUT);
                 return Err(budget.map_error(error));
             }
-            Err(_) => None,
         };
-        let stop = DebugStop {
-            state: DebugSessionState::Stopped,
-            reason: Some("replay".to_owned()),
-            thread_id: Some(1),
-            top_frame,
-            hit_breakpoint_ids: Vec::new(),
-            timed_out: false,
-            error: None,
-            exit_code: None,
-            output_since: Vec::new(),
-        };
+        stop.reason.get_or_insert_with(|| "replay".into());
         let supports_step_back = true;
 
         let mut state = self.state.lock().unwrap();
@@ -340,7 +343,7 @@ impl SessionManager {
                 },
                 state: DebugSessionState::Stopped,
                 last_stop: Some(stop.clone()),
-                output: Vec::new(),
+                output: stop.output_since.clone(),
                 adapter,
                 timeout,
                 idle_ttl,
@@ -932,7 +935,37 @@ fn reverse_unsupported() -> DebugRuntimeError {
     DebugRuntimeError::ReverseUnsupported("reverse_unsupported".to_owned())
 }
 
+// Synchronous adapters may complete configuration without sending a stopped
+// event. A successful stack request supplies evidence for their initial state.
+pub(crate) fn initial_stack_stop(
+    adapter: &mut (impl DebugAdapterSession + ?Sized),
+    timeout: Option<Duration>,
+) -> Result<Option<DebugStop>, DebugRuntimeError> {
+    match adapter.stack(1, timeout) {
+        Ok(frames) => Ok(Some(DebugStop {
+            state: DebugSessionState::Stopped,
+            reason: None,
+            thread_id: Some(1),
+            top_frame: frames.into_iter().next(),
+            hit_breakpoint_ids: Vec::new(),
+            timed_out: false,
+            error: None,
+            exit_code: None,
+            output_since: Vec::new(),
+        })),
+        Err(DebugRuntimeError::LaunchFailed(_) | DebugRuntimeError::NotStopped(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub trait DebugAdapterFactory: Send + Sync {
+    fn start_replay(
+        &self,
+        request: &LaunchRequest,
+    ) -> Result<Box<dyn DebugAdapterSession>, DebugRuntimeError> {
+        self.start(request)
+    }
+
     fn start(
         &self,
         request: &LaunchRequest,
@@ -951,6 +984,13 @@ pub trait DebugAdapterSession: Send {
         breakpoints: &[DebugBreakpoint],
         timeout: Option<Duration>,
     ) -> Result<Vec<DebugBreakpoint>, DebugRuntimeError>;
+    /// First observed stop after configuration, or None if the program is running.
+    fn initial_stop(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<DebugStop>, DebugRuntimeError> {
+        initial_stack_stop(self, timeout)
+    }
     fn continue_session(
         &mut self,
         timeout: Option<Duration>,
@@ -1732,7 +1772,14 @@ mod tests {
 
         assert!(!result.session_id.0.is_empty());
         assert_eq!(result.state, DebugSessionState::Stopped);
-        assert_eq!(result.stop, Some(stopped_at_breakpoint()));
+        assert_eq!(
+            result.stop,
+            Some(DebugStop {
+                reason: None,
+                hit_breakpoint_ids: Vec::new(),
+                ..stopped_at_breakpoint()
+            })
+        );
         assert_eq!(
             *factory.calls.lock().unwrap(),
             vec![

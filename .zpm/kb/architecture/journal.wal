@@ -234,3 +234,17 @@
 {"ts":1795171281,"op":"assert","clause":"arch_convention('conv_agent_memory_timestamp_comparison', 'extensions/agent_memory', 'compare parseable timestamps by instant and use lexical ordering when an internal timestamp is unparseable', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
 {"ts":1795171281,"op":"retractall","clause":"arch_convention('conv_agent_memory_clock_boundaries', _, _, _)"}
 {"ts":1795171281,"op":"assert","clause":"arch_convention('conv_agent_memory_clock_boundaries', 'extensions/agent_memory', 'convert injected SystemTime through checked bounds and return timestamp/out_of_range before a storage mutation for pre-epoch or unsupported values', 'feature_f018_replace_chrono_with_jiff_for_agent_memor')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_component(_,_,_,'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_port(_,_,'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_decision(_,_,_,_,'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_convention(_,_,_,'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_adr(_,_,'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_feature('fix_doc_mcp_install',_,_)"}
+{"ts":1795699507,"op":"retractall","clause":"arch_component('mcp', _, _, _)"}
+{"ts":1795699507,"op":"assert","clause":"arch_component('mcp', infrastructure, '', 'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_component('watcher', _, _, _)"}
+{"ts":1795699507,"op":"assert","clause":"arch_component('watcher', infrastructure, '', 'fix_doc_mcp_install')"}
+{"ts":1795699507,"op":"retractall","clause":"arch_decision('dec_web_push_browser_payload_compatibility', _, _, _, _)"}
+{"ts":1795699507,"op":"assert","clause":"arch_decision('dec_web_push_browser_payload_compatibility', 'web push payload migration', 'make legacy browser tag and url aliases opt-in', 'preserves the exact standard payload for existing receivers while supporting older service workers during migration', 'feat_notifier')"}
+{"ts":1795699508,"op":"retractall","clause":"arch_convention('conv_web_push_aliases_opt_in', _, _, _)"}
+{"ts":1795699508,"op":"assert","clause":"arch_convention('conv_web_push_aliases_opt_in', 'notifier-web-push', 'keep browser aliases disabled unless a service worker migration requires them', 'feat_notifier')"}

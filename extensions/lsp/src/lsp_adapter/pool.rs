@@ -238,7 +238,10 @@ impl SessionSpawner for RealSpawner {
             &cfg.args,
             cfg.extensions.clone(),
             language_id.to_owned(),
-            root,
+            super::SessionRoots {
+                project: &root,
+                workspace: workspace_root,
+            },
             push_tx,
             operation_timeout,
         )?;
@@ -1860,6 +1863,115 @@ mod tests {
             ]
         );
         assert_eq!(spawner.spawn_count("rust"), 2);
+    }
+
+    #[test]
+    fn nested_server_receives_project_root_and_workspace_relative_document_uri() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = workspace.path().join("product");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let source = project.join("src/lib.rs");
+        std::fs::write(&source, "pub struct Stage;").unwrap();
+        let log = workspace.path().join("requests.jsonl");
+        let mut config = rust_config();
+        let server = config.servers.get_mut("rust").unwrap();
+        server.command = fixture_lsp_server::binary_path().display().to_string();
+        server.args = vec!["dispatch_supported".into(), log.display().to_string()];
+        let pool = SessionPool::new(
+            config,
+            workspace.path().to_owned(),
+            Some(TEST_DIAGNOSTICS_DEADLINE),
+        );
+
+        let locations = pool
+            .definition_lsp(
+                &RelativePath::new("product/src/lib.rs"),
+                "pub struct Stage;",
+                Position {
+                    line: 0,
+                    character: 11,
+                },
+            )
+            .unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path.as_str(), "product/src/lib.rs");
+        let messages: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let params =
+            |method: &str| &messages.iter().find(|msg| msg["method"] == method).unwrap()["params"];
+        assert_eq!(
+            params("initialize")["rootUri"],
+            super::super::path_to_uri(&project)
+        );
+        assert_eq!(
+            params("textDocument/definition")["textDocument"]["uri"],
+            super::super::path_to_uri(&source)
+        );
+    }
+
+    #[test]
+    fn nested_navigation_filters_returned_locations_using_their_own_ignore_rules() {
+        let workspace = tempfile::tempdir().unwrap();
+        let project = workspace.path().join("product");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let path = RelativePath::new("product/src/main.rs");
+        let source = "fn main() {}";
+        std::fs::write(workspace.path().join(path.as_str()), source).unwrap();
+        std::fs::write(project.join("src/answer.rs"), "").unwrap();
+        let mut config = rust_config();
+        let server = config.servers.get_mut("rust").unwrap();
+        server.command = fixture_lsp_server::binary_path().display().to_string();
+        server.args = vec![
+            "dispatch_supported".into(),
+            workspace
+                .path()
+                .join("requests.jsonl")
+                .display()
+                .to_string(),
+        ];
+        let pool = SessionPool::new(
+            config,
+            workspace.path().to_owned(),
+            Some(TEST_DIAGNOSTICS_DEADLINE),
+        );
+        let position = Position {
+            line: 0,
+            character: 3,
+        };
+        let definitions = || pool.definition_lsp(&path, source, position);
+        assert_eq!(
+            definitions().unwrap()[0].path.as_str(),
+            "product/src/answer.rs"
+        );
+        let nested_ignore = project.join(".towerignore");
+        std::fs::write(&nested_ignore, "/src/answer.rs\n").unwrap();
+        assert!(definitions().unwrap().is_empty());
+        assert!(
+            pool.references_lsp(&path, source, position)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(workspace.path().join(".towerignore"), "answer.rs\n").unwrap();
+        std::fs::write(&nested_ignore, "!/src/answer.rs\n").unwrap();
+        assert_eq!(
+            definitions().unwrap()[0].path.as_str(),
+            "product/src/answer.rs"
+        );
+        std::fs::write(&nested_ignore, [0xff]).unwrap();
+        let policy_failure =
+            LspSessionError::Backend(extension_protocol::LspOutcomeCode::WorkspacePolicyError);
+        assert_eq!(definitions(), Err(policy_failure.clone()));
+        assert_eq!(
+            pool.references_lsp(&path, source, position),
+            Err(policy_failure)
+        );
+        std::fs::remove_file(nested_ignore).unwrap();
+        assert!(definitions().unwrap().is_empty());
     }
 
     #[cfg(unix)]

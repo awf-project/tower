@@ -277,7 +277,11 @@ impl NotifyWatcherAdapter {
         //
         // The callback receives a batch of events; we normalise them to
         // `WatchEvent` values and debounce them before sending on the channel.
+        let callback_cancelled = Arc::clone(&cancelled);
         let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            if callback_cancelled.load(Ordering::Acquire) {
+                return;
+            }
             match result {
                 Ok(event) => {
                     let raw_events: Vec<WatchEvent> =
@@ -303,11 +307,13 @@ impl NotifyWatcherAdapter {
                         // the worker to finish extension callbacks. Deletion
                         // events are index-correctness signals, so dropping them
                         // under backpressure would create permanent ghosts.
-                        if tx_for_callback.send(WorkerMessage::Event(watch_event)).is_err() {
-                            // Channel closed during shutdown — log and continue.
-                            eprintln!(
-                                "[tower/watcher] event channel closed during shutdown; dropping event"
-                            );
+                        if tx_for_callback
+                            .send(WorkerMessage::Event(watch_event))
+                            .is_err()
+                        {
+                            // Logging a closed receiver here can itself trigger filesystem
+                            // events when the daemon log lives beneath the watched root.
+                            return;
                         }
                     }
                 }

@@ -1,8 +1,7 @@
 #!/bin/sh
 # tower installer — downloads a prebuilt binary from GitHub Releases.
 #
-#   curl --proto '=https' --tlsv1.2 -fsSL \
-#     https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh | sh
 #
 # Environment overrides:
 #   TOWER_VERSION      Which build to install (default: latest stable). One of:
@@ -37,10 +36,8 @@ info() { printf 'install: %s\n' "$1" >&2; }
 # --- download helper: curl or wget, whichever exists ------------------------
 if command -v curl >/dev/null 2>&1; then
   dl() { curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
-  dl_stdout() { curl --proto '=https' --tlsv1.2 -fsSL "$1"; }
 elif command -v wget >/dev/null 2>&1; then
   dl() { wget -qO "$2" "$1"; }
-  dl_stdout() { wget -qO - "$1"; }
 else
   err "need curl or wget"
 fi
@@ -73,32 +70,33 @@ resolve_version() {
   ver="${TOWER_VERSION:-latest}"
   case "$ver" in
     latest | stable)
-      tag="$(dl_stdout "https://api.github.com/repos/$REPO/releases/latest" \
-        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-      [ -n "$tag" ] || err "could not resolve latest release; set TOWER_VERSION (e.g. v0.1.0 or dev)"
-      printf '%s' "$tag"
+      endpoint="releases/latest"
+      prefix=""
       ;;
     dev)
-      tag="$(dl_stdout "https://api.github.com/repos/$REPO/releases?per_page=30" \
-        | grep '"tag_name"' | cut -d'"' -f4 | grep '^dev-' | head -1)"
-      [ -n "$tag" ] || err "no dev release found; set TOWER_VERSION to a specific tag"
-      printf '%s' "$tag"
+      endpoint="releases?per_page=30"
+      prefix="dev-"
       ;;
     *)
       printf '%s' "$ver"
+      return
       ;;
   esac
+  dl "https://api.github.com/repos/$REPO/$endpoint" "$tmp/releases.json" || err "could not fetch $ver release"
+  tag="$(grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' "$tmp/releases.json" \
+    | awk -F'"' -v prefix="$prefix" 'index($4, prefix) == 1 { print $4; exit }')"
+  [ -n "$tag" ] || err "could not resolve $ver release; set TOWER_VERSION to a specific tag"
+  printf '%s' "$tag"
 }
 
 # --- main --------------------------------------------------------------------
 TARGET="$(detect_target)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 VERSION="$(resolve_version)"
 
 asset="${BIN}-${VERSION}-${TARGET}.tar.gz"
 base="https://github.com/$REPO/releases/download/$VERSION"
-
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
 
 info "installing $BIN $VERSION ($TARGET)"
 dl "$base/$asset" "$tmp/$asset" || err "download failed: $base/$asset"
@@ -146,7 +144,7 @@ if [ -d "$tmp/extensions" ]; then
     name="$(basename "$d")"
     # Replace the whole extension dir so a stale binary never lingers beside a
     # new manifest after an upgrade.
-    rm -rf "$ext_dir/$name"
+    rm -rf "${ext_dir:?}/$name"
     mkdir -p "$ext_dir/$name"
     for f in "$d"*; do
       case "$(basename "$f")" in

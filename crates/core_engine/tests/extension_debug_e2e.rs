@@ -748,6 +748,176 @@ fn invoke_debug_tool(
     response["result"]["data"].clone()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a C compiler, GDB DAP and ptrace permissions"]
+fn real_gdb_eval_at_skips_temporary_main_breakpoint() {
+    let mut child = RawDebugChild::spawn();
+    let source = child._workspace.path().join("probe.c");
+    let program = child._workspace.path().join("probe");
+    fs::write(
+        &source,
+        "int main(void) {\n    int x = 0;\n    x = 17;\n    return x;\n}\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-g", "-O0"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success()
+    );
+    initialize_debug_child(
+        &mut child,
+        1,
+        json!({"languages":{"c":{
+            "extensions":["c"], "command":"gdb", "args":["-nx","-q","-i=dap"], "adapter_type":"gdb",
+            "launch":{"stopAtBeginningOfMainSubprogram":true}, "default_timeout_secs":10, "idle_ttl_secs":60
+        }}}),
+    );
+    let result = invoke_debug_tool(
+        &mut child,
+        2,
+        "eval_at",
+        json!({
+            "lang":"c", "program":program, "breakpoint":{"path":source,"line":4}, "expressions":["x"]
+        }),
+    );
+    assert_eq!(result["finished"], "stopped", "{result}");
+    assert_eq!(result["hits"][0]["frame"]["line"], 4, "{result}");
+    assert_eq!(
+        result["hits"][0]["evaluated"]["x"]["value"], "17",
+        "{result}"
+    );
+}
+
+/// Requires native GDB with DAP and an rr-capable Linux host (ptrace and perf).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires GDB DAP and rr recording privileges"]
+fn real_gdb_resume_timeout_and_rr_replay() {
+    let mut child = RawDebugChild::spawn();
+    let workspace = child._workspace.path().to_owned();
+    let source = workspace.join("probe.rs");
+    let program = workspace.join("probe");
+    fs::write(
+        &source,
+        r#"fn main() {
+    if std::env::args().len() > 1 { std::thread::sleep(std::time::Duration::from_secs(3)); }
+    let value = std::hint::black_box(16);
+    let code = std::hint::black_box(value + 1);
+    std::process::exit(code);
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("rustc")
+            .arg("-g")
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut config = valid_rr_debug_init_payload();
+    config["languages"]["rust"] = json!({
+        "command": "gdb", "args": ["-nx", "-q", "-i=dap"], "adapter_type": "gdb",
+        "extensions": ["rs"], "default_timeout_secs": 10, "idle_ttl_secs": 60
+    });
+    initialize_debug_child(&mut child, 1, config);
+    let mut next_id = 2;
+    let mut call = |name: &str, args: Value| {
+        next_id += 1;
+        invoke_debug_tool(&mut child, next_id, name, args)
+    };
+    let launch = call(
+        "launch",
+        json!({"language":"rust", "program":program, "args":["wait"]}),
+    );
+    assert_eq!(launch["state"], "stopped", "{launch}");
+    let session = &launch["session_id"];
+    assert_eq!(
+        call("continue", json!({"session_id":session,"timeout_secs":1}))["timed_out"],
+        true
+    );
+    assert_eq!(
+        call("continue", json!({"session_id":session}))["exit_code"],
+        17
+    );
+    assert_eq!(call("terminate", json!({"session_id":session}))["ok"], true);
+
+    let running = call(
+        "launch",
+        json!({"language":"rust","program":program,"args":["wait"],"launch_overrides":{"stopOnEntry":false}}),
+    );
+    assert_eq!(running["state"], "running", "{running}");
+    assert!(running["stop"].is_null());
+    let session = &running["session_id"];
+    assert_eq!(
+        call("continue", json!({"session_id":session}))["exit_code"],
+        17
+    );
+    assert_eq!(call("terminate", json!({"session_id":session}))["ok"], true);
+
+    let failed = call(
+        "record",
+        json!({"language":"rust", "program":workspace.join("absent")}),
+    );
+    assert_eq!(failed["recordable"], false, "{failed}");
+    assert!(failed["trace_id"].is_null());
+    assert_eq!(call("traces", json!({}))["traces"], json!([]));
+
+    // rr owns trace creation even if the target's working directory differs.
+    let record = call(
+        "record",
+        json!({"language":"rust","program":program,"cwd":workspace.parent()}),
+    );
+    assert_eq!(record["recordable"], true, "{record}");
+    assert_eq!(record["exit_code"], 17);
+    let replay = call(
+        "replay",
+        json!({"language":"rust","trace_id":record["trace_id"]}),
+    );
+    assert_eq!(replay["state"], "stopped", "{replay}");
+    let session = &replay["session_id"];
+    let thread = replay["stop"]["thread_id"].as_u64().unwrap();
+    assert!(
+        call("threads", json!({"session_id":session}))["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == thread)
+    );
+    let breakpoints = call(
+        "set_breakpoints",
+        json!({"session_id":session,"path":source,"breakpoints":[{"line":3},{"line":5}]}),
+    );
+    assert_eq!(
+        breakpoints["breakpoints"][0]["verified"], true,
+        "{breakpoints}"
+    );
+    let first = call("continue", json!({"session_id":session}));
+    assert_eq!(first["top_frame"]["line"], 3, "{first}");
+    let second = call("continue", json!({"session_id":session}));
+    assert_eq!(second["top_frame"]["line"], 5, "{second}");
+    let back = call(
+        "step_back",
+        json!({"session_id":session, "thread_id":thread,"granularity":"instruction"}),
+    );
+    assert_eq!(back["state"], "stopped", "{back}");
+    let previous = call(
+        "reverse_continue",
+        json!({"session_id":session, "thread_id":thread}),
+    );
+    assert_eq!(previous["top_frame"]["line"], 3, "{previous}");
+    assert_eq!(call("terminate", json!({"session_id":session}))["ok"], true);
+}
+
 fn invoke_debug_tool_raw(
     child: &mut RawDebugChild,
     id: u64,

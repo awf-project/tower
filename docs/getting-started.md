@@ -12,7 +12,18 @@ This guide covers prerequisites, building the project, running the quality gate,
 
 ---
 
-## Prerequisites
+## Install the stable release
+
+On Linux (x86_64 or ARM64) and macOS (Apple Silicon), install Tower and its bundled extensions:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/awf-project/tower/main/scripts/install.sh | sh
+tower --version
+```
+
+The binary is installed in `$HOME/.local/bin`. Add that directory to your `PATH` if needed.
+
+## Prerequisites for building from source
 
 ### Rust toolchain
 

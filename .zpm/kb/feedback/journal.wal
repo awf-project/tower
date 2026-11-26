@@ -482,3 +482,5 @@
 {"ts":1795171047,"op":"assert","clause":"trigger('timestamp_migration_preserve_parsed_timestamp_contract','extensions/agent_memory/src/domain.rs',file)"}
 {"ts":1795171047,"op":"assert","clause":"rule('timestamp_compatibility_use_real_mcp_scenario',test,'Require timestamp compatibility tests to exercise the canonical real daemon-sidecar MCP scenario and assert canonical emission remains consistent across tools.',high,'implement')"}
 {"ts":1795171048,"op":"assert","clause":"trigger('timestamp_compatibility_use_real_mcp_scenario','crates/core_engine/tests/*agent_memory*e2e.rs',file)"}
+{"ts":1795556541,"op":"assert","clause":"rule(gdb_real_launch_state_test, test, 'Exercise GDB launch with a real native program in both default entry-stop and explicit stopOnEntry=false modes. Verify the reported state, absence of invented breakpoint IDs, and that the next continue reaches a real stop or exit.', high, 'GDB 18.1 sidecar validation 2026-11-24')"}
+{"ts":1795556544,"op":"assert","clause":"trigger(gdb_real_launch_state_test, 'extensions/debug/src/', directory)"}
