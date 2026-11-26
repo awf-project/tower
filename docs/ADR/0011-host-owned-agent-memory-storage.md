@@ -2,6 +2,7 @@
 
 **Status**: Proposed
 **Date**: 2026-11-04
+**Amended**: 2026-11-26 (extension discovery and storage authorization)
 **Supersedes**: N/A
 **Superseded by**: N/A
 
@@ -34,12 +35,19 @@ behind a dedicated host-owned `AgentMemoryStoragePort`. The port exposes bounded
 ordered scans, and conditional multi-key transactions without exposing Sled or filesystem types.
 The host will provide both Sled-backed and in-memory adapters that pass the same contract suite.
 
-Storage HostCalls will be authorized by both the declared capability and trusted first-party
-extension identity. The host derives a private namespace from the initialized project identity and
-trusted extension identity; the sidecar cannot select or inspect another namespace. Durable mode
-acknowledges a mutation only after the transaction is synchronously flushed. Expected conflicts and
-uncertain commit outcomes are represented by typed protocol results rather than backend-specific
-errors.
+The normal extension search path selects the active `agent_memory` manifest and resolves its
+command. The host grants storage HostCalls to this extension when its manifest declares
+`agent_memory_storage`. The host derives the namespace from the canonical workspace identity
+and the selected extension name. This keeps existing project data accessible after moving the
+extension or changing its installation scope.
+
+A project-local `agent_memory` takes precedence over a global installation of the same name
+and can read and write the same project's memory. Operators can select a specific installation
+with `--extensions-dir` or `TOWER_EXTENSIONS_DIR`. This amends the earlier first-party executable
+check, which rejected the distributed extension in its documented installation directory.
+
+Durable mode acknowledges a mutation only after the transaction is synchronously flushed.
+Expected conflicts and uncertain commit outcomes are represented by typed protocol results.
 
 The existing queued sidecar HostCall transport, supervision, cancellation, and JSON-RPC envelope
 remain unchanged. Memory record schemas, privacy behavior, retrieval rules, and provider
@@ -61,7 +69,7 @@ orchestration remain sidecar concerns and are not added to the core domain.
 - Host assembly must select and inject the configured durable, read-only, or in-memory adapter.
 - Transaction limits, conflict outcomes, flush acknowledgement, and uncertain commits require exact
   cross-adapter semantics.
-- Trust policy must remain explicit so third-party extensions cannot self-authorize durable storage.
+- A local replacement inherits access to the project memory associated with the selected extension name.
 
 ## Constitution Compliance
 
@@ -69,7 +77,7 @@ orchestration remain sidecar concerns and are not added to the core domain.
 | ------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
 | Domain purity             | Compliant | Memory rules remain in the sidecar, and the core domain does not import Sled, filesystem, or transport concerns. |
 | Hexagonal architecture    | Compliant | Physical persistence is hidden behind a dedicated port with real and in-memory adapters.                         |
-| Capability security       | Compliant | Manifest declaration and trusted identity gate access; host-derived namespaces prevent cross-extension access.   |
+| Capability security       | Compliant | The selected manifest must declare storage. The host selects the namespace for each project and extension.       |
 | Extension fault isolation | Compliant | Storage uses the existing supervised out-of-process HostCall path.                                               |
 | Testability               | Compliant | In-memory and Sled-backed implementations must pass the same adapter contract suite.                             |
 | Durability                | Compliant | Durable success is acknowledged only after a conditional transaction is synchronously flushed.                   |

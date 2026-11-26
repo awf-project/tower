@@ -319,16 +319,16 @@ impl MemoryMcpHarness {
         let workspace = tempfile::tempdir().expect("agent-memory workspace");
         let extension_dir = workspace.path().join(".tower/extensions/agent_memory");
         fs::create_dir_all(&extension_dir).unwrap();
-        let trusted_binary = workspace_root().join("target/debug/agent_memory_extension");
-        let manifest =
-            fs::read_to_string(workspace_root().join("extensions/agent_memory/extension.toml"))
-                .unwrap()
-                .replacen(
-                    "command = [\"agent_memory_extension\"]",
-                    &format!("command = [{:?}]", trusted_binary.to_string_lossy()),
-                    1,
-                );
-        fs::write(extension_dir.join("extension.toml"), manifest).unwrap();
+        fs::copy(
+            workspace_root().join("extensions/agent_memory/extension.toml"),
+            extension_dir.join("extension.toml"),
+        )
+        .unwrap();
+        fs::copy(
+            workspace_root().join("target/debug/agent_memory_extension"),
+            extension_dir.join("agent_memory_extension"),
+        )
+        .unwrap();
         let helper_binary = workspace_root().join("target/debug/test_helper_extension");
         let helper_dir = workspace.path().join(".tower/extensions/test_helper");
         fs::create_dir_all(&helper_dir).unwrap();
@@ -369,9 +369,16 @@ impl MemoryMcpHarness {
     }
 
     fn restart(&mut self) {
+        let mut command = Command::new(tower_binary());
+        command
+            .arg("--extensions-dir")
+            .arg(self.workspace.path().join(".tower/extensions"));
+        self.restart_with_command(command);
+    }
+
+    fn restart_with_command(&mut self, mut command: Command) {
         self.stop();
         let stderr = fs::File::create(&self.stderr_path).unwrap();
-        let mut command = Command::new(tower_binary());
         let log_input = self.workspace.path().join(".tower/log-input");
         if log_input.exists() {
             command.env("TOWER_TEST_AGENT_MEMORY_LOG_INPUT", log_input);
@@ -380,8 +387,6 @@ impl MemoryMcpHarness {
             .arg("daemon")
             .arg("--workspace-dir")
             .arg(self.workspace.path())
-            .arg("--extensions-dir")
-            .arg(self.workspace.path().join(".tower/extensions"))
             .env("TOWER_TEST_AGENT_MEMORY_CONTROL", &self.control_path)
             .env(
                 "TOWER_TEST_AGENT_MEMORY_ACCESS_TRACE",
@@ -1813,6 +1818,49 @@ fn provider_delay_and_stale_results_do_not_block_or_restore_baseline_memory() {
         harness.call("tower_memory_get", json!({"ids":[timeout["id"].clone()]}))["items"][0]["code"],
         "ok"
     );
+}
+
+#[test]
+fn local_override_keeps_the_project_memory_written_by_the_global_installation() {
+    let home = tempfile::tempdir().unwrap();
+    let data = home.path().join("data");
+    let global = if cfg!(target_os = "macos") {
+        home.path().join("Library/Application Support")
+    } else {
+        data.clone()
+    }
+    .join("tower/extensions/agent_memory");
+    let daemon = || {
+        let mut command = Command::new(tower_binary());
+        command
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", &data)
+            .env_remove("TOWER_EXTENSIONS_DIR");
+        command
+    };
+    let mut harness = MemoryMcpHarness::new_with_config("");
+    let local = harness
+        .workspace
+        .path()
+        .join(".tower/extensions/agent_memory");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::rename(&local, &global).unwrap();
+    harness.restart_with_command(daemon());
+    let record = harness.remember("global installation", "persistent", "global-install");
+    assert_eq!(record["durable"], true);
+    harness.stop();
+
+    // Keep both manifests discoverable. Only the local one now has its executable.
+    fs::create_dir(&local).unwrap();
+    fs::copy(global.join("extension.toml"), local.join("extension.toml")).unwrap();
+    fs::rename(
+        global.join("agent_memory_extension"),
+        local.join("agent_memory_extension"),
+    )
+    .unwrap();
+    harness.restart_with_command(daemon());
+    let retrieved = harness.call("tower_memory_get", json!({"ids":[record["id"]]}));
+    assert_eq!(retrieved["items"][0]["code"], "ok");
 }
 
 #[test]

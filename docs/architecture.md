@@ -61,8 +61,8 @@ is the kernel extension point.
 
 The `agent_memory` sidecar owns record validation, privacy, and retrieval rules. Physical storage
 stays in the host behind a dedicated `AgentMemoryStoragePort`, separate from the VFS `StoragePort`.
-The host derives a project-and-extension-private namespace and gates storage HostCalls to the
-trusted first-party sidecar. The durable adapter commits canonical records and baseline lexical
+The host derives a project-and-extension-private namespace for the active `agent_memory` manifest
+when it declares the storage capability. The durable adapter commits canonical records and baseline lexical
 projections atomically under `.tower/agent_memory/`; the in-memory adapter follows the same port
 contract. See [ADR 0011](ADR/0011-host-owned-agent-memory-storage.md) for the storage decision.
 

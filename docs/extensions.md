@@ -195,6 +195,10 @@ resolved search path.
    - **Local** — `<workspace>/.tower/extensions/`, scanned **last** (wins on a name collision; this
      project only).
 
+A local `agent_memory` override that declares `agent_memory_storage` can read and update the same
+project memory as the global extension. The host derives the storage namespace from the workspace
+and the selected extension name.
+
 ### Activation
 
 | Activation | Behavior                                                                                                                                                                   |
@@ -329,7 +333,7 @@ The reference extensions live in `extensions/`:
 | `extensions/lsp`              | eager      | Language-server bridge. Subscribes to `fileChanged`/`fileDeleted`, uses `read_file`/`notify`/`log`/`request_apply_edits`. Tools: `diagnostics`, `definition`, `references`, `hover`, `implementations`, `rename`.                                                                                                                                           |
 | `extensions/lint`             | lazy       | Standalone linter runner. Uses `read_file`/`list_files`/`request_apply_edits`/`log`, runs configured external linters read-only, returns LSP-shaped diagnostics, and applies structured fixes through the host. Tools: `check`, `fix`.                                                                                                                      |
 | `extensions/semantic_context` | eager      | Opt-in semantic code retrieval. Uses `read_file`/`list_files`/`index_get`/`log`, stores derived vectors in a private SQLite database, and calls the configured embeddings endpoint. Tools: `semantic_reindex`, `semantic_search`, `semantic_related_files`, `semantic_context_for_task`.                                                                    |
-| `extensions/agent_memory`     | lazy       | Structured project-scoped memory. Uses the trusted `agent_memory_storage` capability for namespaced persistence; lexical retrieval works without a provider. Tools: `memory_remember`, `memory_update`, `memory_forget`, `memory_search`, `memory_timeline`, `memory_get`, `memory_context_for_task`.                                                       |
+| `extensions/agent_memory`     | lazy       | Structured project-scoped memory. Uses the declared `agent_memory_storage` capability for namespaced persistence; lexical retrieval works without a provider. Tools: `memory_remember`, `memory_update`, `memory_forget`, `memory_search`, `memory_timeline`, `memory_get`, `memory_context_for_task`.                                                      |
 
 The `lint` extension is configured from `<workspace>/.tower/config.toml` under `[lint.<language>]`.
 Each entry declares a command, optional positive `timeout_secs` (omitted for no Tower-controlled

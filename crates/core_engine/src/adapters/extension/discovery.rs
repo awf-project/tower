@@ -40,13 +40,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use extension_protocol::{Activation, ExtensionFault, ExtensionManifest};
+use extension_protocol::{Activation, Capability, ExtensionFault, ExtensionManifest};
 use serde_json::Value;
 
 use super::host_deps::HostDeps;
 use super::supervisor::ExtensionSupervisor;
 use crate::domain::extension_host::{
-    CancellationSignal, ExtensionCallError, ExtensionId, ExtensionInstance, ExtensionRegistry,
+    CancellationSignal, ExtensionCallError, ExtensionInstance, ExtensionRegistry,
 };
 use crate::ports::AgentMemoryNamespace;
 
@@ -657,14 +657,14 @@ fn load_extensions_with_register_cancellable_inner(
                 // Resolve the command: if the first element is a relative path
                 // (not starting with '/'), resolve it relative to ext_dir.
                 let manifest = resolve_command_paths(manifest, &ext_dir);
-                let (manifest, instance_deps) = prepare_manifest_deps(&deps, manifest);
+                let instance_deps = prepare_manifest_deps(&deps, &manifest);
 
                 let instance: Box<dyn ExtensionInstance> = match manifest.activation {
                     Activation::Eager => {
                         // Spawn immediately — must be running before events flow (EV1).
                         match super::sidecar::SidecarHostAdapter::spawn(
                             manifest.clone(),
-                            clone_deps(&instance_deps),
+                            instance_deps,
                             instance_timeout,
                             init_config.clone(),
                         ) {
@@ -682,7 +682,7 @@ fn load_extensions_with_register_cancellable_inner(
                         // Wrap in supervisor — spawn deferred to first call.
                         Box::new(ExtensionSupervisor::new(
                             manifest,
-                            clone_deps(&instance_deps),
+                            instance_deps,
                             instance_timeout,
                             init_config,
                         ))
@@ -739,69 +739,28 @@ fn resolve_command_paths(mut manifest: ExtensionManifest, ext_dir: &Path) -> Ext
     manifest
 }
 
-/// Clone a `HostDeps` (all fields are `Arc` — cheap; `push_tx` is cloned too).
-fn clone_deps(deps: &HostDeps) -> HostDeps {
-    HostDeps {
-        fs: std::sync::Arc::clone(&deps.fs),
-        ast_index: std::sync::Arc::clone(&deps.ast_index),
-        format_queue: std::sync::Arc::clone(&deps.format_queue),
-        apply_edits: std::sync::Arc::clone(&deps.apply_edits),
-        push_tx: deps.push_tx.clone(),
-        agent_memory_storage: deps.agent_memory_storage.clone(),
-        agent_memory_namespace: deps.agent_memory_namespace.clone(),
-    }
-}
-
-fn prepare_manifest_deps(
-    deps: &HostDeps,
-    manifest: ExtensionManifest,
-) -> (ExtensionManifest, HostDeps) {
-    let Ok(host) = std::env::current_exe() else {
-        return without_agent_memory_deps(deps, manifest);
-    };
-    prepare_manifest_deps_with_host(deps, manifest, &host)
-}
-
-fn prepare_manifest_deps_with_host(
-    deps: &HostDeps,
-    mut manifest: ExtensionManifest,
-    host_executable: &Path,
-) -> (ExtensionManifest, HostDeps) {
-    let mut instance_deps = clone_deps(deps);
-    let requests_agent_memory = manifest
-        .capabilities
-        .required
-        .iter()
-        .any(|capability| capability == "agent_memory_storage");
-    let selected = (requests_agent_memory && deps.agent_memory_storage.is_some())
-        .then(|| super::sidecar::select_trusted_agent_memory_executable(&manifest, host_executable))
-        .flatten();
-    let namespace = selected.as_ref().and_then(|_| {
-        let workspace = deps.fs.workspace_root()?.canonicalize().ok()?;
-        AgentMemoryNamespace::from_trusted_identity(
+/// Bind storage to the manifest selected by normal scope precedence. Only the host
+/// supplies the project and extension identifiers used to derive the namespace.
+fn prepare_manifest_deps(deps: &HostDeps, manifest: &ExtensionManifest) -> HostDeps {
+    let mut instance = deps.clone();
+    instance.agent_memory_namespace = None;
+    if instance.agent_memory_storage.is_some()
+        && super::sidecar::manifest_grants_capability(manifest, &Capability::AgentMemoryStorage)
+        && let Some(workspace) = deps
+            .fs
+            .workspace_root()
+            .and_then(|root| root.canonicalize().ok())
+    {
+        instance.agent_memory_namespace = AgentMemoryNamespace::from_trusted_identity(
             workspace.as_os_str().as_encoded_bytes(),
-            ExtensionId::new(&manifest.name).as_str().as_bytes(),
+            manifest.name.as_bytes(),
         )
-        .ok()
-    });
-    let Some((selected, namespace)) = selected.zip(namespace) else {
-        instance_deps.agent_memory_storage = None;
-        instance_deps.agent_memory_namespace = None;
-        return (manifest, instance_deps);
-    };
-    manifest.command[0] = selected.to_string_lossy().into_owned();
-    instance_deps.agent_memory_namespace = Some(namespace);
-    (manifest, instance_deps)
-}
-
-fn without_agent_memory_deps(
-    deps: &HostDeps,
-    manifest: ExtensionManifest,
-) -> (ExtensionManifest, HostDeps) {
-    let mut instance_deps = clone_deps(deps);
-    instance_deps.agent_memory_storage = None;
-    instance_deps.agent_memory_namespace = None;
-    (manifest, instance_deps)
+        .ok();
+    }
+    if instance.agent_memory_namespace.is_none() {
+        instance.agent_memory_storage = None;
+    }
+    instance
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1162,45 +1121,31 @@ activation = "lazy"
 
     #[test]
     fn privileged_dependencies_are_attached_only_to_an_admitted_instance() {
-        let install = tempfile::tempdir().expect("temporary installation");
         let workspace = tempfile::tempdir().expect("temporary workspace");
-        let host = install.path().join("tower");
-        let bundled = install.path().join("agent_memory_extension");
-        let untrusted = install.path().join("untrusted");
-        std::fs::write(&host, b"host").expect("write host fixture");
-        std::fs::write(&bundled, b"bundled").expect("write bundled fixture");
-        std::fs::write(&untrusted, b"untrusted").expect("write untrusted fixture");
         let bounds = AgentMemoryStorageBounds::try_new(32, 128, 16, 8, 8, 1024, 4)
             .expect("valid storage bounds");
         let mut deps = make_host_deps();
         deps.fs = Arc::new(Mutex::new(RealFs::new(workspace.path())));
         deps.agent_memory_storage = Some(Arc::new(InMemoryAgentMemoryStorage::new(bounds)));
         assert!(deps.agent_memory_namespace.is_none());
-        let manifest = |command: &Path| ExtensionManifest {
-            name: "agent_memory".to_owned(),
-            version: "0.1.0".to_owned(),
-            command: vec![command.to_string_lossy().into_owned()],
-            activation: Activation::Lazy,
-            tools: vec![],
-            events: EventsSection::default(),
-            capabilities: CapabilitiesSection {
-                required: vec!["agent_memory_storage".to_owned()],
-            },
-        };
+        let mut manifest: ExtensionManifest = toml::from_str(include_str!(
+            "../../../../../extensions/agent_memory/extension.toml"
+        ))
+        .unwrap();
+        let admitted = super::prepare_manifest_deps(&deps, &manifest);
+        assert!(admitted.agent_memory_storage.is_some());
+        assert!(admitted.agent_memory_namespace.is_some());
 
-        let (admitted, admitted_deps) =
-            super::prepare_manifest_deps_with_host(&deps, manifest(&bundled), &host);
-        assert_eq!(
-            Path::new(&admitted.command[0]),
-            bundled.canonicalize().expect("canonical bundled path")
-        );
-        assert!(admitted_deps.agent_memory_storage.is_some());
-        assert!(admitted_deps.agent_memory_namespace.is_some());
+        manifest.name = "another_extension".to_owned();
+        let other = super::prepare_manifest_deps(&deps, &manifest);
+        assert!(other.agent_memory_storage.is_none());
+        assert!(other.agent_memory_namespace.is_none());
 
-        let (_, rejected_deps) =
-            super::prepare_manifest_deps_with_host(&deps, manifest(&untrusted), &host);
-        assert!(rejected_deps.agent_memory_storage.is_none());
-        assert!(rejected_deps.agent_memory_namespace.is_none());
+        manifest.name = "agent_memory".to_owned();
+        manifest.capabilities.required.clear();
+        let undeclared = super::prepare_manifest_deps(&deps, &manifest);
+        assert!(undeclared.agent_memory_storage.is_none());
+        assert!(undeclared.agent_memory_namespace.is_none());
     }
 
     use super::super::timeout_test_support::{assert_timeout_after, timeout_manifest};
