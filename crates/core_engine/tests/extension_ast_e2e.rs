@@ -355,9 +355,16 @@ fn ast_symbol_search(workspace: &Path, symbol: &str) -> serde_json::Value {
         }
     });
     writeln!(stream, "{request}").unwrap();
-    line.clear();
-    reader.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    // The daemon may interleave notifications (tools/list_changed when the
+    // extension publishes its tools) before the response.
+    loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if frame["id"] == 2 {
+            return frame;
+        }
+    }
 }
 
 #[test]
