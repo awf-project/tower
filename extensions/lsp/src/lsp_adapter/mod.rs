@@ -197,6 +197,10 @@ impl ReaderExit {
     }
 }
 
+/// How long a write that hit a broken pipe waits for the reader to report
+/// the server's exit.
+const BROKEN_PIPE_EXIT_WAIT: Duration = Duration::from_millis(500);
+
 fn classify_reader_error(error: &std::io::Error) -> ReaderExit {
     match error.kind() {
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
@@ -1408,7 +1412,7 @@ impl LspClientAdapter {
             return Err(if error.kind() == std::io::ErrorKind::TimedOut {
                 LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
             } else {
-                self.transport_failure()
+                self.transport_failure(&error, deadline)
             });
         }
         Ok(emitted_sync)
@@ -1496,7 +1500,7 @@ impl LspClientAdapter {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
             } else {
-                self.transport_failure()
+                self.transport_failure(&error, deadline)
             }
         })?;
 
@@ -1549,9 +1553,29 @@ impl LspClientAdapter {
         }
     }
 
-    fn transport_failure(&self) -> LspSessionError {
+    /// The outcome of a failed write. A broken pipe means the server is gone:
+    /// its reader sees the end of its output right after, so wait briefly for
+    /// it to classify the exit instead of racing it. The wait never outlives
+    /// the operation deadline; once that has passed, the outcome is a timeout.
+    fn transport_failure(
+        &self,
+        error: &std::io::Error,
+        deadline: Option<Instant>,
+    ) -> LspSessionError {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            let wait = deadline.map_or(BROKEN_PIPE_EXIT_WAIT, |deadline| {
+                BROKEN_PIPE_EXIT_WAIT.min(deadline.saturating_duration_since(Instant::now()))
+            });
+            let (lock, cvar) = &*self.state;
+            let state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = cvar
+                .wait_timeout_while(state, wait, |_| !self.dead_flag.load(Ordering::Acquire))
+                .unwrap_or_else(|p| p.into_inner());
+        }
         if self.dead_flag.load(Ordering::Acquire) {
             self.reader_failure()
+        } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
         } else {
             LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTransportError)
         }
@@ -2102,7 +2126,7 @@ impl pool::PooledSession for LspClientAdapter {
                 return Err(if error.kind() == std::io::ErrorKind::TimedOut {
                     LspSessionError::Backend(extension_protocol::LspOutcomeCode::ServerTimeout)
                 } else {
-                    self.transport_failure()
+                    self.transport_failure(&error, deadline)
                 });
             }
             emitted_sync
@@ -2923,12 +2947,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DIAGNOSTIC_PUBLICATION_HISTORY, DiagnosticsCapability, DiagnosticsEvent, LspClientAdapter,
-        LspSessionError, ProviderCapability, RawLocation, RawWorkspaceEdit, ReaderExit,
-        RenameCapability, RenameNavigationError, ResponseCache, SemanticCapabilities, Session,
-        SharedState, UriAccessPolicy, UriClassification, Writer, build_dispatcher,
-        classify_reader_error, current_generation, decode, initialize_params, mark_ready,
-        parse_publish_diagnostics, path_to_uri, progress_kind, record_diagnostics,
+        BROKEN_PIPE_EXIT_WAIT, DIAGNOSTIC_PUBLICATION_HISTORY, DiagnosticsCapability,
+        DiagnosticsEvent, LspClientAdapter, LspSessionError, ProviderCapability, RawLocation,
+        RawWorkspaceEdit, ReaderExit, RenameCapability, RenameNavigationError, ResponseCache,
+        SemanticCapabilities, Session, SharedState, UriAccessPolicy, UriClassification, Writer,
+        build_dispatcher, classify_reader_error, current_generation, decode, initialize_params,
+        mark_ready, parse_publish_diagnostics, path_to_uri, progress_kind, record_diagnostics,
         server_status_is_quiescent, wait_for_settled, workspace_locations,
     };
     use crate::lsp_adapter::documents::DocumentTracker;
@@ -3905,6 +3929,42 @@ mod tests {
                 .docs
                 .is_open(&uri),
             "a failed didOpen must not retain a document hold"
+        );
+    }
+
+    #[test]
+    fn broken_pipe_wait_is_capped_by_an_expiring_deadline() {
+        let (adapter, _sink, _responses) = test_adapter();
+        let budget = Duration::from_millis(50);
+        let started = Instant::now();
+
+        let error = adapter.transport_failure(
+            &Error::new(ErrorKind::BrokenPipe, "server closed stdin"),
+            Some(started + budget),
+        );
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(LspOutcomeCode::ServerTimeout)
+        );
+        assert!(
+            started.elapsed() < BROKEN_PIPE_EXIT_WAIT,
+            "the broken-pipe wait must stop at the operation deadline"
+        );
+    }
+
+    #[test]
+    fn broken_pipe_without_reader_exit_within_budget_is_a_transport_error() {
+        let (adapter, _sink, _responses) = test_adapter();
+
+        let error = adapter.transport_failure(
+            &Error::new(ErrorKind::BrokenPipe, "server closed stdin"),
+            Some(Instant::now() + Duration::from_secs(60)),
+        );
+
+        assert_eq!(
+            error,
+            LspSessionError::Backend(LspOutcomeCode::ServerTransportError)
         );
     }
 
