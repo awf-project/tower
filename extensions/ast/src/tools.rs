@@ -218,7 +218,9 @@ where
     let mut fresh_hashes: HashMap<String, u64> = HashMap::new();
     let mut indexed_files = 0i64;
 
-    for path in &paths {
+    // Only files a grammar parses can be indexed: reading the others (binaries,
+    // images) would ship their whole content through the host for nothing.
+    for path in paths.iter().filter(|path| is_supported(path)) {
         let bytes = match protocol::host_call_read_file(out, lines, next_id, path) {
             Ok(b) => b,
             Err(_) => continue, // file may have vanished between list and read
@@ -754,6 +756,15 @@ where
     W: Write,
     R: Iterator<Item = Result<String, std::io::Error>>,
 {
+    // No grammar parses it, so its content could never be indexed: drop any
+    // stale entry, as an unsupported parse would, without reading it.
+    if !is_supported(path) {
+        if index.lock().unwrap().by_path.contains_key(path) {
+            index.lock().unwrap().remove_file(path);
+            content_hashes.lock().unwrap().remove(path);
+        }
+        return Ok(());
+    }
     match protocol::host_call_read_file(out, lines, next_id, path) {
         Ok(bytes) => {
             let new_hash = hash_bytes(&bytes);
@@ -991,8 +1002,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 
 /// Check whether the language for `path` is supported.
 ///
-/// Used by `reindex_single_path` to decide whether to try parsing.
-#[allow(dead_code)]
+/// Used by the reindexes to skip reading files no grammar parses.
 pub fn is_supported(path: &str) -> bool {
     SupportedLanguage::from_hint(path).is_some()
 }
@@ -1007,6 +1017,83 @@ mod tests {
         PerFileEditResult, WorkspaceApplyEditsError, WorkspaceApplyEditsErrorCode,
         WorkspaceApplyEditsResult,
     };
+
+    /// A scripted host: answers each HostCall with the next canned result and
+    /// records the methods and paths it was asked for.
+    fn scripted_host(results: &[serde_json::Value]) -> Vec<Result<String, std::io::Error>> {
+        results
+            .iter()
+            .enumerate()
+            .map(|(i, result)| {
+                Ok(
+                    serde_json::json!({"jsonrpc": "2.0", "id": i + 1, "result": result})
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn requested(out: &[u8]) -> Vec<(String, Option<String>)> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .map(|line| {
+                let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+                (
+                    frame["method"].as_str().unwrap().to_owned(),
+                    frame["params"]["path"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    /// A change on a file no grammar parses (a binary, an image) asks the
+    /// host for nothing: its content could never be indexed.
+    #[test]
+    fn a_change_on_an_unsupported_file_reads_nothing() {
+        let index = Mutex::new(SymbolIndex::default());
+        let hashes = Mutex::new(HashMap::new());
+        let mut out = Vec::new();
+        let mut lines = Vec::<Result<String, std::io::Error>>::new().into_iter();
+        let mut next_id = 1;
+        reindex_single_path(
+            "extensions/ast/ast_extension",
+            &index,
+            &hashes,
+            &mut out,
+            &mut lines,
+            &mut next_id,
+        )
+        .unwrap();
+        assert_eq!(requested(&out), Vec::new());
+    }
+
+    /// A full reindex reads only the files a grammar parses.
+    #[test]
+    fn a_full_reindex_reads_only_supported_files() {
+        let index = Mutex::new(SymbolIndex::default());
+        let hashes = Mutex::new(HashMap::new());
+        let mut out = Vec::new();
+        let mut lines = scripted_host(&[
+            serde_json::json!(["src/lib.rs", "bin/tool", "assets/logo.png"]),
+            serde_json::json!("pub fn kept() {}\n"),
+            serde_json::Value::Null,
+        ])
+        .into_iter();
+        let mut next_id = 1;
+        let report = tool_reindex(&index, &hashes, &mut out, &mut lines, &mut next_id).unwrap();
+        assert_eq!(
+            requested(&out),
+            vec![
+                ("workspace/listFiles".to_owned(), None),
+                (
+                    "workspace/readFile".to_owned(),
+                    Some("src/lib.rs".to_owned())
+                ),
+                ("index/put".to_owned(), None),
+            ]
+        );
+        assert_eq!(report["indexed_files"], 1);
+    }
 
     #[test]
     fn extract_str_missing_field_returns_err() {
